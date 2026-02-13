@@ -1,6 +1,6 @@
 FROM python:3.10-slim
 
-# Install git (required for submodules and GitHub verification)
+# Install git (required for GitHub submissions)
 RUN apt-get update && \
     apt-get install -y git && \
     apt-get clean && \
@@ -16,22 +16,23 @@ ARG REPO_BRANCH=main
 RUN git clone --recursive -b ${REPO_BRANCH} ${REPO_URL} . && \
     git submodule update --init --recursive
 
-# Verify clawbench is at correct version (v0.3.0)
-RUN cd clawbench && git checkout b718230cb201fc0a4c28d12e011b1663db07d8f7
-
 # Install Python dependencies
 RUN pip install --no-cache-dir -e .
 
 # Create directories
-RUN mkdir -p /app/logs /tmp/trajectoryrl_packs
+RUN mkdir -p /app/logs /app/packs
 
 # Environment variables (override with docker-compose)
-ENV WALLET_NAME=validator
+ENV WALLET_NAME=miner
 ENV WALLET_HOTKEY=default
 ENV NETUID=11
 ENV NETWORK=finney
 ENV LOG_LEVEL=INFO
-ENV EPOCH_INTERVAL=720
 
-# Run validator
-CMD ["python", "-u", "neurons/validator.py"]
+# Miner-specific settings
+ENV PACK_PATH=/app/packs/pack.json
+ENV PACK_REPO=""
+ENV PACK_COMMIT=""
+
+# Run miner
+CMD ["python", "-u", "neurons/miner.py"]

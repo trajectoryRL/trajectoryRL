@@ -1,0 +1,87 @@
+version: '3.8'
+
+services:
+  validator:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.validator
+    container_name: trajectoryrl_validator
+    restart: unless-stopped
+    environment:
+      # Bittensor config
+      - WALLET_NAME=${WALLET_NAME:-validator}
+      - WALLET_HOTKEY=${WALLET_HOTKEY:-default}
+      - NETUID=${NETUID:-11}
+      - NETWORK=${NETWORK:-finney}
+      
+      # ClawBench config
+      - CLAWBENCH_PATH=/app/clawbench
+      
+      # Evaluation config
+      - EPOCH_INTERVAL=${EPOCH_INTERVAL:-720}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      
+      # API keys (load from .env)
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    volumes:
+      # Persist Bittensor wallet
+      - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
+      
+      # Persist logs
+      - ./logs:/app/logs
+      
+      # Persist pack cache
+      - /tmp/trajectoryrl_packs:/tmp/trajectoryrl_packs
+      
+      # Git cache for GitHub verification
+      - ./git_cache:/app/logs/git_cache
+    networks:
+      - trajectoryrl
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  miner:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.miner
+    container_name: trajectoryrl_miner
+    restart: unless-stopped
+    environment:
+      # Bittensor config
+      - WALLET_NAME=${WALLET_NAME:-miner}
+      - WALLET_HOTKEY=${WALLET_HOTKEY:-default}
+      - NETUID=${NETUID:-11}
+      - NETWORK=${NETWORK:-finney}
+      
+      # Miner config
+      - PACK_PATH=${PACK_PATH:-/app/packs/pack.json}
+      - PACK_REPO=${PACK_REPO}
+      - PACK_COMMIT=${PACK_COMMIT}
+      
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      # Persist Bittensor wallet
+      - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
+      
+      # Mount policy pack
+      - ./packs:/app/packs:ro
+      
+      # Persist logs
+      - ./logs:/app/logs
+    networks:
+      - trajectoryrl
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Only start miner if explicitly enabled
+    profiles:
+      - miner
+
+networks:
+  trajectoryrl:
+    driver: bridge

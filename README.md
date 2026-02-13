@@ -59,10 +59,31 @@ TrajectoryRL employs three layers of protection against copy-paste attacks:
 
 ## Quick Start
 
-### For Validators
+### For Validators (Docker - Recommended)
 
 ```bash
 # 1. Clone repo with submodules
+git clone --recursive https://github.com/trajectoryRL/trajectoryrl.git
+cd trajectoryrl
+
+# 2. Configure environment
+cp .env.example .env
+# Edit: add ANTHROPIC_API_KEY, WALLET_NAME, WALLET_HOTKEY
+
+# 3. Start validator
+docker-compose up -d validator
+
+# 4. View logs
+docker-compose logs -f validator
+```
+
+> **Recommended**: Docker ensures consistent environment and automatic ClawBench version pinning (v0.3.0 / `b718230`). See [docker/README.md](docker/README.md) for full documentation.
+
+<details>
+<summary><b>Manual Installation (Development Only)</b></summary>
+
+```bash
+# 1. Clone repo
 git clone --recursive https://github.com/trajectoryRL/trajectoryrl.git
 cd trajectoryrl
 
@@ -76,33 +97,53 @@ cp .env.example .env
 # 4. Run validator
 python neurons/validator.py
 ```
+</details>
 
-> **Note**: ClawBench is pinned as a git submodule to **v0.3.0** (`b718230`) for reproducible consensus across validators.
+### For Miners (Docker - Recommended)
 
-### For Miners
+```bash
+# 1. Clone repo
+git clone --recursive https://github.com/trajectoryRL/trajectoryrl.git
+cd trajectoryrl
+
+# 2. Prepare policy pack
+mkdir -p packs
+# Create packs/pack.json with your policy
+
+# 3. Publish to GitHub
+cd /path/to/your/pack/repo
+git add pack.json
+git commit -m "Initial pack submission"
+git push origin main
+
+# 4. Configure environment
+cp .env.example .env
+# Edit: add PACK_REPO, PACK_COMMIT (git commit hash)
+
+# 5. Start miner
+docker-compose --profile miner up -d miner
+
+# 6. View logs
+docker-compose logs -f miner
+```
+
+<details>
+<summary><b>Manual Installation</b></summary>
 
 ```bash
 # 1. Install
 pip install -e .
 
-# 2. Create policy pack
-# See: docs/creating_packs.md
-
+# 2. Create policy pack (see: docs/creating_packs.md)
 # 3. Publish to GitHub
-git init my_pack_repo
-cd my_pack_repo
-cp ../my_pack.json pack.json
-git add pack.json
-git commit -m "Initial pack submission"
-git remote add origin https://github.com/YOUR_USERNAME/YOUR_REPO.git
-git push -u origin main
 
-# 4. Run miner (submits git hash + repo URL)
+# 4. Run miner
 python neurons/miner.py \
   --pack.path ./pack.json \
   --pack.repo https://github.com/YOUR_USERNAME/YOUR_REPO \
   --pack.commit $(git rev-parse HEAD)
 ```
+</details>
 
 ## Project Structure
 
