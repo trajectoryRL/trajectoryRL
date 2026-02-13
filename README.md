@@ -245,9 +245,8 @@ NETWORK=local python neurons/validator.py --wallet.name test_validator
 
 ## Community
 
-- **GitHub**: https://github.com/trajectoryRL/trajectoryrl
-- **Discord**: [Join server](https://discord.gg/trajectoryrl)
-- **Docs**: https://docs.trajectoryrl.com
+- **GitHub**: https://github.com/trajectoryRL/trajectoryRL
+- **Website**: https://trajrl.com
 
 ## License
 
