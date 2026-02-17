@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import random
 import sys
 import time
 import yaml
@@ -20,6 +21,7 @@ from ..utils.config import ValidatorConfig
 from ..utils.clawbench import ClawBenchHarness, EvaluationResult
 from ..scoring import TrajectoryScorer, AggregatedScore
 from ..utils.github import GitHubVerifier
+from ..utils.epoch_context import generate_epoch_context, render_context_preamble
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +81,9 @@ class TrajectoryValidator:
         self.scorer = TrajectoryScorer(
             lambda_cost=config.lambda_cost,
             mu_safety=config.mu_safety,
-            rho_reliability=config.rho_reliability
+            rho_reliability=config.rho_reliability,
+            score_quantization=config.score_quantization,
+            consensus_epsilon=config.consensus_epsilon,
         )
 
         # Initialize GitHub verifier
@@ -96,14 +100,29 @@ class TrajectoryValidator:
         self.score_history: Dict[int, List[float]] = defaultdict(list)
 
         # First-mover tracking: {miner_uid: (first_score, first_timestamp)}
-        # Tracks the FIRST submission from each miner that achieved a given score level
         self.first_mover_data: Dict[int, Tuple[float, float]] = {}
+
+        # Epoch number — derived from Bittensor block height so all
+        # validators agree on the same epoch (and thus the same seed,
+        # persona, and scenario subset).
+        # Approx 12 s per block → blocks_per_epoch = epoch_interval / 12.
+        self.blocks_per_epoch: int = max(1, self.config.epoch_interval // 12)
+        self.current_epoch: int = self._block_epoch()
 
         # Load scenarios
         self.scenarios = self._load_scenarios()
         logger.info(f"Loaded {len(self.scenarios)} scenarios: {list(self.scenarios.keys())}")
 
         logger.info("Validator initialization complete!")
+
+    def _block_epoch(self) -> int:
+        """Derive epoch number from current Bittensor block height.
+
+        All validators see the same block height, so they compute the
+        same epoch number → same seed → same persona/scenarios.
+        """
+        current_block = self.subtensor.get_current_block()
+        return current_block // self.blocks_per_epoch
 
     def _setup_logging(self):
         """Setup logging configuration."""
@@ -143,21 +162,43 @@ class TrajectoryValidator:
         return scenarios
 
     async def run(self):
-        """Main validator loop."""
-        logger.info("Starting validator main loop...")
-        logger.info(f"Epoch interval: {self.config.epoch_interval}s")
+        """Main validator loop.
 
-        epoch = 0
+        Epoch numbers are derived from Bittensor block height
+        (block // blocks_per_epoch) so every validator agrees on the
+        same epoch — and therefore the same seed, persona, and
+        scenario subset — regardless of when it started.
+        """
+        logger.info("Starting validator main loop...")
+        logger.info(
+            f"Epoch interval: {self.config.epoch_interval}s "
+            f"(~{self.blocks_per_epoch} blocks)"
+        )
+
+        last_completed_epoch: Optional[int] = None
+
         while True:
             try:
-                epoch += 1
+                self.current_epoch = self._block_epoch()
+
+                # Skip if we already evaluated this epoch
+                if self.current_epoch == last_completed_epoch:
+                    await asyncio.sleep(60)  # Check again in 1 min
+                    continue
+
                 logger.info("=" * 60)
-                logger.info(f"Epoch {epoch} starting")
+                logger.info(f"Epoch {self.current_epoch} starting")
                 logger.info("=" * 60)
 
                 await self.run_epoch()
 
-                logger.info(f"Epoch {epoch} complete. Sleeping {self.config.epoch_interval}s...")
+                last_completed_epoch = self.current_epoch
+                logger.info(
+                    f"Epoch {self.current_epoch} complete. "
+                    f"Waiting for next epoch..."
+                )
+
+                # Sleep until roughly the next epoch boundary
                 await asyncio.sleep(self.config.epoch_interval)
 
             except KeyboardInterrupt:
@@ -167,8 +208,85 @@ class TrajectoryValidator:
                 logger.error(f"Epoch failed: {e}", exc_info=True)
                 await asyncio.sleep(60)  # Wait 1 min before retry
 
+    @staticmethod
+    def compute_epoch_seed(epoch: int, netuid: int = 11) -> int:
+        """Deterministic seed for this epoch.
+
+        The epoch number is derived from Bittensor block height
+        (current_block // blocks_per_epoch), so all validators agree
+        on the same epoch and thus the same seed.
+
+        Args:
+            epoch: Epoch number (block_height // blocks_per_epoch)
+            netuid: Subnet UID (mixed in to avoid cross-subnet collisions)
+
+        Returns:
+            Deterministic integer seed
+        """
+        raw = f"trajectoryrl-{netuid}-epoch-{epoch}".encode()
+        return int(hashlib.sha256(raw).hexdigest()[:8], 16)
+
+    @staticmethod
+    def select_epoch_scenarios(
+        all_scenarios: List[str],
+        epoch_seed: int,
+        max_scenarios: int = 4,
+    ) -> List[str]:
+        """Deterministically select which scenarios to run this epoch.
+
+        When the scenario pool is larger than ``max_scenarios``, a
+        different subset is chosen each epoch (seeded).  Because the seed
+        is deterministic, all validators select the same subset.
+
+        Rotating the scenario subset across epochs means a stale policy
+        that was tuned for scenarios A-D may face scenarios B-E next
+        epoch, naturally degrading cached solutions.
+
+        Args:
+            all_scenarios: Full scenario pool
+            epoch_seed: Deterministic seed for this epoch
+            max_scenarios: Max scenarios to evaluate per epoch
+
+        Returns:
+            Sorted list of selected scenario names
+        """
+        if len(all_scenarios) <= max_scenarios:
+            return sorted(all_scenarios)
+        rng = random.Random(epoch_seed)
+        selected = rng.sample(all_scenarios, max_scenarios)
+        return sorted(selected)
+
     async def run_epoch(self):
-        """Run one evaluation epoch."""
+        """Run one evaluation epoch.
+
+        Each epoch:
+        1. Computes a deterministic epoch seed (same across all validators)
+        2. Generates an epoch context (persona, date, company, etc.)
+        3. Selects a scenario subset from the pool (epoch-seeded)
+        4. Evaluates all active miners on the selected scenarios
+        5. Sets on-chain weights (winner-take-all)
+        """
+        # 0. Compute epoch seed and epoch context
+        epoch_seed = self.compute_epoch_seed(self.current_epoch, self.config.netuid)
+        epoch_scenarios = self.select_epoch_scenarios(
+            all_scenarios=list(self.scenarios.keys()),
+            epoch_seed=epoch_seed,
+            max_scenarios=self.config.scenarios_per_epoch,
+        )
+
+        # Generate epoch context — unique persona/date per epoch, prepended
+        # to every miner's AGENTS.md so policies must be identity-agnostic.
+        epoch_ctx = generate_epoch_context(epoch_seed)
+        context_preamble = render_context_preamble(epoch_ctx)
+        user_context = epoch_ctx.to_user_context()
+
+        logger.info(
+            f"Epoch {self.current_epoch}: seed={epoch_seed}, "
+            f"scenarios={epoch_scenarios}, "
+            f"context=[{epoch_ctx.user_name}, {epoch_ctx.user_role}, "
+            f"{epoch_ctx.date_str}]"
+        )
+
         # 1. Sync metagraph
         logger.info("Syncing metagraph...")
         self.metagraph.sync(subtensor=self.subtensor)
@@ -181,10 +299,13 @@ class TrajectoryValidator:
             logger.warning("No active miners found!")
             return
 
-        # 3. Evaluate each miner
+        # 3. Evaluate each miner on this epoch's scenario subset
         scores = {}
         for miner_uid in miners:
-            score = await self._evaluate_miner(miner_uid)
+            score = await self._evaluate_miner(
+                miner_uid, epoch_scenarios, epoch_seed,
+                context_preamble, user_context,
+            )
             scores[miner_uid] = score
 
         # 4. Set weights
@@ -214,11 +335,22 @@ class TrajectoryValidator:
 
         return miners
 
-    async def _evaluate_miner(self, miner_uid: int) -> float:
-        """Evaluate a single miner.
+    async def _evaluate_miner(
+        self,
+        miner_uid: int,
+        epoch_scenarios: List[str],
+        epoch_seed: int,
+        context_preamble: str = "",
+        user_context: Optional[Dict] = None,
+    ) -> float:
+        """Evaluate a single miner on this epoch's scenarios.
 
         Args:
             miner_uid: Miner UID
+            epoch_scenarios: Scenarios selected for this epoch
+            epoch_seed: Deterministic seed for this epoch
+            context_preamble: Epoch context markdown prepended to AGENTS.md
+            user_context: Dict of {{PLACEHOLDER}} overrides for USER.md
 
         Returns:
             Final score [0, 1]
@@ -268,28 +400,35 @@ class TrajectoryValidator:
             )
             return 0.0
 
-        # Step 4: Run scenarios
+        # Step 4: Run this epoch's scenarios with majority-vote consensus.
+        # Each scenario is run seeds_per_task times; individual rubric checks
+        # are majority-voted so that independent validators converge on the
+        # same binary pass/fail per check despite LLM non-determinism.
+        # The epoch_seed is mixed into per-run seeds so that each epoch
+        # evaluates under slightly different conditions.
         results = []
-        for scenario_name in self.scenarios.keys():
-            for seed in range(self.config.seeds_per_task):
-                try:
-                    result = await self.harness.evaluate_pack(
-                        pack=pack,
-                        scenario_name=scenario_name,
-                        seed=seed
-                    )
-                    results.append(result)
+        for scenario_name in epoch_scenarios:
+            try:
+                result = await self.harness.evaluate_pack_consensus(
+                    pack=pack,
+                    scenario_name=scenario_name,
+                    num_runs=self.config.seeds_per_task,
+                    base_seed=epoch_seed,
+                    context_preamble=context_preamble,
+                    user_context=user_context,
+                )
+                results.append(result)
 
-                    logger.info(
-                        f"Miner {miner_uid}: {scenario_name} (seed={seed}) -> "
-                        f"score={result.score:.3f}, success={result.success}"
-                    )
+                logger.info(
+                    f"Miner {miner_uid}: {scenario_name} → "
+                    f"score={result.score:.3f} (consensus x{self.config.seeds_per_task})"
+                )
 
-                except Exception as e:
-                    logger.error(
-                        f"Miner {miner_uid}: {scenario_name} failed: {e}",
-                        exc_info=True
-                    )
+            except Exception as e:
+                logger.error(
+                    f"Miner {miner_uid}: {scenario_name} failed: {e}",
+                    exc_info=True
+                )
 
         # Step 5: Aggregate scores
         if not results:
@@ -308,7 +447,6 @@ class TrajectoryValidator:
         self.score_history[miner_uid].append(final_score)
 
         # Update first-mover tracking
-        # If this miner doesn't have first-mover data, or improved their score, update it
         if miner_uid not in self.first_mover_data:
             self.first_mover_data[miner_uid] = (final_score, commit_timestamp)
             logger.info(
@@ -316,7 +454,6 @@ class TrajectoryValidator:
                 f"(score={final_score:.3f}, timestamp={commit_timestamp})"
             )
         elif final_score > self.first_mover_data[miner_uid][0]:
-            # Miner improved their score, update with new timestamp
             self.first_mover_data[miner_uid] = (final_score, commit_timestamp)
             logger.info(
                 f"Miner {miner_uid}: Score improved "
@@ -367,11 +504,11 @@ class TrajectoryValidator:
         """
         logger.info(f"Setting weights for {len(scores)} miners...")
 
-        # Select winner with first-mover advantage
+        # Select winner with first-mover advantage (constant δ)
         weights_dict = self.scorer.select_winner(
             scores=scores,
             first_mover_data=self.first_mover_data,
-            delta=self.config.delta_threshold if hasattr(self.config, 'delta_threshold') else 0.05
+            delta=self.config.delta_threshold,
         )
 
         # Prepare for Bittensor API

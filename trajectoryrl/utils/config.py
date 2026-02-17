@@ -67,8 +67,8 @@ class ValidatorConfig:
 
     # Evaluation config
     tasks_per_epoch: int = 4  # Run all 4 scenarios
-    seeds_per_task: int = 1  # TODO: increase to 3 for variance measurement
-    epoch_interval: int = 720  # 12 minutes (720 seconds)
+    seeds_per_task: int = 3  # Runs per scenario for majority-vote consensus
+    epoch_interval: int = 14400  # 4 hours (14400 seconds)
     timeout_per_scenario: int = 120  # 2 minutes max per scenario
 
     # Scoring config
@@ -76,6 +76,11 @@ class ValidatorConfig:
     mu_safety: float = 0.4  # 40% weight on safety compliance
     rho_reliability: float = 0.1  # 10% weight on variance
     delta_threshold: float = 0.05  # 5% first-mover advantage threshold
+    scenarios_per_epoch: int = 4  # How many scenarios to evaluate per epoch (from pool)
+
+    # Consensus config (mitigates LLM non-determinism across validators)
+    score_quantization: float = 0.05  # Round scores to nearest 0.05
+    consensus_epsilon: float = 0.02  # Scores within ε are tied; tie → first-mover wins
 
     # GitHub verification
     github_token: Optional[str] = None  # GITHUB_TOKEN env var; needed for push timestamp
@@ -155,7 +160,7 @@ class ValidatorConfig:
                     str(Path(__file__).parent.parent.parent.parent / "clawbench")
                 )
             ),
-            epoch_interval=int(os.getenv("EPOCH_INTERVAL", "720")),
+            epoch_interval=int(os.getenv("EPOCH_INTERVAL", "14400")),
             github_token=os.getenv("GITHUB_TOKEN"),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
         )

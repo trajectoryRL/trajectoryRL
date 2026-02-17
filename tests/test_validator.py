@@ -32,6 +32,11 @@ from trajectoryrl.utils.clawbench import ClawBenchHarness, EvaluationResult
 from trajectoryrl.utils.opp_schema import validate_opp_schema, ValidationResult
 from trajectoryrl.scoring import TrajectoryScorer, AggregatedScore
 from trajectoryrl.utils.github import GitHubVerifier, GitVerificationResult
+from trajectoryrl.base.validator import TrajectoryValidator
+from trajectoryrl.utils.epoch_context import (
+    generate_epoch_context, render_context_preamble,
+    EpochContext, NAMES, ROLES, COMPANIES, DEPARTMENTS, TIMEZONES,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +52,11 @@ CLAWBENCH_PATH = REPO_ROOT / "clawbench"
 
 @pytest.fixture
 def scorer():
-    return TrajectoryScorer(lambda_cost=0.3, mu_safety=0.4, rho_reliability=0.1)
+    return TrajectoryScorer(
+        lambda_cost=0.3, mu_safety=0.4, rho_reliability=0.1,
+        score_quantization=0,  # Disable quantization for exact-value tests
+        consensus_epsilon=0.02,
+    )
 
 
 @pytest.fixture
@@ -327,6 +336,442 @@ class TestTrajectoryScorer:
 
         assert abs(final - expected_final) < 1e-6
         assert 0.0 <= final <= 1.0
+
+    def test_quantize_score(self):
+        """Score quantization rounds to nearest q."""
+        s = TrajectoryScorer(score_quantization=0.05)
+        assert s.quantize_score(0.87) == 0.85
+        assert s.quantize_score(0.88) == 0.90
+        assert s.quantize_score(0.875) == 0.90  # midpoint rounds up
+        assert s.quantize_score(0.0) == 0.0
+        assert s.quantize_score(1.0) == 1.0
+        assert s.quantize_score(0.924) == 0.90
+        assert s.quantize_score(0.926) == 0.95
+
+    def test_quantize_score_disabled(self):
+        """q=0 means no quantization."""
+        s = TrajectoryScorer(score_quantization=0)
+        assert s.quantize_score(0.873) == 0.873
+
+    def test_compute_final_score_with_quantization(self):
+        """Final score is quantized."""
+        s = TrajectoryScorer(rho_reliability=0.1, score_quantization=0.05)
+        agg = AggregatedScore(
+            mean_score=0.87,
+            variance=0.0,
+            success_rate=1.0,
+            total_evaluations=1,
+            scenario_scores={"a": 0.87},
+        )
+        # 0.87 - 0 = 0.87, quantized to 0.85
+        assert s.compute_final_score(agg) == 0.85
+
+    def test_select_winner_consensus_epsilon_tie(self):
+        """Scores within ε → tie broken by earliest timestamp."""
+        s = TrajectoryScorer(
+            score_quantization=0, consensus_epsilon=0.02
+        )
+        # Two miners with nearly identical scores (within ε)
+        scores = {0: 0.90, 1: 0.91}
+        # No first-mover data → pure epsilon tie-break
+        weights = s.select_winner(scores, first_mover_data={}, delta=0.05)
+        # Without first_mover_data, no timestamps to break tie → highest score wins
+        assert weights[1] == 1.0
+
+        # Now with timestamps: miner 0 submitted first
+        first_mover = {0: (0.90, 100.0), 1: (0.91, 200.0)}
+        # Use delta=0 to isolate epsilon behavior from first-mover protection
+        weights = s.select_winner(scores, first_mover, delta=0.0)
+        # |0.91 - 0.90| = 0.01 ≤ ε=0.02 → tied → earliest (miner 0) wins
+        assert weights[0] == 1.0
+        assert weights[1] == 0.0
+
+    def test_select_winner_clear_margin_no_tie(self):
+        """Scores separated by more than ε → no tie-break."""
+        s = TrajectoryScorer(
+            score_quantization=0, consensus_epsilon=0.02
+        )
+        scores = {0: 0.85, 1: 0.91}
+        first_mover = {0: (0.85, 100.0), 1: (0.91, 200.0)}
+        weights = s.select_winner(scores, first_mover, delta=0.05)
+
+        # |0.91 - 0.85| = 0.06 > ε=0.02 → not tied, miner 1 wins on score
+        # Also 0.91 > 0.85 + 0.05 = 0.90 → beats delta threshold
+        assert weights[1] == 1.0
+        assert weights[0] == 0.0
+
+
+# ===================================================================
+# Epoch Seed & Scenario Rotation Tests
+# ===================================================================
+
+
+class TestEpochSeedAndScenarioRotation:
+    """Tests for deterministic epoch seed and scenario selection."""
+
+    def test_epoch_seed_deterministic(self):
+        """Same epoch + netuid always produces same seed."""
+        seed1 = TrajectoryValidator.compute_epoch_seed(42, netuid=11)
+        seed2 = TrajectoryValidator.compute_epoch_seed(42, netuid=11)
+        assert seed1 == seed2
+
+    def test_epoch_seed_varies_by_epoch(self):
+        """Different epochs produce different seeds."""
+        seed1 = TrajectoryValidator.compute_epoch_seed(1, netuid=11)
+        seed2 = TrajectoryValidator.compute_epoch_seed(2, netuid=11)
+        assert seed1 != seed2
+
+    def test_epoch_seed_varies_by_netuid(self):
+        """Different netuids produce different seeds."""
+        seed1 = TrajectoryValidator.compute_epoch_seed(1, netuid=11)
+        seed2 = TrajectoryValidator.compute_epoch_seed(1, netuid=12)
+        assert seed1 != seed2
+
+    def test_epoch_seed_is_positive_int(self):
+        """Epoch seed is a positive integer."""
+        seed = TrajectoryValidator.compute_epoch_seed(1)
+        assert isinstance(seed, int)
+        assert seed > 0
+
+    def test_select_epoch_scenarios_all_when_small_pool(self):
+        """When pool <= max_scenarios, all are returned."""
+        scenarios = ["a", "b", "c"]
+        selected = TrajectoryValidator.select_epoch_scenarios(scenarios, epoch_seed=42, max_scenarios=4)
+        assert selected == sorted(scenarios)
+
+    def test_select_epoch_scenarios_subsets_large_pool(self):
+        """When pool > max_scenarios, a subset is returned."""
+        scenarios = ["a", "b", "c", "d", "e", "f", "g"]
+        selected = TrajectoryValidator.select_epoch_scenarios(scenarios, epoch_seed=42, max_scenarios=4)
+        assert len(selected) == 4
+        assert all(s in scenarios for s in selected)
+
+    def test_select_epoch_scenarios_deterministic(self):
+        """Same seed always selects the same subset."""
+        scenarios = ["a", "b", "c", "d", "e", "f", "g"]
+        sel1 = TrajectoryValidator.select_epoch_scenarios(scenarios, epoch_seed=42, max_scenarios=4)
+        sel2 = TrajectoryValidator.select_epoch_scenarios(scenarios, epoch_seed=42, max_scenarios=4)
+        assert sel1 == sel2
+
+    def test_select_epoch_scenarios_varies_by_seed(self):
+        """Different seeds can select different subsets."""
+        scenarios = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]
+        sel1 = TrajectoryValidator.select_epoch_scenarios(scenarios, epoch_seed=1, max_scenarios=4)
+        sel2 = TrajectoryValidator.select_epoch_scenarios(scenarios, epoch_seed=2, max_scenarios=4)
+        # With 10 scenarios and 4 chosen, different seeds very likely produce different subsets
+        assert sel1 != sel2
+
+    def test_select_epoch_scenarios_sorted(self):
+        """Selected scenarios are returned sorted."""
+        scenarios = ["z", "m", "a", "f", "q", "b", "x"]
+        selected = TrajectoryValidator.select_epoch_scenarios(scenarios, epoch_seed=42, max_scenarios=4)
+        assert selected == sorted(selected)
+
+
+# ===================================================================
+# Epoch Context Tests
+# ===================================================================
+
+
+class TestEpochContext:
+    """Tests for epoch context generation and rendering."""
+
+    def test_generate_epoch_context_deterministic(self):
+        """Same seed always produces the same context."""
+        ctx1 = generate_epoch_context(12345)
+        ctx2 = generate_epoch_context(12345)
+        assert ctx1 == ctx2
+
+    def test_generate_epoch_context_varies_by_seed(self):
+        """Different seeds produce different contexts."""
+        ctx1 = generate_epoch_context(1)
+        ctx2 = generate_epoch_context(2)
+        # At least one field should differ (extremely unlikely all match)
+        assert (ctx1.user_name, ctx1.date_str, ctx1.company) != (
+            ctx2.user_name, ctx2.date_str, ctx2.company
+        )
+
+    def test_generate_epoch_context_fields_from_pools(self):
+        """All generated fields come from the defined pools."""
+        ctx = generate_epoch_context(42)
+        assert ctx.user_name in NAMES
+        assert ctx.user_role in ROLES
+        assert ctx.company in COMPANIES
+        assert ctx.department in DEPARTMENTS
+        tz_names = [tz[0] for tz in TIMEZONES]
+        assert ctx.timezone in tz_names
+
+    def test_generate_epoch_context_date_in_2026(self):
+        """Generated date is in 2026."""
+        ctx = generate_epoch_context(42)
+        assert "2026" in ctx.date_str
+
+    def test_generate_epoch_context_weekday_matches_date(self):
+        """Weekday field matches the generated date."""
+        from datetime import datetime
+        ctx = generate_epoch_context(42)
+        # Parse the date string and check weekday
+        parsed = datetime.strptime(ctx.date_str, "%B %d, %Y")
+        assert ctx.weekday == parsed.strftime("%A")
+
+    def test_render_context_preamble_contains_fields(self):
+        """Rendered preamble includes all context fields."""
+        ctx = EpochContext(
+            date_str="March 12, 2026",
+            weekday="Thursday",
+            user_name="Jordan Rivera",
+            user_role="Product Manager",
+            company="Meridian Technologies",
+            department="Engineering",
+            timezone="America/Chicago",
+            timezone_abbr="CT",
+        )
+        preamble = render_context_preamble(ctx)
+        assert "Jordan Rivera" in preamble
+        assert "Product Manager" in preamble
+        assert "Meridian Technologies" in preamble
+        assert "Engineering" in preamble
+        assert "March 12, 2026" in preamble
+        assert "Thursday" in preamble
+        assert "America/Chicago" in preamble
+        assert "CT" in preamble
+
+    def test_render_context_preamble_ends_with_separator(self):
+        """Preamble ends with --- separator so miner AGENTS.md follows cleanly."""
+        ctx = generate_epoch_context(42)
+        preamble = render_context_preamble(ctx)
+        assert "---" in preamble
+        assert preamble.endswith("\n")
+
+    def test_context_preamble_prepended_to_agents_md(self, harness):
+        """Harness prepends context preamble to AGENTS.md in workspace."""
+        pack = {
+            "files": {"AGENTS.md": "# My Policy\nBe helpful."},
+        }
+        ctx = generate_epoch_context(42)
+        preamble = render_context_preamble(ctx)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            harness._apply_pack_to_workspace(pack, workspace, preamble)
+
+            agents_md = (workspace / "AGENTS.md").read_text()
+            # Preamble comes first
+            assert agents_md.startswith("<!-- Epoch Evaluation Context")
+            # Miner content follows
+            assert "# My Policy" in agents_md
+            assert "Be helpful." in agents_md
+            # Context fields are present
+            assert ctx.user_name in agents_md
+
+    def test_no_preamble_when_empty(self, harness):
+        """Empty context_preamble leaves AGENTS.md unchanged."""
+        pack = {
+            "files": {"AGENTS.md": "# Original Content"},
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            harness._apply_pack_to_workspace(pack, workspace, "")
+            agents_md = (workspace / "AGENTS.md").read_text()
+            assert agents_md == "# Original Content"
+
+    def test_variation_space_is_large(self):
+        """Verify the combinatorial explosion across pools."""
+        total = 365 * len(NAMES) * len(ROLES) * len(COMPANIES) * len(DEPARTMENTS) * len(TIMEZONES)
+        assert total > 1_000_000, f"Variation space too small: {total}"
+
+    # ---------------------------------------------------------------
+    # to_user_context() and template substitution
+    # ---------------------------------------------------------------
+
+    def test_to_user_context_keys(self):
+        """to_user_context() returns the right template keys."""
+        ctx = EpochContext(
+            date_str="March 12, 2026", weekday="Thursday",
+            user_name="Jordan Rivera", user_role="Engineering Lead",
+            company="Vertex Labs", department="Engineering",
+            timezone="America/Chicago", timezone_abbr="CT",
+        )
+        uc = ctx.to_user_context()
+        assert uc["USER_NAME"] == "Jordan Rivera"
+        assert uc["USER_FIRST_NAME"] == "Jordan"
+        assert uc["USER_ROLE"] == "Engineering Lead"
+        assert uc["COMPANY"] == "Vertex Labs"
+
+    def test_to_user_context_first_name_derived(self):
+        """USER_FIRST_NAME is derived from USER_NAME automatically."""
+        ctx = EpochContext(
+            date_str="March 12, 2026", weekday="Thursday",
+            user_name="Sam Patel", user_role="Product Manager",
+            company="Cascade Systems", department="Product",
+            timezone="America/Denver", timezone_abbr="MT",
+        )
+        uc = ctx.to_user_context()
+        assert uc["USER_FIRST_NAME"] == "Sam"
+
+    def test_fill_templates_basic(self):
+        """ClawBench fill_templates replaces {{PLACEHOLDER}} markers."""
+        import sys as _sys
+        _sys.path.insert(0, str(CLAWBENCH_PATH / "scripts"))
+        from run_episode import fill_templates
+
+        content = "Hello {{USER_NAME}}, welcome to {{COMPANY}}."
+        ctx = {"USER_NAME": "Jordan Rivera", "COMPANY": "Vertex Labs"}
+        result = fill_templates(content, ctx)
+        assert result == "Hello Jordan Rivera, welcome to Vertex Labs."
+
+    def test_fill_templates_auto_first_name(self):
+        """fill_templates auto-derives USER_FIRST_NAME from USER_NAME."""
+        import sys as _sys
+        _sys.path.insert(0, str(CLAWBENCH_PATH / "scripts"))
+        from run_episode import fill_templates
+
+        content = 'Sign off: "Best, {{USER_FIRST_NAME}}"'
+        ctx = {"USER_NAME": "Jordan Rivera"}
+        result = fill_templates(content, ctx)
+        assert result == 'Sign off: "Best, Jordan"'
+
+    def test_fill_templates_preserves_unknown(self):
+        """Unknown {{PLACEHOLDER}} markers are left as-is."""
+        import sys as _sys
+        _sys.path.insert(0, str(CLAWBENCH_PATH / "scripts"))
+        from run_episode import fill_templates
+
+        content = "{{USER_NAME}} and {{UNKNOWN}}"
+        ctx = {"USER_NAME": "Jordan Rivera"}
+        result = fill_templates(content, ctx)
+        assert "Jordan Rivera" in result
+        assert "{{UNKNOWN}}" in result
+
+    def test_fill_templates_on_real_fixture(self):
+        """Template substitution works on a real fixture USER.md."""
+        fixture_path = CLAWBENCH_PATH / "fixtures" / "client_escalation" / "USER.md"
+        if not fixture_path.exists():
+            pytest.skip("ClawBench fixtures not available")
+
+        import sys as _sys
+        _sys.path.insert(0, str(CLAWBENCH_PATH / "scripts"))
+        from run_episode import fill_templates
+
+        content = fixture_path.read_text()
+        ctx = {
+            "USER_NAME": "Sam Patel",
+            "USER_FIRST_NAME": "Sam",
+            "USER_ROLE": "Design Lead",
+            "COMPANY": "Cascade Systems",
+        }
+        result = fill_templates(content, ctx)
+        # Identity replaced
+        assert "Sam Patel" in result
+        assert "Cascade Systems" in result
+        assert "{{USER_NAME}}" not in result
+        assert "{{COMPANY}}" not in result
+        # Team members preserved (not templated)
+        assert "Sarah Kim" in result
+        assert "David Park" in result
+
+    def test_fill_templates_preserves_non_template_content(self):
+        """Scenario-specific content is preserved by template substitution."""
+        import sys as _sys
+        _sys.path.insert(0, str(CLAWBENCH_PATH / "scripts"))
+        from run_episode import fill_templates
+
+        content = (
+            "**Name:** {{USER_NAME}}\n"
+            "Reports to: Sarah Kim (Eng Manager)\n"
+            "Sprint 13 ends Friday Feb 7\n"
+        )
+        ctx = {"USER_NAME": "Morgan Kim", "COMPANY": "Summit Innovations"}
+        result = fill_templates(content, ctx)
+        assert "Morgan Kim" in result
+        assert "Sarah Kim" in result
+        assert "Sprint 13" in result
+
+    def test_epoch_context_to_user_context_roundtrip(self):
+        """Generate epoch context → to_user_context → fill_templates works."""
+        import sys as _sys
+        _sys.path.insert(0, str(CLAWBENCH_PATH / "scripts"))
+        from run_episode import fill_templates
+
+        ctx = generate_epoch_context(42)
+        uc = ctx.to_user_context()
+        content = "{{USER_NAME}} works as {{USER_ROLE}} at {{COMPANY}}"
+        result = fill_templates(content, uc)
+        assert ctx.user_name in result
+        assert ctx.user_role in result
+        assert ctx.company in result
+        assert "{{" not in result
+
+
+# ===================================================================
+# Consensus Evaluation Tests
+# ===================================================================
+
+
+class TestConsensusEvaluation:
+    """Tests for majority-vote consensus evaluation."""
+
+    def test_majority_vote_rubric_all_pass(self):
+        """All runs agree → all checks pass."""
+        rubrics = [
+            {"check_a": {"passed": True, "points": 4}, "check_b": {"passed": True, "points": 3}},
+            {"check_a": {"passed": True, "points": 4}, "check_b": {"passed": True, "points": 3}},
+            {"check_a": {"passed": True, "points": 4}, "check_b": {"passed": True, "points": 3}},
+        ]
+        voted = ClawBenchHarness._majority_vote_rubric(rubrics, quorum=2)
+        assert voted["check_a"]["passed"] is True
+        assert voted["check_b"]["passed"] is True
+
+    def test_majority_vote_rubric_2_of_3(self):
+        """2/3 runs pass → check passes."""
+        rubrics = [
+            {"check_a": {"passed": True, "points": 4}},
+            {"check_a": {"passed": True, "points": 4}},
+            {"check_a": {"passed": False, "points": 4}},
+        ]
+        voted = ClawBenchHarness._majority_vote_rubric(rubrics, quorum=2)
+        assert voted["check_a"]["passed"] is True
+        assert voted["check_a"]["_votes"] == "2/3"
+
+    def test_majority_vote_rubric_1_of_3(self):
+        """1/3 runs pass → check fails."""
+        rubrics = [
+            {"check_a": {"passed": True, "points": 4}},
+            {"check_a": {"passed": False, "points": 4}},
+            {"check_a": {"passed": False, "points": 4}},
+        ]
+        voted = ClawBenchHarness._majority_vote_rubric(rubrics, quorum=2)
+        assert voted["check_a"]["passed"] is False
+
+    def test_majority_vote_rubric_empty(self):
+        voted = ClawBenchHarness._majority_vote_rubric([], quorum=2)
+        assert voted == {}
+
+    def test_score_from_rubric(self):
+        """Score is earned_points / total_points."""
+        rubric = {
+            "a": {"passed": True, "points": 4},
+            "b": {"passed": False, "points": 3},
+            "c": {"passed": True, "points": 3},
+        }
+        score = ClawBenchHarness._score_from_rubric(rubric)
+        assert abs(score - 7 / 10) < 1e-6
+
+    def test_score_from_rubric_all_pass(self):
+        rubric = {
+            "a": {"passed": True, "points": 5},
+            "b": {"passed": True, "points": 5},
+        }
+        assert ClawBenchHarness._score_from_rubric(rubric) == 1.0
+
+    def test_score_from_rubric_empty(self):
+        assert ClawBenchHarness._score_from_rubric({}) == 0.0
+
+    def test_score_from_rubric_bool_values(self):
+        """Rubric with plain bool values (no dict)."""
+        rubric = {"a": True, "b": False, "c": True}
+        score = ClawBenchHarness._score_from_rubric(rubric)
+        assert abs(score - 2 / 3) < 1e-6
 
 
 # ===================================================================
@@ -970,8 +1415,9 @@ class TestValidatorConfig:
         defaults = ValidatorConfig.__dataclass_fields__
         assert defaults["rho_reliability"].default == 0.1
         assert defaults["delta_threshold"].default == 0.05
-        assert defaults["seeds_per_task"].default == 1
-        assert defaults["epoch_interval"].default == 720
+        assert defaults["scenarios_per_epoch"].default == 4
+        assert defaults["seeds_per_task"].default == 3
+        assert defaults["epoch_interval"].default == 14400
 
 
 # ===================================================================

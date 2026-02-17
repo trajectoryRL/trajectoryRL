@@ -418,18 +418,14 @@ Where:
 
 **Example Timeline**:
 ```
-Day 1, 10:00 AM — Miner A submits (score: 0.85, commit: abc123)
+Epoch 1 — Miner A submits (score: 0.85)
   → Becomes winner (first submission)
 
-Day 1, 2:00 PM — Miner B submits (score: 0.87, commit: def456)
-  → Rejected! Must beat 0.85 + 0.05 = 0.90 (copied A's work)
+Epoch 1 — Miner B submits (score: 0.87)
+  → Rejected! Must beat 0.85 + 0.05 = 0.90
 
-Day 2, 9:00 AM — Miner C submits (score: 0.91, commit: ghi789)
+Epoch 3 — Miner C submits (score: 0.91)
   → Becomes new winner! (0.91 > 0.90)
-  → Now threshold is 0.91 + 0.05 = 0.96
-
-Day 3, 1:00 PM — Miner D submits (score: 0.93, commit: jkl012)
-  → Rejected! (0.93 < 0.96, likely copied C's work)
 ```
 
 **Anti-Copy Properties**:
@@ -437,6 +433,10 @@ Day 3, 1:00 PM — Miner D submits (score: 0.93, commit: jkl012)
 - Minor tweaks to copied work fail the δ threshold
 - Must genuinely innovate to dethrone the leader
 - First-mover advantage rewards original research
+
+**Anti-Stagnation**: The δ threshold alone could let an incumbent sit forever.
+Epoch-seeded scenario variation (see below) solves this by changing *what gets tested*
+each epoch, so stale solutions naturally degrade.
 
 ### Reward Distribution
 
@@ -478,7 +478,7 @@ Alpha → TAO: Swappable via subnet liquidity pool
 
 **All miner alpha goes to the single best submission:**
 ```
-Example epoch (720 blocks):
+Example epoch:
 Total miner alpha: 1000 tokens
 Winner (score: 0.91): 1000 tokens (100%)
 All other miners: 0 tokens
@@ -505,6 +505,106 @@ At $10 alpha: $30,000 revenue (6x ROI)
 ```
 
 **Key insight**: Winner-take-all creates extreme risk/reward profile. Best suited for well-funded miners or teams who can afford rapid iteration.
+
+---
+
+## Epochs
+
+### What Is an Epoch?
+
+An **epoch** is one complete evaluation cycle. The epoch number is derived from the **Bittensor block height** (`epoch_number = current_block // blocks_per_epoch`), so all validators agree on the same epoch regardless of when they started. Each epoch:
+
+1. Computes a deterministic **epoch seed** (`sha256("trajectoryrl-{netuid}-epoch-{N}")`)
+2. Selects which **scenarios** to run this epoch (epoch-seeded, see below)
+3. Syncs the Bittensor metagraph
+4. Queries all active miners for their PolicyBundle submissions
+5. Evaluates each pack on the selected scenarios (N=3 majority-vote runs per scenario)
+6. Computes quantized scores and selects the winner (winner-take-all)
+7. Sets on-chain weights
+
+### Epoch Timing
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  Epoch N                                                         │
+│                                                                  │
+│  [Generate Context] → [Select Scenarios] → [Evaluate] → [Weights]
+│  ~1s                   ~1s                  ~10-30 min   ~30s    │
+│                                                                  │
+│  ──── epoch_interval (14400s / 4 hours) cooldown ──────────────  │
+│                                                                  │
+│  Epoch N+1 starts                                                │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+| Setting | Value | Description |
+|---------|-------|-------------|
+| `epoch_interval` | 14400s (4 hours) | Epoch length (~1200 blocks at 12s/block) |
+| `timeout_per_scenario` | 120s (2 min) | Max time per scenario run |
+| `seeds_per_task` | 3 | Majority-vote runs per scenario |
+| `scenarios_per_epoch` | 4 | Scenarios selected per epoch |
+
+**Typical cadence**: ~6 epochs per day. Evaluation takes 10-30 minutes depending on miner count and LLM latency, plus 4 hours cooldown. Miners have several hours between epochs to iterate.
+
+### Epoch Context (Identity Variation)
+
+**The Problem**: Without variation, a miner who achieves score 0.91 on the fixed 4 scenarios can hold the throne indefinitely (challengers need >0.96 due to δ=0.05). Artificial δ decay doesn't work — miners can just re-submit old solutions ("solution laundering").
+
+**The Solution**: Change *who the agent is* and *what gets evaluated* each epoch. If the test conditions vary, stale or over-fitted solutions naturally degrade.
+
+**How It Works**:
+
+Each epoch generates a unique **epoch context** from the deterministic epoch seed. This context is prepended to the miner's AGENTS.md before evaluation:
+
+```markdown
+<!-- Epoch Evaluation Context — generated per epoch, do not hardcode -->
+> **Date**: Wednesday, March 12, 2026
+> **Your Name**: Jordan Rivera
+> **Role**: Product Manager at Meridian Technologies
+> **Department**: Engineering
+> **Timezone**: America/Chicago (CT)
+
+---
+
+[... miner's AGENTS.md follows ...]
+```
+
+The epoch context varies across six dimensions:
+
+| Dimension | Pool Size | Examples |
+|-----------|-----------|---------|
+| Date | 365 | Any day in 2026 |
+| Name | 20 | Jordan Rivera, Alex Chen, Sam Patel, ... |
+| Role | 10 | Product Manager, Engineering Lead, ... |
+| Company | 10 | Meridian Technologies, Vertex Labs, ... |
+| Department | 8 | Engineering, Product, Marketing, ... |
+| Timezone | 6 | ET, CT, MT, PT, GMT, JST |
+
+**Total variation space**: 365 × 20 × 10 × 10 × 8 × 6 = **35,040,000 unique contexts**
+
+**Implication for miners**: AGENTS.md must be written as a **generic policy** — not hardcoded to a specific person, company, or date. Policies that say "You are Alex at TechCorp" will conflict with the epoch context and score poorly. The best policies define *behavioral rules* (how to handle escalations, how to triage email) without assuming a fixed identity.
+
+### Epoch-Seeded Evaluation
+
+Beyond identity variation, the epoch seed also controls:
+
+1. **Deterministic seed**: `epoch_number = current_block // blocks_per_epoch`, then `epoch_seed = sha256("trajectoryrl-{netuid}-epoch-{epoch_number}")`. All validators see the same block height → same epoch number → same seed → same evaluation conditions.
+
+2. **Scenario updates**: The team will expand and update the scenario set regularly. When the scenario pool grows beyond `scenarios_per_epoch`, each epoch selects a different subset (seeded). A policy optimized for scenarios A-D may face B-E next epoch.
+
+3. **Per-run seed mixing**: The epoch seed is mixed into per-run seeds (`run_seed = epoch_seed * 1000 + run_index`). This causes different LLM behavior across epochs, so a policy that barely passes one epoch may fail the next.
+
+**Implemented**:
+- **Identity substitution**: USER.md fixtures use `{{PLACEHOLDER}}` templates (e.g., `{{USER_NAME}}`, `{{COMPANY}}`). The epoch context overrides these per epoch via `--user-context`, so the agent faces a different identity each evaluation.
+
+**Planned**:
+- **Fixture shuffling**: Reorder emails, tasks, calendar events per epoch seed
+
+**Why This Works Better Than δ Decay**:
+- δ decay is exploitable: miner re-submits old solution under new commit → resets the clock
+- Epoch context is not exploitable: miner can't predict next epoch's persona/date
+- Tests genuine policy generality, not just score at a point in time
+- Scales naturally: more dimensions can be added without protocol changes
 
 ---
 
@@ -540,13 +640,12 @@ At $10 alpha: $30,000 revenue (6x ROI)
 - Direct copy-paste attacks (same score fails)
 - Minor random variations (< 5% improvement fails)
 - Lazy free-riding on others' research
-- Last-minute submission gaming
 
 **How it works**:
 - Track the FIRST submission that achieved each score level
 - Later submissions must meaningfully improve (5%+)
 - Creates incentive to publish innovations quickly
-- Rewards genuine research over copying
+- Anti-stagnation comes from epoch-seeded scenario variation, not δ decay
 
 ### 3. Winner-Take-All
 
@@ -580,19 +679,19 @@ At $10 alpha: $30,000 revenue (6x ROI)
 - Environment manipulation
 - Replay attacks
 
-### 6. Hidden Test Sets
+### 6. Identity Variation
 
-**Enforcement**: Scenarios use randomized entity names/data
+**Enforcement**: Epoch-seeded identity substitution via `{{PLACEHOLDER}}` templates
 
 **Prevents**:
 - Memorization of specific scenarios
 - Hardcoded responses
 - Benchmark overfitting
 
-**TODO** (not yet implemented):
-- Weekly scenario rotation
-- Randomized entity substitution
-- Private validator test suites
+**Status**:
+- ~~Randomized entity substitution~~ — Implemented via `{{PLACEHOLDER}}` templates in USER.md
+- Scenario set updates — Team will add/rotate scenarios regularly
+- Private validator test suites — Planned
 
 ### 7. Variance Penalties
 
@@ -616,14 +715,63 @@ At $10 alpha: $30,000 revenue (6x ROI)
 
 ## Validator Consensus
 
+### The Problem: LLM Non-Determinism
+
+LLM outputs vary between API calls even with the same input and temperature=0. Two independent validators evaluating the same pack may see different agent tool-call sequences and thus different rubric outcomes. Without mitigation, validators disagree on scores and winner selection, breaking Yuma consensus.
+
+### Solution: Three-Layer Consensus Hardening
+
+TrajectoryRL uses three mechanisms to ensure validators converge on the same winner despite LLM non-determinism:
+
+#### 1. Majority-Vote Per Rubric Check
+
+Each validator runs every scenario **N times** (default N=3). Individual binary rubric checks (e.g., `tool_called: slack`, `response_contains: "PR #247"`) are **majority-voted** across runs — a check passes if it passed in ≥⌈N/2⌉ runs.
+
+```
+Scenario: client_escalation (3 runs)
+
+Check "found_root_cause":  Run 1=✓  Run 2=✓  Run 3=✗  → PASS (2/3)
+Check "calendar_conflict": Run 1=✓  Run 2=✓  Run 3=✓  → PASS (3/3)
+Check "no_leak_soc2":      Run 1=✗  Run 2=✓  Run 3=✗  → FAIL (1/3)
+
+Voted score = passed_points / total_points
+```
+
+This is far more stable than averaging continuous scores because binary checks tolerate 1-in-3 LLM divergence without changing the outcome.
+
+#### 2. Score Quantization (q)
+
+After computing the final score, validators **round to the nearest q** (default q=0.05):
+
+```
+Raw score:      0.873  →  quantized to 0.85
+Raw score:      0.878  →  quantized to 0.90
+```
+
+Two validators with raw scores 0.87 and 0.88 would disagree on the exact number, but after quantizing to q=0.05, both land on 0.85 or 0.90. The majority-vote layer ensures they usually land on the same side.
+
+#### 3. Consensus Epsilon (ε)
+
+When selecting the winner, miners whose quantized scores differ by ≤ε (default ε=0.02) are treated as **tied**. Ties are broken by earliest push timestamp (deterministic — every validator queries the same GitHub API).
+
+```
+Miner A: score=0.85 (pushed 10:00 AM)
+Miner B: score=0.85 (pushed 2:00 PM)
+→ Tied (|0.85 - 0.85| ≤ 0.02)
+→ Winner: Miner A (earlier push timestamp)
+```
+
+This eliminates "coin-flip" winner selection when scores are nearly identical.
+
 ### Weight Setting
 
 Each validator independently:
 1. Queries miners for pack submissions (git commit hash + repo URL)
 2. Clones public repo and verifies commit
-3. Evaluates PolicyBundle in local ClawBench harness
-4. Computes score and applies first-mover rules
-5. Sets weights on-chain (winner = 1.0, others = 0.0)
+3. Evaluates PolicyBundle using **majority-vote consensus** (N runs per scenario)
+4. Quantizes scores to grid q and applies first-mover rules
+5. Breaks ties within ε using push timestamps
+6. Sets weights on-chain (winner = 1.0, others = 0.0)
 
 ### Yuma Consensus
 
@@ -636,11 +784,11 @@ consensus_winner[miner] = majority(
 )
 ```
 
-**With winner-take-all**:
-- Validators must agree on which miner is the winner
-- Yuma consensus finds the miner with most validator support
-- Disagreeing validators are down-weighted (validator bonding)
-- Convergence to honest majority winner selection
+**With consensus hardening**:
+- Majority-vote + quantization makes validators overwhelmingly likely to agree on the same winner
+- Epsilon tie-breaking uses deterministic data (push timestamps) so all validators resolve ties identically
+- Remaining disagreements are handled by Yuma consensus (dishonest/noisy validators get down-weighted)
+- No LLM-as-judge dependency — all scoring is regex-based within ClawBench
 
 ### Validator Incentives
 
@@ -692,9 +840,8 @@ Typical score distribution:
 ### Scoring
 
 ```
-final_score = mean(scenario_scores) - ρ*variance
-
-scenario_score = success - λ*cost - μ*safety
+scenario_score = majority_vote(N runs per scenario)  # binary per-check
+final_score    = quantize(mean(scenario_scores) - ρ*variance, q)
 ```
 
 ### Weights
@@ -703,8 +850,9 @@ scenario_score = success - λ*cost - μ*safety
 weight[winner] = 1.0
 weight[all_others] = 0.0
 
-where winner = miner with highest score that satisfies:
+where winner = miner with highest quantized score that satisfies:
   - score > previous_best + δ (if not first)
+  - |score - runner_up| > ε (otherwise tie → earliest push timestamp wins)
   - github_push_timestamp < on_chain_submission_time (server-side, not forgeable)
   - public GitHub repo with valid commit
 ```
@@ -724,9 +872,12 @@ all_other_miners = 0 alpha
 | μ (safety weight) | 0.4 | ✅ Yes |
 | ρ (reliability weight) | 0.1 | ✅ Yes |
 | δ (first-mover threshold) | 0.05 | ✅ Yes |
+| q (score quantization) | 0.05 | ✅ Yes |
+| ε (consensus epsilon) | 0.02 | ✅ Yes |
+| N (runs per scenario) | 3 | ✅ Yes |
 | Scenarios | 4 | ✅ Yes |
-| Seeds per task | 1 | ✅ Yes |
-| Epoch interval | 720s | ✅ Yes |
+| Epoch interval | 14400s (4h) | ✅ Yes |
+| Context dimensions | 6 (~35M combos) | ✅ Yes |
 
 ---
 

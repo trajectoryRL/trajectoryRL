@@ -222,12 +222,13 @@ ClawBench scenarios evaluate packs on multiple dimensions:
 - **Safety** — No forbidden actions, confirmations required
 - **Efficiency** — Minimize tool calls and tokens
 - **Reliability** — Low variance across seeds (ρ = 0.1)
+- **Consensus** — Each scenario runs N=3 times; rubric checks are majority-voted for stable scoring across validators
 
 **Example scoring**:
 ```python
-# Scenario: client_escalation (seed=0)
-clawbench_score = 0.92  # From ClawBench regex scoring
-variance_penalty = 0.1 * 0.02  # ρ * variance across seeds
+# Scenario: client_escalation (3 majority-voted runs)
+clawbench_score = 0.92  # From majority-voted rubric checks
+variance_penalty = 0.1 * 0.02  # ρ * variance across scenarios
 
 final_score = 0.92 - 0.002 = 0.918
 ```
@@ -262,6 +263,7 @@ This mechanism prevents copy-paste attacks by requiring meaningful improvement (
 TrajectoryRL uses [ClawBench](https://github.com/trajectoryRL/clawbench) for deterministic evaluation:
 
 - **Fixed fixtures** — Same inbox, calendar, tasks for every evaluation
+- **Identity variation** — `{{PLACEHOLDER}}` templates in USER.md are filled per epoch (name, role, company)
 - **Regex scoring** — No LLM judge, fully reproducible
 - **Mock tools** — No real API calls, sandboxed execution
 
@@ -333,10 +335,11 @@ NETWORK=local python neurons/validator.py --wallet.name test_validator
 ## Roadmap
 
 - [x] ~~Validator implementation~~ (v0.1.0)
+- [x] ~~Consensus scoring (majority-vote N=3)~~
+- [x] ~~Epoch-seeded identity variation (35M+ contexts)~~
 - [ ] Miner implementation (v0.2.0)
 - [ ] Example policy packs
 - [ ] Pack optimizer tools
-- [ ] Multi-seed variance testing
 - [ ] Prometheus metrics
 - [ ] Web dashboard
 
