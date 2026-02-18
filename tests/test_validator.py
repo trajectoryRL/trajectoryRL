@@ -42,7 +42,7 @@ from trajectoryrl.utils.epoch_context import (
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent  # /data2/trajectory_rl
+REPO_ROOT = Path(__file__).resolve().parent.parent  # /data2/trajectory_rl
 CLAWBENCH_PATH = REPO_ROOT / "clawbench"
 
 

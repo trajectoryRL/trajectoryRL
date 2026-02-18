@@ -19,9 +19,9 @@ fi
 echo "✓ Python $python_version"
 
 # Check for ClawBench
-if [ ! -d "../clawbench" ]; then
-    echo "⚠️  ClawBench not found in ../clawbench"
-    echo "   Clone it: git clone https://github.com/trajectoryRL/clawbench.git ../clawbench"
+if [ ! -d "./clawbench" ]; then
+    echo "⚠️  ClawBench not found in ./clawbench"
+    echo "   Clone it: git clone https://github.com/trajectoryRL/clawbench.git ./clawbench"
     exit 1
 fi
 

@@ -157,7 +157,7 @@ class ValidatorConfig:
             clawbench_path=Path(
                 os.getenv(
                     "CLAWBENCH_PATH",
-                    str(Path(__file__).parent.parent.parent.parent / "clawbench")
+                    str(Path(__file__).parent.parent.parent / "clawbench")
                 )
             ),
             epoch_interval=int(os.getenv("EPOCH_INTERVAL", "14400")),
