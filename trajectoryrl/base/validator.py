@@ -491,11 +491,23 @@ class TrajectoryValidator:
                 timeout=10.0
             )
 
-            # dendrite.forward returns list of responses
+            # dendrite.forward returns list of synapses (same object mutated).
+            # If the miner didn't fill in response fields, it's still a
+            # PackRequest — not a usable PackResponse.
             if not response or len(response) == 0:
                 return None
 
-            return response[0]
+            resp = response[0]
+            if not isinstance(resp, PackResponse):
+                logger.debug(f"Miner {miner_uid}: got {type(resp).__name__} instead of PackResponse")
+                return None
+
+            # Check that the miner actually filled in required fields
+            if not resp.pack_hash:
+                logger.debug(f"Miner {miner_uid}: empty pack_hash in response")
+                return None
+
+            return resp
 
         except Exception as e:
             logger.warning(f"Failed to fetch pack from miner {miner_uid}: {e}")
