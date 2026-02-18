@@ -74,7 +74,7 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN:-sandbox-token-12345}
-      - CLAWBENCH_MODEL=${CLAWBENCH_MODEL:-anthropic/claude-sonnet-4-6}
+      - CLAWBENCH_MODEL=${CLAWBENCH_MODEL:-anthropic/claude-sonnet-4-5-20250929}
     depends_on:
       init:
         condition: service_completed_successfully
@@ -115,7 +115,7 @@ services:
       # API keys
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       # Model
-      - CLAWBENCH_MODEL=${CLAWBENCH_MODEL:-anthropic/claude-sonnet-4-6}
+      - CLAWBENCH_MODEL=${CLAWBENCH_MODEL:-anthropic/claude-sonnet-4-5-20250929}
     volumes:
       - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
       - workspace:/workspace

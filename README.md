@@ -88,7 +88,7 @@ Set `CLAWBENCH_MODEL` to change the LLM used for evaluation:
 
 ```bash
 # In .env
-CLAWBENCH_MODEL=anthropic/claude-sonnet-4-6  # default
+CLAWBENCH_MODEL=anthropic/claude-sonnet-4-5-20250929  # default
 CLAWBENCH_MODEL=ollama/llama3.3                        # local Ollama
 CLAWBENCH_MODEL=openai/gpt-4o                          # OpenAI
 ```
