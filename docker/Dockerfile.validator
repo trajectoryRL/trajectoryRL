@@ -17,7 +17,7 @@ RUN git clone --recursive -b ${REPO_BRANCH} ${REPO_URL} . && \
     git submodule update --init --recursive
 
 # Verify clawbench is at correct version (v0.3.0)
-RUN cd clawbench && git checkout b718230cb201fc0a4c28d12e011b1663db07d8f7
+RUN cd clawbench && git checkout e50824df75e10989c0adaf398b6897b5284701d5
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -e .

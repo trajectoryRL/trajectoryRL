@@ -1,6 +1,6 @@
 # TrajectoryRL Docker Deployment
 
-Docker is the **recommended way** to run TrajectoryRL validators and miners. It ensures consistent environments, automatic ClawBench version pinning (v0.3.0), and simplified deployment.
+Docker is the **recommended way** to run TrajectoryRL validators and miners. It ensures consistent environments, automatic ClawBench version pinning, and simplified deployment.
 
 ## Quick Start
 
@@ -86,7 +86,7 @@ docker-compose up -d validator
 
 ### Validator Container
 - Base: Python 3.10-slim
-- ClawBench: Pinned to v0.3.0 (b718230) via submodule
+- ClawBench: Pinned via submodule (see [Updating ClawBench](#updating-clawbench))
 - Volumes:
   - `~/.bittensor/wallets` → Wallet access (ro)
   - `./logs` → Persistent logs
@@ -129,7 +129,7 @@ docker exec trajectoryrl_miner ls -la /app/packs/
 docker exec trajectoryrl_validator ping -c 3 api.bittensor.com
 
 # Check subtensor
-docker exec trajectoryrl_validator python -c "import bittensor as bt; print(bt.subtensor(network='finney'))"
+docker exec trajectoryrl_validator python -c "import bittensor as bt; print(bt.Subtensor(network='finney'))"
 ```
 
 ## Production
@@ -175,13 +175,34 @@ WantedBy=multi-user.target
 
 ## Updating ClawBench
 
+ClawBench is pinned as a git submodule. The Dockerfile also hardcodes the
+commit hash as a safety check. Both must be updated together.
+
 ```bash
-# When new ClawBench version released:
-git pull && git submodule update --remote clawbench
-# Update trajectoryrl/utils/config.py → clawbench_commit
+# 1. Update the submodule to latest upstream main
+cd clawbench
+git fetch origin
+git checkout origin/main
+cd ..
+
+# 2. Record the new commit hash
+git -C clawbench rev-parse HEAD
+# e.g. e50824df75e10989c0adaf398b6897b5284701d5
+
+# 3. Update the hash in docker/Dockerfile.validator (line ~20)
+#    RUN cd clawbench && git checkout <NEW_HASH>
+
+# 4. Stage both changes
+git add clawbench docker/Dockerfile.validator
+
+# 5. Rebuild and restart
 docker-compose build --no-cache validator
 docker-compose up -d validator
 ```
+
+**Important**: The submodule pointer (`git add clawbench`) and the Dockerfile
+hash must always match. If they diverge, the Docker build will check out a
+different version than your local tree.
 
 ## Support
 
