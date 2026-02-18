@@ -58,13 +58,13 @@ class TrajectoryValidator:
 
         # Initialize Bittensor components
         logger.info("Initializing Bittensor components...")
-        self.wallet = bt.wallet(
+        self.wallet = bt.Wallet(
             name=config.wallet_name,
             hotkey=config.wallet_hotkey
         )
-        self.subtensor = bt.subtensor(network=config.network)
+        self.subtensor = bt.Subtensor(network=config.network)
         self.metagraph = self.subtensor.metagraph(config.netuid)
-        self.dendrite = bt.dendrite(wallet=self.wallet)
+        self.dendrite = bt.Dendrite(wallet=self.wallet)
 
         logger.info(f"Wallet: {self.wallet}")
         logger.info(f"Network: {config.network}")
