@@ -83,8 +83,8 @@ def validate_opp_schema(pack: dict) -> ValidationResult:
     # Size check (prevent token bombs)
     import json
     pack_size = len(json.dumps(pack))
-    if pack_size > 100000:  # 100KB limit
-        issues.append(f"Pack too large: {pack_size} bytes (max 100KB)")
+    if pack_size > 32000:  # 32KB limit
+        issues.append(f"Pack too large: {pack_size} bytes (max 32KB)")
 
     return ValidationResult(
         passed=len(issues) == 0,

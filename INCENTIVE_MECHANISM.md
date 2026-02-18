@@ -481,7 +481,7 @@ A **PolicyBundle** (also called an OpenClaw Policy Pack / OPP) is a JSON object 
 ### Validation Rules
 
 - **`AGENTS.md` required**: The `files` dict must contain `AGENTS.md` — this is the primary policy document
-- **Size limit**: Total pack JSON ≤ **100 KB** (`json.dumps(pack)` byte length). Prevents token bombs
+- **Size limit**: Total pack JSON ≤ **32 KB** (`json.dumps(pack)` byte length). Prevents token bombs and scenario-stuffing
 - **File content must be strings**: Every value in `files` must be a string (no nested objects)
 - **Dangerous tool check**: If `allow` includes `exec`, `shell`, `group:runtime`, or `admin_*`, the pack must also have corresponding `deny` entries (defense-in-depth)
 - **Semver version**: `metadata.pack_version` must be valid semver (e.g., `1.0.0`)
@@ -998,7 +998,7 @@ To earn non-zero rewards:
 | Schema validation | MUST pass |
 | Safety violations | 0 critical violations |
 | Success rate | ≥ 0.3 (30%) |
-| Size limit | ≤ 100 KB |
+| Size limit | ≤ 32 KB |
 
 Packs failing these thresholds receive **score = 0**.
 
@@ -1043,7 +1043,7 @@ where winner = miner with highest quantized score that satisfies:
   - |score - runner_up| > ε (otherwise tie → earliest push timestamp wins)
   - github_push_timestamp < on_chain_submission_time (server-side, not forgeable)
   - public GitHub repo with valid commit
-  - pack passes OPP v1 schema validation (AGENTS.md required, ≤100KB)
+  - pack passes OPP v1 schema validation (AGENTS.md required, ≤32KB)
 ```
 
 ### Rewards

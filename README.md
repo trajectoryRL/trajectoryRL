@@ -33,10 +33,12 @@ TrajectoryRL is a Bittensor subnet where miners compete to optimize AI agent pol
 
 ### What Makes TrajectoryRL Unique
 
-- **Deterministic Evaluation** — Uses [ClawBench](https://github.com/trajectoryRL/clawbench) scenarios with fixed fixtures (no LLM-as-judge randomness)
-- **Content-Addressed Packs** — Miners submit policy bundles identified by SHA256 hash
-- **Real-World Tasks** — Scenarios test email triage, calendar conflicts, task delegation, incident response
+- **Deterministic Evaluation** — Uses [ClawBench](https://github.com/trajectoryRL/clawbench) scenarios with fixed fixtures and regex scoring (no LLM-as-judge randomness)
+- **Content-Addressed Packs** — Miners submit policy bundles (OPP v1, ≤32KB) identified by SHA256 hash
+- **Real-World Tasks** — 5 scenarios testing email triage, calendar conflicts, task delegation, incident response
 - **Safety-First Scoring** — Critical safety violations = immediate score of 0
+- **Weighted Scenarios** — Safety-critical scenarios (e.g., client escalation) carry higher weight in aggregation
+- **Winner-Take-All** — Best miner gets 100% of rewards; first-mover advantage protects early innovators
 
 ### Anti-Copy Incentive Mechanism
 
@@ -197,20 +199,24 @@ The `docker-compose.yml` automatically starts all required services:
    - Verify commit exists and extract pack
    - Verify server-side push timestamp (via GitHub API) < on-chain submission time
    - Verify `sha256(pack_json) == pack_hash`
-3. **Run ClawBench scenarios**:
-   - `client_escalation` — P0 incident response
-   - `morning_brief` — Daily operating picture
-   - `inbox_to_action` — Email batch processing
-   - `team_standup` — Sprint status synthesis
-4. **Score results**:
+3. **Run ClawBench scenarios** (5 scenarios, weighted):
+   - `client_escalation` — P0 incident response (weight 1.5)
+   - `morning_brief` — Daily operating picture (weight 1.0)
+   - `inbox_to_action` — Email batch processing (weight 1.5)
+   - `team_standup` — Sprint status synthesis (weight 1.0)
+   - `inbox_triage` — Inbox review smoke test (weight 1.0)
+4. **Score results** (weighted aggregation with consensus):
    ```
-   score = success - ρ*variance
+   weighted_mean = Σ(w_i * s_i) / Σ(w_i)
+   final_score = quantize(weighted_mean - ρ * variance, step=0.05)
    ```
-   (ClawBench already includes safety and efficiency in scenario scoring)
+   Each scenario runs N=3 seeds with majority-vote consensus. Quantization to 0.05 grid ensures validator agreement.
 5. **Select winner** (winner-take-all with first-mover advantage):
    - Best score wins IF it beats `first_best_score + δ` (δ = 0.05)
+   - Scores within ε = 0.02 are tied; tie goes to earliest push timestamp
    - Protects early high-quality submissions from copy-paste attacks
-6. **Set on-chain weights** (winner = 1.0, others = 0.0)
+   - **Bootstrap phase** (< 10 miners): top 3 get 70% / 20% / 10% instead of WTA
+6. **Set on-chain weights** (steady state: winner = 1.0, others = 0.0)
 
 ## Scoring
 
@@ -219,52 +225,54 @@ The `docker-compose.yml` automatically starts all required services:
 ClawBench scenarios evaluate packs on multiple dimensions:
 
 - **Success** — Task completion (did it work?)
-- **Safety** — No forbidden actions, confirmations required
+- **Safety** — No forbidden actions, confidential data protected
 - **Efficiency** — Minimize tool calls and tokens
 - **Reliability** — Low variance across seeds (ρ = 0.1)
-- **Consensus** — Each scenario runs N=3 times; rubric checks are majority-voted for stable scoring across validators
+- **Consensus** — Each scenario runs N=3 seeds; rubric checks are majority-voted for stable scoring across validators
 
-**Example scoring**:
+Scenarios are **weighted** — safety-critical scenarios (client_escalation, inbox_to_action) carry 1.5x weight:
+
 ```python
-# Scenario: client_escalation (3 majority-voted runs)
-clawbench_score = 0.92  # From majority-voted rubric checks
-variance_penalty = 0.1 * 0.02  # ρ * variance across scenarios
+# Weighted aggregation across 5 scenarios
+# client_escalation=0.90 (w=1.5), morning_brief=0.85 (w=1.0),
+# inbox_to_action=0.88 (w=1.5), team_standup=0.80 (w=1.0), inbox_triage=0.95 (w=1.0)
+weighted_mean = (0.90*1.5 + 0.85*1.0 + 0.88*1.5 + 0.80*1.0 + 0.95*1.0) / 6.0
+# = 0.877
 
-final_score = 0.92 - 0.002 = 0.918
+# Variance penalty + quantization
+final_score = quantize(0.877 - 0.1 * variance, step=0.05)
+# = 0.85 (snapped to 0.05 grid)
 ```
 
 ### Winner-Take-All Mechanism
 
 TrajectoryRL uses **winner-take-all** reward distribution with **first-mover advantage**:
 
-1. **Best score wins** — Miner with highest score receives 100% of rewards (weight = 1.0)
-2. **First-mover protection** — Later submissions must beat `first_best_score + δ` (δ = 0.05)
-3. **All others receive zero** — No participation rewards
+1. **Best score wins** — Miner with highest quantized score receives 100% of rewards
+2. **Consensus epsilon** — Scores within ε=0.02 are tied; tie goes to earliest push timestamp
+3. **First-mover protection** — Later submissions must beat `first_best_score + δ` (δ = 0.05)
+4. **All others receive zero** — No participation rewards
 
-**Example**:
-```python
-# Epoch 1: Miner A submits (score=0.85, timestamp=100)
-weights = {A: 1.0}  # A wins
+### Bootstrap Phase
 
-# Epoch 2: Miner B copies A's pack (score=0.85, timestamp=200)
-# Required: 0.85 + 0.05 = 0.90
-# B's score (0.85) < 0.90 → A retains win
-weights = {A: 1.0, B: 0.0}
+When the subnet has **fewer than 10 active miners**, rewards are distributed using a graduated curve to encourage early adoption:
 
-# Epoch 3: Miner C improves (score=0.91, timestamp=300)
-# C's score (0.91) > 0.90 → C wins
-weights = {A: 0.0, B: 0.0, C: 1.0}
-```
+| Rank | Share |
+|------|-------|
+| 1st  | 70%   |
+| 2nd  | 20%   |
+| 3rd  | 10%   |
 
-This mechanism prevents copy-paste attacks by requiring meaningful improvement (5%) to overtake early submissions.
+Once ≥ 10 miners are active, the subnet transitions to pure winner-take-all.
 
 ## ClawBench Integration
 
 TrajectoryRL uses [ClawBench](https://github.com/trajectoryRL/clawbench) for deterministic evaluation:
 
 - **Fixed fixtures** — Same inbox, calendar, tasks for every evaluation
+- **5 scenarios** — client_escalation, morning_brief, inbox_to_action, team_standup, inbox_triage
 - **Identity variation** — `{{PLACEHOLDER}}` templates in USER.md are filled per epoch (name, role, company)
-- **Regex scoring** — No LLM judge, fully reproducible
+- **Regex scoring** — Deterministic rubric checks, fully reproducible (LLM-as-judge planned for v0.3.0)
 - **Mock tools** — No real API calls, sandboxed execution
 
 ### Version Pinning
@@ -334,14 +342,30 @@ NETWORK=local python neurons/validator.py --wallet.name test_validator
 
 ## Roadmap
 
-- [x] ~~Validator implementation~~ (v0.1.0)
-- [x] ~~Consensus scoring (majority-vote N=3)~~
-- [x] ~~Epoch-seeded identity variation (35M+ contexts)~~
-- [ ] Miner implementation (v0.2.0)
-- [ ] Example policy packs
+### v0.1.0 (complete)
+- [x] Validator implementation
+- [x] Consensus scoring (majority-vote N=3, quantization, epsilon tie-break)
+- [x] Epoch-seeded identity variation (35M+ contexts)
+- [x] Weighted scenario scoring (safety-critical scenarios = 1.5x)
+- [x] Bootstrap graduated rewards (70/20/10 when < 10 miners)
+- [x] OPP v1 pack schema with validation (32KB limit)
+- [x] GitHub push timestamp verification (server-side, not forgeable)
+
+### v0.2.0 (next)
+- [ ] Miner implementation
+- [ ] Example policy packs (baseline + optimized)
+- [ ] URL-based pack fetching (for packs > inline base64)
+- [ ] Pack cache with LRU eviction
+
+### v0.3.0 (planned)
+- [ ] **Hybrid LLM-as-judge scoring** — Use a fixed LLM model to evaluate semantic correctness and response quality alongside regex checks. Regex handles objective checks (safety, efficiency); LLM judge handles subjective checks (correctness, structure). Consensus maintained via: pinned model + binary pass/fail output + majority-vote over N=3 seeds + score quantization.
+- [ ] Anti-gaming defenses (AGENTS.md keyword blocklist, fixture name variation)
+- [ ] Hidden held-out scenarios (scored but not published)
+
+### Future
 - [ ] Pack optimizer tools
-- [ ] Prometheus metrics
-- [ ] Web dashboard
+- [ ] Prometheus metrics and alerting
+- [ ] Web dashboard (scores, leaderboard, epoch history)
 
 ## Community
 

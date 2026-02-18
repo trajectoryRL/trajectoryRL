@@ -191,7 +191,7 @@ class TestOPPSchemaValidation:
         valid_pack["files"]["AGENTS.md"] = "x" * 200_000
         result = validate_opp_schema(valid_pack)
         assert not result.passed
-        assert any("too large" in i.lower() or "100KB" in i for i in result.issues)
+        assert any("too large" in i.lower() or "32KB" in i for i in result.issues)
 
     def test_validation_result_bool(self):
         assert bool(ValidationResult(passed=True, issues=[])) is True
