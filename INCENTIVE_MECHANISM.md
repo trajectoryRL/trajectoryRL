@@ -572,6 +572,14 @@ Once the 10th miner registers and submits, the next epoch automatically switches
 | 1-9 | Bootstrap | Top-3: 70/20/10 |
 | 10+ | Steady state | Winner-take-all: 100/0/0 |
 
+### No Eligible Miners
+
+If **no miner scores above `min_score_threshold`** (default 0.30) in an epoch — e.g., no miners respond, all packs fail schema validation, or all score zero — the validator sets **uniform weights** (`1/N`) across all miners.
+
+**Why uniform instead of skipping?** Not calling `set_weights` means the validator's `last_update` block never advances. After `activity_cutoff` blocks, Bittensor marks the validator inactive and eventually deregisters it. If *all* validators get deregistered during a quiet period, there would be no validators left when miners finally arrive.
+
+**What happens to miner alpha with uniform weights?** The miner alpha gets spread thinly and evenly across all miners — no single miner is favoured. Once a miner submits a valid pack scoring above `min_score_threshold`, normal winner-take-all resumes immediately.
+
 ### First-Mover Protection
 
 To prevent copy-paste attacks, validators enforce **chronological precedence**:
@@ -1066,6 +1074,7 @@ Bootstrap:     top-3 get 70/20/10 of miner alpha emissions
 | N (runs per scenario) | 3 | ✅ Yes |
 | Scenario pool | 5 (select 4/epoch) | ✅ Yes |
 | Scenario weights | 1.0-1.5 per YAML | ✅ Yes |
+| min_score_threshold | 0.30 | ✅ Yes |
 | Bootstrap threshold | 10 miners | ✅ Yes |
 | Epoch interval | 14400s (4h) | ✅ Yes |
 | Context dimensions | 6 (~35M combos) | ✅ Yes |

@@ -82,6 +82,9 @@ class ValidatorConfig:
     score_quantization: float = 0.05  # Round scores to nearest 0.05
     consensus_epsilon: float = 0.02  # Scores within ε are tied; tie → first-mover wins
 
+    # Minimum score to be eligible for rewards (INCENTIVE_MECHANISM.md § Pack Requirements)
+    min_score_threshold: float = 0.30  # Miners below this get weight=0
+
     # Bootstrap config (graduated rewards until enough miners join)
     bootstrap_threshold: int = 10  # When active miners < this, use top-3 curve (70/20/10)
 

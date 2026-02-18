@@ -529,9 +529,45 @@ class TrajectoryValidator:
         """
         logger.info(f"Setting weights for {len(scores)} miners...")
 
+        # Filter out miners below minimum score threshold.
+        # Without this, all-zero scores would give weight=1.0 to an
+        # arbitrary miner.  When no miner qualifies, we skip setting
+        # weights entirely — Bittensor's Yuma Consensus redirects
+        # the miner alpha share to validators.
+        eligible = {
+            uid: s for uid, s in scores.items()
+            if s >= self.config.min_score_threshold
+        }
+        if not eligible:
+            # No miner qualifies, but we must still call set_weights
+            # to keep the validator active on-chain (prevents
+            # deregistration after activity_cutoff blocks).
+            # Set uniform weights so no single miner is favoured.
+            logger.warning(
+                f"No miners above min_score_threshold "
+                f"({self.config.min_score_threshold}). "
+                f"Setting uniform weights to stay active."
+            )
+            uids = list(scores.keys())
+            uniform_w = 1.0 / len(uids)
+            weights = [uniform_w] * len(uids)
+            try:
+                self.subtensor.set_weights(
+                    netuid=self.config.netuid,
+                    wallet=self.wallet,
+                    uids=uids,
+                    weights=weights,
+                    wait_for_inclusion=True,
+                    wait_for_finalization=False,
+                )
+                logger.info("✓ Uniform weights set (no eligible miners)")
+            except Exception as e:
+                logger.error(f"Error setting uniform weights: {e}", exc_info=True)
+            return
+
         # Select winner (or bootstrap curve) with first-mover advantage
         weights_dict = self.scorer.select_winner(
-            scores=scores,
+            scores=eligible,
             first_mover_data=self.first_mover_data,
             delta=self.config.delta_threshold,
             num_active_miners=num_active_miners,
@@ -547,16 +583,16 @@ class TrajectoryValidator:
         logger.info("=" * 60)
         logger.info("WINNER-TAKE-ALL RESULTS")
         logger.info("=" * 60)
-        logger.info(f"🏆 Winner: Miner {winner_uid} (score={scores[winner_uid]:.3f})")
+        logger.info(f"🏆 Winner: Miner {winner_uid} (score={eligible[winner_uid]:.3f})")
         logger.info("-" * 60)
-        logger.info("All miners:")
+        logger.info(f"Eligible miners ({len(eligible)}/{len(scores)}):")
         for uid, weight in sorted(
             weights_dict.items(),
-            key=lambda x: scores[x[0]],
+            key=lambda x: eligible[x[0]],
             reverse=True
         ):
             marker = "🏆 WINNER" if weight == 1.0 else ""
-            logger.info(f"  Miner {uid}: weight={weight:.4f}, score={scores[uid]:.3f} {marker}")
+            logger.info(f"  Miner {uid}: weight={weight:.4f}, score={eligible[uid]:.3f} {marker}")
 
         # Set weights on chain
         try:
