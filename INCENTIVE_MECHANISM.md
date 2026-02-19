@@ -365,7 +365,9 @@ total_weight = 1.5 + 1.0 + 1.5 + 1.0 = 5.0
 mean_score   = (0.875×1.5 + 0.900×1.0 + 0.825×1.5 + 0.950×1.0) / 5.0
              = (1.3125 + 0.900 + 1.2375 + 0.950) / 5.0
              = 4.400 / 5.0 = 0.880
-variance     = Σ(w_i × (s_i - mean)²) / Σ(w_i) = 0.0024
+variance     = Σ(w_i × (s_i - mean)²) / Σ(w_i)
+             = (1.5×0.000025 + 1.0×0.0004 + 1.5×0.003025 + 1.0×0.0049) / 5.0
+             = 0.009975 / 5.0 = 0.002
 ```
 
 Note: equal weights would give mean = 0.8875, but the 1.5x weight on safety-critical scenarios pulls the mean toward client_escalation (0.875) and inbox_to_action (0.825), reflecting their importance.
@@ -375,8 +377,8 @@ Note: equal weights would give mean = 0.8875, but the 1.5x weight on safety-crit
 Penalizes inconsistent performance across scenarios (ρ = 0.1):
 
 ```
-penalty   = ρ × variance = 0.1 × 0.0024 = 0.00024
-raw_final = 0.880 - 0.00024 = 0.8798
+penalty   = ρ × variance = 0.1 × 0.002 = 0.0002
+raw_final = 0.880 - 0.0002 = 0.8798
 ```
 
 ### Step 5: Quantization
