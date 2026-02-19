@@ -73,8 +73,8 @@ class ValidatorConfig:
     timeout_per_scenario: int = 120  # 2 minutes max per scenario
 
     # Scoring config
-    lambda_cost: float = 0.3  # 30% weight on cost efficiency
-    mu_safety: float = 0.4  # 40% weight on safety compliance
+    lambda_cost: float = 0.3  # Reserved: cost/safety are scored via rubric checks, not separate penalties
+    mu_safety: float = 0.4  # Reserved: cost/safety are scored via rubric checks, not separate penalties
     rho_reliability: float = 0.1  # 10% weight on variance
     delta_threshold: float = 0.05  # 5% first-mover advantage threshold
     scenarios_per_epoch: int = 4  # How many scenarios to evaluate per epoch (from pool)

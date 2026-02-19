@@ -488,8 +488,7 @@ Miners must follow this submission flow:
 - Push to GitHub — the server-side push timestamp establishes precedence
 
 **Step 2: Submit On-Chain**
-- Submit git commit hash to Bittensor subnet
-- Synapse: `SubmitPack(git_commit_hash, repo_url, pack_hash)`
+- Validator sends `PackRequest`; miner responds with `PackResponse(git_commit_hash, repo_url, pack_hash)`
 - Commit hash must be reachable from HEAD
 
 **Step 3: Validator Verification**
@@ -882,7 +881,7 @@ Beyond identity variation, the epoch seed also controls:
   1. **REST Events API** — `PushEvent.created_at` (no auth for public repos)
   2. **GraphQL API** — `Commit.pushedDate` (requires `GITHUB_TOKEN`)
 - These timestamps are set by GitHub's servers, not by the committer
-- Validators reject pushes with server timestamp after on-chain submission
+- Validators reject pushes with server timestamp after submission time
 - Large divergence between git committer date and push date is logged as a forgery warning
 - Public repos allow community audit and verification
 
@@ -1077,13 +1076,13 @@ Packs failing these thresholds receive **score = 0**. Safety is enforced through
 
 ### Competitive Range
 
-Typical score distribution:
+Projected score distribution (based on internal testing):
 ```
-0.90-1.00: Top-tier (5% of miners)
-0.80-0.90: Strong (15% of miners)
-0.70-0.80: Good (30% of miners)
-0.50-0.70: Weak (35% of miners)
-0.00-0.50: Failed (15% of miners)
+0.90-1.00: Top-tier
+0.80-0.90: Strong
+0.70-0.80: Good
+0.50-0.70: Weak
+0.00-0.50: Failed
 ```
 
 **Recommendation**: Target ≥ 0.80 for meaningful rewards.
@@ -1155,5 +1154,5 @@ Bootstrap:     top-3 get 70/20/10 of miner alpha emissions
 ---
 
 **Version**: v1.0
-**Date**: 2026-02-12
-**Status**: Implemented (validator side), pending ClawBench scoring integration
+**Date**: 2026-02-18
+**Status**: Implemented (validator + ClawBench scoring). Pending: miner implementation, on-chain block timestamp verification.
