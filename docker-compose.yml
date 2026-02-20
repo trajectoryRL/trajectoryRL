@@ -109,7 +109,7 @@ services:
       - MOCK_TOOLS_URL=http://mock-tools:3001
       - OPENCLAW_URL=http://openclaw:18789
       - WORKSPACE_PATH=/workspace
-      # Evaluation
+      # Evaluation (720s = 12min for local testing; production uses 86400s = 24h)
       - EPOCH_INTERVAL=${EPOCH_INTERVAL:-720}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       # API keys

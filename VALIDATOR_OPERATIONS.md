@@ -19,8 +19,8 @@ Each epoch, a validator evaluates every active miner:
 
 ```
 episodes_per_epoch = scenarios_per_epoch(4) × seeds_per_task(3) = 12 per miner
-epochs_per_day     = 24h / epoch_interval(4h) = 6
-episodes_per_day   = miners × 12 × 6 = miners × 72
+epochs_per_day     = 24h / epoch_interval(24h) = 1
+episodes_per_day   = miners × 12 × 1 = miners × 12
 ```
 
 **Per-episode token estimate** (averaged across 5 scenarios):
@@ -40,14 +40,14 @@ Default model: Claude Sonnet 4.5 ($3/M input, $15/M output). Cost per episode �
 
 | Active Miners | Episodes/day | Daily Cost | Monthly Cost |
 |:-------------:|:------------:|:----------:|:------------:|
-| 5 | 360 | **$7** | **$216** |
-| 14 | 1,008 | **$20** | **$605** |
-| 30 | 2,160 | **$43** | **$1,296** |
-| 64 | 4,608 | **$92** | **$2,765** |
-| 128 | 9,216 | **$184** | **$5,530** |
-| 256 | 18,432 | **$369** | **$11,059** |
+| 5 | 60 | **$1** | **$36** |
+| 14 | 168 | **$3** | **$101** |
+| 30 | 360 | **$7** | **$216** |
+| 64 | 768 | **$15** | **$461** |
+| 128 | 1,536 | **$31** | **$922** |
+| 256 | 3,072 | **$61** | **$1,843** |
 
-**Formula**: `daily_cost ≈ miners × $1.44/day` (at Sonnet pricing).
+**Formula**: `daily_cost ≈ miners × $0.24/day` (at Sonnet pricing).
 
 ## Model Alternatives
 
@@ -55,8 +55,8 @@ Validators can use cheaper models to reduce costs. Scoring is regex-based (no LL
 
 | Model | Input $/M | Output $/M | Cost/episode | 30 miners/day | 128 miners/day |
 |-------|:---------:|:----------:|:------------:|:--------------:|:--------------:|
-| Claude Sonnet 4.5 | $3 | $15 | $0.020 | $43 | $184 |
-| Claude Haiku 4.5 | $0.80 | $4 | $0.005 | $11 | $46 |
+| Claude Sonnet 4.5 | $3 | $15 | $0.020 | $7 | $31 |
+| Claude Haiku 4.5 | $0.80 | $4 | $0.005 | $2 | $8 |
 | Local (Llama 3.3) | $0 | $0 | ~$0* | ~$0 | ~$0 |
 
 *Local models: hardware cost instead (~$1.50/hr for A100, handles ~100 episodes/hr).
@@ -84,10 +84,10 @@ Validators can use cheaper models to reduce costs. Scoring is regex-based (no LL
 Validator economics depend on TAO emissions exceeding LLM costs:
 
 ```
-Break-even: daily_TAO_earnings × TAO_price > miners × $1.44/day
+Break-even: daily_TAO_earnings × TAO_price > miners × $0.24/day
 
 Example (30 miners, ~6 TAO/day validator earnings):
-  Break-even TAO price = (30 × $1.44) / 6 = $7.20/TAO
+  Break-even TAO price = (30 × $0.24) / 6 = $1.20/TAO
 ```
 
-At scale (128+ miners), validators should consider Haiku or local models to remain profitable.
+With 24h epochs, Sonnet 4.5 remains economically viable even at scale. At 128 miners and ~10 TAO/day validator earnings, break-even TAO price is only $3.07/TAO.

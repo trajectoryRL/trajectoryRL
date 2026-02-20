@@ -53,7 +53,7 @@ NETWORK=finney
 
 # Validator
 ANTHROPIC_API_KEY=sk-ant-...
-EPOCH_INTERVAL=720
+EPOCH_INTERVAL=720      # 12 minutes for fast testing (production: 86400 = 24h)
 LOG_LEVEL=INFO
 
 # Miner

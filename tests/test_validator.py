@@ -1560,7 +1560,7 @@ class TestValidatorConfig:
         assert defaults["delta_threshold"].default == 0.05
         assert defaults["scenarios_per_epoch"].default == 4
         assert defaults["seeds_per_task"].default == 3
-        assert defaults["epoch_interval"].default == 14400
+        assert defaults["epoch_interval"].default == 86400
 
 
 # ===================================================================

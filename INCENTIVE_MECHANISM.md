@@ -401,7 +401,7 @@ If **no miner scores above `min_score_threshold`** (default 0.30) in an epoch �
 
 **Rules**:
 
-1. **Activity window**: A miner is considered "active" if they responded with a valid pack (passes schema + git verification) within the last `inactivity_window` epochs (default: 6 epochs = ~24 hours).
+1. **Activity window**: A miner is considered "active" if they responded with a valid pack (passes schema + git verification) within the last `inactivity_window` epochs (default: 2 epochs = ~48 hours).
 
 2. **Tracking**: Validators track `last_valid_epoch[miner_uid]` — the most recent epoch in which the miner submitted a pack that passed pre-evaluation checks.
 
@@ -417,11 +417,11 @@ If **no miner scores above `min_score_threshold`** (default 0.30) in an epoch �
 
 4. **Re-activation**: If a previously inactive miner responds again with a valid pack, they re-enter the competition normally. Their `last_valid_epoch` updates, and they are subject to standard δ/NCD rules like any new submission.
 
-**Why `inactivity_window = 6`?** At one epoch per 4 hours, this gives miners 24 hours of downtime (maintenance, key rotation, etc.) before losing first-mover protection. Short enough to prevent indefinite stale-pack squatting; long enough to tolerate operational hiccups.
+**Why `inactivity_window = 2`?** At one epoch per 24 hours, this gives miners 48 hours (2 days) of downtime (maintenance, key rotation, etc.) before losing first-mover protection. Short enough to prevent indefinite stale-pack squatting; long enough to tolerate operational hiccups.
 
 | Parameter | Value | Tunable? |
 |-----------|-------|----------|
-| `inactivity_window` | 6 epochs (~24h) | Yes |
+| `inactivity_window` | 2 epochs (~48h) | Yes |
 
 ### First-Mover Protection
 
@@ -570,7 +570,7 @@ An **epoch** is one complete evaluation cycle. The epoch number is derived from 
 │  [Generate Context] → [Select Scenarios] → [Evaluate] → [Weights]
 │  ~1s                   ~1s                  ~10-30 min   ~30s    │
 │                                                                  │
-│  ──── epoch_interval (14400s / 4 hours) cooldown ──────────────  │
+│  ──── epoch_interval (86400s / 24 hours) cooldown ─────────────  │
 │                                                                  │
 │  Epoch N+1 starts                                                │
 └──────────────────────────────────────────────────────────────────┘
@@ -578,12 +578,14 @@ An **epoch** is one complete evaluation cycle. The epoch number is derived from 
 
 | Setting | Value | Description |
 |---------|-------|-------------|
-| `epoch_interval` | 14400s (4 hours) | Epoch length (~1200 blocks at 12s/block) |
+| `epoch_interval` | 86400s (24 hours) | Epoch length (~7200 blocks at 12s/block) |
 | `timeout_per_scenario` | 120s (2 min) | Max time per scenario run |
 | `seeds_per_task` | 3 | Majority-vote runs per scenario |
 | `scenarios_per_epoch` | 4 | Scenarios selected per epoch |
 
-**Typical cadence**: ~6 epochs per day. Evaluation takes 10-30 minutes depending on miner count and LLM latency, plus 4 hours cooldown. Miners have several hours between epochs to iterate.
+**Typical cadence**: 1 epoch per day. Evaluation takes 10-30 minutes depending on miner count and LLM latency, plus 24-hour cooldown. Miners have a full day between epochs to iterate.
+
+**Note**: Validators evaluate miners once per day (to minimize LLM costs), but set weights on-chain every tempo (~72 minutes) to maintain Yuma consensus participation. Between evaluations, validators re-submit cached scores.
 
 ### Epoch Context (Identity Variation)
 
@@ -1038,9 +1040,9 @@ Bootstrap:     top-3 get 70/20/10 of miner alpha emissions
 | Scenario weights | 1.0-1.5 per YAML | ✅ Yes |
 | min_score_threshold | 0.30 | ✅ Yes |
 | Bootstrap threshold | 10 miners | ✅ Yes |
-| Epoch interval | 14400s (4h) | ✅ Yes |
+| Epoch interval | 86400s (24h) | ✅ Yes |
 | σ (similarity threshold) | 0.80 (NCD) | ✅ Yes |
-| Inactivity window | 6 epochs (~24h) | ✅ Yes |
+| Inactivity window | 2 epochs (~48h) | ✅ Yes |
 | Context dimensions | 6 (~35M combos) | ✅ Yes |
 
 ---

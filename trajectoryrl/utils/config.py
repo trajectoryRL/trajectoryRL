@@ -65,7 +65,7 @@ class ValidatorConfig:
 
     # Evaluation config
     seeds_per_task: int = 3  # Runs per scenario for majority-vote consensus
-    epoch_interval: int = 14400  # 4 hours (14400 seconds)
+    epoch_interval: int = 86400  # 24 hours (86400 seconds)
     timeout_per_scenario: int = 120  # 2 minutes max per scenario
 
     # Scoring config
@@ -161,7 +161,7 @@ class ValidatorConfig:
                     str(Path(__file__).parent.parent.parent.parent / "clawbench")
                 )
             ),
-            epoch_interval=int(os.getenv("EPOCH_INTERVAL", "14400")),
+            epoch_interval=int(os.getenv("EPOCH_INTERVAL", "86400")),
             github_token=os.getenv("GITHUB_TOKEN"),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
         )
