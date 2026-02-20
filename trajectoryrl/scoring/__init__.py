@@ -338,6 +338,11 @@ class TrajectoryScorer:
             if i < len(BOOTSTRAP_SHARES):
                 weights[uid] = BOOTSTRAP_SHARES[i]
 
+        # Normalize so weights always sum to 1.0 (handles <3 miners)
+        total = sum(weights.values())
+        if total > 0 and total != 1.0:
+            weights = {uid: w / total for uid, w in weights.items()}
+
         logger.info(
             f"Bootstrap phase ({len(scores)} miners < {self.bootstrap_threshold}): "
             f"graduated rewards {dict((uid, w) for uid, w in weights.items() if w > 0)}"

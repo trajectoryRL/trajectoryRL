@@ -435,8 +435,30 @@ class TestTrajectoryScorer:
         weights = s.select_winner(
             scores, first_mover, delta=0.05, num_active_miners=2
         )
-        assert weights[1] == 0.70  # miner 1 first (earlier timestamp)
-        assert weights[0] == 0.20
+        # 2 miners: raw 0.70/0.20 normalized to sum to 1.0
+        assert weights[1] == pytest.approx(0.70 / 0.90)  # ~0.778
+        assert weights[0] == pytest.approx(0.20 / 0.90)  # ~0.222
+
+    def test_select_winner_bootstrap_single_miner(self):
+        """Single miner in bootstrap gets weight 1.0 (normalized)."""
+        s = TrajectoryScorer(bootstrap_threshold=10)
+        scores = {0: 0.75}
+        first_mover = {0: (0.75, 100.0)}
+        weights = s.select_winner(
+            scores, first_mover, delta=0.05, num_active_miners=1
+        )
+        assert weights[0] == 1.0
+
+    def test_select_winner_bootstrap_two_miners_sum_to_one(self):
+        """Two miners in bootstrap: weights must sum to 1.0."""
+        s = TrajectoryScorer(bootstrap_threshold=10)
+        scores = {0: 0.80, 1: 0.91}
+        first_mover = {0: (0.80, 100.0), 1: (0.91, 200.0)}
+        weights = s.select_winner(
+            scores, first_mover, delta=0.05, num_active_miners=2
+        )
+        assert weights[1] > weights[0]  # higher score wins more
+        assert sum(weights.values()) == pytest.approx(1.0)
 
     def test_select_winner_above_threshold_is_wta(self):
         """Once miner count >= threshold, pure winner-take-all resumes."""
