@@ -304,13 +304,9 @@ A **PolicyBundle** (also called an OpenClaw Policy Pack / OPP) is a JSON object 
 
 ### What Goes in AGENTS.md
 
-AGENTS.md is the primary policy document. It should contain:
-- **Behavioral rules**: How to handle escalations, triage email, prepare standups
-- **Tool usage guidelines**: When to use each tool, what to avoid
-- **Safety constraints**: Approval gates, forbidden actions, confidentiality rules
-- **Output format**: How to structure responses (numbered lists, sections, etc.)
+AGENTS.md is the primary policy document controlling agent behavior. It must be **identity-agnostic** — the epoch context (see [Identity Variation](#epoch-context-identity-variation)) prepends a random persona each epoch, so hardcoded names/companies will conflict and score poorly.
 
-**Important**: AGENTS.md must be **identity-agnostic** — do not hardcode user names, companies, or dates. The epoch context (see Identity Variation) prepends a persona to AGENTS.md each epoch, so policies that say "You are Alex at TechCorp" will conflict and score poorly.
+For practical writing guidance, examples, and common failure patterns, see [MINER_OPERATIONS.md — Writing AGENTS.md](MINER_OPERATIONS.md#writing-agentsmd).
 
 ---
 
@@ -530,39 +526,14 @@ Total miner alpha: 1000 tokens
 
 ### Competitive Strategy
 
-**To maximize ROI, miners should:**
-1. **Innovate rapidly** — Be FIRST to discover new techniques
-2. **Publish fast** — Git timestamp determines precedence
-3. **Iterate continuously** — 5% improvements compound
-4. **Study past winners** — Public repos create learning flywheel
-
-**Example ROI** (as of Feb 2026, TAO @ $195):
-```
-Validator stake: 5,000 TAO (~$975,000)
-Daily validator earnings: ~4 TAO/day (varies by subnet alpha inflow)
-Daily validator revenue: ~$780/day = $23,400/month
-
-Daily LLM costs (30 miners, Sonnet): $7/day = $210/month
-Net validator profit: ~$23,190/month (~95% margin)
-
-Miner research cost: $5,000 (compute + iteration)
-Win duration: 3 epochs (3 days)
-Daily alpha emissions (41% of subnet): varies by Taoflow
-Estimated alpha earnings: 50-200 alpha tokens per day
-
-Alpha/TAO conversion: via subnet liquidity pool (varies by demand)
-Conservative alpha price: $1-5 (depends on subnet adoption)
-At $2 alpha, 3-day win: 150 alpha × $2 = $300 (~6% ROI, needs longer hold)
-At $10 alpha, 3-day win: 150 alpha × $10 = $1,500 (~30% ROI)
-```
-
-**Key insight**: Winner-take-all creates extreme risk/reward profile in steady state. The bootstrap phase (top-3 at 70/20/10) lowers the barrier for early miners. Once ≥10 miners are active, pure winner-take-all resumes.
+Winner-take-all creates extreme risk/reward in steady state. The bootstrap phase (top-3 at 70/20/10) lowers the barrier for early miners. For practical mining strategy, iteration tips, and cost model, see [MINER_OPERATIONS.md](MINER_OPERATIONS.md).
 
 ---
 
 ## Operational Costs
 
-Validators bear all LLM inference costs; miners pay zero per epoch. See [VALIDATOR_OPERATIONS.md](VALIDATOR_OPERATIONS.md) for full cost projections, model alternatives, and sustainability analysis.
+- **Validators**: Bear all LLM inference costs. See [VALIDATOR_OPERATIONS.md](VALIDATOR_OPERATIONS.md) for cost projections and sustainability analysis.
+- **Miners**: Zero ongoing cost (policy iteration only). See [MINER_OPERATIONS.md](MINER_OPERATIONS.md) for local testing costs and setup.
 
 ---
 
@@ -995,16 +966,7 @@ A miner's submission can fail at multiple points in the validation pipeline. The
 
 ### Competitive Range
 
-Projected score distribution (based on internal testing):
-```
-0.90-1.00: Top-tier
-0.80-0.90: Strong
-0.70-0.80: Good
-0.50-0.70: Weak
-0.00-0.50: Failed
-```
-
-**Recommendation**: Target ≥ 0.80 for meaningful rewards.
+Target ≥ 0.85 for competitive scores. For score targets, iteration strategy, and common failure patterns, see [MINER_OPERATIONS.md — Score Targets](MINER_OPERATIONS.md#score-targets).
 
 ---
 
@@ -1072,7 +1034,9 @@ Bootstrap:     top-3 get 70/20/10 of miner alpha emissions
 - **Dynamic TAO**: https://docs.bittensor.com/dtao
 - **Yuma Consensus**: https://docs.bittensor.com/yuma-consensus
 - **ClawBench**: https://github.com/trajectoryRL/clawbench
-- **Miner/Validator Design**: See `neurons/validator.py` and `trajectoryrl/` package
+- **Miner Guide**: [MINER_OPERATIONS.md](MINER_OPERATIONS.md) — Local testing, pack writing, iteration strategy
+- **Validator Guide**: [VALIDATOR_OPERATIONS.md](VALIDATOR_OPERATIONS.md) — Cost projections, model alternatives, sustainability
+- **Source Code**: See `neurons/validator.py` and `trajectoryrl/` package
 
 ---
 
