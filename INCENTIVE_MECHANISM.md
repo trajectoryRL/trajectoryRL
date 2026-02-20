@@ -490,14 +490,25 @@ Miner A (score: 0.85): 10% of miner alpha
 TrajectoryRL uses **Dynamic TAO (dTAO)** with subnet-specific alpha token:
 
 ```
-Alpha Emissions per Tempo (~360 blocks):
+Network Emissions (Post-Halving, Dec 2025):
+├─ Daily TAO emissions: 3,600 TAO/day (was 7,200 pre-halving)
+├─ Per-tempo emissions: ~0.3 TAO/tempo (360 blocks = ~72 min)
+└─ Current TAO price: ~$195 USD (Feb 2026)
+
+Alpha Emissions per Tempo (Subnet-Specific):
 ├─ 41% to miners (100% to winner in steady state; 70/20/10 in bootstrap)
 ├─ 41% to validators and their stakers
 └─ 18% to subnet owner
 
-TAO → Subnet: Based on net staking inflows ("Taoflow")
-Alpha → TAO: Swappable via subnet liquidity pool
+TAO → Subnet Alpha: Based on net staking inflows ("Taoflow")
+Alpha → TAO: Swappable via subnet liquidity pool (market-determined price)
+Validator Earnings: Varies by stake weight and subnet alpha demand
 ```
+
+**Realistic validator earnings** (SN11, medium stake ~5k TAO):
+- **Daily**: 2-6 TAO/day ($390-$1,170/day at $195/TAO)
+- **Monthly**: 60-180 TAO/month (~$11,700-$35,100/month)
+- **APY**: 6-15% on staked TAO (varies by subnet performance)
 
 ### Miner Reward
 
@@ -525,16 +536,24 @@ Total miner alpha: 1000 tokens
 3. **Iterate continuously** — 5% improvements compound
 4. **Study past winners** — Public repos create learning flywheel
 
-**Example ROI**:
+**Example ROI** (as of Feb 2026, TAO @ $195):
 ```
-Research cost: $5,000 (compute + time)
-Win duration: 3 epochs
-Alpha per epoch: 1000 tokens
-Total earnings: 3000 alpha tokens
+Validator stake: 5,000 TAO (~$975,000)
+Daily validator earnings: ~4 TAO/day (varies by subnet alpha inflow)
+Daily validator revenue: ~$780/day = $23,400/month
 
-Break-even alpha price: $1.67
-At $5 alpha: $15,000 revenue (3x ROI)
-At $10 alpha: $30,000 revenue (6x ROI)
+Daily LLM costs (30 miners, Sonnet): $7/day = $210/month
+Net validator profit: ~$23,190/month (~95% margin)
+
+Miner research cost: $5,000 (compute + iteration)
+Win duration: 3 epochs (3 days)
+Daily alpha emissions (41% of subnet): varies by Taoflow
+Estimated alpha earnings: 50-200 alpha tokens per day
+
+Alpha/TAO conversion: via subnet liquidity pool (varies by demand)
+Conservative alpha price: $1-5 (depends on subnet adoption)
+At $2 alpha, 3-day win: 150 alpha × $2 = $300 (~6% ROI, needs longer hold)
+At $10 alpha, 3-day win: 150 alpha × $10 = $1,500 (~30% ROI)
 ```
 
 **Key insight**: Winner-take-all creates extreme risk/reward profile in steady state. The bootstrap phase (top-3 at 70/20/10) lowers the barrier for early miners. Once ≥10 miners are active, pure winner-take-all resumes.

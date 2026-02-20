@@ -86,8 +86,23 @@ Validator economics depend on TAO emissions exceeding LLM costs:
 ```
 Break-even: daily_TAO_earnings × TAO_price > miners × $0.24/day
 
-Example (30 miners, ~6 TAO/day validator earnings):
-  Break-even TAO price = (30 × $0.24) / 6 = $1.20/TAO
+Example (30 miners, ~4 TAO/day validator earnings):
+  Daily costs:   30 × $0.24 = $7.20/day
+  Daily revenue: 4 TAO × $195 (Feb 2026 price) = $780/day
+  Net profit:    $772.80/day (~99% margin)
+
+  Break-even TAO price = $7.20 / 4 = $1.80/TAO
 ```
 
-With 24h epochs, Sonnet 4.5 remains economically viable even at scale. At 128 miners and ~10 TAO/day validator earnings, break-even TAO price is only $3.07/TAO.
+**At current TAO price ($195)**, TrajectoryRL validators are highly profitable:
+
+| Scenario | Daily Cost | Daily Revenue (4 TAO @ $195) | Monthly Profit |
+|----------|:----------:|:----------------------------:|:--------------:|
+| 30 miners | $7 | $780 | **$23,190** |
+| 64 miners | $15 | $780 | **$22,950** |
+| 128 miners | $31 | $780 | **$22,470** |
+| 256 miners | $61 | $780 | **$21,570** |
+
+Even at 256 miners (worst case), LLM costs are only **~8%** of validator revenue. Sonnet 4.5 remains economically viable at any realistic scale.
+
+**Break-even analysis**: TAO would need to drop below **$15** before validators with 128 miners become unprofitable (assuming 4 TAO/day earnings). At Feb 2026 price ($195), there is **13x safety margin**.
