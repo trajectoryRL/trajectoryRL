@@ -36,7 +36,9 @@ episodes_per_day   = miners × 12 × 1 = miners × 12
 
 ## Daily Cost Projections
 
-Default model: Claude Sonnet 4.5 ($3/M input, $15/M output). Cost per episode ≈ **$0.020**.
+Designated model: `anthropic/claude-sonnet-4-5-20250929` ($3/M input, $15/M output). Cost per episode ≈ **$0.020**. Will switch to `claude-sonnet-4-6` once OpenClaw supports it (same pricing).
+
+**All validators must use the designated model.** This is a consensus requirement: if validators use different models, agents produce different tool-call sequences, leading to different rubric outcomes and validator disagreement on scores. Using the wrong model puts your validator out of consensus and risks down-weighting by Yuma.
 
 | Active Miners | Episodes/day | Daily Cost | Monthly Cost |
 |:-------------:|:------------:|:----------:|:------------:|
@@ -48,18 +50,6 @@ Default model: Claude Sonnet 4.5 ($3/M input, $15/M output). Cost per episode �
 | 256 | 3,072 | **$61** | **$1,843** |
 
 **Formula**: `daily_cost ≈ miners × $0.24/day` (at Sonnet pricing).
-
-## Model Alternatives
-
-Validators can use cheaper models to reduce costs. Scoring is regex-based (no LLM judge), so model choice only affects the agent's task execution quality — not scoring fidelity.
-
-| Model | Input $/M | Output $/M | Cost/episode | 30 miners/day | 128 miners/day |
-|-------|:---------:|:----------:|:------------:|:--------------:|:--------------:|
-| Claude Sonnet 4.5 | $3 | $15 | $0.020 | $7 | $31 |
-| Claude Haiku 4.5 | $0.80 | $4 | $0.005 | $2 | $8 |
-| Local (Llama 3.3) | $0 | $0 | ~$0* | ~$0 | ~$0 |
-
-*Local models: hardware cost instead (~$1.50/hr for A100, handles ~100 episodes/hr).
 
 ## Miner Cost Model
 
@@ -73,11 +63,10 @@ Validators can use cheaper models to reduce costs. Scoring is regex-based (no LL
 
 ## Cost Reduction Levers
 
-1. **Cheaper model** — Haiku 4.5 cuts costs **4x** with likely acceptable evaluation fidelity
-2. **Prompt caching** — Anthropic prompt caching saves ~80% on input tokens (fixture data is identical across seeds for the same scenario)
-3. **Fewer seeds** — `seeds_per_task=1` instead of 3 → **3x** cheaper (but weaker consensus)
-4. **Fewer scenarios** — 2 per epoch instead of 4 → **2x** cheaper
-5. **Skip unchanged packs** — Don't re-evaluate miners whose pack hash hasn't changed since last epoch
+1. **Prompt caching**: Anthropic prompt caching saves ~80% on input tokens (fixture data is identical across seeds for the same scenario)
+2. **Fewer seeds**: `seeds_per_task=1` instead of 3, 3x cheaper (but weaker consensus)
+3. **Fewer scenarios**: 2 per epoch instead of 4, 2x cheaper
+4. **Skip unchanged packs**: don't re-evaluate miners whose pack hash hasn't changed since last epoch
 
 ## Sustainability
 

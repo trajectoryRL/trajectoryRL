@@ -174,7 +174,7 @@ cp .env.example .env
 
 ### Model Choice for Local Testing
 
-Validators use Sonnet 4.5 for official evaluation, but **miners can use any model for local testing**. Since scoring is regex-based (not LLM-judged), the model only affects the agent's behavior — not how it's scored.
+Validators must all use the designated model (`anthropic/claude-sonnet-4-5-20250929`) for consensus, but **miners can use any model for local testing**. Since scoring is regex-based (not LLM-judged), the model only affects the agent's behavior, not how it's scored.
 
 ```bash
 # .env — pick one:
