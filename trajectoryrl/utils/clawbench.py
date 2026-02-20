@@ -105,23 +105,29 @@ class ClawBenchHarness:
         )
 
         try:
-            # Write pack files to the shared workspace so OpenClaw can read them.
-            # OpenClaw loads AGENTS.md from this directory on each request.
-            self._apply_pack_to_workspace(
-                pack, self.workspace_path, context_preamble
-            )
+            # Use an isolated workspace per evaluation to prevent concurrent
+            # evaluations from overwriting each other's pack files.
+            with tempfile.TemporaryDirectory(
+                prefix="trajectoryrl_eval_",
+                dir=self.workspace_path.parent,
+            ) as tmpdir:
+                workspace = Path(tmpdir)
+                # Write pack files so OpenClaw can read them.
+                self._apply_pack_to_workspace(
+                    pack, workspace, context_preamble
+                )
 
-            # Run scenario — user_context is passed to run_episode.py which
-            # handles template substitution in workspace files and pushes
-            # context to the mock server.
-            result = await self._run_scenario(
-                scenario_name=scenario_name,
-                workspace=self.workspace_path,
-                seed=seed,
-                user_context=user_context,
-            )
+                # Run scenario — user_context is passed to run_episode.py which
+                # handles template substitution in workspace files and pushes
+                # context to the mock server.
+                result = await self._run_scenario(
+                    scenario_name=scenario_name,
+                    workspace=workspace,
+                    seed=seed,
+                    user_context=user_context,
+                )
 
-            return result
+                return result
 
         except Exception as e:
             logger.error(f"Evaluation failed: {e}", exc_info=True)
@@ -241,7 +247,10 @@ class ClawBenchHarness:
     ) -> Dict[str, Any]:
         """Majority-vote across multiple rubric dicts.
 
-        Each rubric is ``{check_name: {"passed": bool, "points": int, ...}}``.
+        Each rubric is the full score dict returned by ``score_episode()``,
+        which contains a ``"checks"`` list of per-check dicts with ``"id"``,
+        ``"passed"``, ``"points"``, ``"max_points"``, etc.
+
         A check passes in the voted rubric if it passed in >= ``quorum`` runs.
 
         Args:
@@ -249,21 +258,27 @@ class ClawBenchHarness:
             quorum: Minimum number of passes for majority
 
         Returns:
-            Voted rubric dict
+            Voted rubric dict keyed by check id
         """
         if not rubrics:
             return {}
 
-        # Collect all check names across runs
+        # Collect all check results across runs, keyed by check id
         all_checks: Dict[str, List[dict]] = {}
         for rubric in rubrics:
-            for check_name, check_data in rubric.items():
-                if check_name not in all_checks:
-                    all_checks[check_name] = []
-                all_checks[check_name].append(check_data)
+            checks_list = rubric.get("checks")
+            if isinstance(checks_list, list):
+                items = [(c["id"], c) for c in checks_list if "id" in c]
+            else:
+                # Fallback: rubric is already {check_id: check_data}
+                items = [(k, v) for k, v in rubric.items() if isinstance(v, dict)]
+            for check_id, check_data in items:
+                if check_id not in all_checks:
+                    all_checks[check_id] = []
+                all_checks[check_id].append(check_data)
 
         voted = {}
-        for check_name, check_results in all_checks.items():
+        for check_id, check_results in all_checks.items():
             pass_count = sum(
                 1 for c in check_results
                 if (isinstance(c, dict) and c.get("passed", False))
@@ -272,13 +287,13 @@ class ClawBenchHarness:
             # Use the first occurrence as the template
             template = check_results[0]
             if isinstance(template, dict):
-                voted[check_name] = {
+                voted[check_id] = {
                     **template,
                     "passed": pass_count >= quorum,
                     "_votes": f"{pass_count}/{len(check_results)}",
                 }
             else:
-                voted[check_name] = pass_count >= quorum
+                voted[check_id] = pass_count >= quorum
 
         return voted
 
@@ -303,7 +318,9 @@ class ClawBenchHarness:
 
         for check_name, check_data in rubric.items():
             if isinstance(check_data, dict):
-                points = check_data.get("points", 1)
+                # max_points is the full weight regardless of pass/fail;
+                # "points" is earned (0 when failed), so not suitable as weight.
+                points = check_data.get("max_points", check_data.get("points", 1))
                 passed = check_data.get("passed", False)
             else:
                 points = 1

@@ -74,7 +74,7 @@ def valid_pack():
         },
         "tool_policy": {
             "allow": ["exec", "slack", "memory_search"],
-            "deny": ["group:runtime"],
+            "deny": ["group:runtime", "exec"],
         },
         "metadata": {
             "pack_name": "test_pack",
@@ -822,6 +822,99 @@ class TestConsensusEvaluation:
         rubric = {"a": True, "b": False, "c": True}
         score = ClawBenchHarness._score_from_rubric(rubric)
         assert abs(score - 2 / 3) < 1e-6
+
+    # --- Tests for real score_episode() output format (bug fix coverage) ---
+
+    def test_majority_vote_rubric_real_format(self):
+        """Rubrics in the real score_episode() format with top-level metadata
+        and a nested 'checks' list should be handled correctly."""
+        rubrics = [
+            {
+                "score": 0.5, "points_earned": 5, "points_possible": 10,
+                "passed": 2, "failed": 2, "total_checks": 4,
+                "checks": [
+                    {"id": "c1", "passed": True, "points": 3, "max_points": 3},
+                    {"id": "c2", "passed": False, "points": 0, "max_points": 3},
+                    {"id": "c3", "passed": True, "points": 2, "max_points": 2},
+                    {"id": "c4", "passed": False, "points": 0, "max_points": 2},
+                ],
+                "by_category": {},
+            },
+            {
+                "score": 0.5, "points_earned": 5, "points_possible": 10,
+                "passed": 2, "failed": 2, "total_checks": 4,
+                "checks": [
+                    {"id": "c1", "passed": True, "points": 3, "max_points": 3},
+                    {"id": "c2", "passed": True, "points": 3, "max_points": 3},
+                    {"id": "c3", "passed": False, "points": 0, "max_points": 2},
+                    {"id": "c4", "passed": False, "points": 0, "max_points": 2},
+                ],
+                "by_category": {},
+            },
+            {
+                "score": 0.3, "points_earned": 3, "points_possible": 10,
+                "passed": 1, "failed": 3, "total_checks": 4,
+                "checks": [
+                    {"id": "c1", "passed": True, "points": 3, "max_points": 3},
+                    {"id": "c2", "passed": False, "points": 0, "max_points": 3},
+                    {"id": "c3", "passed": False, "points": 0, "max_points": 2},
+                    {"id": "c4", "passed": False, "points": 0, "max_points": 2},
+                ],
+                "by_category": {},
+            },
+        ]
+        voted = ClawBenchHarness._majority_vote_rubric(rubrics, quorum=2)
+        # c1: 3/3 pass → True
+        assert voted["c1"]["passed"] is True
+        # c2: 1/3 pass → False
+        assert voted["c2"]["passed"] is False
+        # c3: 1/3 pass → False
+        assert voted["c3"]["passed"] is False
+        # c4: 0/3 pass → False
+        assert voted["c4"]["passed"] is False
+        # Should only have the 4 check IDs, not top-level keys like "score"
+        assert set(voted.keys()) == {"c1", "c2", "c3", "c4"}
+
+    def test_score_from_rubric_max_points(self):
+        """Failed checks have points=0 but max_points>0.
+        Score must use max_points as the denominator weight so failed checks
+        are NOT excluded from the total."""
+        rubric = {
+            "c1": {"passed": True, "points": 3, "max_points": 3},
+            "c2": {"passed": False, "points": 0, "max_points": 3},
+            "c3": {"passed": True, "points": 2, "max_points": 2},
+            "c4": {"passed": False, "points": 0, "max_points": 2},
+        }
+        score = ClawBenchHarness._score_from_rubric(rubric)
+        # earned = 3 + 2 = 5, total = 3 + 3 + 2 + 2 = 10 → 0.5
+        assert abs(score - 0.5) < 1e-6
+
+    def test_score_from_rubric_all_fail_not_100_percent(self):
+        """When all checks fail, score should be 0, not 100%.
+        This was the core symptom of using points (0 for failures) as weight."""
+        rubric = {
+            "c1": {"passed": False, "points": 0, "max_points": 5},
+            "c2": {"passed": False, "points": 0, "max_points": 5},
+        }
+        score = ClawBenchHarness._score_from_rubric(rubric)
+        assert score == 0.0
+
+    def test_majority_vote_then_score_real_format(self):
+        """End-to-end: majority vote on real-format rubrics then score."""
+        rubric_template = {
+            "score": 0.0, "points_earned": 0, "points_possible": 6,
+            "passed": 0, "failed": 2, "total_checks": 2,
+            "checks": [
+                {"id": "greeting", "passed": True, "points": 3, "max_points": 3},
+                {"id": "farewell", "passed": False, "points": 0, "max_points": 3},
+            ],
+            "by_category": {},
+        }
+        rubrics = [rubric_template, rubric_template, rubric_template]
+        voted = ClawBenchHarness._majority_vote_rubric(rubrics, quorum=2)
+        score = ClawBenchHarness._score_from_rubric(voted)
+        # greeting passes (3/3), farewell fails (0/3) → 3/6 = 0.5
+        assert abs(score - 0.5) < 1e-6
 
 
 # ===================================================================

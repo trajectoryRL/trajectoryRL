@@ -132,12 +132,12 @@ def _validate_tool_policy(tool_policy: dict) -> List[str]:
     allow_set = set(tool_policy.get("allow", []))
     deny_set = set(tool_policy.get("deny", []))
 
-    if any(t in allow_set for t in dangerous):
-        if not any(t in deny_set for t in dangerous):
-            issues.append(
-                "Dangerous tools in 'allow' (exec, shell, etc.) "
-                "without corresponding 'deny' entries"
-            )
+    dangerous_allowed = dangerous & allow_set
+    if dangerous_allowed and not dangerous_allowed.issubset(deny_set):
+        issues.append(
+            f"Dangerous tools in 'allow' without corresponding 'deny' "
+            f"entries: {sorted(dangerous_allowed - deny_set)}"
+        )
 
     return issues
 

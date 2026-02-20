@@ -289,15 +289,18 @@ class TrajectoryScorer:
                 key=lambda x: x[1][1]  # Sort by timestamp
             ):
                 if uid in scores:
-                    required_score = first_score + delta
+                    # Use current score (not historical best) for protection
+                    # threshold so stale packs lose protection naturally.
+                    current = scores[uid]
+                    required_score = current + delta
                     if best_score <= required_score and uid != best_uid:
                         logger.info(
-                            f"First-mover protection: Miner {uid} (score={first_score:.3f}) "
+                            f"First-mover protection: Miner {uid} (score={current:.3f}) "
                             f"blocks Miner {best_uid} (score={best_score:.3f}, "
                             f"required={required_score:.3f})"
                         )
                         best_uid = uid
-                        best_score = scores[uid]
+                        best_score = current
                         break
 
         # Winner takes all

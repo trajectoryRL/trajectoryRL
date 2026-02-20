@@ -171,7 +171,7 @@ class GitHubVerifier:
             pack_content=pack_content
         )
 
-    async def _clone_or_update_repo(self, repo_url: str) -> Optional[Path]:
+    async def _clone_or_update_repo(self, repo_url: str, _retry: bool = True) -> Optional[Path]:
         """Clone repository or update if already cached.
 
         Args:
@@ -180,9 +180,11 @@ class GitHubVerifier:
         Returns:
             Path to cloned repo, or None if failed
         """
-        # Create safe directory name from repo URL
-        repo_name = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
-        repo_path = self.cache_dir / repo_name
+        # Create safe directory name from repo URL using owner__repo to
+        # avoid collisions between different owners with the same repo name.
+        parts = repo_url.rstrip("/").split("/")
+        owner, repo_name = parts[-2], parts[-1].replace(".git", "")
+        repo_path = self.cache_dir / f"{owner}__{repo_name}"
 
         try:
             if repo_path.exists():
@@ -196,9 +198,11 @@ class GitHubVerifier:
                 )
                 if result.returncode != 0:
                     logger.warning(f"Failed to update repo: {result.stderr}")
+                    if not _retry:
+                        return None
                     # Try to clone fresh
                     subprocess.run(["rm", "-rf", str(repo_path)], check=True)
-                    return await self._clone_or_update_repo(repo_url)
+                    return await self._clone_or_update_repo(repo_url, _retry=False)
             else:
                 # Clone fresh
                 logger.debug(f"Cloning repo to: {repo_path}")

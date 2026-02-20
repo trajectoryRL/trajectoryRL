@@ -125,6 +125,27 @@ class TrajectoryValidator:
         current_block = self.subtensor.get_current_block()
         return current_block // self.blocks_per_epoch
 
+    def _get_block_timestamp(self) -> float:
+        """Get timestamp of the current block from the chain.
+
+        Uses the Substrate Timestamp pallet for a deterministic,
+        chain-agreed timestamp that all validators will read identically
+        (unlike time.time() which varies per machine).
+        Falls back to time.time() if the query fails.
+        """
+        try:
+            block = self.subtensor.get_current_block()
+            block_hash = self.subtensor.substrate.get_block_hash(block)
+            result = self.subtensor.substrate.query(
+                module='Timestamp',
+                storage_function='Now',
+                block_hash=block_hash,
+            )
+            return result.value / 1000  # milliseconds to seconds
+        except Exception as e:
+            logger.warning(f"Failed to get block timestamp, using time.time(): {e}")
+            return time.time()
+
     def _setup_logging(self):
         """Setup logging configuration."""
         log_format = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
@@ -281,6 +302,11 @@ class TrajectoryValidator:
         context_preamble = render_context_preamble(epoch_ctx)
         user_context = epoch_ctx.to_user_context()
 
+        # Compute a deterministic timestamp from the chain for GitHub
+        # push-time verification.  All validators reading the same block
+        # will agree on this value (unlike time.time()).
+        epoch_timestamp = self._get_block_timestamp()
+
         logger.info(
             f"Epoch {self.current_epoch}: seed={epoch_seed}, "
             f"scenarios={epoch_scenarios}, "
@@ -306,6 +332,7 @@ class TrajectoryValidator:
             score = await self._evaluate_miner(
                 miner_uid, epoch_scenarios, epoch_seed,
                 context_preamble, user_context,
+                epoch_timestamp=epoch_timestamp,
             )
             scores[miner_uid] = score
 
@@ -324,8 +351,8 @@ class TrajectoryValidator:
         # Get all UIDs with non-zero stake
         miners = []
         for uid in range(len(self.metagraph.S)):
-            # Skip if UID is a validator (high stake)
-            if self.metagraph.S[uid] > 1000:  # Arbitrary threshold
+            # Skip validators (identified by on-chain permit)
+            if self.metagraph.validator_permit[uid]:
                 continue
 
             # Skip if UID is not registered
@@ -343,6 +370,7 @@ class TrajectoryValidator:
         epoch_seed: int,
         context_preamble: str = "",
         user_context: Optional[Dict] = None,
+        epoch_timestamp: Optional[float] = None,
     ) -> float:
         """Evaluate a single miner on this epoch's scenarios.
 
@@ -375,7 +403,7 @@ class TrajectoryValidator:
             repo_url=pack_response.repo_url,
             git_commit_hash=pack_response.git_commit_hash,
             pack_hash=pack_response.pack_hash,
-            on_chain_submission_time=time.time()  # TODO: Get actual on-chain time
+            on_chain_submission_time=epoch_timestamp or time.time()
         )
 
         if not verification.valid:
@@ -459,10 +487,14 @@ class TrajectoryValidator:
                 f"(score={final_score:.3f}, timestamp={commit_timestamp})"
             )
         elif final_score > self.first_mover_data[miner_uid][0]:
-            self.first_mover_data[miner_uid] = (final_score, commit_timestamp)
+            old_score = self.first_mover_data[miner_uid][0]
+            original_timestamp = self.first_mover_data[miner_uid][1]
+            # Update score but preserve the original submission timestamp
+            # so first-mover protection stays anchored to initial submission.
+            self.first_mover_data[miner_uid] = (final_score, original_timestamp)
             logger.info(
                 f"Miner {miner_uid}: Score improved "
-                f"(new={final_score:.3f}, old={self.first_mover_data[miner_uid][0]:.3f})"
+                f"(new={final_score:.3f}, old={old_score:.3f})"
             )
 
         return final_score
@@ -549,6 +581,9 @@ class TrajectoryValidator:
                 f"Setting uniform weights to stay active."
             )
             uids = list(scores.keys())
+            if not uids:
+                logger.warning("No miners to set weights for")
+                return
             uniform_w = 1.0 / len(uids)
             weights = [uniform_w] * len(uids)
             try:
