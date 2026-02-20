@@ -494,22 +494,24 @@ TrajectoryRL uses **Dynamic TAO (dTAO)** with subnet-specific alpha token:
 Network Emissions (Post-Halving, Dec 2025):
 ├─ Daily TAO emissions: 3,600 TAO/day (was 7,200 pre-halving)
 ├─ Per-tempo emissions: ~0.3 TAO/tempo (360 blocks = ~72 min)
-└─ Current TAO price: ~$195 USD (Feb 2026)
+└─ Current TAO price: ~$180 USD (Feb 2026)
 
-Alpha Emissions per Tempo (Subnet-Specific):
+Alpha Emissions (Subnet-Specific):
+├─ 1 alpha per block, 360 blocks per tempo, ~20 tempos/day
+├─ Total: ~7,200 alpha/day per subnet
 ├─ 41% to miners (100% to winner in steady state; 70/20/10 in bootstrap)
 ├─ 41% to validators and their stakers
 └─ 18% to subnet owner
 
 TAO → Subnet Alpha: Based on net staking inflows ("Taoflow")
 Alpha → TAO: Swappable via subnet liquidity pool (market-determined price)
-Validator Earnings: Varies by stake weight and subnet alpha demand
+Current SN11 alpha: ~$2.64 (1 alpha ≈ 0.015 TAO at current pool rate)
 ```
 
-**Realistic validator earnings** (SN11, medium stake ~5k TAO):
-- **Daily**: 2-6 TAO/day ($390-$1,170/day at $195/TAO)
-- **Monthly**: 60-180 TAO/month (~$11,700-$35,100/month)
-- **APY**: 6-15% on staked TAO (varies by subnet performance)
+**Estimated validator earnings** (SN11, medium stake ~5k TAO, ~10% of validator weight):
+- ~295 alpha/day, worth roughly 4 TAO at current pool rates (~$720/day at $180/TAO)
+- These are **alpha earnings, not TAO**. The TAO-equivalent fluctuates with the subnet's liquidity pool exchange rate
+- Actual earnings depend on total validator stake in the subnet, your share of it, and the alpha-TAO pool depth
 
 ### Miner Reward
 

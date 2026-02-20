@@ -81,28 +81,29 @@ Validators can use cheaper models to reduce costs. Scoring is regex-based (no LL
 
 ## Sustainability
 
-Validator economics depend on TAO emissions exceeding LLM costs:
+Validator economics depend on alpha earnings (convertible to TAO) exceeding LLM costs.
+
+Validators earn **subnet alpha**, not TAO directly. Alpha can be swapped for TAO via the subnet's liquidity pool at a market-determined rate. Current SN11 alpha price: ~$2.64 (≈0.015 TAO at ~$180/TAO).
 
 ```
-Break-even: daily_TAO_earnings × TAO_price > miners × $0.24/day
+Estimated alpha earnings (medium stake ~5k TAO, ~10% validator weight):
+  ~295 alpha/day ≈ 4 TAO-equivalent at current pool rate ≈ $720/day
 
-Example (30 miners, ~4 TAO/day validator earnings):
+Example (30 miners):
   Daily costs:   30 × $0.24 = $7.20/day
-  Daily revenue: 4 TAO × $195 (Feb 2026 price) = $780/day
-  Net profit:    $772.80/day (~99% margin)
-
-  Break-even TAO price = $7.20 / 4 = $1.80/TAO
+  Daily revenue: ~$720/day (alpha, at current pool rate)
+  Net profit:    ~$713/day (~99% margin)
 ```
 
-**At current TAO price ($195)**, TrajectoryRL validators are highly profitable:
+**At current rates**, TrajectoryRL validators are highly profitable:
 
-| Scenario | Daily Cost | Daily Revenue (4 TAO @ $195) | Monthly Profit |
-|----------|:----------:|:----------------------------:|:--------------:|
-| 30 miners | $7 | $780 | **$23,190** |
-| 64 miners | $15 | $780 | **$22,950** |
-| 128 miners | $31 | $780 | **$22,470** |
-| 256 miners | $61 | $780 | **$21,570** |
+| Scenario | Daily Cost | Daily Revenue (~$720 alpha) | Monthly Profit |
+|----------|:----------:|:---------------------------:|:--------------:|
+| 30 miners | $7 | $720 | **$21,390** |
+| 64 miners | $15 | $720 | **$21,150** |
+| 128 miners | $31 | $720 | **$20,670** |
+| 256 miners | $61 | $720 | **$19,770** |
 
-Even at 256 miners (worst case), LLM costs are only **~8%** of validator revenue. Sonnet 4.5 remains economically viable at any realistic scale.
+Even at 256 miners (worst case), LLM costs are only **~8%** of validator alpha revenue. Sonnet 4.5 remains economically viable at any realistic scale.
 
-**Break-even analysis**: TAO would need to drop below **$15** before validators with 128 miners become unprofitable (assuming 4 TAO/day earnings). At Feb 2026 price ($195), there is **13x safety margin**.
+**Break-even analysis**: At 256 miners ($61/day cost), the alpha-TAO pool rate would need to drop ~12x from current levels before validators become unprofitable. Note: these figures fluctuate with pool exchange rates and subnet demand.
