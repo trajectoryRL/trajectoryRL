@@ -1,7 +1,8 @@
 # TrajectoryRL — All-in-One Docker Compose
 #
 # Starts everything needed to run the validator:
-#   docker compose up -d
+#   docker compose up --watch       # auto-update on code changes
+#   docker compose up -d            # or detached without auto-update
 #   docker compose logs -f validator
 #
 # Services:
@@ -32,6 +33,12 @@ services:
     environment:
       - SCENARIO=${SCENARIO:-client_escalation}
       - VARIANT=${VARIANT:-optimized}
+    develop:
+      watch:
+        - action: rebuild
+          path: ./clawbench/fixtures
+        - action: rebuild
+          path: ./clawbench/scenarios
 
   # --------------------------------------------------------------------------
   # Mock Tools: deterministic tool responses from fixtures (:3001)
@@ -57,6 +64,16 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
+    develop:
+      watch:
+        - action: sync+restart
+          path: ./clawbench/clawbench/mock_tools
+          target: /app/mock_tools
+          ignore:
+            - __pycache__/
+            - "*.pyc"
+        - action: rebuild
+          path: ./clawbench/requirements-mock.txt
 
   # --------------------------------------------------------------------------
   # OpenClaw: AI gateway — runs Claude with AGENTS.md from /workspace
@@ -132,6 +149,37 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    develop:
+      watch:
+        # Validator source code — sync + restart on changes
+        - action: sync+restart
+          path: ./trajectoryrl
+          target: /app/trajectoryrl
+          ignore:
+            - __pycache__/
+            - "*.pyc"
+        # Neuron entry points
+        - action: sync+restart
+          path: ./neurons
+          target: /app/neurons
+          ignore:
+            - __pycache__/
+            - "*.pyc"
+        # ClawBench scenarios, fixtures, and scoring
+        - action: sync+restart
+          path: ./clawbench
+          target: /app/clawbench
+          ignore:
+            - __pycache__/
+            - "*.pyc"
+            - .git/
+        # Dependency or Dockerfile changes — full rebuild
+        - action: rebuild
+          path: ./requirements.txt
+        - action: rebuild
+          path: ./pyproject.toml
+        - action: rebuild
+          path: ./docker/Dockerfile.validator
 
   # --------------------------------------------------------------------------
   # Miner (optional): start with `docker compose --profile miner up -d`

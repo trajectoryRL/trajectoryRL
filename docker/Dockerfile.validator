@@ -29,6 +29,9 @@ RUN pip install --no-cache-dir -e ./clawbench 2>/dev/null || \
 # Create directories
 RUN mkdir -p /app/logs /tmp/trajectoryrl_packs /workspace
 
+# Prevent .pyc files (avoids conflicts during docker compose watch sync)
+ENV PYTHONDONTWRITEBYTECODE=1
+
 # Environment variables (override with docker-compose)
 ENV WALLET_NAME=validator
 ENV WALLET_HOTKEY=default

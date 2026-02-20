@@ -96,3 +96,53 @@ Example (30 miners):
 Even at 256 miners (worst case), LLM costs are only **~8%** of validator alpha revenue. Sonnet 4.5 remains economically viable at any realistic scale.
 
 **Break-even analysis**: At 256 miners ($61/day cost), the alpha-TAO pool rate would need to drop ~12x from current levels before validators become unprofitable. Note: these figures fluctuate with pool exchange rates and subnet demand.
+
+## Automatic Updates
+
+Validators should run with `docker compose watch` to automatically pick up new scenarios, scoring updates, and code changes without manual container rebuilds.
+
+### Starting with auto-update
+
+```bash
+# Start all services with file watching enabled
+docker compose up --watch
+```
+
+### How it works
+
+When the team releases updates (new scenarios, scoring fixes, validator code), pull the changes:
+
+```bash
+git pull --recurse-submodules
+```
+
+`docker compose watch` detects the file changes and automatically applies them:
+
+| Change type | Action | Downtime |
+|-------------|--------|----------|
+| Validator source code (`trajectoryrl/`, `neurons/`) | Sync + restart | Seconds |
+| ClawBench scenarios, fixtures, scoring (`clawbench/`) | Sync + restart | Seconds |
+| Mock tools server (`clawbench/clawbench/mock_tools/`) | Sync + restart | Seconds |
+| Dependencies (`requirements.txt`, `pyproject.toml`) | Full rebuild | Minutes |
+| Dockerfile changes | Full rebuild | Minutes |
+
+### Optional: automated git pull
+
+Set up a cron job to pull updates periodically:
+
+```bash
+# Pull every 6 hours (add to crontab -e)
+0 */6 * * * cd /path/to/trajectoryrl && git pull --recurse-submodules >> /var/log/trajectoryrl-pull.log 2>&1
+```
+
+### Running without auto-update
+
+If you prefer manual control, run detached without watch:
+
+```bash
+docker compose up -d
+
+# After pulling updates, manually rebuild:
+git pull --recurse-submodules
+docker compose up -d --build
+```

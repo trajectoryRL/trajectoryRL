@@ -73,27 +73,28 @@ cd trajectoryrl
 cp .env.example .env
 # Edit .env: add your ANTHROPIC_API_KEY and wallet info
 
-# 3. Start (launches validator + ClawBench services automatically)
+# 3. Start with auto-update (watches for code changes)
+docker compose up --watch
+
+# Or run detached (no auto-update)
 docker compose up -d
 
 # 4. View logs
 docker compose logs -f validator
 ```
 
-One command starts everything: the validator, ClawBench mock-tools, and the OpenClaw AI gateway. ClawBench is pinned to v0.3.0 (`b718230`) for validator consensus.
+One command starts everything: the validator, ClawBench mock-tools, and the OpenClaw AI gateway. `--watch` monitors the local repo for changes — after `git pull`, the validator automatically picks up new scenarios, scoring updates, and code fixes without manual container rebuilds. ClawBench is pinned to v0.3.0 (`b718230`) for validator consensus.
 
 ### Model Selection
 
-Set `CLAWBENCH_MODEL` to change the LLM used for evaluation:
+All validators **must** use the designated model for consensus:
 
 ```bash
-# In .env
-CLAWBENCH_MODEL=anthropic/claude-sonnet-4-5-20250929  # default
-CLAWBENCH_MODEL=ollama/llama3.3                        # local Ollama
-CLAWBENCH_MODEL=openai/gpt-4o                          # OpenAI
+# In .env (default — do not change)
+CLAWBENCH_MODEL=anthropic/claude-sonnet-4-5-20250929
 ```
 
-See [ClawBench Model Configuration](https://github.com/trajectoryRL/clawbench#model-configuration) for local LLM setup details.
+Using a different model will produce different tool-call sequences and scoring outcomes, putting your validator out of consensus. See [VALIDATOR_OPERATIONS.md](VALIDATOR_OPERATIONS.md) for details.
 
 ### For Miners
 
