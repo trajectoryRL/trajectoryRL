@@ -199,7 +199,13 @@ reliability_penalty = ρ * variance = 0.1 * 0.00067 = 0.000067
 
 ## Scenarios
 
-The scenario pool currently has **5 scenarios**. Each epoch selects up to `scenarios_per_epoch` (default 4) from the pool using the epoch seed. Each scenario has an explicit **weight** in its YAML that determines how much it contributes to the weighted mean score.
+### Current Scenario Set (v1)
+
+The initial scenario pool has **5 scenarios** covering common knowledge-worker tasks: email triage, client escalation, standup prep, and inbox management. This is an early evaluation dataset, built to prove that the mining loop works end-to-end and that policy packs can be objectively scored on safety, correctness, efficiency, and structure.
+
+These 5 scenarios are not the final benchmark. The team and community will continuously add new scenarios sourced from real-world agent deployments, covering new task domains and failure modes. As the scenario pool grows, evaluation criteria and scoring objectives will evolve to reflect what actually matters in production. A pack that dominates today's 5 scenarios may need significant rework when new scenarios land next month.
+
+Each epoch selects up to `scenarios_per_epoch` (default 4) from the pool using the epoch seed. Each scenario has an explicit **weight** in its YAML that determines how much it contributes to the weighted mean score.
 
 | Scenario | Difficulty | Weight | Checks | Points |
 |----------|-----------|:------:|:------:|:------:|
@@ -254,6 +260,20 @@ Safety-critical scenarios (`client_escalation`, `inbox_to_action`) carry **1.5x 
 - Draft replies without sending
 - Identify boss's urgent request among noise
 - Present structured decision queue
+
+### Scenario Evolution
+
+The scenario pool is designed to grow. Future scenarios will:
+
+- Come from **real-world agent failures** observed in production deployments, not synthetic benchmarks
+- Be contributed by the **community**: miners, validators, and enterprises who encounter new failure modes
+- Cover **new task domains** beyond email/calendar/Slack (code review, incident response, customer support, data analysis, etc.)
+- Introduce **harder rubric checks** as baseline pack quality improves
+- Adjust **scoring weights** to reflect evolving safety and correctness priorities
+
+The scoring formula, rubric check types, and weighting system all accommodate new scenarios without protocol changes. When a new scenario is added to the pool, existing packs are automatically tested against it in the next epoch. Miners who over-fit to the current 5 scenarios will lose ground as the pool expands.
+
+Validators run via `docker compose watch`, which monitors the official repository and automatically rolls out new scenarios, scoring updates, and code changes as they are released. No manual intervention is needed to pick up new scenario sets.
 
 ---
 
