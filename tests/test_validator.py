@@ -53,7 +53,7 @@ CLAWBENCH_PATH = REPO_ROOT / "clawbench"
 @pytest.fixture
 def scorer():
     return TrajectoryScorer(
-        lambda_cost=0.3, mu_safety=0.4, rho_reliability=0.1,
+        rho_reliability=0.1,
         score_quantization=0,  # Disable quantization for exact-value tests
         consensus_epsilon=0.02,
     )
@@ -74,7 +74,7 @@ def valid_pack():
         },
         "tool_policy": {
             "allow": ["exec", "slack", "memory_search"],
-            "deny": ["group:runtime", "exec"],
+            "deny": ["group:runtime"],
         },
         "metadata": {
             "pack_name": "test_pack",

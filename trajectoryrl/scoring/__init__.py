@@ -36,8 +36,6 @@ class TrajectoryScorer:
 
     def __init__(
         self,
-        lambda_cost: float = 0.3,
-        mu_safety: float = 0.4,
         rho_reliability: float = 0.1,
         score_quantization: float = 0.05,
         consensus_epsilon: float = 0.02,
@@ -46,8 +44,6 @@ class TrajectoryScorer:
         """Initialize scorer.
 
         Args:
-            lambda_cost: Weight for cost penalty (unused in ClawBench)
-            mu_safety: Weight for safety penalty (already in ClawBench scoring)
             rho_reliability: Weight for variance penalty
             score_quantization: Round final scores to this grid (e.g., 0.05 →
                 scores snap to 0.00, 0.05, 0.10, …). Reduces validator
@@ -57,17 +53,14 @@ class TrajectoryScorer:
             bootstrap_threshold: When active miners < this, use graduated
                 reward curve instead of winner-take-all.
         """
-        self.lambda_cost = lambda_cost
-        self.mu_safety = mu_safety
         self.rho_reliability = rho_reliability
         self.score_quantization = score_quantization
         self.consensus_epsilon = consensus_epsilon
         self.bootstrap_threshold = bootstrap_threshold
 
         logger.info(
-            f"Scorer initialized: λ={lambda_cost}, μ={mu_safety}, "
-            f"ρ={rho_reliability}, q={score_quantization}, ε={consensus_epsilon}, "
-            f"bootstrap_threshold={bootstrap_threshold}"
+            f"Scorer initialized: ρ={rho_reliability}, q={score_quantization}, "
+            f"ε={consensus_epsilon}, bootstrap_threshold={bootstrap_threshold}"
         )
 
     def aggregate_scores(
@@ -284,7 +277,7 @@ class TrajectoryScorer:
         # Skip if winner was already resolved by epsilon tie-break (which
         # already used timestamps, so re-applying delta would undo it).
         if first_mover_data and not resolved_by_epsilon:
-            for uid, (first_score, _) in sorted(
+            for uid, _ in sorted(
                 first_mover_data.items(),
                 key=lambda x: x[1][1]  # Sort by timestamp
             ):

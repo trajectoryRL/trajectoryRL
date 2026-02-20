@@ -158,7 +158,7 @@ weight[all_others] = 0.0
 Where:
 - **δ** = 0.05 (5% improvement threshold for later submissions)
 - **ε** = 0.02 (consensus epsilon — scores within ε are treated as tied)
-- **current_best_score** = score of first submission at that level
+- **current_best_score** = current epoch score of the first-mover (stale packs lose protection naturally)
 
 ---
 
@@ -461,7 +461,7 @@ A **PolicyBundle** (also called an OpenClaw Policy Pack / OPP) is a JSON object 
 - **`AGENTS.md` required**: The `files` dict must contain `AGENTS.md` — this is the primary policy document
 - **Size limit**: Total pack JSON ≤ **32 KB** (`json.dumps(pack)` byte length). Prevents token bombs and scenario-stuffing
 - **File content must be strings**: Every value in `files` must be a string (no nested objects)
-- **Dangerous tool check**: If `allow` includes `exec`, `shell`, `group:runtime`, or `admin_*`, the pack must also have corresponding `deny` entries (defense-in-depth)
+- **Dangerous tool check**: If `allow` includes dangerous tools (`exec`, `shell`, `group:runtime`, `admin_*`), `deny` must also contain at least one dangerous tool (defense-in-depth)
 - **Semver version**: `metadata.pack_version` must be valid semver (e.g., `1.0.0`)
 - **Content-addressed**: `sha256(json.dumps(pack, sort_keys=True))` must match the `pack_hash` submitted on-chain
 
@@ -496,7 +496,7 @@ Miners must follow this submission flow:
 Validators verify:
 1. Repository is publicly accessible
 2. Commit hash exists and is valid
-3. **Server-side push timestamp** (via GitHub API) is before submission time (currently uses validator local clock; on-chain block timestamp planned)
+3. **Server-side push timestamp** (via GitHub API) is before submission time (uses on-chain block timestamp from Substrate Timestamp pallet for deterministic, cross-validator agreement)
 4. Pack content matches `pack_hash`
 5. PolicyBundle passes schema validation
 
@@ -568,7 +568,7 @@ new_score > current_best_score + δ
 
 Where:
 - **δ** = 0.05 (5% improvement threshold)
-- **current_best_score** = score of the FIRST submission that achieved this level
+- **current_best_score** = current epoch score of the first-mover (stale packs lose protection naturally)
 - Chronological order determined by **GitHub server-side push timestamp** (not forgeable git commit date)
 
 **Example Timeline**:
@@ -1156,4 +1156,4 @@ Bootstrap:     top-3 get 70/20/10 of miner alpha emissions
 
 **Version**: v1.0
 **Date**: 2026-02-18
-**Status**: Implemented (validator + ClawBench scoring). Pending: miner implementation, on-chain block timestamp verification.
+**Status**: Implemented (validator + ClawBench scoring + on-chain block timestamps). Pending: miner implementation.

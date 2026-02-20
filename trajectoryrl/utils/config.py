@@ -24,14 +24,11 @@ class ValidatorConfig:
         scenarios_path: Path to scenarios directory
 
         # Evaluation config
-        tasks_per_epoch: Number of tasks to sample per epoch
         seeds_per_task: Number of seeds to run per task (for variance)
         epoch_interval: Seconds between evaluation epochs
         timeout_per_scenario: Max seconds per scenario evaluation
 
         # Scoring config
-        lambda_cost: Weight for cost penalty (0-1)
-        mu_safety: Weight for safety penalty (0-1)
         rho_reliability: Weight for variance penalty (0-1)
         delta_threshold: First-mover advantage threshold (0-1)
 
@@ -67,14 +64,11 @@ class ValidatorConfig:
     scenarios_path: Optional[Path] = None
 
     # Evaluation config
-    tasks_per_epoch: int = 4  # Select 4 scenarios from pool per epoch
     seeds_per_task: int = 3  # Runs per scenario for majority-vote consensus
     epoch_interval: int = 14400  # 4 hours (14400 seconds)
     timeout_per_scenario: int = 120  # 2 minutes max per scenario
 
     # Scoring config
-    lambda_cost: float = 0.3  # Reserved: cost/safety are scored via rubric checks, not separate penalties
-    mu_safety: float = 0.4  # Reserved: cost/safety are scored via rubric checks, not separate penalties
     rho_reliability: float = 0.1  # 10% weight on variance
     delta_threshold: float = 0.05  # 5% first-mover advantage threshold
     scenarios_per_epoch: int = 4  # How many scenarios to evaluate per epoch (from pool)

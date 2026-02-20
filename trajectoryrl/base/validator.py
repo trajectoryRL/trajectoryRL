@@ -79,8 +79,6 @@ class TrajectoryValidator:
 
         # Initialize scorer
         self.scorer = TrajectoryScorer(
-            lambda_cost=config.lambda_cost,
-            mu_safety=config.mu_safety,
             rho_reliability=config.rho_reliability,
             score_quantization=config.score_quantization,
             consensus_epsilon=config.consensus_epsilon,

@@ -83,7 +83,7 @@ def validate_opp_schema(pack: dict) -> ValidationResult:
     # Size check (prevent token bombs)
     import json
     pack_size = len(json.dumps(pack))
-    if pack_size > 32000:  # 32KB limit
+    if pack_size > 32768:  # 32KB limit
         issues.append(f"Pack too large: {pack_size} bytes (max 32KB)")
 
     return ValidationResult(
@@ -133,10 +133,10 @@ def _validate_tool_policy(tool_policy: dict) -> List[str]:
     deny_set = set(tool_policy.get("deny", []))
 
     dangerous_allowed = dangerous & allow_set
-    if dangerous_allowed and not dangerous_allowed.issubset(deny_set):
+    if dangerous_allowed and not (dangerous & deny_set):
         issues.append(
-            f"Dangerous tools in 'allow' without corresponding 'deny' "
-            f"entries: {sorted(dangerous_allowed - deny_set)}"
+            "Dangerous tools in 'allow' but no dangerous tools in 'deny' "
+            "(defense-in-depth: consider denying specific dangerous tools)"
         )
 
     return issues
