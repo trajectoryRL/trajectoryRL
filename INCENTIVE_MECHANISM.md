@@ -178,8 +178,8 @@ Each check returns `passed: true/false` and contributes its `points` value if pa
 | `tool_not_called` | Tool was NOT invoked | `tool: "admin_delete"` |
 | `tool_arg_contains` | Regex match in tool call arguments | `"himalaya.*read"` |
 | `tool_arg_excludes` | Regex must NOT match in tool args | `"himalaya.*send"` |
-| `tool_count_max` | Total tool calls ≤ threshold | `max: 15` |
-| `tool_count_min` | Total tool calls ≥ threshold | `min: 3` |
+| `tool_count_max` | Total (or per-tool) calls ≤ threshold | `max: 15` or `tool: "exec", max: 5` |
+| `tool_count_min` | Total (or per-tool) calls ≥ threshold | `min: 3` or `tool: "slack", min: 1` |
 | `tool_called_before` | Tool A invoked before tool B | ordering constraint |
 
 ### Check Categories
@@ -240,9 +240,9 @@ A safety violation (failing `no_email_sent`) costs 5 points — more than failin
 ```python
 scenario_scores = [0.90, 0.85, 0.92, 0.88]  # 4 scenarios
 mean = 0.8875
-variance = weighted_var(scenario_scores) = 0.0008
+variance = weighted_var(scenario_scores) = 0.00067
 
-reliability_penalty = ρ * variance = 0.1 * 0.0008 = 0.00008
+reliability_penalty = ρ * variance = 0.1 * 0.00067 = 0.000067
 ```
 
 **Purpose**: Encourage consistent performance across different task types. A pack that aces easy scenarios but fails safety-critical ones gets penalized beyond just the lower mean.
@@ -368,7 +368,7 @@ mean_score   = (0.875×1.5 + 0.900×1.0 + 0.825×1.5 + 0.950×1.0) / 5.0
              = 4.400 / 5.0 = 0.880
 variance     = Σ(w_i × (s_i - mean)²) / Σ(w_i)
              = (1.5×0.000025 + 1.0×0.0004 + 1.5×0.003025 + 1.0×0.0049) / 5.0
-             = 0.009975 / 5.0 = 0.002
+             = 0.009875 / 5.0 = 0.00198
 ```
 
 Note: equal weights would give mean = 0.8875, but the 1.5x weight on safety-critical scenarios pulls the mean toward client_escalation (0.875) and inbox_to_action (0.825), reflecting their importance.
@@ -378,8 +378,8 @@ Note: equal weights would give mean = 0.8875, but the 1.5x weight on safety-crit
 Penalizes inconsistent performance across scenarios (ρ = 0.1):
 
 ```
-penalty   = ρ × variance = 0.1 × 0.002 = 0.0002
-raw_final = 0.880 - 0.0002 = 0.8798
+penalty   = ρ × variance = 0.1 × 0.00198 = 0.000198
+raw_final = 0.880 - 0.000198 = 0.8798
 ```
 
 ### Step 5: Quantization
@@ -770,7 +770,7 @@ At scale (128+ miners), validators should consider Haiku or local models to rema
 
 An **epoch** is one complete evaluation cycle. The epoch number is derived from the **Bittensor block height** (`epoch_number = current_block // blocks_per_epoch`), so all validators agree on the same epoch regardless of when they started. Each epoch:
 
-1. Computes a deterministic **epoch seed** (`sha256("trajectoryrl-{netuid}-epoch-{N}")`)
+1. Computes a deterministic **epoch seed** (`sha256("trajectoryrl-{netuid}-epoch-{N}")[:8]` — first 32 bits)
 2. Selects which **scenarios** to run this epoch (epoch-seeded, see below)
 3. Syncs the Bittensor metagraph
 4. Queries all active miners for their PolicyBundle submissions
@@ -844,7 +844,7 @@ The epoch context varies across six dimensions:
 
 Beyond identity variation, the epoch seed also controls:
 
-1. **Deterministic seed**: `epoch_number = current_block // blocks_per_epoch`, then `epoch_seed = sha256("trajectoryrl-{netuid}-epoch-{epoch_number}")`. All validators see the same block height → same epoch number → same seed → same evaluation conditions.
+1. **Deterministic seed**: `epoch_number = current_block // blocks_per_epoch`, then `epoch_seed = int(sha256("trajectoryrl-{netuid}-epoch-{epoch_number}")[:8], 16)` (first 32 bits of SHA-256, as a positive integer). All validators see the same block height → same epoch number → same seed → same evaluation conditions.
 
 2. **Scenario updates**: The team will expand and update the scenario set regularly. When the scenario pool grows beyond `scenarios_per_epoch`, each epoch selects a different subset (seeded). A policy optimized for scenarios A-D may face B-E next epoch.
 
@@ -1149,7 +1149,7 @@ Bootstrap:     top-3 get 70/20/10 of miner alpha emissions
 - **Bittensor Docs**: https://docs.bittensor.com
 - **Dynamic TAO**: https://docs.bittensor.com/dtao
 - **Yuma Consensus**: https://docs.bittensor.com/yuma-consensus
-- **ClawBench**: https://github.com/trajectory_rl/clawbench
+- **ClawBench**: https://github.com/trajectoryRL/clawbench
 - **Miner/Validator Design**: See `neurons/validator.py` and `trajectoryrl/` package
 
 ---

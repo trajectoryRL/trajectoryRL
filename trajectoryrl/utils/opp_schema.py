@@ -153,11 +153,11 @@ def _validate_metadata(metadata: dict) -> List[str]:
     """
     issues = []
 
-    # Check for recommended fields
-    recommended = ["pack_name", "pack_version", "target_suite"]
-    for field in recommended:
+    # Check for required metadata fields
+    required = ["pack_name", "pack_version", "target_suite"]
+    for field in required:
         if field not in metadata:
-            issues.append(f"Recommended metadata field missing: {field}")
+            issues.append(f"Required metadata field missing: {field}")
 
     # Validate pack_version format if present
     if "pack_version" in metadata:
