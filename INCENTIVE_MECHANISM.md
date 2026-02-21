@@ -455,7 +455,7 @@ new_score > current_best_score + δ
 
 Where:
 - **δ** = 0.05 (5% improvement threshold)
-- **current_best_score** = current epoch score of the first-mover (stale packs lose protection naturally)
+- **current_best_score** = current epoch score of the first-mover
 - Chronological order determined by **GitHub server-side push timestamp** (not forgeable git commit date)
 
 **Example Timeline**:
@@ -525,7 +525,7 @@ Alpha Emissions (Subnet-Specific):
 
 TAO → Subnet Alpha: Based on net staking inflows ("Taoflow")
 Alpha → TAO: Swappable via subnet liquidity pool (market-determined price)
-Current SN11 alpha: ~$2.64 (1 alpha ≈ 0.015 TAO at current pool rate)
+Current SN11 alpha (as of Feb 2026): ~$2.64 (1 alpha ≈ 0.015 TAO at current pool rate)
 ```
 
 **Estimated validator earnings** (SN11, medium stake ~5k TAO, ~10% of validator weight):
@@ -1044,7 +1044,7 @@ Bootstrap:     top-3 get 70/20/10 of miner alpha emissions
 | q (score quantization) | 0.05 | ✅ Yes |
 | ε (consensus epsilon) | 0.02 | ✅ Yes |
 | N (runs per scenario) | 3 | ✅ Yes |
-| Scenario pool | 5 (select 4/epoch) | ✅ Yes |
+| Scenario pool | 5 (select 4/epoch; 80% overlap until pool grows) | ✅ Yes |
 | Scenario weights | 1.0-1.5 per YAML | ✅ Yes |
 | min_score_threshold | 0.30 | ✅ Yes |
 | Bootstrap threshold | 10 miners | ✅ Yes |
