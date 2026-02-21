@@ -1,8 +1,10 @@
 # TrajectoryRL Incentive Mechanism
 
 **Subnet**: SN11 (TrajectoryRL)
+
 **Version**: v1.0
-**Date**: 2026-02-18
+
+**Date**: 2026-02-20
 
 ---
 
@@ -917,5 +919,7 @@ Bootstrap:     top-3 get 70/20/10 of miner alpha emissions
 ---
 
 **Version**: v1.0
-**Date**: 2026-02-18
+
+**Date**: 2026-02-20
+
 **Status**: Implemented (validator + ClawBench scoring + on-chain block timestamps). Pending: miner implementation.
