@@ -275,9 +275,9 @@ Once the 10th miner registers and submits, the next epoch automatically switches
 
 If **no miner scores above `min_score_threshold`** (default 0.30) in an epoch, the validator sets **uniform weights only among miners who responded with a valid pack** (passed schema + git verification). Non-responsive miners receive weight 0.
 
-If **no miner responded at all**, the validator sets uniform weights (`1/N`) across all UIDs as a last resort to prevent validator deregistration (`set_weights` must be called to keep `last_update` advancing).
+If **no miner responded at all**, the validator **skips `set_weights`** for that epoch. This means the validator's `last_update` does not advance, and prolonged inactivity may lead to validator deregistration. However, this is preferable to the alternative: setting uniform weights across all UIDs would enable a Sybil attack where an attacker registers many UIDs, submits nothing, and collects free alpha. Validator self-weight is also not viable — Yuma Consensus applies self-weight masking, so it would be ignored.
 
-**Why not uniform across all UIDs?** Giving equal weight to non-responsive UIDs enables a Sybil attack: an attacker registers many UIDs, submits nothing, and collects free alpha. By restricting uniform weights to responsive miners only, empty UIDs get nothing and face UID pressure (eventual deregistration from weight 0).
+In practice, this edge case (zero responsive miners) only occurs on a dead subnet. If the subnet recovers, the validator re-registers and resumes normally.
 
 Once a miner submits a valid pack scoring above `min_score_threshold`, normal winner-take-all resumes immediately.
 
