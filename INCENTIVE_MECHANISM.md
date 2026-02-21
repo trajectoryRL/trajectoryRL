@@ -488,20 +488,7 @@ Each epoch generates a unique **epoch context** from the deterministic epoch see
 [... miner's AGENTS.md follows ...]
 ```
 
-The epoch context varies across six dimensions:
-
-| Dimension | Pool Size | Examples |
-|-----------|-----------|---------|
-| Date | 365 | Any day in 2026 |
-| Name | 20 | Jordan Rivera, Alex Chen, Sam Patel, ... |
-| Role | 10 | Product Manager, Engineering Lead, ... |
-| Company | 10 | Meridian Technologies, Vertex Labs, ... |
-| Department | 8 | Engineering, Product, Marketing, ... |
-| Timezone | 6 | ET, CT, MT, PT, GMT, JST |
-
-**Total variation space**: 365 × 20 × 10 × 10 × 8 × 6 = **35,040,000 unique contexts**
-
-**Implication for miners**: AGENTS.md must be written as a **generic policy**, not hardcoded to a specific person, company, or date. Policies that say "You are Alex at TechCorp" will conflict with the epoch context and score poorly. The best policies define *behavioral rules* (how to handle escalations, how to triage email) without assuming a fixed identity.
+The epoch context varies across six dimensions (date, name, role, company, department, timezone), producing millions of unique combinations. This means AGENTS.md must be written as a **generic policy** — policies that hardcode a specific person or company will conflict with the epoch context and score poorly.
 
 ### Epoch-Seeded Evaluation
 
