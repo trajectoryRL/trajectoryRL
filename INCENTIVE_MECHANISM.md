@@ -2,7 +2,7 @@
 
 **Subnet**: SN11 (TrajectoryRL)
 
-**Version**: v1.0
+**Version**: v1.01
 
 **Date**: 2026-02-20
 
@@ -273,11 +273,13 @@ Once the 10th miner registers and submits, the next epoch automatically switches
 
 ### No Eligible Miners
 
-If **no miner scores above `min_score_threshold`** (default 0.30) in an epoch (e.g., no miners respond, all packs fail schema validation, or all score zero), the validator sets **uniform weights** (`1/N`) across all miners.
+If **no miner scores above `min_score_threshold`** (default 0.30) in an epoch, the validator sets **uniform weights only among miners who responded with a valid pack** (passed schema + git verification). Non-responsive miners receive weight 0.
 
-**Why uniform instead of skipping?** Not calling `set_weights` means the validator's `last_update` block never advances. After `activity_cutoff` blocks, Bittensor marks the validator inactive and eventually deregisters it. If *all* validators get deregistered during a quiet period, there would be no validators left when miners finally arrive.
+If **no miner responded at all**, the validator **skips `set_weights`** for that epoch. This means the validator's `last_update` does not advance, and prolonged inactivity may lead to validator deregistration. However, this is preferable to the alternative: setting uniform weights across all UIDs would enable a Sybil attack where an attacker registers many UIDs, submits nothing, and collects free alpha. Validator self-weight is also not viable — Yuma Consensus applies self-weight masking, so it would be ignored.
 
-**What happens to miner alpha with uniform weights?** The miner alpha gets spread thinly and evenly across all miners, so no single miner is favoured. Once a miner submits a valid pack scoring above `min_score_threshold`, normal winner-take-all resumes immediately.
+In practice, this edge case (zero responsive miners) only occurs on a dead subnet. If the subnet recovers, the validator re-registers and resumes normally.
+
+Once a miner submits a valid pack scoring above `min_score_threshold`, normal winner-take-all resumes immediately.
 
 ### Miner Inactivity
 
@@ -918,7 +920,7 @@ Bootstrap:     top-3 get 70/20/10 of miner alpha emissions
 
 ---
 
-**Version**: v1.0
+**Version**: v1.01
 
 **Date**: 2026-02-20
 
