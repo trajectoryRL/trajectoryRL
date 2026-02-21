@@ -98,8 +98,10 @@ class TrajectoryValidator:
         # Score history for tracking
         self.score_history: Dict[int, List[float]] = defaultdict(list)
 
-        # First-mover tracking: {miner_uid: (first_score, first_timestamp)}
-        self.first_mover_data: Dict[int, Tuple[float, float]] = {}
+        # First-mover tracking: {hotkey: (first_score, first_timestamp)}
+        # Keyed by miner hotkey (public key) rather than UID so that
+        # history is never inherited when a UID is recycled.
+        self.first_mover_data: Dict[str, Tuple[float, float]] = {}
 
         # Epoch number — derived from Bittensor block height so all
         # validators agree on the same epoch (and thus the same seed,
@@ -477,21 +479,22 @@ class TrajectoryValidator:
         # Track history
         self.score_history[miner_uid].append(final_score)
 
-        # Update first-mover tracking
-        if miner_uid not in self.first_mover_data:
-            self.first_mover_data[miner_uid] = (final_score, commit_timestamp)
+        # Update first-mover tracking (keyed by hotkey, not UID)
+        hotkey = self.metagraph.hotkeys[miner_uid]
+        if hotkey not in self.first_mover_data:
+            self.first_mover_data[hotkey] = (final_score, commit_timestamp)
             logger.info(
-                f"Miner {miner_uid}: First submission recorded "
+                f"Miner {miner_uid} ({hotkey[:8]}): First submission recorded "
                 f"(score={final_score:.3f}, timestamp={commit_timestamp})"
             )
-        elif final_score > self.first_mover_data[miner_uid][0]:
-            old_score = self.first_mover_data[miner_uid][0]
-            original_timestamp = self.first_mover_data[miner_uid][1]
+        elif final_score > self.first_mover_data[hotkey][0]:
+            old_score = self.first_mover_data[hotkey][0]
+            original_timestamp = self.first_mover_data[hotkey][1]
             # Update score but preserve the original submission timestamp
             # so first-mover protection stays anchored to initial submission.
-            self.first_mover_data[miner_uid] = (final_score, original_timestamp)
+            self.first_mover_data[hotkey] = (final_score, original_timestamp)
             logger.info(
-                f"Miner {miner_uid}: Score improved "
+                f"Miner {miner_uid} ({hotkey[:8]}): Score improved "
                 f"(new={final_score:.3f}, old={old_score:.3f})"
             )
 
@@ -598,12 +601,19 @@ class TrajectoryValidator:
                 logger.error(f"Error setting uniform weights: {e}", exc_info=True)
             return
 
+        # Build UID→hotkey mapping so the scorer can bridge between
+        # UID-keyed scores and hotkey-keyed first_mover_data.
+        uid_to_hotkey = {
+            uid: self.metagraph.hotkeys[uid] for uid in eligible
+        }
+
         # Select winner (or bootstrap curve) with first-mover advantage
         weights_dict = self.scorer.select_winner(
             scores=eligible,
             first_mover_data=self.first_mover_data,
             delta=self.config.delta_threshold,
             num_active_miners=num_active_miners,
+            uid_to_hotkey=uid_to_hotkey,
         )
 
         # Prepare for Bittensor API

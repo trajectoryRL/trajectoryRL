@@ -306,12 +306,14 @@ class TestTrajectoryScorer:
         """Early miner A (score=0.85) should be protected against B (score=0.88)
         because B doesn't beat A + delta (0.85 + 0.05 = 0.90)."""
         scores = {0: 0.85, 1: 0.88}
+        uid_to_hotkey = {0: "hk_A", 1: "hk_B"}
         first_mover_data = {
-            0: (0.85, 100.0),  # A submitted first
-            1: (0.88, 200.0),  # B submitted later
+            "hk_A": (0.85, 100.0),  # A submitted first
+            "hk_B": (0.88, 200.0),  # B submitted later
         }
         weights = scorer.select_winner(
-            scores, first_mover_data, delta=0.05, num_active_miners=20
+            scores, first_mover_data, delta=0.05, num_active_miners=20,
+            uid_to_hotkey=uid_to_hotkey,
         )
 
         # A should win due to first-mover protection
@@ -321,12 +323,14 @@ class TestTrajectoryScorer:
     def test_select_winner_first_mover_beaten(self, scorer):
         """New miner B (score=0.91) beats A + delta (0.85 + 0.05 = 0.90)."""
         scores = {0: 0.85, 1: 0.91}
+        uid_to_hotkey = {0: "hk_A", 1: "hk_B"}
         first_mover_data = {
-            0: (0.85, 100.0),
-            1: (0.91, 200.0),
+            "hk_A": (0.85, 100.0),
+            "hk_B": (0.91, 200.0),
         }
         weights = scorer.select_winner(
-            scores, first_mover_data, delta=0.05, num_active_miners=20
+            scores, first_mover_data, delta=0.05, num_active_miners=20,
+            uid_to_hotkey=uid_to_hotkey,
         )
 
         # B wins because 0.91 > 0.90
@@ -389,10 +393,12 @@ class TestTrajectoryScorer:
         assert weights[1] == 1.0
 
         # Now with timestamps: miner 0 submitted first
-        first_mover = {0: (0.90, 100.0), 1: (0.91, 200.0)}
+        uid_to_hotkey = {0: "hk_0", 1: "hk_1"}
+        first_mover = {"hk_0": (0.90, 100.0), "hk_1": (0.91, 200.0)}
         # Use delta=0 to isolate epsilon behavior from first-mover protection
         weights = s.select_winner(
-            scores, first_mover, delta=0.0, num_active_miners=20
+            scores, first_mover, delta=0.0, num_active_miners=20,
+            uid_to_hotkey=uid_to_hotkey,
         )
         # |0.91 - 0.90| = 0.01 ≤ ε=0.02 → tied → earliest (miner 0) wins
         assert weights[0] == 1.0
@@ -404,9 +410,11 @@ class TestTrajectoryScorer:
             score_quantization=0, consensus_epsilon=0.02
         )
         scores = {0: 0.85, 1: 0.91}
-        first_mover = {0: (0.85, 100.0), 1: (0.91, 200.0)}
+        uid_to_hotkey = {0: "hk_0", 1: "hk_1"}
+        first_mover = {"hk_0": (0.85, 100.0), "hk_1": (0.91, 200.0)}
         weights = s.select_winner(
-            scores, first_mover, delta=0.05, num_active_miners=20
+            scores, first_mover, delta=0.05, num_active_miners=20,
+            uid_to_hotkey=uid_to_hotkey,
         )
 
         # |0.91 - 0.85| = 0.06 > ε=0.02 → not tied, miner 1 wins on score
@@ -418,10 +426,12 @@ class TestTrajectoryScorer:
         """With few miners, use graduated 70/20/10 curve instead of WTA."""
         s = TrajectoryScorer(bootstrap_threshold=10)
         scores = {0: 0.80, 1: 0.91, 2: 0.85}
-        first_mover = {0: (0.80, 100.0), 1: (0.91, 200.0), 2: (0.85, 300.0)}
+        uid_to_hotkey = {0: "hk_0", 1: "hk_1", 2: "hk_2"}
+        first_mover = {"hk_0": (0.80, 100.0), "hk_1": (0.91, 200.0), "hk_2": (0.85, 300.0)}
         # 3 miners < threshold 10 → bootstrap mode
         weights = s.select_winner(
-            scores, first_mover, delta=0.05, num_active_miners=3
+            scores, first_mover, delta=0.05, num_active_miners=3,
+            uid_to_hotkey=uid_to_hotkey,
         )
         assert weights[1] == 0.70  # 1st (highest score)
         assert weights[2] == 0.20  # 2nd
@@ -431,9 +441,11 @@ class TestTrajectoryScorer:
         """Bootstrap ties broken by earliest push timestamp."""
         s = TrajectoryScorer(bootstrap_threshold=10)
         scores = {0: 0.90, 1: 0.90}  # same score
-        first_mover = {0: (0.90, 200.0), 1: (0.90, 100.0)}  # miner 1 pushed first
+        uid_to_hotkey = {0: "hk_0", 1: "hk_1"}
+        first_mover = {"hk_0": (0.90, 200.0), "hk_1": (0.90, 100.0)}  # miner 1 pushed first
         weights = s.select_winner(
-            scores, first_mover, delta=0.05, num_active_miners=2
+            scores, first_mover, delta=0.05, num_active_miners=2,
+            uid_to_hotkey=uid_to_hotkey,
         )
         # 2 miners: raw 0.70/0.20 normalized to sum to 1.0
         assert weights[1] == pytest.approx(0.70 / 0.90)  # ~0.778
@@ -443,9 +455,11 @@ class TestTrajectoryScorer:
         """Single miner in bootstrap gets weight 1.0 (normalized)."""
         s = TrajectoryScorer(bootstrap_threshold=10)
         scores = {0: 0.75}
-        first_mover = {0: (0.75, 100.0)}
+        uid_to_hotkey = {0: "hk_0"}
+        first_mover = {"hk_0": (0.75, 100.0)}
         weights = s.select_winner(
-            scores, first_mover, delta=0.05, num_active_miners=1
+            scores, first_mover, delta=0.05, num_active_miners=1,
+            uid_to_hotkey=uid_to_hotkey,
         )
         assert weights[0] == 1.0
 
@@ -453,9 +467,11 @@ class TestTrajectoryScorer:
         """Two miners in bootstrap: weights must sum to 1.0."""
         s = TrajectoryScorer(bootstrap_threshold=10)
         scores = {0: 0.80, 1: 0.91}
-        first_mover = {0: (0.80, 100.0), 1: (0.91, 200.0)}
+        uid_to_hotkey = {0: "hk_0", 1: "hk_1"}
+        first_mover = {"hk_0": (0.80, 100.0), "hk_1": (0.91, 200.0)}
         weights = s.select_winner(
-            scores, first_mover, delta=0.05, num_active_miners=2
+            scores, first_mover, delta=0.05, num_active_miners=2,
+            uid_to_hotkey=uid_to_hotkey,
         )
         assert weights[1] > weights[0]  # higher score wins more
         assert sum(weights.values()) == pytest.approx(1.0)
