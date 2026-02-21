@@ -331,7 +331,7 @@ A **PolicyBundle** (also called an OpenClaw Policy Pack / OPP) is a JSON object 
 
 AGENTS.md is the primary policy document controlling agent behavior. It must be **identity-agnostic** because the epoch context (see [Identity Variation](#epoch-context-identity-variation)) prepends a random persona each epoch, so hardcoded names/companies will conflict and score poorly.
 
-For practical writing guidance, examples, and common failure patterns, see [MINER_OPERATIONS.md: Writing AGENTS.md](MINER_OPERATIONS.md#writing-agentsmd).
+For the reference miner implementation and local testing, see [MINER_OPERATIONS.md](MINER_OPERATIONS.md).
 
 ---
 
@@ -993,7 +993,7 @@ A miner's submission can fail at multiple points in the validation pipeline. The
 
 ### Competitive Range
 
-Target ≥ 0.85 for competitive scores. For score targets, iteration strategy, and common failure patterns, see [MINER_OPERATIONS.md: Score Targets](MINER_OPERATIONS.md#score-targets).
+Target ≥ 0.85 for competitive scores. See [MINER_OPERATIONS.md: Score Targets](MINER_OPERATIONS.md#score-targets) for the full ladder.
 
 ---
 
