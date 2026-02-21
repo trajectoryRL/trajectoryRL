@@ -203,9 +203,10 @@ class TrajectoryScorer:
     def select_winner(
         self,
         scores: Dict[int, float],
-        first_mover_data: Dict[int, Tuple[float, float]],
+        first_mover_data: Dict[str, Tuple[float, float]],
         delta: float = 0.05,
         num_active_miners: Optional[int] = None,
+        uid_to_hotkey: Optional[Dict[int, str]] = None,
     ) -> Dict[int, float]:
         """Select winner using winner-take-all with first-mover advantage.
 
@@ -224,10 +225,12 @@ class TrajectoryScorer:
 
         Args:
             scores: Dict of miner_uid -> quantized score [0, 1]
-            first_mover_data: Dict of miner_uid -> (score, timestamp)
+            first_mover_data: Dict of hotkey -> (score, timestamp)
             delta: First-mover threshold (new score must beat best + delta)
             num_active_miners: Total active miners in metagraph.
                 If None, defaults to len(scores).
+            uid_to_hotkey: Dict of miner_uid -> hotkey. Required to bridge
+                UID-keyed scores with hotkey-keyed first_mover_data.
 
         Returns:
             Dict of miner_uid -> weight (sums to 1.0)
@@ -235,11 +238,13 @@ class TrajectoryScorer:
         if not scores:
             return {}
 
+        _uid_to_hotkey = uid_to_hotkey or {}
+
         n_miners = num_active_miners if num_active_miners is not None else len(scores)
 
         # --- Bootstrap phase: graduated rewards ---
         if n_miners < self.bootstrap_threshold:
-            return self._bootstrap_weights(scores, first_mover_data)
+            return self._bootstrap_weights(scores, first_mover_data, _uid_to_hotkey)
 
         # --- Steady-state: winner-take-all ---
 
@@ -257,12 +262,12 @@ class TrajectoryScorer:
 
         resolved_by_epsilon = False
         if len(tied_uids) > 1 and first_mover_data:
-            # Break tie by earliest push timestamp
-            tied_with_ts = [
-                (uid, first_mover_data[uid][1])
-                for uid in tied_uids
-                if uid in first_mover_data
-            ]
+            # Break tie by earliest push timestamp (look up by hotkey)
+            tied_with_ts = []
+            for uid in tied_uids:
+                hk = _uid_to_hotkey.get(uid)
+                if hk and hk in first_mover_data:
+                    tied_with_ts.append((uid, first_mover_data[hk][1]))
             if tied_with_ts:
                 tied_with_ts.sort(key=lambda x: x[1])  # earliest first
                 best_uid = tied_with_ts[0][0]
@@ -277,11 +282,16 @@ class TrajectoryScorer:
         # Skip if winner was already resolved by epsilon tie-break (which
         # already used timestamps, so re-applying delta would undo it).
         if first_mover_data and not resolved_by_epsilon:
-            for uid, _ in sorted(
+            for hotkey, (_, ts) in sorted(
                 first_mover_data.items(),
                 key=lambda x: x[1][1]  # Sort by timestamp
             ):
-                if uid in scores:
+                # Reverse-lookup: find the UID currently using this hotkey
+                uid = next(
+                    (u for u, hk in _uid_to_hotkey.items() if hk == hotkey),
+                    None,
+                )
+                if uid is not None and uid in scores:
                     # Use current score (not historical best) for protection
                     # threshold so stale packs lose protection naturally.
                     current = scores[uid]
@@ -310,7 +320,8 @@ class TrajectoryScorer:
     def _bootstrap_weights(
         self,
         scores: Dict[int, float],
-        first_mover_data: Dict[int, Tuple[float, float]],
+        first_mover_data: Dict[str, Tuple[float, float]],
+        uid_to_hotkey: Dict[int, str],
     ) -> Dict[int, float]:
         """Graduated reward curve for the bootstrap phase.
 
@@ -319,7 +330,8 @@ class TrajectoryScorer:
 
         Args:
             scores: Dict of miner_uid -> quantized score
-            first_mover_data: Dict of miner_uid -> (score, timestamp)
+            first_mover_data: Dict of hotkey -> (score, timestamp)
+            uid_to_hotkey: Dict of miner_uid -> hotkey
 
         Returns:
             Dict of miner_uid -> weight (sums to 1.0)
@@ -328,7 +340,8 @@ class TrajectoryScorer:
 
         # Sort by score desc, breaking ties by earliest push timestamp
         def sort_key(uid: int) -> Tuple[float, float]:
-            ts = first_mover_data[uid][1] if uid in first_mover_data else float("inf")
+            hk = uid_to_hotkey.get(uid)
+            ts = first_mover_data[hk][1] if hk and hk in first_mover_data else float("inf")
             return (-scores[uid], ts)
 
         ranked = sorted(scores.keys(), key=sort_key)
