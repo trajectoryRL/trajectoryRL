@@ -1,7 +1,7 @@
 # Miner Operations Guide
 
 **Subnet**: SN11 (TrajectoryRL)
-**Date**: 2026-02-20
+**Date**: 2026-02-23
 
 > For mechanism design and scoring rules, see [INCENTIVE_MECHANISM.md](INCENTIVE_MECHANISM.md).
 
@@ -50,7 +50,7 @@ A PolicyBundle is a JSON object. Full schema: [INCENTIVE_MECHANISM.md — Pack S
 }
 ```
 
-Constraints: `AGENTS.md` required, total JSON ≤ 32KB, valid semver, content-addressed via SHA256. AGENTS.md must be **identity-agnostic** — each epoch prepends a random persona, so hardcoded names/companies will conflict and score poorly.
+Constraints: `AGENTS.md` required, total JSON ≤ 32KB, valid semver, content-addressed via SHA256. Write AGENTS.md as a **generic policy** — avoid hardcoding specific names, companies, or dates, since the evaluation fixtures define the agent's identity context.
 
 ---
 
@@ -70,7 +70,7 @@ The reference miner uses **Claude Opus 4.6** to autonomously generate, test, and
 │  4. Feed failed checks back to Opus 4.6 for iteration   │
 │  5. Repeat until score stabilizes or budget exhausted   │
 │  6. Push winning pack to GitHub                         │
-│  7. Respond to validator PackRequests with commit hash  │
+│  7. Submit on-chain commitment (pack_hash + git info)   │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -146,9 +146,9 @@ git remote add origin https://github.com/YOUR_USER/my-trajectoryrl-pack.git
 git push -u origin main
 ```
 
-The **server-side push timestamp** (set by GitHub) establishes first-mover precedence.
+### 2. Submit On-Chain Commitment
 
-### 2. Run Miner
+After pushing to GitHub, submit your pack metadata on-chain:
 
 ```bash
 python neurons/miner.py \
@@ -159,9 +159,13 @@ python neurons/miner.py \
   --pack_commit $(git rev-parse HEAD)
 ```
 
+This calls `subtensor.set_commitment(netuid=11, data=commitment_string)` with your `pack_hash`, `git_commit_hash`, and `repo_url`. The **on-chain commitment block number** establishes first-mover precedence (unforgeable, deterministic).
+
+> **Rate limit**: One commitment per ~100 blocks (~20 min) per hotkey — sufficient for daily epochs.
+
 ### 3. Iterate
 
-Epochs run every 24 hours. Push improved packs anytime — the next epoch picks up your latest commit.
+Epochs run every 24 hours. Push improved packs and submit a new on-chain commitment — the next epoch picks up your latest submission. Validators only re-evaluate when your `pack_hash` changes, so resubmitting the same pack is a no-op.
 
 ---
 

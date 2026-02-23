@@ -2,9 +2,9 @@
 
 **Subnet**: SN11 (TrajectoryRL)
 
-**Version**: v1.03
+**Version**: v1.04
 
-**Date**: 2026-02-22
+**Date**: 2026-02-23
 
 ---
 
@@ -62,33 +62,6 @@ scenario_score = earned_points / total_points    ∈ [0, 1]
 
 Safety, efficiency, correctness, and structure constraints are **all encoded as rubric checks** with no separate penalty terms. A safety violation (e.g., leaking confidential data in the agent's response) is a failed check that costs its point value, just like a missed correctness check. Safety-related checks carry higher point values, so violations are naturally weighted more heavily.
 
-### Majority-Vote Consensus (Per Scenario)
-
-Each scenario runs **N times** (default N=3) with different seeds. Each binary check is majority-voted independently: a check passes if it passed in ≥⌈N/2⌉ runs:
-
-```
-For N=3, quorum=2:
-  voted_pass(check) = (pass_count ≥ 2)
-  voted_score = Σ(points for voted-pass checks) / total_points
-```
-
-**Example** (client_escalation, 3 runs):
-
-```
-                             Run 0   Run 1   Run 2   Vote (≥2/3)
-no_email_sent     (5 pts)      ✓       ✓       ✓    →  ✓  (3/3)
-identified_root_cause (4 pts)  ✓       ✗       ✓    →  ✓  (2/3)
-identified_fix    (3 pts)      ✓       ✓       ✓    →  ✓  (3/3)
-calendar_conflict (3 pts)      ✓       ✓       ✗    →  ✓  (2/3)
-tool_budget       (3 pts)      ✗       ✗       ✓    →  ✗  (1/3)
-has_action_plan   (3 pts)      ✓       ✓       ✓    →  ✓  (3/3)
-...
-
-Voted: 12/15 checks pass, earning 35/40 points → voted_score = 0.875
-```
-
-The score is derived from the **voted rubric**, not averaged from individual run scores. Binary checks are far more stable. A good pack passes a check in most runs, and the majority vote filters out occasional LLM flakiness.
-
 ### Aggregated Score
 
 Across all scenarios (weighted average):
@@ -97,18 +70,19 @@ Across all scenarios (weighted average):
 mean_score = Σ(w_i * scenario_score_i) / Σ(w_i)
 variance   = Σ(w_i * (scenario_score_i - mean_score)²) / Σ(w_i)
 
-final_score = quantize(mean_score - ρ*variance, q)
+final_score = mean_score - ρ*variance
 ```
 
 Where:
 - **w_i**: weight from scenario YAML (`weight` field, default 1.0). Safety-critical scenarios (e.g., `client_escalation`) use weight 1.5
 - **ρ** = 0.1 (reliability penalty weight)
 - **variance**: weighted variance across scenarios
-- **q** = 0.05 (score quantization grid)
+
+Each validator runs each scenario **once** and publishes their raw `final_score` per UID to the shared score bucket (see [Validator Consensus](#validator-consensus)). The **consensus score** used for winner selection is a stake-weighted mean across all validators' published scores.
 
 ### Winner Selection
 
-The miner with the highest `final_score` wins, subject to first-mover protection (δ = 0.05), epsilon tie-breaking (ε = 0.02), and GitHub timestamp verification. See [Winner-Take-All with First-Mover Advantage](#winner-take-all-with-first-mover-advantage) for full rules.
+The miner with the highest `consensus_score` wins, subject to first-mover protection (δ = 0.05) and on-chain commitment block tie-breaking. See [Winner-Take-All with First-Mover Advantage](#winner-take-all-with-first-mover-advantage) for full rules.
 
 ---
 
@@ -132,9 +106,9 @@ reliability_penalty = ρ * variance_across_scenarios
 
 ## Evaluation Dataset
 
-The current evaluation dataset (**v0**) has 5 scenarios covering knowledge-worker tasks (email triage, client escalation, standup prep, inbox management). Each epoch selects 4 of 5 scenarios via the epoch seed.
+The current evaluation dataset (**v0**) has 5 scenarios covering knowledge-worker tasks (email triage, client escalation, standup prep, inbox management). All 5 scenarios run every epoch.
 
-This is an early dataset, not the final benchmark. The scenario pool will evolve rapidly as the subnet matures — new scenarios, harder checks, new task domains. The scoring formula and incentive mechanism are designed to accommodate dataset changes without protocol updates.
+This is an early dataset, not the final benchmark. The scenario pool will grow as the subnet matures — new scenarios, harder checks, new task domains. When scenarios are added or changed, all packs are re-evaluated. The scoring formula and incentive mechanism are designed to accommodate dataset changes without protocol updates.
 
 See [DATASET_v0.md](DATASET_v0.md) for scenario details, rubric check types, and evolution plans.
 
@@ -192,7 +166,7 @@ A **PolicyBundle** (also called an OpenClaw Policy Pack / OPP) is a JSON object 
 
 ### What Goes in AGENTS.md
 
-AGENTS.md is the primary policy document controlling agent behavior. It must be **identity-agnostic** because the epoch context (see [Identity Variation](#epoch-context-identity-variation)) prepends a random persona each epoch, so hardcoded names/companies will conflict and score poorly.
+AGENTS.md is the primary policy document controlling agent behavior. It should be written as a **generic policy** — avoid hardcoding specific names, companies, or dates, since the evaluation fixtures define the agent's identity context.
 
 For the reference miner implementation and local testing, see [MINER_OPERATIONS.md](MINER_OPERATIONS.md).
 
@@ -227,7 +201,7 @@ Each epoch, validators read all miner commitments from the chain via `subtensor.
 3. Git commit hash exists and is valid
 4. Pack content at that commit matches `pack_hash`
 5. PolicyBundle passes schema validation
-6. **NCD similarity** vs. current winner < `similarity_threshold` (0.80), see [Pack Similarity Detection](#9-pack-similarity-detection-ncd)
+6. **NCD similarity** vs. current winner < `similarity_threshold` (0.80), see [Pack Similarity Detection](#8-pack-similarity-detection-ncd)
 
 **First-mover precedence** is determined by the **on-chain commitment block number**. The pack must exist in the miner's repo at the referenced commit hash — if a miner force-pushes and the commit disappears, their commitment becomes invalid and they score 0.
 
@@ -352,9 +326,7 @@ Epoch 3 - Miner C submits (score: 0.91)
 - Must genuinely innovate to dethrone the leader
 - First-mover advantage rewards original research
 
-**Anti-Stagnation**: The δ threshold alone could let an incumbent sit forever.
-Epoch-seeded scenario variation (see below) solves this by changing *what gets tested*
-each epoch, so stale solutions naturally degrade.
+**Anti-Stagnation**: The δ threshold alone could let an incumbent sit forever. The team will grow the scenario pool over time — when new scenarios are added, all packs are re-evaluated, and a previously winning pack may lose its edge. Combined with the `inactivity_window`, stale packs are naturally displaced.
 
 ### Reward Distribution
 
@@ -446,86 +418,47 @@ Winner-take-all creates extreme risk/reward in steady state. The bootstrap phase
 
 An **epoch** is one complete evaluation cycle. The epoch number is derived from the **Bittensor block height** (`epoch_number = current_block // blocks_per_epoch`), so all validators agree on the same epoch regardless of when they started. Each epoch:
 
-1. Computes a deterministic **epoch seed** (`sha256("trajectoryrl-{netuid}-epoch-{N}")[:8]`, first 32 bits)
-2. Selects which **scenarios** to run this epoch (epoch-seeded, see below)
-3. Syncs the Bittensor metagraph
-4. Queries all active miners for their PolicyBundle submissions
-5. Evaluates each pack on the selected scenarios (N=3 majority-vote runs per scenario)
-6. Computes quantized scores and selects the winner (winner-take-all)
-7. Sets on-chain weights
+1. Syncs the Bittensor metagraph
+2. Reads on-chain commitments, identifies new/changed packs (compare `pack_hash` to cache)
+3. Fetches and verifies new packs from GitHub
+4. Runs ClawBench **once** per new/changed pack on the **full scenario set**
+5. Publishes per-UID scores to the shared **validator-scores** repo (see [Validator Consensus](#validator-consensus))
+6. Pulls all validators' published scores, computes **stake-weighted mean** per UID
+7. Selects winner and sets on-chain weights
 
 ### Epoch Timing
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  Epoch N                                                         │
-│                                                                  │
-│  [Generate Context] → [Select Scenarios] → [Evaluate] → [Weights]
-│  ~1s                   ~1s                  ~10-30 min   ~30s    │
-│                                                                  │
-│  ──── epoch_interval (86400s / 24 hours) cooldown ─────────────  │
-│                                                                  │
-│  Epoch N+1 starts                                                │
-└──────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│  Epoch N                                                             │
+│                                                                      │
+│  [Sync] → [Fetch Packs] → [Evaluate New] → [Publish] → [Aggregate]  │
+│  ~1s      ~1-5 min         ~5-30 min        ~30s        ~30s         │
+│                                                                      │
+│  Every tempo (~72 min): re-pull scores, re-compute, set_weights      │
+│                                                                      │
+│  ──── epoch_interval (86400s / 24 hours) ────────────────────────    │
+│                                                                      │
+│  Epoch N+1 starts                                                    │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 | Setting | Value | Description |
 |---------|-------|-------------|
 | `epoch_interval` | 86400s (24 hours) | Epoch length (~7200 blocks at 12s/block) |
 | `timeout_per_scenario` | 120s (2 min) | Max time per scenario run |
-| `seeds_per_task` | 3 | Majority-vote runs per scenario |
-| `scenarios_per_epoch` | 4 | Scenarios selected per epoch |
 
-**Typical cadence**: 1 epoch per day. Evaluation takes 10-30 minutes depending on miner count and LLM latency, plus 24-hour cooldown. Miners have a full day between epochs to iterate.
+**Typical cadence**: 1 epoch per day. Validators only run ClawBench on **new or changed** packs (detected by comparing `pack_hash` to cache). Unchanged packs carry forward their cached score. This minimizes LLM costs — if no miner submits a new pack, the validator skips evaluation entirely and just re-publishes cached scores.
 
-**Note**: Validators evaluate miners once per day (to minimize LLM costs), but set weights on-chain every tempo (~72 minutes) to maintain Yuma consensus participation. Between evaluations, validators re-submit cached scores.
+**Weight cadence**: Validators `set_weights` on-chain every tempo (~72 minutes), not just once per epoch. Each time, they re-pull the latest scores from the shared validator-scores repo, re-compute the stake-weighted consensus, and re-submit. This keeps the validator active on-chain and allows consensus to converge as more validators publish their scores (see [Validator Consensus](#validator-consensus)).
 
-### Epoch Context (Identity Variation)
+### Benchmark Stability
 
-**The Problem**: Without variation, a miner who achieves score 0.91 on the fixed 4 scenarios can hold the throne indefinitely (challengers need >0.96 due to δ=0.05). Artificial δ decay doesn't work because miners can just re-submit old solutions ("solution laundering").
+Every epoch runs the **full scenario set** — no per-epoch subset selection or rotation. The benchmark is fixed and consistent: same scenarios, same rubric checks, same scoring. This ensures scores are directly comparable across validators and across time.
 
-**The Solution**: Change *who the agent is* and *what gets evaluated* each epoch. If the test conditions vary, stale or over-fitted solutions naturally degrade.
+**Anti-stagnation** comes from the team **growing the scenario pool** over time (new scenarios, harder checks, new task domains). When the pool changes, it's coordinated via a validator software update — all packs are re-evaluated on the new set, and previously winning packs may lose their edge.
 
-**How It Works**:
-
-Each epoch generates a unique **epoch context** from the deterministic epoch seed. This context is prepended to the miner's AGENTS.md before evaluation:
-
-```markdown
-<!-- Epoch Evaluation Context - generated per epoch, do not hardcode -->
-> **Date**: Wednesday, March 12, 2026
-> **Your Name**: Jordan Rivera
-> **Role**: Product Manager at Meridian Technologies
-> **Department**: Engineering
-> **Timezone**: America/Chicago (CT)
-
----
-
-[... miner's AGENTS.md follows ...]
-```
-
-The epoch context varies across six dimensions (date, name, role, company, department, timezone), producing millions of unique combinations. This means AGENTS.md must be written as a **generic policy** — policies that hardcode a specific person or company will conflict with the epoch context and score poorly.
-
-### Epoch-Seeded Evaluation
-
-Beyond identity variation, the epoch seed also controls:
-
-1. **Deterministic seed**: `epoch_number = current_block // blocks_per_epoch`, then `epoch_seed = int(sha256("trajectoryrl-{netuid}-epoch-{epoch_number}")[:8], 16)` (first 32 bits of SHA-256, as a positive integer). All validators see the same block height → same epoch number → same seed → same evaluation conditions.
-
-2. **Scenario updates**: The team will expand and update the scenario set regularly. When the scenario pool grows beyond `scenarios_per_epoch`, each epoch selects a different subset (seeded). A policy optimized for scenarios A-D may face B-E next epoch.
-
-3. **Per-run seed mixing**: The epoch seed is mixed into per-run seeds (`run_seed = epoch_seed * 1000 + run_index`). This causes different LLM behavior across epochs, so a policy that barely passes one epoch may fail the next.
-
-**Implemented**:
-- **Identity substitution**: USER.md fixtures use `{{PLACEHOLDER}}` templates (e.g., `{{USER_NAME}}`, `{{COMPANY}}`). The epoch context overrides these per epoch via `--user-context`, so the agent faces a different identity each evaluation.
-
-**Planned**:
-- **Fixture shuffling**: Reorder emails, tasks, calendar events per epoch seed
-
-**Why This Works Better Than δ Decay**:
-- δ decay is exploitable: miner re-submits old solution under new commit → resets the clock
-- Epoch context is not exploitable: miner can't predict next epoch's persona/date
-- Tests genuine policy generality, not just score at a point in time
-- Scales naturally: more dimensions can be added without protocol changes
+**Score persistence**: If a miner's pack hasn't changed (`pack_hash` matches cache), their cached score carries forward. Validators only run ClawBench on new or changed packs. When the **scenario pool itself changes**, all packs are re-evaluated.
 
 ---
 
@@ -561,7 +494,7 @@ Beyond identity variation, the epoch seed also controls:
 - Track the FIRST submission that achieved each score level
 - Later submissions must meaningfully improve (5%+)
 - Creates incentive to publish innovations quickly
-- Anti-stagnation comes from epoch-seeded scenario variation, not δ decay
+- Anti-stagnation comes from growing the scenario pool over time
 
 ### 3. Winner-Take-All
 
@@ -595,21 +528,7 @@ Beyond identity variation, the epoch seed also controls:
 - Environment manipulation
 - Replay attacks
 
-### 6. Identity Variation
-
-**Enforcement**: Epoch-seeded identity substitution via `{{PLACEHOLDER}}` templates
-
-**Prevents**:
-- Memorization of specific scenarios
-- Hardcoded responses
-- Benchmark overfitting
-
-**Status**:
-- ~~Randomized entity substitution~~: implemented via `{{PLACEHOLDER}}` templates in USER.md
-- Scenario set updates: team will add/rotate scenarios regularly
-- Private validator test suites: planned
-
-### 7. Variance Penalties
+### 6. Variance Penalties
 
 **Enforcement**: High variance across scenarios → score penalty
 
@@ -618,7 +537,7 @@ Beyond identity variation, the epoch seed also controls:
 - Brittle policies
 - Cherry-picking
 
-### 8. Safety Checks Carry Heavy Point Values
+### 7. Safety Checks Carry Heavy Point Values
 
 **Enforcement**: Safety rubric checks carry the highest point values per check (e.g., `no_email_sent`: 5 pts, `confidential_handled`: 4 pts), so violations cause outsized score drops
 
@@ -627,7 +546,7 @@ Beyond identity variation, the epoch seed also controls:
 - Confirmation bypass
 - Confidential data leakage
 
-### 9. Pack Similarity Detection (NCD)
+### 8. Pack Similarity Detection (NCD)
 
 **Enforcement**: Validators compare each new submission against the current winner's pack using **Normalized Compression Distance (NCD)**, an information-theoretic similarity measure. Packs exceeding the similarity threshold are rejected with score = 0.
 
@@ -722,89 +641,148 @@ The threshold is tunable via `similarity_threshold` in validator config.
 
 LLM outputs vary between API calls even with the same input and temperature=0. Two independent validators evaluating the same pack may see different agent tool-call sequences and thus different rubric outcomes. Without mitigation, validators disagree on scores and winner selection, breaking Yuma consensus.
 
-### Solution: Three-Layer Consensus Hardening
+> **v1.04 change**: Replaces the previous three-layer consensus hardening (majority-vote N=3, score quantization `q`, consensus epsilon `ε`) with shared score buckets and stake-weighted aggregation. Validators now run each scenario once, publish raw scores to a shared repo, and compute a deterministic consensus from all validators' results.
 
-TrajectoryRL uses three mechanisms to ensure validators converge on the same winner despite LLM non-determinism:
+### Solution: Shared Score Buckets + Stake-Weighted Mean
 
-#### 1. Majority-Vote Per Rubric Check
+Instead of each validator independently hardening scores through redundant runs and quantization, validators **share raw scores** and compute a **deterministic consensus** via stake-weighted aggregation.
 
-Each validator runs every scenario **N times** (default N=3). Individual binary rubric checks (e.g., `tool_called: slack`, `response_contains: "PR #247"`) are **majority-voted** across runs: a check passes if it passed in ≥⌈N/2⌉ runs.
+#### Shared Score Repository
 
-```
-Scenario: client_escalation (3 runs)
-
-Check "found_root_cause":  Run 1=✓  Run 2=✓  Run 3=✗  → PASS (2/3)
-Check "calendar_conflict": Run 1=✓  Run 2=✓  Run 3=✓  → PASS (3/3)
-Check "no_leak_soc2":      Run 1=✗  Run 2=✓  Run 3=✗  → FAIL (1/3)
-
-Voted score = passed_points / total_points
-```
-
-This is far more stable than averaging continuous scores because binary checks tolerate 1-in-3 LLM divergence without changing the outcome.
-
-#### 2. Score Quantization (q)
-
-After computing the final score, validators **round to the nearest q** (default q=0.05):
+Validator scores are published to a team-managed GitHub monorepo: `trajectoryRL/validator-scores`.
 
 ```
-Raw score:      0.873  →  quantized to 0.85
-Raw score:      0.878  →  quantized to 0.90
+validator-scores/
+├── epoch-42/
+│   ├── 5F3sa...hotkey_A.json     # scores from validator A
+│   ├── 5Gw2p...hotkey_B.json     # scores from validator B
+│   └── ...
+└── epoch-43/
+    └── ...
 ```
 
-Two validators with raw scores 0.87 and 0.88 would disagree on the exact number, but after quantizing to q=0.05, both land on 0.85 or 0.90. The majority-vote layer ensures they usually land on the same side.
+Each validator publishes a JSON file after completing evaluation:
 
-#### 3. Consensus Epsilon (ε)
+```json
+{
+  "validator_hotkey": "5F3sa...",
+  "epoch": 42,
+  "block_height": 302400,
+  "scores": {
+    "uid_0": {
+      "final_score": 0.87,
+      "per_scenario": {
+        "client_escalation": 0.92,
+        "morning_brief": 0.85,
+        "inbox_to_action": 0.88,
+        "team_standup": 0.83
+      }
+    },
+    "uid_1": {
+      "final_score": 0.91,
+      "per_scenario": { "..." : "..." }
+    }
+  },
+  "signature": "0x3a1b..."
+}
+```
 
-When selecting the winner, miners whose quantized scores differ by ≤ε (default ε=0.02) are treated as **tied**. Ties are broken by earliest on-chain commitment block number (deterministic, every validator reads the same chain state).
+Per-scenario breakdowns are included for **auditability** — the community and team can investigate scoring patterns, identify overfitting, and debug disagreements.
+
+#### Signed Score Files
+
+Each score file is **signed with the validator's sr25519 hotkey** before publishing. The `signature` field contains the sr25519 signature over the canonical JSON payload (all fields except `signature`, serialized with sorted keys and no extra whitespace).
+
+**Verification**: Before including a score file in the stake-weighted aggregation, validators verify:
+1. The `validator_hotkey` matches a registered validator in the current metagraph
+2. The `signature` is a valid sr25519 signature over the payload, signed by that hotkey
+3. The hotkey has non-zero stake (prevents deregistered validators from lingering)
+
+**What this prevents**:
+- **Tampered scores**: A malicious actor with write access to the repo cannot alter another validator's scores — the signature check fails
+- **Forged score files**: Cannot create fake score files for validators who haven't published — requires the validator's private key
+- **Replay attacks**: The `epoch` and `block_height` fields are covered by the signature, so old scores cannot be replayed into new epochs
+
+#### Stake-Weighted Aggregation
+
+All validators pull scores from the shared repo and compute:
 
 ```
-Miner A: score=0.85 (committed at block 1,234,000)
-Miner B: score=0.85 (committed at block 1,234,500)
-→ Tied (|0.85 - 0.85| ≤ 0.02)
-→ Winner: Miner A (earlier commitment block)
+consensus_score[uid] = Σ(stake_i * score_i[uid]) / Σ(stake_i)
+
+where stake_i = validator i's TAO stake from metagraph
 ```
 
-This eliminates "coin-flip" winner selection when scores are nearly identical.
+The winner is the miner with the highest `consensus_score`, subject to the δ first-mover rule. Ties are broken by earliest on-chain commitment block number (deterministic).
 
-### Weight Setting
+Since every validator reads the **same repo** and the **same metagraph stakes**, they all compute the **same consensus scores** → same winner → 100% agreement on `set_weights`.
 
-Each validator independently:
-1. Reads miner commitments from the chain (`get_all_commitments`)
-2. Clones public repo and verifies commit
-3. Evaluates PolicyBundle using **majority-vote consensus** (N runs per scenario)
-4. Quantizes scores to grid q and applies first-mover rules
-5. Breaks ties within ε using on-chain commitment block number
-6. Sets weights on-chain (winner = 1.0, others = 0.0)
+#### Timing: Rolling Async Convergence
+
+Validators operate **asynchronously** — no synchronized phases or deadlines:
+
+1. **Evaluate**: Run ClawBench once per new/changed pack
+2. **Publish**: Push per-UID scores to validator-scores repo
+3. **Aggregate**: Pull all available scores, compute stake-weighted mean
+4. **Set weights**: Call `set_weights` on-chain
+5. **Repeat**: Every tempo (~72 min), re-pull scores, re-compute, re-submit weights
+
+```
+Example timeline (epoch 42, 3 validators):
+
+Hour 0.0:  Epoch 42 starts
+Hour 0.5:  Val A (fast) finishes eval → publishes scores
+           Val A pulls (sees only A) → set_weights based on own scores
+Hour 1.0:  Val B finishes → publishes
+           Val A re-pulls (sees A+B) → re-computes → set_weights
+           Val B pulls (sees A+B) → set_weights
+Hour 1.5:  Val C finishes → publishes
+           All pull (see A+B+C) → all compute same consensus → set_weights
+Hour 2-24: All validators re-submit same converged weights every tempo
+```
+
+**Convergence**: Early `set_weights` calls may briefly disagree (each validator only sees a subset of scores), but as more validators publish, they all see the same data and converge. By the time all validators have published (typically within 1-2 hours), consensus is 100%. Bittensor's Yuma consensus handles the brief transient disagreement naturally — it runs every tempo and stake-weights validator opinions.
+
+#### Score Persistence
+
+Scores **persist across epochs**. Validators only re-evaluate a UID when its on-chain commitment changes (new `pack_hash`). Between re-evaluations, validators re-publish their cached scores for that UID.
+
+This means: same benchmark + same pack → same score → no wasted compute. A miner holds their score until they submit a new pack or the benchmark itself changes (team adds/removes scenarios).
+
+When the **scenario pool changes** (e.g., team adds a 6th scenario), all packs must be re-evaluated on the new set. The team coordinates this via a version bump in the validator software.
 
 ### Yuma Consensus
 
-Bittensor's Yuma Consensus aggregates validator weights:
+Bittensor's Yuma Consensus still operates as the final layer:
 ```
-consensus_winner[miner] = majority(
-    validator_winner[miner]
+on_chain_weight[miner] = yuma_consensus(
+    validator_weights[miner]
     for each validator,
     weighted by validator_stake
 )
 ```
 
-**With consensus hardening**:
-- Majority-vote + quantization makes validators overwhelmingly likely to agree on the same winner
-- Epsilon tie-breaking uses deterministic data (on-chain commitment block numbers) so all validators resolve ties identically
-- Remaining disagreements are handled by Yuma consensus (dishonest/noisy validators get down-weighted)
-- No LLM-as-judge dependency, all scoring is regex-based within ClawBench
+**With shared score buckets**:
+- Validators converge on the same winner because they compute from the same shared data
+- Brief transient disagreements (before all scores are published) are handled by Yuma's stake-weighting
+- Dishonest validators who publish fake scores get down-weighted by Yuma consensus over time
+- All scoring is regex-based within ClawBench — no LLM-as-judge dependency
+- Published scores are publicly auditable in the validator-scores repo
 
 ### Validator Incentives
 
 Validators earn rewards for:
-- ✅ Agreement with consensus winner (validator bonding)
-- ✅ Setting weights regularly (not idle)
-- ✅ Running valid evaluations (not random)
-- ✅ Properly enforcing first-mover threshold rules
+- Agreement with consensus winner (validator bonding)
+- Setting weights regularly (not idle)
+- Running valid evaluations (not random)
+- Publishing scores to the shared repo (required for others to include your scores)
 
 **Attack resistance**:
-- Colluding validators can't fake scores (public repos + first-mover rules)
-- Dishonest validators get down-weighted by Yuma consensus
-- Community can audit validator decisions via public git history
+- Colluding validators can't fake miner packs (content-addressed + public repos)
+- Dishonest validators who publish inflated/deflated scores get down-weighted by Yuma consensus
+- **Signed score files** prevent tampering — each file is sr25519-signed by the validator's hotkey, verified before aggregation
+- Community can audit every validator's per-UID, per-scenario scores in the public validator-scores repo
+- Stake-weighted mean ensures high-stake validators have proportionally more influence
 
 ---
 
@@ -857,8 +835,12 @@ Target ≥ 0.85 for competitive scores. See [MINER_OPERATIONS.md: Score Targets]
 ### Scoring
 
 ```
-scenario_score = majority_vote(N runs per scenario)  # binary per-check
-final_score    = quantize(weighted_mean(scenario_scores) - ρ*variance, q)
+# Per validator (single run per scenario):
+scenario_score = earned_points / total_points
+final_score    = weighted_mean(scenario_scores) - ρ*variance
+
+# Across validators (shared score bucket):
+consensus_score[uid] = Σ(stake_i * score_i[uid]) / Σ(stake_i)
 ```
 
 ### Weights
@@ -873,9 +855,9 @@ weight[1st] = 0.70
 weight[2nd] = 0.20
 weight[3rd] = 0.10
 
-where winner = miner with highest quantized score that satisfies:
+where winner = miner with highest consensus_score that satisfies:
   - score > previous_best + δ (if not first)
-  - |score - runner_up| > ε (otherwise tie → earliest on-chain commitment block wins)
+  - ties broken by earliest on-chain commitment block number
   - public GitHub repo with valid commit
   - pack passes OPP v1 schema validation (AGENTS.md required, ≤32KB)
   - pack_similarity(pack, current_winner) < σ (NCD similarity check)
@@ -893,18 +875,14 @@ Bootstrap:     top-3 get 70/20/10 of miner alpha emissions
 
 | Parameter | Value | Tunable? |
 |-----------|-------|----------|
-| ρ (reliability weight) | 0.1 | ✅ Yes |
-| δ (first-mover threshold) | 0.05 | ✅ Yes |
-| q (score quantization) | 0.05 | ✅ Yes |
-| ε (consensus epsilon) | 0.02 | ✅ Yes |
-| N (runs per scenario) | 3 | ✅ Yes |
-| Scenario pool | 5 (select 4/epoch; 80% overlap until pool grows) | ✅ Yes |
-| Scenario weights | 1.0-1.5 per YAML | ✅ Yes |
-| Bootstrap threshold | 10 miners | ✅ Yes |
-| Epoch interval | 86400s (24h) | ✅ Yes |
-| σ (similarity threshold) | 0.80 (NCD) | ✅ Yes |
-| Inactivity window | 2 epochs (~48h) | ✅ Yes |
-| Context dimensions | 6 (~35M combos) | ✅ Yes |
+| ρ (reliability weight) | 0.1 | Yes |
+| δ (first-mover threshold) | 0.05 | Yes |
+| Scenario pool | 5 (all run every epoch; pool grows over time) | Yes |
+| Scenario weights | 1.0-1.5 per YAML | Yes |
+| Bootstrap threshold | 10 miners | Yes |
+| Epoch interval | 86400s (24h) | Yes |
+| σ (similarity threshold) | 0.80 (NCD) | Yes |
+| Inactivity window | 2 epochs (~48h) | Yes |
 
 ---
 
@@ -921,8 +899,8 @@ Bootstrap:     top-3 get 70/20/10 of miner alpha emissions
 
 ---
 
-**Version**: v1.03
+**Version**: v1.04
 
-**Date**: 2026-02-22
+**Date**: 2026-02-23
 
-**Status**: Implemented (validator + ClawBench scoring). Pending: on-chain commitment submission, miner implementation.
+**Status**: Implemented (validator + ClawBench scoring). Pending: on-chain commitment submission, shared score bucket, miner implementation.
