@@ -2,7 +2,7 @@
 
 **Subnet**: SN11 (TrajectoryRL)
 
-**Version**: v1.02
+**Version**: v1.03
 
 **Date**: 2026-02-22
 
@@ -284,15 +284,13 @@ Once the 10th miner registers and submits, the next epoch automatically switches
 | 1-9 | Bootstrap | Top-3: 70/20/10 |
 | 10+ | Steady state | Winner-take-all: 100/0/0 |
 
-### No Eligible Miners
+### Always Set Weights
 
-If **no miner scores above `min_score_threshold`** (default 0.30) in an epoch, the validator sets **uniform weights only among miners with a valid on-chain commitment** (passed schema + git verification). Miners without a valid commitment receive weight 0.
+Validators **always call `set_weights` every epoch** — never skip. Validators that don't set weights get deregistered by the chain, and there is no benefit to the complexity of conditional skipping.
 
-If **no miner has a valid commitment at all**, the validator **skips `set_weights`** for that epoch. This means the validator's `last_update` does not advance, and prolonged inactivity may lead to validator deregistration. However, this is preferable to the alternative: setting uniform weights across all UIDs would enable a Sybil attack where an attacker registers many UIDs, submits nothing, and collects free alpha. Validator self-weight is also not viable — Yuma Consensus applies self-weight masking, so it would be ignored.
+**Bootstrap at zero**: The initial best score is 0, so the **first miner to submit any valid pack immediately wins all the weight**. This gets beaten quickly as other miners join. There is no `min_score_threshold` — any valid pack that passes schema and git verification is eligible to win.
 
-In practice, this edge case (zero valid commitments) only occurs on a dead subnet. If the subnet recovers, the validator re-registers and resumes normally.
-
-Once a miner submits a valid pack scoring above `min_score_threshold`, normal winner-take-all resumes immediately.
+If no miner has a valid on-chain commitment, the validator sets **uniform weights across all registered UIDs**. This is a degenerate case (dead subnet) that resolves itself as soon as any miner submits.
 
 ### Miner Inactivity
 
@@ -311,7 +309,7 @@ Once a miner submits a valid pack scoring above `min_score_threshold`, normal wi
 | Score | 0 (no pack to evaluate) |
 | Weight | 0.0 |
 | Bootstrap threshold | Does NOT count. Only active miners count toward the 10-miner threshold |
-| First-mover protection | **Lost**: an inactive incumbent's `current_best_score` is treated as 0, so any active challenger with score > `min_score_threshold` can claim the crown without crossing δ |
+| First-mover protection | **Lost**: an inactive incumbent's `current_best_score` is treated as 0, so any active challenger can claim the crown without crossing δ |
 | Bittensor deregistration | Handled natively. Miners receiving weight 0.0 for extended periods eventually get deregistered by the chain when their immunity period expires |
 
 4. **Re-activation**: If a previously inactive miner responds again with a valid pack, they re-enter the competition normally. Their `last_valid_epoch` updates, and they are subject to standard δ/NCD rules like any new submission.
@@ -819,10 +817,9 @@ To earn non-zero rewards:
 | Requirement | Threshold |
 |-------------|-----------|
 | Schema validation | MUST pass |
-| Success rate | ≥ 0.3 (30%) |
 | Size limit | ≤ 32 KB |
 
-Packs failing these thresholds receive **score = 0**. Safety is enforced through high-value rubric checks, so failing safety checks costs more points per check than any other category.
+Packs failing schema validation or exceeding the size limit receive **score = 0**. There is no minimum score threshold — any valid pack is eligible to win. Safety is enforced through high-value rubric checks, so failing safety checks costs more points per check than any other category.
 
 ### Pack Rejection Flow
 
@@ -836,8 +833,7 @@ A miner's submission can fail at multiple points in the validation pipeline. The
 | **NCD similarity** ≥ threshold vs. current winner | 0 | 0.0 | No | Skipped |
 | **ClawBench timeout** (scenario exceeds `timeout_per_scenario`) | 0 for that scenario | Computed | Yes | Partial |
 | **ClawBench error** (LLM API failure, runtime crash) | 0 for that scenario | Computed | Yes | Partial |
-| **Score < `min_score_threshold`** (0.30) | Computed but treated as 0 for rewards | 0.0 | Yes | Full |
-| **Valid pack, above threshold** | Computed | Computed | Yes | Full |
+| **Valid pack** | Computed | Computed | Yes | Full |
 
 **Key rules**:
 
@@ -845,7 +841,6 @@ A miner's submission can fail at multiple points in the validation pipeline. The
 
 2. **"Active" means valid commitment**: A miner counts as "active" only if their on-chain commitment passes all pre-evaluation checks (schema, git, NCD) and at least one ClawBench scenario completes. This definition is used for:
    - Bootstrap threshold (need ≥10 *active* miners for winner-take-all)
-   - The "No Eligible Miners" fallback (uniform weights only if zero active miners score above `min_score_threshold`)
 
 3. **Partial failures are scored, not skipped**: If a pack passes schema but 1 of 4 scenarios times out, that scenario scores 0, but the other 3 still count. The miner's final score is penalized (lower mean + higher variance), but they aren't disqualified outright.
 
@@ -905,7 +900,6 @@ Bootstrap:     top-3 get 70/20/10 of miner alpha emissions
 | N (runs per scenario) | 3 | ✅ Yes |
 | Scenario pool | 5 (select 4/epoch; 80% overlap until pool grows) | ✅ Yes |
 | Scenario weights | 1.0-1.5 per YAML | ✅ Yes |
-| min_score_threshold | 0.30 | ✅ Yes |
 | Bootstrap threshold | 10 miners | ✅ Yes |
 | Epoch interval | 86400s (24h) | ✅ Yes |
 | σ (similarity threshold) | 0.80 (NCD) | ✅ Yes |
@@ -927,7 +921,7 @@ Bootstrap:     top-3 get 70/20/10 of miner alpha emissions
 
 ---
 
-**Version**: v1.02
+**Version**: v1.03
 
 **Date**: 2026-02-22
 
