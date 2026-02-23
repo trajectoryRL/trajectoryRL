@@ -2,7 +2,7 @@
 
 **Subnet**: SN11 (TrajectoryRL)
 
-**Version**: v1.05
+**Version**: v1.06
 
 **Date**: 2026-02-23
 
@@ -368,7 +368,7 @@ Current SN11 alpha (as of Feb 2026): ~$2.64 (1 alpha ≈ 0.015 TAO at current po
 ```
 
 **Estimated validator earnings** (SN11, medium stake ~5k TAO, ~10% of validator weight):
-- ~295 alpha/day, worth roughly 4 TAO at current pool rates (~$720/day at $180/TAO)
+- about 295 alpha/day, worth roughly 4 TAO at current pool rates (~$720/day at $180/TAO)
 - These are **alpha earnings, not TAO**. The TAO-equivalent fluctuates with the subnet's liquidity pool exchange rate
 - Actual earnings depend on total validator stake in the subnet, your share of it, and the alpha-TAO pool depth
 
@@ -413,7 +413,7 @@ An **epoch** is one complete evaluation cycle. The epoch number is derived from 
 2. Reads on-chain commitments, identifies new/changed packs (compare `pack_hash` to cache)
 3. Fetches and verifies new packs from GitHub
 4. Runs ClawBench **once** per new/changed pack on the **full scenario set**
-5. Publishes per-UID scores to the shared **validator-scores** repo (see [Validator Consensus](#validator-consensus))
+5. Submits per-UID scores to the shared **validator-scores** repo via PR (see [Validator Consensus](#validator-consensus))
 6. Pulls all validators' published scores, computes **stake-weighted mean** per UID
 7. Selects winner and sets on-chain weights
 
@@ -423,7 +423,7 @@ An **epoch** is one complete evaluation cycle. The epoch number is derived from 
 ┌──────────────────────────────────────────────────────────────────────┐
 │  Epoch N                                                             │
 │                                                                      │
-│  [Sync] → [Fetch Packs] → [Evaluate New] → [Publish] → [Aggregate]  │
+│  [Sync] → [Fetch Packs] → [Evaluate New] → [Publish] → [Aggregate]   │
 │  ~1s      ~1-5 min         ~5-30 min        ~30s        ~30s         │
 │                                                                      │
 │  Every tempo (~72 min): re-pull scores, re-compute, set_weights      │
@@ -629,7 +629,7 @@ Validators **share raw scores** and compute a **deterministic consensus** via st
 
 #### Shared Score Repository
 
-Validator scores are published to a team-managed GitHub monorepo: `trajectoryRL/validator-scores`.
+Validator scores are published to a team-managed GitHub repo: `trajectoryRL/validator-scores`. The repo is **append-only** for validators: they can only add score files via signed commits and pull requests. A CI pipeline verifies and auto-merges valid submissions.
 
 ```
 validator-scores/
@@ -640,6 +640,32 @@ validator-scores/
 └── epoch-43/
     └── ...
 ```
+
+#### Submission Flow
+
+Validators do **not** have direct write access to the repo. Instead, each validator:
+
+1. **Forks** the `validator-scores` repo (one-time setup)
+2. **Creates a score file** (`epoch-{N}/{hotkey}.json`) containing an sr25519 signature over the payload (see [Score File Schema](#score-file-schema))
+3. **Commits and pushes** to their fork
+4. **Opens a PR** against `trajectoryRL/validator-scores`
+
+A **GitHub Actions CI pipeline** on the repo automatically validates each PR:
+1. The PR only adds/updates a single file matching the pattern `epoch-{N}/{hotkey}.json`
+2. The JSON passes schema validation (required fields: `validator_hotkey`, `epoch`, `block_height`, `scores`, `signature`)
+3. The `signature` field is a valid sr25519 signature over the payload, signed by the `validator_hotkey`
+4. The `validator_hotkey` matches a registered validator in the current metagraph
+5. The validator has non-zero stake
+
+If all checks pass, the CI **auto-merges** the PR. If any check fails, the PR is rejected with a comment explaining why.
+
+**Why this design?**
+- **No direct push access**: Validators cannot modify each other's files, delete history, or force-push. Only the CI bot merges.
+- **Payload signatures**: The sr25519 signature inside the JSON is the authentication mechanism. Even if someone opens a PR, they cannot produce a valid signature without the validator's private key. Git commit signing is not used (sr25519 is incompatible with git's GPG/SSH signing).
+- **Audit trail**: Every score submission is a PR, visible in GitHub's merge history.
+- **Deterministic**: All validators pull from the same `main` branch and see the same merged scores.
+
+#### Score File Schema
 
 Each validator publishes a JSON file after completing evaluation:
 
@@ -667,21 +693,16 @@ Each validator publishes a JSON file after completing evaluation:
 }
 ```
 
-Per-scenario breakdowns are included for **auditability**: the community and team can investigate scoring patterns, identify overfitting, and debug disagreements.
+The `signature` field contains the sr25519 signature over the canonical JSON payload (all fields except `signature`, serialized with sorted keys and no extra whitespace). Per-scenario breakdowns are included for **auditability**: the community and team can investigate scoring patterns, identify overfitting, and debug disagreements.
 
-#### Signed Score Files
+#### Verification
 
-Each score file is **signed with the validator's sr25519 hotkey** before publishing. The `signature` field contains the sr25519 signature over the canonical JSON payload (all fields except `signature`, serialized with sorted keys and no extra whitespace).
-
-**Verification**: Before including a score file in the stake-weighted aggregation, validators verify:
+Before including a score file in the stake-weighted aggregation, validators verify:
 1. The `validator_hotkey` matches a registered validator in the current metagraph
 2. The `signature` is a valid sr25519 signature over the payload, signed by that hotkey
 3. The hotkey has non-zero stake (prevents deregistered validators from lingering)
 
-**What this prevents**:
-- **Tampered scores**: A malicious actor with write access to the repo cannot alter another validator's scores. The signature check fails
-- **Forged score files**: Cannot create fake score files for validators who haven't published. Requires the validator's private key
-- **Replay attacks**: The `epoch` and `block_height` fields are covered by the signature, so old scores cannot be replayed into new epochs
+These checks are redundant with the CI pipeline (defense-in-depth). Even if the CI is compromised, each validator independently rejects invalid score files.
 
 #### Stake-Weighted Aggregation
 
@@ -702,7 +723,7 @@ Since every validator reads the **same repo** and the **same metagraph stakes**,
 Validators operate **asynchronously** with no synchronized phases or deadlines:
 
 1. **Evaluate**: Run ClawBench once per new/changed pack
-2. **Publish**: Push per-UID scores to validator-scores repo
+2. **Publish**: Submit PR to validator-scores repo (CI verifies payload signature, auto-merges)
 3. **Aggregate**: Pull all available scores, compute stake-weighted mean
 4. **Set weights**: Call `set_weights` on-chain
 5. **Repeat**: Every tempo (~72 min), re-pull scores, re-compute, re-submit weights
@@ -726,6 +747,26 @@ Hour 2-24: All validators re-submit same converged weights every tempo
 #### Score Persistence
 
 Scores **persist across epochs**. Validators only re-evaluate a UID when its `pack_hash` changes. See [Benchmark Stability](#benchmark-stability) for details.
+
+#### Resilience and Recovery
+
+The validator-scores repo is a **coordination layer**, not the ultimate source of truth. On-chain weights (set via `set_weights`) are immutable and determine emissions. The repo only helps validators converge on which weights to set.
+
+**Why the repo is not a single point of failure:**
+
+1. **Git is distributed.** Every validator maintains a fork with the full commit history. If the upstream repo is lost or corrupted, it can be reconstructed from any validator's fork.
+2. **Scores are reconstructable.** ClawBench scoring is deterministic (regex-based, no LLM judge). Given the same pack (content-addressed, stored on miners' public GitHub repos) and the same model, any validator can re-run evaluation and produce identical scores.
+3. **On-chain weights survive.** Previous `set_weights` calls are recorded on the Bittensor chain and cannot be altered. Only the current epoch's consensus process would be disrupted during recovery.
+4. **Local retention.** Validators store their own computed scores locally before publishing. A repo outage does not erase data that validators already hold.
+
+**Recovery procedure** (if the upstream repo is lost or compromised):
+
+1. Team designates a validator fork with the most complete history as the new upstream
+2. Other validators re-point their forks and resume PR submissions
+3. Any missing epochs can be backfilled from validators' local score caches
+4. If a full rebuild is needed, validators re-evaluate current packs (unchanged `pack_hash` values are still on-chain via `set_commitments`)
+
+**What cannot be recovered from the repo alone:** The repo does not store on-chain data (miner commitments, validator stakes, weight history). That data lives on the Bittensor chain and is independently preserved by the substrate network.
 
 ### Yuma Consensus
 
@@ -756,7 +797,8 @@ Validators earn rewards for:
 **Attack resistance**:
 - Colluding validators can't fake miner packs (content-addressed + public repos)
 - Dishonest validators who publish inflated/deflated scores get down-weighted by Yuma consensus
-- **Signed score files** prevent tampering: each file is sr25519-signed by the validator's hotkey, verified before aggregation
+- **No direct write access**: Validators submit scores via PRs, auto-merged by CI after verification
+- **Signed score files** prevent impersonation: each file contains an sr25519 payload signature, verified both by CI and by every validator on pull
 - Community can audit every validator's per-UID, per-scenario scores in the public validator-scores repo
 - Stake-weighted mean ensures high-stake validators have proportionally more influence
 
@@ -875,7 +917,7 @@ Bootstrap:     top-3 get 70/20/10 of miner alpha emissions
 
 ---
 
-**Version**: v1.05
+**Version**: v1.06
 
 **Date**: 2026-02-23
 

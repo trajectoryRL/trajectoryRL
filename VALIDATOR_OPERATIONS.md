@@ -109,14 +109,17 @@ Even at 256 miners (worst case, all submitting new packs every day), LLM costs a
 
 ## Score Publishing
 
-Validators publish per-UID scores to the shared `trajectoryRL/validator-scores` GitHub repo after each evaluation. This is required for stake-weighted consensus — validators that don't publish are excluded from the aggregation.
+Validators publish per-UID scores to the shared `trajectoryRL/validator-scores` GitHub repo after each evaluation. This is required for stake-weighted consensus: validators that don't publish are excluded from the aggregation.
+
+Validators do not have direct write access to the repo. Scores are submitted via PRs that a CI pipeline auto-merges after verifying the sr25519 payload signature inside the JSON.
 
 Each epoch, the validator:
 1. Evaluates new/changed packs via ClawBench
-2. Signs the score JSON with its sr25519 hotkey
-3. Pushes the signed score file to `validator-scores/epoch-{N}/{hotkey}.json`
-4. Pulls all other validators' scores, computes stake-weighted mean
-5. Sets on-chain weights based on the consensus winner
+2. Creates a score file with an sr25519 signature over the payload
+3. Commits to its fork of `validator-scores`, opens a PR with the score file at `epoch-{N}/{hotkey}.json`
+4. CI verifies the payload signature, hotkey registration, stake, and JSON schema, then auto-merges
+5. Pulls all merged scores, computes stake-weighted mean
+6. Sets on-chain weights based on the consensus winner
 
 Every tempo (~72 min), the validator re-pulls scores, re-computes consensus, and re-submits weights. This allows consensus to converge as more validators publish their results.
 
