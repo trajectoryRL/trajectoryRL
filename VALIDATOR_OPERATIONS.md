@@ -1,7 +1,7 @@
 # Validator Operations Guide
 
 **Subnet**: SN11 (TrajectoryRL)
-**Date**: 2026-02-19
+**Date**: 2026-02-23
 
 > Operational guidance for running a TrajectoryRL validator. For mechanism design and scoring rules, see [INCENTIVE_MECHANISM.md](INCENTIVE_MECHANISM.md).
 
@@ -15,13 +15,15 @@ This is by design: miners compete on *intelligence* (better prompts/policies), n
 
 ## Validator Cost Model
 
-Each epoch, a validator evaluates every active miner:
+Each epoch, a validator evaluates every active miner whose pack has changed since last evaluation:
 
 ```
-episodes_per_epoch = scenarios_per_epoch(4) × seeds_per_task(3) = 12 per miner
-epochs_per_day     = 24h / epoch_interval(24h) = 1
-episodes_per_day   = miners × 12 × 1 = miners × 12
+episodes_per_new_miner = scenarios(5) × 1 run each = 5 per miner
+epochs_per_day         = 24h / epoch_interval(24h) = 1
+episodes_per_day       = new_or_changed_miners × 5
 ```
+
+> **Score persistence**: Validators only re-evaluate a miner when their `pack_hash` changes. Unchanged packs carry forward their cached score at zero cost. In steady state, most epochs evaluate only 0-2 new submissions.
 
 **Per-episode token estimate** (averaged across 5 scenarios):
 
@@ -40,16 +42,20 @@ Designated model: `anthropic/claude-sonnet-4-5-20250929` ($3/M input, $15/M outp
 
 **All validators must use the designated model.** This is a consensus requirement: if validators use different models, agents produce different tool-call sequences, leading to different rubric outcomes and validator disagreement on scores. Using the wrong model puts your validator out of consensus and risks down-weighting by Yuma.
 
+### Worst-case: all miners submit new packs every epoch
+
 | Active Miners | Episodes/day | Daily Cost | Monthly Cost |
 |:-------------:|:------------:|:----------:|:------------:|
-| 5 | 60 | **$1** | **$36** |
-| 14 | 168 | **$3** | **$101** |
-| 30 | 360 | **$7** | **$216** |
-| 64 | 768 | **$15** | **$461** |
-| 128 | 1,536 | **$31** | **$922** |
-| 256 | 3,072 | **$61** | **$1,843** |
+| 5 | 25 | **$0.50** | **$15** |
+| 14 | 70 | **$1.40** | **$42** |
+| 30 | 150 | **$3.00** | **$90** |
+| 64 | 320 | **$6.40** | **$192** |
+| 128 | 640 | **$12.80** | **$384** |
+| 256 | 1,280 | **$25.60** | **$768** |
 
-**Formula**: `daily_cost ≈ miners × $0.24/day` (at Sonnet pricing).
+**Worst-case formula**: `daily_cost ≈ miners × $0.10/day` (5 scenarios × $0.02/episode).
+
+In practice, most epochs only re-evaluate a handful of new/changed packs. A typical day with 30 miners and 2 new submissions costs ~$0.20, not $3.00.
 
 ## Miner Cost Model
 
@@ -63,10 +69,9 @@ Designated model: `anthropic/claude-sonnet-4-5-20250929` ($3/M input, $15/M outp
 
 ## Cost Reduction Levers
 
-1. **Prompt caching**: Anthropic prompt caching saves ~80% on input tokens (fixture data is identical across seeds for the same scenario)
-2. **Fewer seeds**: `seeds_per_task=1` instead of 3, 3x cheaper (but weaker consensus)
-3. **Fewer scenarios**: 2 per epoch instead of 4, 2x cheaper
-4. **Skip unchanged packs**: don't re-evaluate miners whose pack hash hasn't changed since last epoch
+1. **Score persistence** (built-in): Validators only re-evaluate when `pack_hash` changes — unchanged packs cost zero. This is the primary cost control mechanism
+2. **24h epoch interval** (built-in): Caps evaluation to once per miner per day, even if a miner submits multiple times
+3. **Prompt caching**: Anthropic prompt caching saves ~80% on input tokens (fixture data is identical across runs for the same scenario)
 
 ## Sustainability
 
@@ -78,24 +83,46 @@ Validators earn **subnet alpha**, not TAO directly. Alpha can be swapped for TAO
 Estimated alpha earnings (medium stake ~5k TAO, ~10% validator weight):
   ~295 alpha/day ≈ 4 TAO-equivalent at current pool rate ≈ $720/day
 
-Example (30 miners):
-  Daily costs:   30 × $0.24 = $7.20/day
+Example (30 miners, worst-case all submit new packs):
+  Daily costs:   30 × $0.10 = $3.00/day
   Daily revenue: ~$720/day (alpha, at current pool rate)
-  Net profit:    ~$713/day (~99% margin)
+  Net profit:    ~$717/day (~99% margin)
+
+Example (30 miners, typical day with 2 new submissions):
+  Daily costs:   2 × $0.10 = $0.20/day
+  Daily revenue: ~$720/day
+  Net profit:    ~$720/day
 ```
 
 **At current rates**, TrajectoryRL validators are highly profitable:
 
-| Scenario | Daily Cost | Daily Revenue (~$720 alpha) | Monthly Profit |
+| Scenario | Daily Cost (worst-case) | Daily Revenue (~$720 alpha) | Monthly Profit |
 |----------|:----------:|:---------------------------:|:--------------:|
-| 30 miners | $7 | $720 | **$21,390** |
-| 64 miners | $15 | $720 | **$21,150** |
-| 128 miners | $31 | $720 | **$20,670** |
-| 256 miners | $61 | $720 | **$19,770** |
+| 30 miners | $3.00 | $720 | **$21,510** |
+| 64 miners | $6.40 | $720 | **$21,408** |
+| 128 miners | $12.80 | $720 | **$21,216** |
+| 256 miners | $25.60 | $720 | **$20,832** |
 
-Even at 256 miners (worst case), LLM costs are only **~8%** of validator alpha revenue. Sonnet 4.5 remains economically viable at any realistic scale.
+Even at 256 miners (worst case, all submitting new packs every day), LLM costs are only **~4%** of validator alpha revenue. In practice, costs are far lower due to score persistence.
 
-**Break-even analysis**: At 256 miners ($61/day cost), the alpha-TAO pool rate would need to drop ~12x from current levels before validators become unprofitable. Note: these figures fluctuate with pool exchange rates and subnet demand.
+**Break-even analysis**: At 256 miners ($25.60/day worst-case cost), the alpha-TAO pool rate would need to drop ~28x from current levels before validators become unprofitable. Note: these figures fluctuate with pool exchange rates and subnet demand.
+
+## Score Publishing
+
+Validators publish per-UID scores to the shared `trajectoryRL/validator-scores` GitHub repo after each evaluation. This is required for stake-weighted consensus — validators that don't publish are excluded from the aggregation.
+
+Each epoch, the validator:
+1. Evaluates new/changed packs via ClawBench
+2. Signs the score JSON with its sr25519 hotkey
+3. Pushes the signed score file to `validator-scores/epoch-{N}/{hotkey}.json`
+4. Pulls all other validators' scores, computes stake-weighted mean
+5. Sets on-chain weights based on the consensus winner
+
+Every tempo (~72 min), the validator re-pulls scores, re-computes consensus, and re-submits weights. This allows consensus to converge as more validators publish their results.
+
+For full details on the shared score bucket, signed score files, and stake-weighted aggregation, see [INCENTIVE_MECHANISM.md — Validator Consensus](INCENTIVE_MECHANISM.md#validator-consensus).
+
+---
 
 ## Automatic Updates
 
