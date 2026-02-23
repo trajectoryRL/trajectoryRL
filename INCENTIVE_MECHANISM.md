@@ -2,9 +2,9 @@
 
 **Subnet**: SN11 (TrajectoryRL)
 
-**Version**: v1.01
+**Version**: v1.02
 
-**Date**: 2026-02-20
+**Date**: 2026-02-22
 
 ---
 
@@ -18,7 +18,7 @@ TrajectoryRL rewards miners who submit **high-quality policy packs** (also calle
 
 Validators evaluate packs using **deterministic ClawBench scenarios** and set on-chain weights based on objective, reproducible scores.
 
-> **Current Status**: Validator and ClawBench scoring are implemented. Miner implementation is in progress, see [Status](#summary) for details.
+> **Current Status**: Validator and ClawBench scoring are implemented. On-chain commitment submission and miner implementation are in progress, see [Status](#summary) for details.
 
 ---
 
@@ -200,34 +200,47 @@ For the reference miner implementation and local testing, see [MINER_OPERATIONS.
 
 ## Submission Protocol
 
-### GitHub-Based Public Submission
+### On-Chain Commitments + Public GitHub
 
-Miners must follow this submission flow:
+Miners publish packs to their own **public GitHub repository** and submit pack metadata **on-chain** via Bittensor's `set_commitment` extrinsic. Validators read submissions directly from the chain and fetch packs from the miner's repo. Miners do not need to run a server or have a public IP.
+
+> **v1.02 change**: Replaces the previous dendrite/axon P2P protocol (`PackRequest`/`PackResponse` synapses) with on-chain commitments. Miners no longer need to run an axon HTTP server or maintain a public IP.
+
+#### Submission Flow
 
 **Step 1: Publish to GitHub**
 - Create a public GitHub repository
-- Commit PolicyBundle (AGENTS.md, SOUL.md, etc.) to the repo
-- Push to GitHub (the server-side push timestamp establishes precedence)
+- Commit PolicyBundle (`pack.json`) to the repo
+- Push to GitHub
 
-**Step 2: Submit On-Chain**
-- Validator sends `PackRequest`; miner responds with `PackResponse(git_commit_hash, repo_url, pack_hash)`
-- Commit hash must be reachable from HEAD
+**Step 2: Commit on-chain**
+- Miner calls `subtensor.set_commitment(netuid=11, data=commitment_string)` with their pack metadata
+- The commitment contains: `pack_hash`, `git_commit_hash`, and `repo_url` (compact-encoded to fit 128-byte limit)
+- The chain records the commitment with a **block-timestamped** entry — unforgeable and deterministic
+- Commit hash must be reachable from HEAD of the repo
+- Rate limit: one commitment per ~100 blocks (~20 min) per hotkey — sufficient for daily epochs
 
-**Step 3: Validator Verification**
-Validators verify:
-1. Repository is publicly accessible
-2. Commit hash exists and is valid
-3. **Server-side push timestamp** (via GitHub API) is before submission time (uses on-chain block timestamp from Substrate Timestamp pallet for deterministic, cross-validator agreement)
-4. Pack content matches `pack_hash`
+**Step 3: Validator verification**
+Each epoch, validators read all miner commitments from the chain via `subtensor.get_all_commitments(netuid=11)`, then verify:
+1. Commitment is parseable and contains required fields (`pack_hash`, `git_commit_hash`, `repo_url`)
+2. Repository is publicly accessible
+3. Git commit hash exists and is valid
+4. Pack content at that commit matches `pack_hash`
 5. PolicyBundle passes schema validation
 6. **NCD similarity** vs. current winner < `similarity_threshold` (0.80), see [Pack Similarity Detection](#9-pack-similarity-detection-ncd)
 
-**Why Public GitHub + Server-Side Timestamps?**
-- GitHub API push timestamps are server-controlled and cannot be forged
-- Git committer dates (`git commit --date`) are NOT trusted, only used for divergence detection
-- Public repos prevent retroactive changes
-- Community can audit and learn from winning policies
+**First-mover precedence** is determined by the **on-chain commitment block number**. The pack must exist in the miner's repo at the referenced commit hash — if a miner force-pushes and the commit disappears, their commitment becomes invalid and they score 0.
+
+**Why On-Chain Commitments (instead of dendrite/axon)?**
+- **No server required**: Miners commit once and go offline — no axon, no public IP, no uptime requirement
+- **Deterministic discovery**: All validators read the same chain state, eliminating disagreements from network failures or timeouts
+- **Unforgeable timestamps**: Block-timestamped by the Substrate chain, not by the miner
+- **Simpler architecture**: Eliminates dendrite/axon P2P protocol, synapse definitions, retry logic, and timeout handling
+
+**Why Public GitHub?**
+- Public repos allow community audit and learning from winning policies
 - Commit history creates innovation trail
+- Force-push is self-punishing: if the referenced commit disappears, the miner's submission becomes invalid
 
 ---
 
@@ -253,7 +266,7 @@ weight[3rd place] = 0.10  (10%)
 weight[all others] = 0.0
 ```
 
-Ties within a rank are broken by earliest push timestamp (same rule as steady-state).
+Ties within a rank are broken by earliest on-chain commitment (same rule as steady-state).
 
 **Example** (bootstrap phase, 5 active miners):
 ```
@@ -273,23 +286,23 @@ Once the 10th miner registers and submits, the next epoch automatically switches
 
 ### No Eligible Miners
 
-If **no miner scores above `min_score_threshold`** (default 0.30) in an epoch, the validator sets **uniform weights only among miners who responded with a valid pack** (passed schema + git verification). Non-responsive miners receive weight 0.
+If **no miner scores above `min_score_threshold`** (default 0.30) in an epoch, the validator sets **uniform weights only among miners with a valid on-chain commitment** (passed schema + git verification). Miners without a valid commitment receive weight 0.
 
-If **no miner responded at all**, the validator **skips `set_weights`** for that epoch. This means the validator's `last_update` does not advance, and prolonged inactivity may lead to validator deregistration. However, this is preferable to the alternative: setting uniform weights across all UIDs would enable a Sybil attack where an attacker registers many UIDs, submits nothing, and collects free alpha. Validator self-weight is also not viable — Yuma Consensus applies self-weight masking, so it would be ignored.
+If **no miner has a valid commitment at all**, the validator **skips `set_weights`** for that epoch. This means the validator's `last_update` does not advance, and prolonged inactivity may lead to validator deregistration. However, this is preferable to the alternative: setting uniform weights across all UIDs would enable a Sybil attack where an attacker registers many UIDs, submits nothing, and collects free alpha. Validator self-weight is also not viable — Yuma Consensus applies self-weight masking, so it would be ignored.
 
-In practice, this edge case (zero responsive miners) only occurs on a dead subnet. If the subnet recovers, the validator re-registers and resumes normally.
+In practice, this edge case (zero valid commitments) only occurs on a dead subnet. If the subnet recovers, the validator re-registers and resumes normally.
 
 Once a miner submits a valid pack scoring above `min_score_threshold`, normal winner-take-all resumes immediately.
 
 ### Miner Inactivity
 
-**Problem**: What if a miner registers, wins once, then stops responding? Without explicit handling, the miner's stale pack could hold the throne indefinitely (protected by δ), and the miner could count toward the bootstrap threshold despite being offline.
+**Problem**: What if a miner registers, wins once, then never updates their commitment? Without explicit handling, the miner's stale pack could hold the throne indefinitely (protected by δ), and the miner could count toward the bootstrap threshold despite being inactive.
 
 **Rules**:
 
-1. **Activity window**: A miner is considered "active" if they responded with a valid pack (passes schema + git verification) within the last `inactivity_window` epochs (default: 2 epochs = ~48 hours).
+1. **Activity window**: A miner is considered "active" if they have a valid on-chain commitment (passes schema + git verification) that was updated within the last `inactivity_window` epochs (default: 2 epochs = ~48 hours).
 
-2. **Tracking**: Validators track `last_valid_epoch[miner_uid]`, the most recent epoch in which the miner submitted a pack that passed pre-evaluation checks.
+2. **Tracking**: Validators track `last_valid_epoch[miner_uid]`, the most recent epoch in which the miner's on-chain commitment passed pre-evaluation checks.
 
 3. **Consequences of inactivity** (no valid submission for > `inactivity_window` epochs):
 
@@ -321,7 +334,7 @@ new_score > current_best_score + δ
 Where:
 - **δ** = 0.05 (5% improvement threshold)
 - **current_best_score** = current epoch score of the first-mover
-- Chronological order determined by **GitHub server-side push timestamp** (not forgeable git commit date)
+- Chronological order determined by **on-chain commitment block number** (unforgeable)
 
 **Example Timeline**:
 ```
@@ -520,27 +533,22 @@ Beyond identity variation, the epoch seed also controls:
 
 ## Anti-Gaming Measures
 
-### 1. Server-Side Push Timestamps
+### 1. On-Chain Commitments + Content-Addressed Packs
 
-**Enforcement**: All submissions must be git commits in public repos; validators verify using **GitHub's server-side push timestamps** (not git committer dates)
+**Enforcement**: All submissions must be git commits in public repos; first-mover precedence determined by **on-chain commitment block number** (unforgeable).
 
 **Prevents**:
-- `git commit --date` / `GIT_COMMITTER_DATE` timestamp forgery
-- Retroactive pack changes after seeing validator feedback
-- Private optimization followed by submission date manipulation
-- Claims of earlier innovation without proof
+- `git commit --date` / `GIT_COMMITTER_DATE` timestamp forgery (on-chain block timestamp is the source of truth, git dates are ignored)
+- Retroactive pack changes after seeing validator feedback (force-push is self-punishing — referenced commit disappears → score 0)
+- Claims of earlier innovation without proof (on-chain commitment is permanent and block-timestamped)
 
 **How it works**:
-- Git commit SHA creates cryptographic link to exact code state
-- Validators query **GitHub API** for the server-recorded push time:
-  1. **REST Events API**: `PushEvent.created_at` (no auth for public repos)
-  2. **GraphQL API**: `Commit.pushedDate` (requires `GITHUB_TOKEN`)
-- These timestamps are set by GitHub's servers, not by the committer
-- Validators reject pushes with server timestamp after submission time
-- Large divergence between git committer date and push date is logged as a forgery warning
+- Miner pushes pack to their public GitHub repo
+- Miner calls `set_commitment` on-chain with `pack_hash` + `git_commit_hash` + `repo_url`
+- On-chain commitment is block-timestamped by the Substrate chain — unforgeable and deterministic
+- Validators verify that the referenced commit exists and `sha256(pack.json)` matches `pack_hash`
+- Force-push is self-punishing: if the commit disappears, the miner's commitment becomes invalid (score 0)
 - Public repos allow community audit and verification
-
-**Validator requirement**: Set `GITHUB_TOKEN` env var for reliable GraphQL-based verification. Without it, only the REST Events API is available (limited to last 90 days, 60 req/hr unauthenticated).
 
 ### 2. First-Mover Advantage (δ Threshold)
 
@@ -749,13 +757,13 @@ Two validators with raw scores 0.87 and 0.88 would disagree on the exact number,
 
 #### 3. Consensus Epsilon (ε)
 
-When selecting the winner, miners whose quantized scores differ by ≤ε (default ε=0.02) are treated as **tied**. Ties are broken by earliest push timestamp (deterministic, every validator queries the same GitHub API).
+When selecting the winner, miners whose quantized scores differ by ≤ε (default ε=0.02) are treated as **tied**. Ties are broken by earliest on-chain commitment block number (deterministic, every validator reads the same chain state).
 
 ```
-Miner A: score=0.85 (pushed 10:00 AM)
-Miner B: score=0.85 (pushed 2:00 PM)
+Miner A: score=0.85 (committed at block 1,234,000)
+Miner B: score=0.85 (committed at block 1,234,500)
 → Tied (|0.85 - 0.85| ≤ 0.02)
-→ Winner: Miner A (earlier push timestamp)
+→ Winner: Miner A (earlier commitment block)
 ```
 
 This eliminates "coin-flip" winner selection when scores are nearly identical.
@@ -763,11 +771,11 @@ This eliminates "coin-flip" winner selection when scores are nearly identical.
 ### Weight Setting
 
 Each validator independently:
-1. Queries miners for pack submissions (git commit hash + repo URL)
+1. Reads miner commitments from the chain (`get_all_commitments`)
 2. Clones public repo and verifies commit
 3. Evaluates PolicyBundle using **majority-vote consensus** (N runs per scenario)
 4. Quantizes scores to grid q and applies first-mover rules
-5. Breaks ties within ε using push timestamps
+5. Breaks ties within ε using on-chain commitment block number
 6. Sets weights on-chain (winner = 1.0, others = 0.0)
 
 ### Yuma Consensus
@@ -783,7 +791,7 @@ consensus_winner[miner] = majority(
 
 **With consensus hardening**:
 - Majority-vote + quantization makes validators overwhelmingly likely to agree on the same winner
-- Epsilon tie-breaking uses deterministic data (push timestamps) so all validators resolve ties identically
+- Epsilon tie-breaking uses deterministic data (on-chain commitment block numbers) so all validators resolve ties identically
 - Remaining disagreements are handled by Yuma consensus (dishonest/noisy validators get down-weighted)
 - No LLM-as-judge dependency, all scoring is regex-based within ClawBench
 
@@ -822,7 +830,7 @@ A miner's submission can fail at multiple points in the validation pipeline. The
 
 | Failure | Score | Weight | Counts as Active? | ClawBench Runs? |
 |---------|:-----:|:------:|:------------------:|:---------------:|
-| **No response** to PackRequest | 0 | 0.0 | No | Skipped |
+| **No commitment** on-chain (or unparseable) | 0 | 0.0 | No | Skipped |
 | **Invalid git repo** (404, private, bad commit) | 0 | 0.0 | No | Skipped |
 | **Schema validation failure** (missing AGENTS.md, >32KB, bad semver) | 0 | 0.0 | No | Skipped |
 | **NCD similarity** ≥ threshold vs. current winner | 0 | 0.0 | No | Skipped |
@@ -835,7 +843,7 @@ A miner's submission can fail at multiple points in the validation pipeline. The
 
 1. **Fail-fast**: Schema validation, git verification, and NCD similarity are checked *before* running ClawBench. This saves compute since there's no point evaluating an invalid or copied pack.
 
-2. **"Active" means valid submission**: A miner counts as "active" only if their pack passes all pre-evaluation checks (schema, git, NCD) and at least one ClawBench scenario completes. This definition is used for:
+2. **"Active" means valid commitment**: A miner counts as "active" only if their on-chain commitment passes all pre-evaluation checks (schema, git, NCD) and at least one ClawBench scenario completes. This definition is used for:
    - Bootstrap threshold (need ≥10 *active* miners for winner-take-all)
    - The "No Eligible Miners" fallback (uniform weights only if zero active miners score above `min_score_threshold`)
 
@@ -872,8 +880,7 @@ weight[3rd] = 0.10
 
 where winner = miner with highest quantized score that satisfies:
   - score > previous_best + δ (if not first)
-  - |score - runner_up| > ε (otherwise tie → earliest push timestamp wins)
-  - github_push_timestamp < on_chain_submission_time (server-side, not forgeable)
+  - |score - runner_up| > ε (otherwise tie → earliest on-chain commitment block wins)
   - public GitHub repo with valid commit
   - pack passes OPP v1 schema validation (AGENTS.md required, ≤32KB)
   - pack_similarity(pack, current_winner) < σ (NCD similarity check)
@@ -920,8 +927,8 @@ Bootstrap:     top-3 get 70/20/10 of miner alpha emissions
 
 ---
 
-**Version**: v1.01
+**Version**: v1.02
 
-**Date**: 2026-02-20
+**Date**: 2026-02-22
 
-**Status**: Implemented (validator + ClawBench scoring + on-chain block timestamps). Pending: miner implementation.
+**Status**: Implemented (validator + ClawBench scoring). Pending: on-chain commitment submission, miner implementation.
