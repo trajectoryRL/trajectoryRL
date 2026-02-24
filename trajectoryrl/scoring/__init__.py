@@ -217,15 +217,17 @@ class TrajectoryScorer:
 
         Consensus-safe: miners whose quantized scores differ by less than
         ``consensus_epsilon`` are treated as tied. Ties are broken in favour
-        of the earliest submitter (by push timestamp), which every validator
-        can resolve identically.
+        of the earliest submitter (by on-chain block number), which every
+        validator can resolve identically.
 
-        Anti-stagnation is handled by epoch-seeded scenario variation (not
-        by decaying δ).  See ``TrajectoryValidator._select_epoch_scenarios``.
+        Anti-stagnation is handled by epoch-seeded context variation (not
+        by decaying δ).
 
         Args:
             scores: Dict of miner_uid -> quantized score [0, 1]
-            first_mover_data: Dict of hotkey -> (score, timestamp)
+            first_mover_data: Dict of hotkey -> (score, block_number).
+                block_number is the on-chain block at which the miner first
+                submitted; lower block number = earlier submission.
             delta: First-mover threshold (new score must beat best + delta)
             num_active_miners: Total active miners in metagraph.
                 If None, defaults to len(scores).
@@ -262,14 +264,14 @@ class TrajectoryScorer:
 
         resolved_by_epsilon = False
         if len(tied_uids) > 1 and first_mover_data:
-            # Break tie by earliest push timestamp (look up by hotkey)
+            # Break tie by earliest block number (look up by hotkey)
             tied_with_ts = []
             for uid in tied_uids:
                 hk = _uid_to_hotkey.get(uid)
                 if hk and hk in first_mover_data:
                     tied_with_ts.append((uid, first_mover_data[hk][1]))
             if tied_with_ts:
-                tied_with_ts.sort(key=lambda x: x[1])  # earliest first
+                tied_with_ts.sort(key=lambda x: x[1])  # lowest block first
                 best_uid = tied_with_ts[0][0]
                 best_score = scores[best_uid]
                 resolved_by_epsilon = True
@@ -280,11 +282,11 @@ class TrajectoryScorer:
 
         # Apply first-mover protection (constant δ threshold).
         # Skip if winner was already resolved by epsilon tie-break (which
-        # already used timestamps, so re-applying delta would undo it).
+        # already used block numbers, so re-applying delta would undo it).
         if first_mover_data and not resolved_by_epsilon:
             for hotkey, (_, ts) in sorted(
                 first_mover_data.items(),
-                key=lambda x: x[1][1]  # Sort by timestamp
+                key=lambda x: x[1][1]  # Sort by block number (ascending)
             ):
                 # Reverse-lookup: find the UID currently using this hotkey
                 uid = next(
@@ -326,11 +328,11 @@ class TrajectoryScorer:
         """Graduated reward curve for the bootstrap phase.
 
         Top-3 miners receive 70% / 20% / 10% of rewards. Ties are broken
-        by earliest push timestamp (same rule as steady-state).
+        by earliest block number (same rule as steady-state).
 
         Args:
             scores: Dict of miner_uid -> quantized score
-            first_mover_data: Dict of hotkey -> (score, timestamp)
+            first_mover_data: Dict of hotkey -> (score, block_number)
             uid_to_hotkey: Dict of miner_uid -> hotkey
 
         Returns:
@@ -338,7 +340,7 @@ class TrajectoryScorer:
         """
         BOOTSTRAP_SHARES = [0.70, 0.20, 0.10]
 
-        # Sort by score desc, breaking ties by earliest push timestamp
+        # Sort by score desc, breaking ties by earliest block number
         def sort_key(uid: int) -> Tuple[float, float]:
             hk = uid_to_hotkey.get(uid)
             ts = first_mover_data[hk][1] if hk and hk in first_mover_data else float("inf")

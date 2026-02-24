@@ -71,20 +71,31 @@ class ValidatorConfig:
     # Scoring config
     rho_reliability: float = 0.1  # 10% weight on variance
     delta_threshold: float = 0.05  # 5% first-mover advantage threshold
-    scenarios_per_epoch: int = 4  # How many scenarios to evaluate per epoch (from pool)
 
     # Consensus config (mitigates LLM non-determinism across validators)
     score_quantization: float = 0.05  # Round scores to nearest 0.05
     consensus_epsilon: float = 0.02  # Scores within ε are tied; tie → first-mover wins
 
-    # Minimum score to be eligible for rewards (INCENTIVE_MECHANISM.md § Pack Requirements)
-    min_score_threshold: float = 0.30  # Miners below this get weight=0
-
     # Bootstrap config (graduated rewards until enough miners join)
     bootstrap_threshold: int = 10  # When active miners < this, use top-3 curve (70/20/10)
 
+    # NCD similarity threshold (reject packs >= this similarity to current winner)
+    similarity_threshold: float = 0.80
+
+    # Inactivity tracking
+    inactivity_window: int = 2  # Epochs before losing first-mover protection
+
     # GitHub verification
     github_token: Optional[str] = None  # GITHUB_TOKEN env var; needed for push timestamp
+
+    # Validator score publishing (shared score bucket)
+    validator_scores_fork_url: Optional[str] = None  # Validator's fork of validator-scores repo
+    validator_scores_local_path: Path = field(
+        default_factory=lambda: Path("/tmp/trajectoryrl_validator_scores")
+    )
+
+    # Weight cadence (set weights every tempo, not just every epoch)
+    weight_interval_blocks: int = 360  # 1 tempo ≈ 72 min at 12s/block
 
     # Pack caching
     pack_cache_dir: Path = field(
@@ -164,4 +175,8 @@ class ValidatorConfig:
             epoch_interval=int(os.getenv("EPOCH_INTERVAL", "86400")),
             github_token=os.getenv("GITHUB_TOKEN"),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
+            similarity_threshold=float(os.getenv("SIMILARITY_THRESHOLD", "0.80")),
+            inactivity_window=int(os.getenv("INACTIVITY_WINDOW", "2")),
+            validator_scores_fork_url=os.getenv("VALIDATOR_SCORES_FORK_URL"),
+            weight_interval_blocks=int(os.getenv("WEIGHT_INTERVAL_BLOCKS", "360")),
         )
