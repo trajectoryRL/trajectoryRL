@@ -281,13 +281,26 @@ class TrajectoryScorer:
                 )
 
         # Apply first-mover protection (constant δ threshold).
+        # Only an EARLIER submitter can block a later challenger.
         # Skip if winner was already resolved by epsilon tie-break (which
         # already used block numbers, so re-applying delta would undo it).
         if first_mover_data and not resolved_by_epsilon:
+            # Look up the current best's block number
+            best_hotkey = _uid_to_hotkey.get(best_uid)
+            best_block = (
+                first_mover_data[best_hotkey][1]
+                if best_hotkey and best_hotkey in first_mover_data
+                else float("inf")
+            )
+
             for hotkey, (_, ts) in sorted(
                 first_mover_data.items(),
                 key=lambda x: x[1][1]  # Sort by block number (ascending)
             ):
+                # Only earlier submitters can block the current best
+                if ts >= best_block:
+                    continue
+
                 # Reverse-lookup: find the UID currently using this hotkey
                 uid = next(
                     (u for u, hk in _uid_to_hotkey.items() if hk == hotkey),
@@ -298,7 +311,7 @@ class TrajectoryScorer:
                     # threshold so stale packs lose protection naturally.
                     current = scores[uid]
                     required_score = current + delta
-                    if best_score <= required_score and uid != best_uid:
+                    if best_score <= required_score:
                         logger.info(
                             f"First-mover protection: Miner {uid} (score={current:.3f}) "
                             f"blocks Miner {best_uid} (score={best_score:.3f}, "
