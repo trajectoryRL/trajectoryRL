@@ -123,6 +123,9 @@ class TrajectoryValidator:
         self.current_winner_pack: Optional[dict] = None
         self.current_winner_uid: Optional[int] = None
 
+        # Evaluated packs by UID (populated during epoch, used to set current_winner_pack)
+        self._uid_packs: Dict[int, dict] = {}
+
         # Score history for tracking
         self.score_history: Dict[int, List[float]] = defaultdict(list)
 
@@ -467,6 +470,7 @@ class TrajectoryValidator:
             return 0.0, {}
 
         pack = verification.pack_content
+        self._uid_packs[miner_uid] = pack
 
         # Step 3: Schema validation
         lint_result = validate_opp_schema(pack)
@@ -632,7 +636,7 @@ class TrajectoryValidator:
         winner_uid = max(weights_dict, key=weights_dict.get)
         if weights_dict.get(winner_uid, 0) > 0:
             self.current_winner_uid = winner_uid
-            # current_winner_pack is set from cache during evaluation
+            self.current_winner_pack = self._uid_packs.get(winner_uid)
 
         # Log results
         logger.info("=" * 60)
