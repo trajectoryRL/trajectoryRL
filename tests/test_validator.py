@@ -521,39 +521,8 @@ class TestEpochSeedAndScenarioRotation:
         assert isinstance(seed, int)
         assert seed > 0
 
-    def test_select_epoch_scenarios_all_when_small_pool(self):
-        """When pool <= max_scenarios, all are returned."""
-        scenarios = ["a", "b", "c"]
-        selected = TrajectoryValidator.select_epoch_scenarios(scenarios, epoch_seed=42, max_scenarios=4)
-        assert selected == sorted(scenarios)
-
-    def test_select_epoch_scenarios_subsets_large_pool(self):
-        """When pool > max_scenarios, a subset is returned."""
-        scenarios = ["a", "b", "c", "d", "e", "f", "g"]
-        selected = TrajectoryValidator.select_epoch_scenarios(scenarios, epoch_seed=42, max_scenarios=4)
-        assert len(selected) == 4
-        assert all(s in scenarios for s in selected)
-
-    def test_select_epoch_scenarios_deterministic(self):
-        """Same seed always selects the same subset."""
-        scenarios = ["a", "b", "c", "d", "e", "f", "g"]
-        sel1 = TrajectoryValidator.select_epoch_scenarios(scenarios, epoch_seed=42, max_scenarios=4)
-        sel2 = TrajectoryValidator.select_epoch_scenarios(scenarios, epoch_seed=42, max_scenarios=4)
-        assert sel1 == sel2
-
-    def test_select_epoch_scenarios_varies_by_seed(self):
-        """Different seeds can select different subsets."""
-        scenarios = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]
-        sel1 = TrajectoryValidator.select_epoch_scenarios(scenarios, epoch_seed=1, max_scenarios=4)
-        sel2 = TrajectoryValidator.select_epoch_scenarios(scenarios, epoch_seed=2, max_scenarios=4)
-        # With 10 scenarios and 4 chosen, different seeds very likely produce different subsets
-        assert sel1 != sel2
-
-    def test_select_epoch_scenarios_sorted(self):
-        """Selected scenarios are returned sorted."""
-        scenarios = ["z", "m", "a", "f", "q", "b", "x"]
-        selected = TrajectoryValidator.select_epoch_scenarios(scenarios, epoch_seed=42, max_scenarios=4)
-        assert selected == sorted(selected)
+    # NOTE: select_epoch_scenarios was removed in v0.2.0.
+    # All scenarios run every epoch (per INCENTIVE_MECHANISM.md v1.06).
 
 
 # ===================================================================
@@ -1596,9 +1565,357 @@ class TestValidatorConfig:
         defaults = ValidatorConfig.__dataclass_fields__
         assert defaults["rho_reliability"].default == 0.1
         assert defaults["delta_threshold"].default == 0.05
-        assert defaults["scenarios_per_epoch"].default == 4
         assert defaults["seeds_per_task"].default == 3
         assert defaults["epoch_interval"].default == 86400
+        assert defaults["similarity_threshold"].default == 0.80
+        assert defaults["inactivity_window"].default == 2
+        assert defaults["weight_interval_blocks"].default == 360
+
+
+# ===================================================================
+# NCD Similarity Tests
+# ===================================================================
+
+
+class TestNCDSimilarity:
+    """Tests for Normalized Compression Distance anti-copy check."""
+
+    def test_identical_packs(self):
+        from trajectoryrl.utils.ncd import pack_similarity, is_too_similar
+        a = {"files": {"AGENTS.md": "Be safe and careful. Follow instructions."}}
+        b = {"files": {"AGENTS.md": "Be safe and careful. Follow instructions."}}
+        sim = pack_similarity(a, b)
+        assert sim > 0.90  # Identical content → near 1.0 (short strings have zlib overhead)
+        assert is_too_similar(a, b, threshold=0.80) is True
+
+    def test_completely_different_packs(self):
+        from trajectoryrl.utils.ncd import pack_similarity, is_too_similar
+        a = {"files": {"AGENTS.md": "Be safe and careful. Follow instructions precisely."}}
+        b = {"files": {"AGENTS.md": "Cook pasta for dinner. Add salt to water."}}
+        sim = pack_similarity(a, b)
+        assert sim < 0.5  # Unrelated content → low similarity
+        assert is_too_similar(a, b, threshold=0.80) is False
+
+    def test_whitespace_only_difference(self):
+        from trajectoryrl.utils.ncd import pack_similarity
+        a = {"files": {"AGENTS.md": "# Rules\n\nBe safe and careful."}}
+        b = {"files": {"AGENTS.md": "#  Rules\n\n\nBe  safe  and  careful."}}
+        sim = pack_similarity(a, b)
+        # After normalization, whitespace is collapsed → should be very similar
+        assert sim > 0.90
+
+    def test_no_winner_never_similar(self):
+        from trajectoryrl.utils.ncd import is_too_similar
+        a = {"files": {"AGENTS.md": "Any content"}}
+        assert is_too_similar(a, None, threshold=0.80) is False
+
+    def test_threshold_boundary(self):
+        from trajectoryrl.utils.ncd import is_too_similar, pack_similarity
+        a = {"files": {"AGENTS.md": "Be safe and careful. Follow all rules."}}
+        b = {"files": {"AGENTS.md": "Be safe and careful. Follow all rules."}}
+        sim = pack_similarity(a, b)
+        # Exact match should be >= threshold
+        assert is_too_similar(a, b, threshold=sim) is True
+        # Threshold above similarity should pass
+        assert is_too_similar(a, b, threshold=sim + 0.01) is False
+
+    def test_normalize_strips_headings(self):
+        from trajectoryrl.utils.ncd import normalize_policy
+        result = normalize_policy("## My Heading\nSome text")
+        assert "#" not in result
+        assert "my heading" in result
+        assert "some text" in result
+
+
+# ===================================================================
+# Commitment Parsing Tests
+# ===================================================================
+
+
+class TestCommitmentParsing:
+    """Tests for on-chain commitment parsing."""
+
+    def test_valid_commitment(self):
+        from trajectoryrl.utils.commitments import parse_commitment
+        raw = "a" * 64 + "|" + "b" * 40 + "|alice/my-pack"
+        result = parse_commitment(raw)
+        assert result is not None
+        pack_hash, git_commit, repo_url = result
+        assert pack_hash == "a" * 64
+        assert git_commit == "b" * 40
+        assert repo_url == "https://github.com/alice/my-pack"
+
+    def test_full_url_commitment(self):
+        from trajectoryrl.utils.commitments import parse_commitment
+        raw = "a" * 64 + "|" + "b" * 40 + "|https://github.com/alice/my-pack"
+        result = parse_commitment(raw)
+        assert result is not None
+        _, _, repo_url = result
+        assert repo_url == "https://github.com/alice/my-pack"
+
+    def test_empty_commitment(self):
+        from trajectoryrl.utils.commitments import parse_commitment
+        assert parse_commitment("") is None
+        assert parse_commitment(None) is None
+
+    def test_too_few_parts(self):
+        from trajectoryrl.utils.commitments import parse_commitment
+        assert parse_commitment("a" * 64 + "|" + "b" * 40) is None
+
+    def test_invalid_hex_pack_hash(self):
+        from trajectoryrl.utils.commitments import parse_commitment
+        # Too short
+        raw = "a" * 63 + "|" + "b" * 40 + "|alice/my-pack"
+        assert parse_commitment(raw) is None
+        # Non-hex chars
+        raw = "g" * 64 + "|" + "b" * 40 + "|alice/my-pack"
+        assert parse_commitment(raw) is None
+
+    def test_invalid_hex_git_commit(self):
+        from trajectoryrl.utils.commitments import parse_commitment
+        raw = "a" * 64 + "|" + "b" * 39 + "|alice/my-pack"
+        assert parse_commitment(raw) is None
+
+    def test_invalid_repo_format(self):
+        from trajectoryrl.utils.commitments import parse_commitment
+        raw = "a" * 64 + "|" + "b" * 40 + "|not-a-repo"
+        assert parse_commitment(raw) is None
+
+    def test_whitespace_handling(self):
+        from trajectoryrl.utils.commitments import parse_commitment
+        raw = "  " + "a" * 64 + " | " + "b" * 40 + " | alice/my-pack  "
+        result = parse_commitment(raw)
+        assert result is not None
+
+
+# ===================================================================
+# Score Consensus Tests
+# ===================================================================
+
+
+class TestScoreConsensus:
+    """Tests for stake-weighted consensus computation."""
+
+    def test_equal_stakes(self):
+        from trajectoryrl.utils.score_publisher import (
+            ScorePublisher, ValidatorScoreFile,
+        )
+        files = [
+            ValidatorScoreFile(
+                validator_hotkey="hk_1", epoch=1, block_height=100,
+                scores={"0": {"final_score": 0.8}},
+                signature="sig1",
+            ),
+            ValidatorScoreFile(
+                validator_hotkey="hk_2", epoch=1, block_height=100,
+                scores={"0": {"final_score": 0.9}},
+                signature="sig2",
+            ),
+        ]
+        metagraph = MagicMock()
+        metagraph.hotkeys = ["hk_1", "hk_2"]
+        metagraph.S = [100.0, 100.0]  # equal stake
+
+        result = ScorePublisher.compute_consensus(files, metagraph)
+        assert result.num_validators == 2
+        assert abs(result.consensus_scores[0] - 0.85) < 1e-6  # (0.8+0.9)/2
+
+    def test_unequal_stakes(self):
+        from trajectoryrl.utils.score_publisher import (
+            ScorePublisher, ValidatorScoreFile,
+        )
+        files = [
+            ValidatorScoreFile(
+                validator_hotkey="hk_1", epoch=1, block_height=100,
+                scores={"0": {"final_score": 0.8}},
+                signature="sig1",
+            ),
+            ValidatorScoreFile(
+                validator_hotkey="hk_2", epoch=1, block_height=100,
+                scores={"0": {"final_score": 0.9}},
+                signature="sig2",
+            ),
+        ]
+        metagraph = MagicMock()
+        metagraph.hotkeys = ["hk_1", "hk_2"]
+        metagraph.S = [300.0, 100.0]  # hk_1 has 3x stake
+
+        result = ScorePublisher.compute_consensus(files, metagraph)
+        # weighted: (300*0.8 + 100*0.9) / 400 = (240+90)/400 = 0.825
+        assert abs(result.consensus_scores[0] - 0.825) < 1e-6
+
+    def test_single_validator(self):
+        from trajectoryrl.utils.score_publisher import (
+            ScorePublisher, ValidatorScoreFile,
+        )
+        files = [
+            ValidatorScoreFile(
+                validator_hotkey="hk_1", epoch=1, block_height=100,
+                scores={"0": {"final_score": 0.7}, "1": {"final_score": 0.9}},
+                signature="sig1",
+            ),
+        ]
+        metagraph = MagicMock()
+        metagraph.hotkeys = ["hk_1"]
+        metagraph.S = [100.0]
+
+        result = ScorePublisher.compute_consensus(files, metagraph)
+        assert result.num_validators == 1
+        assert result.consensus_scores[0] == 0.7
+        assert result.consensus_scores[1] == 0.9
+
+    def test_zero_stake_excluded(self):
+        from trajectoryrl.utils.score_publisher import (
+            ScorePublisher, ValidatorScoreFile,
+        )
+        files = [
+            ValidatorScoreFile(
+                validator_hotkey="hk_1", epoch=1, block_height=100,
+                scores={"0": {"final_score": 0.5}},
+                signature="sig1",
+            ),
+            ValidatorScoreFile(
+                validator_hotkey="hk_2", epoch=1, block_height=100,
+                scores={"0": {"final_score": 0.9}},
+                signature="sig2",
+            ),
+        ]
+        metagraph = MagicMock()
+        metagraph.hotkeys = ["hk_1", "hk_2"]
+        metagraph.S = [0.0, 100.0]  # hk_1 has zero stake
+
+        result = ScorePublisher.compute_consensus(files, metagraph)
+        assert result.num_validators == 1  # only hk_2 counted
+        assert result.consensus_scores[0] == 0.9  # only hk_2's score
+
+    def test_empty_input(self):
+        from trajectoryrl.utils.score_publisher import ScorePublisher
+        metagraph = MagicMock()
+        result = ScorePublisher.compute_consensus([], metagraph)
+        assert result.num_validators == 0
+        assert result.consensus_scores == {}
+
+
+# ===================================================================
+# Inactivity Window Tests
+# ===================================================================
+
+
+class TestInactivityWindow:
+    """Tests for miner inactivity tracking and first-mover protection loss."""
+
+    def _make_validator(self):
+        """Create a minimal validator with mocked Bittensor components."""
+        with patch("trajectoryrl.base.validator.bt") as mock_bt, \
+             patch("trajectoryrl.base.validator.ClawBenchHarness"), \
+             patch("trajectoryrl.base.validator.GitHubVerifier"), \
+             patch("trajectoryrl.base.validator.yaml") as mock_yaml, \
+             patch("trajectoryrl.base.validator.ValidatorConfig") as MockConfig:
+
+            # Mock config
+            config = MagicMock()
+            config.wallet_name = "test"
+            config.wallet_hotkey = "default"
+            config.network = "test"
+            config.netuid = 11
+            config.clawbench_path = Path("/tmp/test_clawbench")
+            config.timeout_per_scenario = 120
+            config.rho_reliability = 0.1
+            config.score_quantization = 0.05
+            config.consensus_epsilon = 0.02
+            config.bootstrap_threshold = 10
+            config.log_dir = Path("/tmp/test_logs")
+            config.log_level = "WARNING"
+            config.github_token = None
+            config.validator_scores_fork_url = None
+            config.scenarios = ["client_escalation"]
+            config.scenarios_path = Path("/tmp/test_scenarios")
+            config.inactivity_window = 2
+            config.epoch_interval = 86400
+            config.similarity_threshold = 0.80
+            config.weight_interval_blocks = 360
+
+            # Mock subtensor
+            mock_subtensor = MagicMock()
+            mock_subtensor.get_current_block.return_value = 100000
+            mock_bt.Subtensor.return_value = mock_subtensor
+
+            # Mock metagraph
+            mock_metagraph = MagicMock()
+            mock_metagraph.hotkeys = ["hk_0", "hk_1", "hk_2"]
+            mock_metagraph.validator_permit = [False, False, False]
+            mock_metagraph.S = [100.0, 100.0, 100.0]
+            mock_subtensor.metagraph.return_value = mock_metagraph
+
+            validator = TrajectoryValidator.__new__(TrajectoryValidator)
+            validator.config = config
+            validator.metagraph = mock_metagraph
+            validator.subtensor = mock_subtensor
+            validator.first_mover_data = {}
+            validator.last_valid_epoch = {}
+            validator.current_epoch = 5
+            validator.blocks_per_epoch = 7200
+
+            return validator
+
+    def test_active_miner_tracked(self):
+        """Miners with valid commitments are marked active."""
+        v = self._make_validator()
+        from trajectoryrl.utils.commitments import MinerCommitment
+        commitments = {
+            0: MinerCommitment(
+                uid=0, hotkey="hk_0", pack_hash="a" * 64,
+                git_commit_hash="b" * 40,
+                repo_url="https://github.com/test/pack",
+                block_number=1000, raw="raw",
+            ),
+        }
+        active = v._get_active_miners_from_commitments(commitments)
+        assert 0 in active
+        assert v.last_valid_epoch[0] == 5
+
+    def test_inactive_miner_loses_first_mover(self):
+        """Miners inactive > window epochs lose first-mover protection."""
+        v = self._make_validator()
+        v.current_epoch = 10
+        v.last_valid_epoch = {1: 7}  # last seen epoch 7, current=10, gap=3 > window=2
+        v.first_mover_data = {"hk_1": (0.85, 5000.0)}
+
+        # No commitments this epoch
+        active = v._get_active_miners_from_commitments({})
+        assert len(active) == 0
+        assert "hk_1" not in v.first_mover_data  # Protection lost
+
+    def test_reactivation_preserves_tracking(self):
+        """Miner returning after inactivity gets fresh tracking."""
+        v = self._make_validator()
+        v.current_epoch = 10
+        v.last_valid_epoch = {0: 7}  # Was inactive
+        v.first_mover_data = {}  # Already lost protection
+
+        from trajectoryrl.utils.commitments import MinerCommitment
+        commitments = {
+            0: MinerCommitment(
+                uid=0, hotkey="hk_0", pack_hash="a" * 64,
+                git_commit_hash="b" * 40,
+                repo_url="https://github.com/test/pack",
+                block_number=9000, raw="raw",
+            ),
+        }
+        active = v._get_active_miners_from_commitments(commitments)
+        assert 0 in active
+        assert v.last_valid_epoch[0] == 10  # Updated to current epoch
+
+    def test_within_window_keeps_protection(self):
+        """Miner within inactivity window keeps first-mover protection."""
+        v = self._make_validator()
+        v.current_epoch = 10
+        v.last_valid_epoch = {1: 9}  # gap=1, within window=2
+        v.first_mover_data = {"hk_1": (0.85, 5000.0)}
+
+        # No commitments this epoch for miner 1
+        active = v._get_active_miners_from_commitments({})
+        assert "hk_1" in v.first_mover_data  # Protection kept
 
 
 # ===================================================================
