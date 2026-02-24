@@ -152,7 +152,7 @@ class ScorePublisher:
         score_file.write_text(json.dumps(payload, indent=2, sort_keys=True))
 
         # Commit and push
-        branch = f"scores/epoch-{epoch}-{hotkey[:8]}"
+        branch = f"scores/epoch-{epoch}-{hotkey}"
         await _run_git(
             ["git", "-C", str(self.local_path), "checkout", "-B", branch]
         )
@@ -180,7 +180,7 @@ class ScorePublisher:
                 "gh", "pr", "create",
                 "--repo", UPSTREAM_REPO,
                 "--head", f"{self._fork_owner()}:{branch}",
-                "--title", f"scores: epoch {epoch} {hotkey[:8]}",
+                "--title", f"scores: epoch {epoch} {hotkey}",
                 "--body", f"Validator {hotkey} epoch {epoch} scores",
             ],
             check=False,
@@ -213,12 +213,22 @@ class ScorePublisher:
         for score_path in epoch_dir.glob("*.json"):
             try:
                 data = json.loads(score_path.read_text())
+                hotkey = data["validator_hotkey"]
+                signature = data["signature"]
+
+                # Verify sr25519 signature to reject forged score files
+                if not ScorePublisher.verify_signature(data, signature, hotkey):
+                    logger.warning(
+                        f"Score file {score_path.name}: invalid signature, skipping"
+                    )
+                    continue
+
                 sf = ValidatorScoreFile(
-                    validator_hotkey=data["validator_hotkey"],
+                    validator_hotkey=hotkey,
                     epoch=data["epoch"],
                     block_height=data["block_height"],
                     scores=data["scores"],
-                    signature=data["signature"],
+                    signature=signature,
                 )
                 results.append(sf)
             except (json.JSONDecodeError, KeyError) as e:
