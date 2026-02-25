@@ -454,6 +454,48 @@ class TrajectoryValidator:
         return active
 
     # ------------------------------------------------------------------
+    # First-mover tracking
+    # ------------------------------------------------------------------
+
+    def _update_first_mover(
+        self,
+        miner_uid: int,
+        hotkey: str,
+        score: float,
+        block_number: float,
+    ) -> None:
+        """Detect re-registration and update first-mover data for a miner.
+
+        Called from both the cache-hit and full-eval paths so that the
+        re-registration detection + first-mover insert/update logic lives
+        in a single place.
+        """
+        # Detect re-registration: same hotkey at a different UID means the
+        # miner deregistered and re-registered.  Reset first-mover data so
+        # they don't inherit an unfair chronological advantage.
+        prev_uid = self._hotkey_uid_map.get(hotkey)
+        if prev_uid is not None and prev_uid != miner_uid:
+            logger.info(
+                f"Miner {miner_uid}: hotkey {hotkey[:8]} previously at UID "
+                f"{prev_uid}; re-registration detected, resetting first-mover data"
+            )
+            self.first_mover_data.pop(hotkey, None)
+        self._hotkey_uid_map[hotkey] = miner_uid
+
+        if hotkey not in self.first_mover_data:
+            self.first_mover_data[hotkey] = (score, block_number)
+            logger.info(
+                f"Miner {miner_uid}: First submission "
+                f"(score={score:.3f}, block={block_number:.0f})"
+            )
+        elif score > self.first_mover_data[hotkey][0]:
+            original_block = self.first_mover_data[hotkey][1]
+            self.first_mover_data[hotkey] = (score, original_block)
+            logger.info(
+                f"Miner {miner_uid}: Score improved to {score:.3f}"
+            )
+
+    # ------------------------------------------------------------------
     # Miner evaluation
     # ------------------------------------------------------------------
 
@@ -490,7 +532,11 @@ class TrajectoryValidator:
 
             # NCD gate: a different miner submitting the same pack_hash as the
             # current winner is a copy attack — reject even without re-evaluating.
-            if miner_uid != self.current_winner_uid and cached_pack is not None:
+            if (
+                miner_uid != self.current_winner_uid
+                and cached_pack is not None
+                and self.current_winner_pack is not None
+            ):
                 if is_too_similar(
                     cached_pack, self.current_winner_pack,
                     self.config.similarity_threshold
@@ -508,26 +554,12 @@ class TrajectoryValidator:
             if cached_pack is not None:
                 self._uid_packs[miner_uid] = cached_pack
 
-            # Update first-mover tracking — mirrors Step 8 in the full-eval path.
-            # Without this, the second miner to share a pack_hash has no entry in
-            # first_mover_data and always loses tie-breaks (block defaults to inf).
-            hotkey = commitment.hotkey
-            prev_uid = self._hotkey_uid_map.get(hotkey)
-            if prev_uid is not None and prev_uid != miner_uid:
-                logger.info(
-                    f"Miner {miner_uid}: hotkey {hotkey[:8]} previously at UID "
-                    f"{prev_uid}; re-registration detected, resetting first-mover data"
-                )
-                self.first_mover_data.pop(hotkey, None)
-            self._hotkey_uid_map[hotkey] = miner_uid
-
-            if hotkey not in self.first_mover_data:
-                self.first_mover_data[hotkey] = (
-                    cached_score, float(commitment.block_number)
-                )
-            elif cached_score > self.first_mover_data[hotkey][0]:
-                original_block = self.first_mover_data[hotkey][1]
-                self.first_mover_data[hotkey] = (cached_score, original_block)
+            # Update first-mover tracking so the second miner to share a
+            # pack_hash still gets its own entry for tie-breaking.
+            self._update_first_mover(
+                miner_uid, commitment.hotkey,
+                cached_score, float(commitment.block_number),
+            )
 
             logger.info(
                 f"Miner {miner_uid}: pack_hash unchanged, "
@@ -634,36 +666,10 @@ class TrajectoryValidator:
         self._pack_by_hash[commitment.pack_hash] = pack
 
         # Step 8: Update first-mover tracking (on-chain block number)
-        hotkey = commitment.hotkey
-
-        # Detect re-registration: the same hotkey appearing at a different UID
-        # means the miner deregistered and re-registered.  Their first-mover
-        # block_number must reset to the current commitment's block so they
-        # don't inherit an unfair chronological advantage from a prior slot.
-        prev_uid = self._hotkey_uid_map.get(hotkey)
-        if prev_uid is not None and prev_uid != miner_uid:
-            logger.info(
-                f"Miner {miner_uid}: hotkey {hotkey[:8]} previously at UID "
-                f"{prev_uid}; re-registration detected, resetting first-mover data"
-            )
-            self.first_mover_data.pop(hotkey, None)
-        self._hotkey_uid_map[hotkey] = miner_uid
-
-        if hotkey not in self.first_mover_data:
-            self.first_mover_data[hotkey] = (
-                final_score,
-                float(commitment.block_number),
-            )
-            logger.info(
-                f"Miner {miner_uid}: First submission "
-                f"(score={final_score:.3f}, block={commitment.block_number})"
-            )
-        elif final_score > self.first_mover_data[hotkey][0]:
-            original_block = self.first_mover_data[hotkey][1]
-            self.first_mover_data[hotkey] = (final_score, original_block)
-            logger.info(
-                f"Miner {miner_uid}: Score improved to {final_score:.3f}"
-            )
+        self._update_first_mover(
+            miner_uid, commitment.hotkey,
+            final_score, float(commitment.block_number),
+        )
 
         # Track history
         self.score_history[miner_uid].append(final_score)
