@@ -119,6 +119,11 @@ class TrajectoryValidator:
         # Pack score cache: pack_hash -> (final_score, per_scenario_scores)
         self.pack_score_cache: Dict[str, Tuple[float, Dict[str, float]]] = {}
 
+        # Pack content cache: pack_hash -> pack dict.
+        # Allows cache-hitting miners to still populate _uid_packs so that
+        # current_winner_pack is never left as None after winner selection.
+        self._pack_by_hash: Dict[str, dict] = {}
+
         # Current winner tracking (for NCD comparison)
         self.current_winner_pack: Optional[dict] = None
         self.current_winner_uid: Optional[int] = None
@@ -132,6 +137,12 @@ class TrajectoryValidator:
         # First-mover tracking: {hotkey: (best_score, first_block_number)}
         # Keyed by miner hotkey so history is never inherited on UID recycling.
         self.first_mover_data: Dict[str, Tuple[float, float]] = {}
+
+        # Tracks which UID each hotkey was last evaluated at.  Used to detect
+        # re-registration (same hotkey at a new UID), which must reset the
+        # first-mover block_number to the current commitment block so the miner
+        # doesn't inherit an unfair chronological advantage.
+        self._hotkey_uid_map: Dict[str, int] = {}
 
         # Inactivity tracking: {uid: last_epoch_with_valid_commitment}
         self.last_valid_epoch: Dict[int, int] = {}
@@ -238,8 +249,10 @@ class TrajectoryValidator:
 
         while True:
             try:
-                self.current_epoch = self._block_epoch()
+                # Single RPC call for consistency: both epoch derivation and
+                # block-based checks use the same snapshot.
                 current_block = self.subtensor.get_current_block()
+                self.current_epoch = current_block // self.blocks_per_epoch
 
                 # --- Epoch work: evaluate new/changed packs ---
                 if self.current_epoch != last_completed_epoch:
@@ -251,10 +264,14 @@ class TrajectoryValidator:
                     # epoch seed / context (even if pack_hash is unchanged).
                     self.pack_score_cache.clear()
                     self._uid_packs.clear()
+                    self._pack_by_hash.clear()
 
                     await self.run_epoch()
                     last_completed_epoch = self.current_epoch
-                    self.last_weight_block = current_block
+                    # Use a fresh block number so blocks_since is measured from
+                    # when the epoch actually finished, not from when the loop
+                    # iteration started (epoch eval can take hours).
+                    self.last_weight_block = self.subtensor.get_current_block()
 
                     logger.info(
                         f"Epoch {self.current_epoch} complete. "
@@ -263,6 +280,11 @@ class TrajectoryValidator:
                     )
 
                 # --- Tempo work: re-set weights ---
+                # Re-read current_block here so that the tempo cadence is based
+                # on time since the epoch finished (not time since loop start).
+                # Without this, a multi-hour epoch would make blocks_since huge
+                # and immediately fire a redundant tempo refresh.
+                current_block = self.subtensor.get_current_block()
                 blocks_since = current_block - self.last_weight_block
                 if blocks_since >= self.config.weight_interval_blocks:
                     logger.info(
@@ -333,7 +355,10 @@ class TrajectoryValidator:
 
         if not active:
             logger.warning("No active miners with valid commitments!")
-            # Set uniform weights to stay active on-chain
+            # Clear stale scores so tempo refreshes don't keep directing
+            # emission to UIDs from a previous epoch (avoids UID-recycling risk).
+            self.cached_scores = {}
+            self.cached_per_scenario = {}
             await self._set_uniform_weights()
             return
 
@@ -401,14 +426,13 @@ class TrajectoryValidator:
 
             active[uid] = commitment
 
-        # Remove miners that have been inactive too long
+        # Remove miners that have been inactive too long.
         # (only affects miners from previous epochs not in current commitments)
         for uid in list(self.last_valid_epoch.keys()):
             if uid in active:
                 continue
             last = self.last_valid_epoch[uid]
             if (self.current_epoch - last) > self.config.inactivity_window:
-                # Lose first-mover protection
                 hotkey = (
                     self.metagraph.hotkeys[uid]
                     if uid < len(self.metagraph.hotkeys)
@@ -421,6 +445,11 @@ class TrajectoryValidator:
                         f"first-mover protection lost"
                     )
                     del self.first_mover_data[hotkey]
+                    self._hotkey_uid_map.pop(hotkey, None)
+                # Always remove from last_valid_epoch once the inactivity window
+                # is exceeded; otherwise stale UIDs accumulate unboundedly and
+                # pollute _set_uniform_weights() with potentially-recycled slots.
+                del self.last_valid_epoch[uid]
 
         return active
 
@@ -448,11 +477,58 @@ class TrajectoryValidator:
             f"(hash={commitment.pack_hash[:12]}...)"
         )
 
-        # Step 1: Check pack cache — skip if pack_hash unchanged
+        # Step 1: Check pack cache — skip LLM evaluation if pack_hash unchanged.
+        # NCD and first-mover tracking still run even on a cache hit so that:
+        #  (a) copy-cat miners who share the same pack_hash as the winner are
+        #      still NCD-rejected rather than inheriting the cached score, and
+        #  (b) every miner gets its own first_mover_data entry for tie-breaking.
         if commitment.pack_hash in self.pack_score_cache:
             cached_score, cached_breakdown = self.pack_score_cache[
                 commitment.pack_hash
             ]
+            cached_pack = self._pack_by_hash.get(commitment.pack_hash)
+
+            # NCD gate: a different miner submitting the same pack_hash as the
+            # current winner is a copy attack — reject even without re-evaluating.
+            if miner_uid != self.current_winner_uid and cached_pack is not None:
+                if is_too_similar(
+                    cached_pack, self.current_winner_pack,
+                    self.config.similarity_threshold
+                ):
+                    sim = pack_similarity(cached_pack, self.current_winner_pack)
+                    logger.warning(
+                        f"Miner {miner_uid}: NCD similarity={sim:.3f} "
+                        f">= {self.config.similarity_threshold} "
+                        f"(cache hit), rejected"
+                    )
+                    return 0.0, {}
+
+            # Populate _uid_packs so that if this miner wins, current_winner_pack
+            # is never left as None.
+            if cached_pack is not None:
+                self._uid_packs[miner_uid] = cached_pack
+
+            # Update first-mover tracking — mirrors Step 8 in the full-eval path.
+            # Without this, the second miner to share a pack_hash has no entry in
+            # first_mover_data and always loses tie-breaks (block defaults to inf).
+            hotkey = commitment.hotkey
+            prev_uid = self._hotkey_uid_map.get(hotkey)
+            if prev_uid is not None and prev_uid != miner_uid:
+                logger.info(
+                    f"Miner {miner_uid}: hotkey {hotkey[:8]} previously at UID "
+                    f"{prev_uid}; re-registration detected, resetting first-mover data"
+                )
+                self.first_mover_data.pop(hotkey, None)
+            self._hotkey_uid_map[hotkey] = miner_uid
+
+            if hotkey not in self.first_mover_data:
+                self.first_mover_data[hotkey] = (
+                    cached_score, float(commitment.block_number)
+                )
+            elif cached_score > self.first_mover_data[hotkey][0]:
+                original_block = self.first_mover_data[hotkey][1]
+                self.first_mover_data[hotkey] = (cached_score, original_block)
+
             logger.info(
                 f"Miner {miner_uid}: pack_hash unchanged, "
                 f"cached score={cached_score:.3f}"
@@ -475,7 +551,6 @@ class TrajectoryValidator:
             return 0.0, {}
 
         pack = verification.pack_content
-        self._uid_packs[miner_uid] = pack
 
         # Step 3: Schema validation
         lint_result = validate_opp_schema(pack)
@@ -485,8 +560,12 @@ class TrajectoryValidator:
             )
             return 0.0, {}
 
-        # Step 4: NCD similarity check vs current winner
-        if is_too_similar(
+        # Step 4: NCD similarity check vs current winner.
+        # The current winner is exempt — they must be allowed to re-submit the
+        # same pack and defend their position.  Without this exception,
+        # pack_similarity(X, X) = 1.0 ≥ threshold and the winner would always
+        # be rejected in the very next epoch, breaking first-mover protection.
+        if miner_uid != self.current_winner_uid and is_too_similar(
             pack, self.current_winner_pack, self.config.similarity_threshold
         ):
             sim = pack_similarity(pack, self.current_winner_pack)
@@ -495,6 +574,12 @@ class TrajectoryValidator:
                 f">= {self.config.similarity_threshold}, rejected"
             )
             return 0.0, {}
+
+        # Only add to _uid_packs after the pack has cleared schema + NCD.
+        # This prevents schema-invalid or NCD-rejected packs from being used
+        # as the NCD comparison target if a bug ever allows them to appear as
+        # winner candidates.
+        self._uid_packs[miner_uid] = pack
 
         # Step 5: Run ALL scenarios with majority-vote consensus
         results: List[EvaluationResult] = []
@@ -541,14 +626,29 @@ class TrajectoryValidator:
             f"var={aggregated.variance:.3f})"
         )
 
-        # Step 7: Cache result
+        # Step 7: Cache result (score + pack content for _uid_packs on cache hits)
         self.pack_score_cache[commitment.pack_hash] = (
             final_score,
             scenario_breakdown,
         )
+        self._pack_by_hash[commitment.pack_hash] = pack
 
         # Step 8: Update first-mover tracking (on-chain block number)
         hotkey = commitment.hotkey
+
+        # Detect re-registration: the same hotkey appearing at a different UID
+        # means the miner deregistered and re-registered.  Their first-mover
+        # block_number must reset to the current commitment's block so they
+        # don't inherit an unfair chronological advantage from a prior slot.
+        prev_uid = self._hotkey_uid_map.get(hotkey)
+        if prev_uid is not None and prev_uid != miner_uid:
+            logger.info(
+                f"Miner {miner_uid}: hotkey {hotkey[:8]} previously at UID "
+                f"{prev_uid}; re-registration detected, resetting first-mover data"
+            )
+            self.first_mover_data.pop(hotkey, None)
+        self._hotkey_uid_map[hotkey] = miner_uid
+
         if hotkey not in self.first_mover_data:
             self.first_mover_data[hotkey] = (
                 final_score,
@@ -598,10 +698,22 @@ class TrajectoryValidator:
                         score_files, self.metagraph
                     )
                     if consensus.consensus_scores:
-                        scores = consensus.consensus_scores
+                        # Filter to UIDs within the current metagraph bounds.
+                        # Score files are published at evaluation time; by the
+                        # next tempo refresh some UIDs may have been deregistered
+                        # or recycled.  Stale UIDs would cause set_weights() to
+                        # fail or (worse) direct emission to the new occupant of
+                        # a recycled slot.
+                        n_uids = len(self.metagraph.S)
+                        scores = {
+                            uid: s
+                            for uid, s in consensus.consensus_scores.items()
+                            if uid < n_uids
+                        }
                         logger.info(
                             f"Consensus from {consensus.num_validators} "
-                            f"validators (stake={consensus.total_stake:.1f})"
+                            f"validators (stake={consensus.total_stake:.1f}), "
+                            f"{len(scores)} valid UIDs"
                         )
             except Exception as e:
                 logger.warning(
@@ -616,7 +728,9 @@ class TrajectoryValidator:
     async def _set_weights(self, scores: Dict[int, float]):
         """Set on-chain weights based on scores.
 
-        No min_score_threshold: any valid pack is eligible (per spec v1.06).
+        Only miners with score > 0 are eligible for emission.  A score of 0
+        means the pack failed evaluation (git, schema, NCD, or all scenarios)
+        and must not earn any weight regardless of bootstrap phase.
         """
         logger.info(f"Setting weights for {len(scores)} miners...")
 
@@ -624,29 +738,54 @@ class TrajectoryValidator:
             await self._set_uniform_weights()
             return
 
-        # Count active miners for bootstrap detection
-        num_active = len([uid for uid, s in scores.items() if s > 0])
+        # Only miners with positive scores are eligible for emission.
+        # Filtering here prevents bootstrap mode from awarding weight to a
+        # miner whose pack completely failed evaluation (score=0).
+        scored = {uid: s for uid, s in scores.items() if s > 0}
+        if not scored:
+            logger.warning(
+                "All evaluated miners scored 0 — no emission directed to miners"
+            )
+            await self._set_uniform_weights()
+            return
 
-        # Build UID -> hotkey mapping
+        # Count active miners for bootstrap detection
+        num_active = len(scored)
+
+        # Build UID -> hotkey mapping (only for scored miners)
         uid_to_hotkey = {}
-        for uid in scores:
+        for uid in scored:
             if uid < len(self.metagraph.hotkeys):
                 uid_to_hotkey[uid] = self.metagraph.hotkeys[uid]
 
-        # Select winner (or bootstrap curve) with first-mover advantage
+        # Select winner (or bootstrap curve) with first-mover advantage.
+        # Pass only scored (score > 0) miners so bootstrap thresholding and
+        # winner-take-all never consider zero-score entries.
         weights_dict = self.scorer.select_winner(
-            scores=scores,
+            scores=scored,
             first_mover_data=self.first_mover_data,
             delta=self.config.delta_threshold,
             num_active_miners=num_active,
             uid_to_hotkey=uid_to_hotkey,
         )
 
-        # Track current winner for NCD comparison
+        # Track current winner for NCD comparison.
+        # Only commit the new winner when we hold the verified pack locally.
+        # During tempo refreshes, consensus may resolve to a UID that this
+        # validator didn't evaluate (not in _uid_packs).  Writing None to
+        # current_winner_pack would silently disable NCD protection next epoch.
         winner_uid = max(weights_dict, key=weights_dict.get)
         if weights_dict.get(winner_uid, 0) > 0:
-            self.current_winner_uid = winner_uid
-            self.current_winner_pack = self._uid_packs.get(winner_uid)
+            winner_pack = self._uid_packs.get(winner_uid)
+            if winner_pack is not None:
+                self.current_winner_uid = winner_uid
+                self.current_winner_pack = winner_pack
+            else:
+                logger.debug(
+                    f"Winner UID {winner_uid} not in local _uid_packs "
+                    f"(consensus-only result); keeping previous winner state "
+                    f"for NCD protection"
+                )
 
         # Log results
         logger.info("=" * 60)
@@ -654,13 +793,13 @@ class TrajectoryValidator:
         logger.info("=" * 60)
         for uid, weight in sorted(
             weights_dict.items(),
-            key=lambda x: scores.get(x[0], 0),
+            key=lambda x: scored.get(x[0], 0),
             reverse=True,
         ):
-            marker = " <- WINNER" if weight > 0 else ""
+            marker = " <- WINNER" if uid == winner_uid else ""
             logger.info(
                 f"  Miner {uid}: weight={weight:.4f}, "
-                f"score={scores.get(uid, 0):.3f}{marker}"
+                f"score={scored.get(uid, 0):.3f}{marker}"
             )
 
         # Set weights on chain
@@ -680,13 +819,38 @@ class TrajectoryValidator:
             logger.error(f"Error setting weights: {e}", exc_info=True)
 
     async def _set_uniform_weights(self):
-        """Set uniform weights to stay active on-chain when no miners qualify."""
+        """Set uniform weights to stay active on-chain when no miners qualify.
+
+        Distributes only among miners that have been seen in at least one
+        previous epoch (i.e. have a valid commitment history).  This prevents
+        a freshly-registered miner from earning emission before their pack has
+        been evaluated.  Falls back to the full metagraph only when no miners
+        have ever been seen (e.g. very first epoch after validator start).
+        """
         try:
-            n_uids = len(self.metagraph.S)
-            if n_uids == 0:
-                return
-            uids = list(range(n_uids))
-            weights = [1.0 / n_uids] * n_uids
+            known_uids = [
+                uid for uid in self.last_valid_epoch
+                if uid < len(self.metagraph.S)
+            ]
+            if known_uids:
+                uids = known_uids
+                logger.info(
+                    f"Uniform weights over {len(uids)} previously-seen miners "
+                    f"(no eligible scored miners this round)"
+                )
+            else:
+                # No miners have been evaluated yet — fall back to all UIDs
+                # so the validator stays active on-chain.
+                n_uids = len(self.metagraph.S)
+                if n_uids == 0:
+                    return
+                uids = list(range(n_uids))
+                logger.info(
+                    "Uniform weights over full metagraph "
+                    "(no miners evaluated yet)"
+                )
+
+            weights = [1.0 / len(uids)] * len(uids)
             self.subtensor.set_weights(
                 netuid=self.config.netuid,
                 wallet=self.wallet,
