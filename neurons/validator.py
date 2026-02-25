@@ -77,7 +77,15 @@ async def main():
             )
 
             elapsed = time.time() - t0
-            logger.info(f"set_weights result: {result}  ({elapsed:.1f}s)")
+
+            if result.success:
+                logger.info(f"set_weights OK  ({elapsed:.1f}s)")
+            else:
+                logger.warning(
+                    f"set_weights returned success=False  ({elapsed:.1f}s) — "
+                    f"error={result.error}, message={result.message}, "
+                    f"extrinsic={result.extrinsic_function}"
+                )
 
         except Exception as e:
             logger.error(f"set_weights failed: {e}", exc_info=True)
