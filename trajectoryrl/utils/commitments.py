@@ -153,10 +153,13 @@ def _get_commitment_block(subtensor, netuid: int, uid: int) -> int:
         meta = subtensor.get_commitment_metadata(netuid=netuid, uid=uid)
         if meta and hasattr(meta, "block"):
             return meta.block
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"UID {uid}: get_commitment_metadata failed ({e}), falling back to current block")
 
-    # Fallback: use current block (less precise but functional)
+    # Fallback: use current block (less precise but functional).
+    # This inflates the apparent first-mover block number so the miner
+    # looks like a late submitter — safer than defaulting to 0 (which
+    # would give them an artificially early timestamp).
     try:
         return subtensor.get_current_block()
     except Exception:

@@ -350,13 +350,24 @@ class ClawBenchHarness:
         """
         # Create workspace directory
         workspace.mkdir(parents=True, exist_ok=True)
+        workspace_abs = workspace.resolve()
 
-        # Write files from pack
+        # Write files from pack.
+        # SECURITY: validate every miner-supplied filename before writing.
+        # Without this check, a filename like "../../etc/cron.d/exploit"
+        # resolves outside the temp workspace → arbitrary file write on host.
         files = pack.get("files", {})
         for filename, content in files.items():
             if filename == "AGENTS.md" and context_preamble:
                 content = context_preamble + content
-            file_path = workspace / filename
+            file_path = (workspace_abs / filename).resolve()
+            try:
+                file_path.relative_to(workspace_abs)
+            except ValueError:
+                logger.warning(
+                    f"Skipping file with path traversal attempt: {filename!r}"
+                )
+                continue
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(content)
             logger.debug(f"Wrote {filename} ({len(content)} chars)")
@@ -445,6 +456,14 @@ class ClawBenchHarness:
             )
 
         except asyncio.TimeoutError:
+            # Kill the child process so it doesn't keep running as an orphan.
+            # Without this, timed-out evaluations leak CPU and RAM; over a
+            # full epoch with many miners these accumulate significantly.
+            try:
+                proc.kill()
+                await proc.communicate()
+            except Exception:
+                pass
             logger.error(f"Scenario timeout: {scenario_name}")
             return EvaluationResult(
                 scenario_name=scenario_name,

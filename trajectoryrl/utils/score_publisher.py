@@ -162,6 +162,10 @@ class ScorePublisher:
         await _run_git(
             [
                 "git", "-C", str(self.local_path),
+                # Set identity inline so commit succeeds even without a global
+                # git config (common on freshly provisioned validator machines).
+                "-c", "user.email=validator@trajectoryrl.local",
+                "-c", "user.name=TrajectoryRL Validator",
                 "commit", "-m", f"scores: epoch {epoch} validator {hotkey[:8]}",
             ],
             check=False,
@@ -192,6 +196,7 @@ class ScorePublisher:
 
     async def pull_all_scores(self, epoch: int) -> List[ValidatorScoreFile]:
         """Pull all published scores for a given epoch from upstream."""
+        import shutil
         await self._ensure_repo()
 
         # Fetch latest
@@ -199,13 +204,20 @@ class ScorePublisher:
             ["git", "-C", str(self.local_path), "fetch", "upstream", "main"],
             check=False,
         )
+
+        # Remove any stale local epoch directory before checking out from
+        # upstream. Without this, a failed/missing upstream checkout leaves
+        # old files in place and the validator reads stale scores silently.
+        epoch_dir = self.local_path / f"epoch-{epoch}"
+        if epoch_dir.exists():
+            shutil.rmtree(epoch_dir)
+
         await _run_git(
             ["git", "-C", str(self.local_path), "checkout", "upstream/main", "--",
              f"epoch-{epoch}/"],
             check=False,
         )
 
-        epoch_dir = self.local_path / f"epoch-{epoch}"
         if not epoch_dir.exists():
             return []
 
@@ -230,6 +242,12 @@ class ScorePublisher:
                     scores=data["scores"],
                     signature=signature,
                 )
+                if sf.epoch != epoch:
+                    logger.warning(
+                        f"Score file {score_path.name}: epoch mismatch "
+                        f"(file says {sf.epoch}, expected {epoch}), skipping"
+                    )
+                    continue
                 results.append(sf)
             except (json.JSONDecodeError, KeyError) as e:
                 logger.warning(f"Invalid score file {score_path}: {e}")
@@ -258,6 +276,16 @@ class ScorePublisher:
             hk = metagraph.hotkeys[uid]
             stake = float(metagraph.S[uid]) if hasattr(metagraph, "S") else 0.0
             hotkey_stake[hk] = stake
+
+        # Deduplicate: keep the latest score file per validator hotkey.
+        # A validator that restarts mid-epoch can push two files for the same
+        # epoch, and double-counting their stake inflates the denominator.
+        deduped: Dict[str, "ValidatorScoreFile"] = {}
+        for sf in score_files:
+            prev = deduped.get(sf.validator_hotkey)
+            if prev is None or sf.block_height > prev.block_height:
+                deduped[sf.validator_hotkey] = sf
+        score_files = list(deduped.values())
 
         # Aggregate: weighted sum per UID
         weighted_sums: Dict[int, float] = {}
@@ -293,19 +321,45 @@ class ScorePublisher:
     def _fork_owner(self) -> str:
         """Extract owner from fork URL."""
         # https://github.com/owner/repo.git -> owner
-        url = self.fork_repo_url.rstrip("/").rstrip(".git")
+        url = self.fork_repo_url.rstrip("/")
+        if url.endswith(".git"):
+            url = url[:-4]
         parts = url.split("/")
         return parts[-2] if len(parts) >= 2 else ""
 
 
-async def _run_git(cmd: list, check: bool = True) -> subprocess.CompletedProcess:
-    """Run a git/gh command asynchronously."""
+_GIT_TIMEOUT = 120  # seconds; covers slow push/fetch over bad connections
+
+
+async def _run_git(
+    cmd: list,
+    check: bool = True,
+    timeout: float = _GIT_TIMEOUT,
+) -> subprocess.CompletedProcess:
+    """Run a git/gh command asynchronously with a hard timeout.
+
+    Without a timeout, ``proc.communicate()`` can block the entire asyncio
+    event loop forever on network issues (unreachable GitHub, stalled push).
+    """
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        msg = f"Git command timed out after {timeout}s: {' '.join(cmd)}"
+        logger.error(msg)
+        result = subprocess.CompletedProcess(
+            cmd, returncode=-1, stdout="", stderr=msg
+        )
+        if check:
+            raise subprocess.CalledProcessError(-1, cmd, "", msg)
+        return result
+
     result = subprocess.CompletedProcess(
         cmd, proc.returncode,
         stdout=stdout.decode() if stdout else "",
