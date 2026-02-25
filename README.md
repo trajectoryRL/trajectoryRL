@@ -84,10 +84,23 @@ docker compose -f docker/docker-compose.validator.yml --env-file .env.validator 
 docker compose -f docker/docker-compose.validator.yml logs -f validator
 ```
 
-Requirements:
-- Docker + Docker Compose
-- A registered hotkey on SN11 with sufficient stake for a validator permit (top 64 by stake)
-- Wallet files in `~/.bittensor/wallets/`
+**Prerequisites** (one-time setup on the host, before starting Docker):
+
+```bash
+# Install btcli
+pip install bittensor-cli
+
+# Create or import your wallet
+btcli wallet create --wallet-name my-validator
+
+# Register hotkey on SN11 (~0.2 TAO burn fee)
+btcli subnets register --wallet-name my-validator --hotkey default --netuid 11
+
+# Stake alpha so your weights count (must be top 64 by stake for validator permit)
+btcli stake add --wallet-name my-validator --hotkey default --netuid 11 --amount 100
+```
+
+The Docker container uses the bittensor Python SDK to set weights — it reads wallet keyfiles from the mounted `~/.bittensor/wallets/` directory. No btcli is needed inside the container.
 
 ### For Miners
 
