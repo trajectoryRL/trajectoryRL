@@ -13,54 +13,38 @@ TrajectoryRL is a Bittensor subnet where miners compete to optimize AI agent pol
 ## Overview
 
 ```
-┌─────────────────────────────────────────────────────┐
-│              TRAJECTORYRL SUBNET (SN11)              │
-│                                                      │
-│  MINERS                        VALIDATORS            │
-│  ┌──────────────┐              ┌──────────────┐    │
-│  │ Submit       │  PackRequest │ Query miners │    │
-│  │ AGENTS.md    │─────────────▶│              │    │
-│  │ policy packs │              │ Evaluate via │    │
-│  │              │◀─────────────│ ClawBench    │    │
-│  └──────────────┘  PackResponse└──────────────┘    │
-│        │                              │             │
-│        │  Optimized policies          │ Set weights │
-│        ▼                              ▼             │
-│  ┌──────────────────────────────────────────────┐  │
-│  │         BITTENSOR BLOCKCHAIN                 │  │
-│  │  TAO rewards based on performance            │  │
-│  └──────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                   TRAJECTORYRL SUBNET (SN11)                  │
+│                                                               │
+│  MINERS                              VALIDATORS               │
+│  ┌──────────────┐                    ┌──────────────────┐   │
+│  │ Publish       │   on-chain        │ Read commitments  │   │
+│  │ pack.json to  │   commitment      │ from chain        │   │
+│  │ public GitHub │──────────────────▶│                   │   │
+│  │ repo          │                   │ Fetch packs from  │   │
+│  └──────────────┘                    │ GitHub, verify    │   │
+│        │                              │ hash + timestamp  │   │
+│        │                              │                   │   │
+│        │                              │ Evaluate via      │   │
+│        │                              │ ClawBench         │   │
+│        │                              └──────────────────┘   │
+│        │                                      │               │
+│        │                                      │ set_weights   │
+│        ▼                                      ▼               │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │              BITTENSOR BLOCKCHAIN                     │   │
+│  │   Commitments, weights, TAO rewards                   │   │
+│  └──────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-### What Makes TrajectoryRL Unique
+- **No server required** — Miners publish packs to GitHub and commit metadata on-chain. No public IP, no uptime needed.
+- **Deterministic evaluation** — [ClawBench](https://github.com/trajectoryRL/clawbench) scenarios with fixed fixtures and regex scoring (no LLM-as-judge randomness)
+- **Content-addressed** — Packs identified by SHA256 hash, verified against on-chain commitment
+- **Winner-take-all** — Best miner gets 100% of rewards; first-mover advantage protects early innovators
+- **Anti-copy** — GitHub push timestamps + NCD similarity detection + first-mover threshold (delta=0.05)
 
-- **Deterministic Evaluation** — Uses [ClawBench](https://github.com/trajectoryRL/clawbench) scenarios with fixed fixtures and regex scoring (no LLM-as-judge randomness)
-- **Content-Addressed Packs** — Miners submit policy bundles (OPP v1, ≤32KB) identified by SHA256 hash
-- **Real-World Tasks** — 5 scenarios testing email triage, calendar conflicts, task delegation, incident response
-- **Safety-First Scoring** — Critical safety violations = immediate score of 0
-- **Weighted Scenarios** — Safety-critical scenarios (e.g., client escalation) carry higher weight in aggregation
-- **Winner-Take-All** — Best miner gets 100% of rewards; first-mover advantage protects early innovators
-
-### Anti-Copy Incentive Mechanism
-
-TrajectoryRL employs three layers of protection against copy-paste attacks:
-
-1. **GitHub-Based Submission**
-   - Miners publish packs to public repositories FIRST
-   - Validators verify **server-side push timestamps** via GitHub API (not forgeable git dates)
-   - Uses Events API + Compare API (public, no auth required)
-   - Validators independently clone repos and verify hashes
-
-2. **Winner-Take-All**
-   - Only the best miner receives rewards (100% of epoch emissions)
-   - No participation rewards for mediocre submissions
-   - Forces miners to innovate, not copy
-
-3. **First-Mover Advantage**
-   - Later submissions must beat `first_best_score + 0.05` to win
-   - Protects early innovators from marginal improvements
-   - Prevents "copy then tweak" strategies
+See [INCENTIVE_MECHANISM.md](INCENTIVE_MECHANISM.md) for full scoring, rewards, and anti-gaming details.
 
 ## Quick Start
 
