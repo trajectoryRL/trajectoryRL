@@ -113,26 +113,6 @@ See [INCENTIVE_MECHANISM.md](INCENTIVE_MECHANISM.md) for full details on how pac
 - **[Incentive Mechanism](INCENTIVE_MECHANISM.md)** — Scoring, rewards, winner-take-all, and anti-copy protection
 - **[ClawBench](https://github.com/trajectoryRL/clawbench)** — Evaluation framework (scenarios, fixtures, scoring)
 
-## Roadmap
-
-### Cold-Start Phase (current)
-- [x] Validator and miner implementation
-- [x] Docker + Watchtower auto-deploy pipeline
-- [x] Consensus anchoring via owner validators
-- [ ] Onboard first external miners and validators
-- [ ] Enable full ClawBench evaluation
-
-### v1.0 (next)
-- [ ] Example policy packs (baseline + optimized)
-- [ ] Miner getting started guide
-- [ ] Pack cache with LRU eviction
-
-### v2.0 (planned)
-- [ ] Hybrid LLM-as-judge scoring alongside regex checks
-- [ ] Anti-gaming defenses (keyword blocklist, fixture name variation)
-- [ ] Hidden held-out scenarios (scored but not published)
-- [ ] Web dashboard (scores, leaderboard, epoch history)
-
 ## Community
 
 - **GitHub**: https://github.com/trajectoryRL/trajectoryRL
