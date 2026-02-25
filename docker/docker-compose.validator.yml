@@ -1,0 +1,62 @@
+# TrajectoryRL Validator — Production Compose
+#
+# Runs the validator from GHCR with Watchtower auto-update.
+# Works for both cold-start and production phases — push new code to main
+# and Watchtower auto-pulls the new image within 5 minutes.
+#
+# Setup:
+#   1. Create .env file (see below)
+#   2. docker compose -f docker/docker-compose.validator.yml up -d
+#   3. docker compose -f docker/docker-compose.validator.yml logs -f validator
+#
+# Required .env:
+#   WALLET_NAME=sn11-owner
+#   WALLET_HOTKEY=default
+#   NETUID=11
+#   NETWORK=finney
+#   TARGET_UID=74
+
+services:
+  # --------------------------------------------------------------------------
+  # Validator: sets on-chain weights (auto-updated by Watchtower)
+  # --------------------------------------------------------------------------
+  validator:
+    image: ghcr.io/trajectoryrl/trajectoryrl:latest
+    container_name: trajectoryrl_validator
+    restart: unless-stopped
+    environment:
+      - WALLET_NAME=${WALLET_NAME:-validator}
+      - WALLET_HOTKEY=${WALLET_HOTKEY:-default}
+      - NETUID=${NETUID:-11}
+      - NETWORK=${NETWORK:-finney}
+      - TARGET_UID=${TARGET_UID:-74}
+      - WEIGHT_INTERVAL=${WEIGHT_INTERVAL:-1500}
+    volumes:
+      - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # --------------------------------------------------------------------------
+  # Watchtower: polls GHCR every 5 min, auto-pulls new images, restarts
+  # --------------------------------------------------------------------------
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: trajectoryrl_watchtower
+    restart: unless-stopped
+    environment:
+      - WATCHTOWER_LABEL_ENABLE=true
+      - WATCHTOWER_POLL_INTERVAL=300
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_INCLUDE_STOPPED=true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"

@@ -1,0 +1,55 @@
+# Build and push validator Docker image to GHCR
+#
+# Triggers on push to main when validator-related files change.
+# Watchtower on validator machines auto-pulls the new image.
+
+name: Build Validator Image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "neurons/**"
+      - "trajectoryrl/**"
+      - "docker/Dockerfile.validator"
+      - "pyproject.toml"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: trajectoryrl/trajectoryrl
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.validator
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
