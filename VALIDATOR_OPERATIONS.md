@@ -1,9 +1,81 @@
 # Validator Operations Guide
 
 **Subnet**: SN11 (TrajectoryRL)
-**Date**: 2026-02-23
+**Date**: 2026-02-24
 
 > Operational guidance for running a TrajectoryRL validator. For mechanism design and scoring rules, see [INCENTIVE_MECHANISM.md](INCENTIVE_MECHANISM.md).
+
+---
+
+## Current Phase: Cold-Start
+
+The subnet is bootstrapping. Validators set consensus weights to anchor the network while the full ClawBench evaluation pipeline is finalized. **Mainnet launch with live evaluation is expected in ~1 week.** Your validator will automatically transition to the production pipeline via Watchtower — no manual action required.
+
+During cold-start, the validator:
+- Sets weights every ~25 minutes
+- Requires no LLM API key (no inference costs)
+- Auto-updates when we push new code to `main`
+
+---
+
+## Quick Start
+
+```bash
+# 1. Clone the repo
+git clone https://github.com/trajectoryRL/trajectoryRL.git
+cd trajectoryRL
+
+# 2. Create your .env file
+cat > .env.validator <<'EOF'
+WALLET_NAME=your-wallet-name
+WALLET_HOTKEY=default
+NETUID=11
+NETWORK=finney
+EOF
+
+# 3. Start the validator + Watchtower (auto-updates from GHCR)
+docker compose -f docker/docker-compose.validator.yml --env-file .env.validator up -d
+
+# 4. Check logs
+docker logs -f trajectoryrl_validator
+docker logs -f trajectoryrl_watchtower
+```
+
+Requirements: Docker, a registered SN11 hotkey. That's it.
+
+---
+
+## Automatic Updates (Watchtower + GHCR)
+
+The validator image is hosted on GitHub Container Registry (`ghcr.io/trajectoryrl/trajectoryrl:latest`). A Watchtower sidecar polls GHCR every 5 minutes and automatically pulls new images when we push code to `main`.
+
+**Update flow:**
+1. Team pushes code to `main`
+2. GitHub Actions builds and pushes a new image to GHCR (~1 min)
+3. Watchtower detects the new image (~5 min poll interval)
+4. Watchtower stops the old container, starts a new one with the updated image
+5. Total latency: **~5 minutes from push to running new code**
+
+**No git pull, no manual rebuilds, no downtime management.**
+
+### Verify auto-updates are working
+
+```bash
+# Watchtower should show "Found new image" entries
+docker logs trajectoryrl_watchtower
+
+# Validator should show a recent start time
+docker inspect trajectoryrl_validator --format '{{.Created}}'
+```
+
+### Running without auto-update
+
+If you prefer manual control, pull the image yourself:
+
+```bash
+docker compose -f docker/docker-compose.validator.yml --env-file .env.validator pull
+docker compose -f docker/docker-compose.validator.yml --env-file .env.validator up -d
+```
 
 ---
 
@@ -125,54 +197,3 @@ Every tempo (~72 min), the validator re-pulls scores, re-computes consensus, and
 
 For full details on the shared score bucket, signed score files, and stake-weighted aggregation, see [INCENTIVE_MECHANISM.md — Validator Consensus](INCENTIVE_MECHANISM.md#validator-consensus).
 
----
-
-## Automatic Updates
-
-Validators should run with `docker compose watch` to automatically pick up new scenarios, scoring updates, and code changes without manual container rebuilds.
-
-### Starting with auto-update
-
-```bash
-# Start all services with file watching enabled
-docker compose up --watch
-```
-
-### How it works
-
-When the team releases updates (new scenarios, scoring fixes, validator code), pull the changes:
-
-```bash
-git pull --recurse-submodules
-```
-
-`docker compose watch` detects the file changes and automatically applies them:
-
-| Change type | Action | Downtime |
-|-------------|--------|----------|
-| Validator source code (`trajectoryrl/`, `neurons/`) | Sync + restart | Seconds |
-| ClawBench scenarios, fixtures, scoring (`clawbench/`) | Sync + restart | Seconds |
-| Mock tools server (`clawbench/clawbench/mock_tools/`) | Sync + restart | Seconds |
-| Dependencies (`requirements.txt`, `pyproject.toml`) | Full rebuild | Minutes |
-| Dockerfile changes | Full rebuild | Minutes |
-
-### Optional: automated git pull
-
-Set up a cron job to pull updates periodically:
-
-```bash
-# Pull every 6 hours (add to crontab -e)
-0 */6 * * * cd /path/to/trajectoryrl && git pull --recurse-submodules >> /var/log/trajectoryrl-pull.log 2>&1
-```
-
-### Running without auto-update
-
-If you prefer manual control, run detached without watch:
-
-```bash
-docker compose up -d
-
-# After pulling updates, manually rebuild:
-git pull --recurse-submodules
-docker compose up -d --build
-```
