@@ -49,6 +49,7 @@ services:
     container_name: trajectoryrl_watchtower
     restart: unless-stopped
     environment:
+      - DOCKER_API_VERSION=1.44
       - WATCHTOWER_LABEL_ENABLE=true
       - WATCHTOWER_POLL_INTERVAL=300
       - WATCHTOWER_CLEANUP=true
