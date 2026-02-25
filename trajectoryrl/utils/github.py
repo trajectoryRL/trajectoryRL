@@ -1,8 +1,10 @@
 """GitHub repository verification utilities."""
 
+import asyncio
 import json
 import logging
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -12,6 +14,38 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 import httpx
+
+_SUBPROCESS_TIMEOUT = 60  # seconds for network git ops (clone/fetch)
+_GIT_LOCAL_TIMEOUT = 10   # seconds for local-only git ops (cat-file/show)
+
+
+async def _run_subprocess(
+    cmd: list,
+    timeout: float = _GIT_LOCAL_TIMEOUT,
+) -> subprocess.CompletedProcess:
+    """Run a command asynchronously without blocking the event loop.
+
+    All git/subprocess calls in this module previously used blocking
+    ``subprocess.run()``, which stalls the entire asyncio event loop
+    during network I/O (clone, fetch) — sometimes for 30-60 seconds.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        raise subprocess.TimeoutExpired(cmd, timeout)
+
+    return subprocess.CompletedProcess(
+        cmd, proc.returncode,
+        stdout=stdout.decode() if stdout else "",
+        stderr=stderr.decode() if stderr else "",
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -190,27 +224,23 @@ class GitHubVerifier:
             if repo_path.exists():
                 # Update existing repo
                 logger.debug(f"Updating cached repo: {repo_path}")
-                result = subprocess.run(
+                result = await _run_subprocess(
                     ["git", "-C", str(repo_path), "fetch", "--all"],
-                    capture_output=True,
-                    text=True,
-                    timeout=30
+                    timeout=_SUBPROCESS_TIMEOUT,
                 )
                 if result.returncode != 0:
                     logger.warning(f"Failed to update repo: {result.stderr}")
                     if not _retry:
                         return None
-                    # Try to clone fresh
-                    subprocess.run(["rm", "-rf", str(repo_path)], check=True)
+                    # Try to clone fresh (shutil.rmtree is fast — no network I/O)
+                    shutil.rmtree(repo_path, ignore_errors=True)
                     return await self._clone_or_update_repo(repo_url, _retry=False)
             else:
                 # Clone fresh
                 logger.debug(f"Cloning repo to: {repo_path}")
-                result = subprocess.run(
+                result = await _run_subprocess(
                     ["git", "clone", "--quiet", repo_url, str(repo_path)],
-                    capture_output=True,
-                    text=True,
-                    timeout=60
+                    timeout=_SUBPROCESS_TIMEOUT,
                 )
                 if result.returncode != 0:
                     logger.error(f"Failed to clone repo: {result.stderr}")
@@ -236,10 +266,9 @@ class GitHubVerifier:
             True if commit exists, False otherwise
         """
         try:
-            result = subprocess.run(
+            result = await _run_subprocess(
                 ["git", "-C", str(repo_path), "cat-file", "-e", commit_hash],
-                capture_output=True,
-                timeout=5
+                timeout=_GIT_LOCAL_TIMEOUT,
             )
             return result.returncode == 0
         except Exception as e:
@@ -260,11 +289,9 @@ class GitHubVerifier:
             Unix timestamp, or None if failed
         """
         try:
-            result = subprocess.run(
+            result = await _run_subprocess(
                 ["git", "-C", str(repo_path), "show", "-s", "--format=%ct", commit_hash],
-                capture_output=True,
-                text=True,
-                timeout=5
+                timeout=_GIT_LOCAL_TIMEOUT,
             )
             if result.returncode != 0:
                 return None
@@ -555,11 +582,9 @@ class GitHubVerifier:
         """
         try:
             # First try to find pack.json
-            result = subprocess.run(
+            result = await _run_subprocess(
                 ["git", "-C", str(repo_path), "show", f"{commit_hash}:pack.json"],
-                capture_output=True,
-                text=True,
-                timeout=5
+                timeout=_GIT_LOCAL_TIMEOUT,
             )
 
             if result.returncode == 0:
@@ -578,31 +603,25 @@ class GitHubVerifier:
             }
 
             # Extract AGENTS.md
-            result = subprocess.run(
+            result = await _run_subprocess(
                 ["git", "-C", str(repo_path), "show", f"{commit_hash}:AGENTS.md"],
-                capture_output=True,
-                text=True,
-                timeout=5
+                timeout=_GIT_LOCAL_TIMEOUT,
             )
             if result.returncode == 0:
                 pack["files"]["AGENTS.md"] = result.stdout
 
             # Extract SOUL.md (optional)
-            result = subprocess.run(
+            result = await _run_subprocess(
                 ["git", "-C", str(repo_path), "show", f"{commit_hash}:SOUL.md"],
-                capture_output=True,
-                text=True,
-                timeout=5
+                timeout=_GIT_LOCAL_TIMEOUT,
             )
             if result.returncode == 0:
                 pack["files"]["SOUL.md"] = result.stdout
 
             # Extract tool_policy.json (optional)
-            result = subprocess.run(
+            result = await _run_subprocess(
                 ["git", "-C", str(repo_path), "show", f"{commit_hash}:tool_policy.json"],
-                capture_output=True,
-                text=True,
-                timeout=5
+                timeout=_GIT_LOCAL_TIMEOUT,
             )
             if result.returncode == 0:
                 pack["tool_policy"] = json.loads(result.stdout)
