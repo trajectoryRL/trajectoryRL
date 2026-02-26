@@ -50,7 +50,7 @@ See [INCENTIVE_MECHANISM.md](INCENTIVE_MECHANISM.md) for full scoring, rewards, 
 
 ### For Validators
 
-Validators run via Docker with automatic updates from GHCR via Watchtower. When new code is pushed to `main`, GitHub Actions builds a new image and Watchtower auto-pulls and restarts within 5 minutes.
+Validators run via Docker with automatic updates from GHCR via Watchtower. When new code is pushed to `prod`, GitHub Actions builds a new image and Watchtower auto-pulls and restarts within 5 minutes.
 
 ```bash
 # 1. Create .env.validator
