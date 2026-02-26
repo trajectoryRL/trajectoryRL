@@ -1548,7 +1548,7 @@ class TestValidatorConfig:
         defaults = ValidatorConfig.__dataclass_fields__
         assert defaults["rho_reliability"].default == 0.1
         assert defaults["delta_threshold"].default == 0.05
-        assert defaults["seeds_per_task"].default == 3
+        assert defaults["seeds_per_task"].default == 1
         assert defaults["epoch_interval"].default == 86400
         assert defaults["similarity_threshold"].default == 0.80
         assert defaults["inactivity_window"].default == 2
