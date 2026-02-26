@@ -73,7 +73,6 @@ class ValidatorConfig:
     delta_threshold: float = 0.05  # 5% first-mover advantage threshold
 
     # Consensus config (mitigates LLM non-determinism across validators)
-    score_quantization: float = 0.05  # Round scores to nearest 0.05
     consensus_epsilon: float = 0.02  # Scores within ε are tied; tie → first-mover wins
 
     # Bootstrap config (graduated rewards until enough miners join)

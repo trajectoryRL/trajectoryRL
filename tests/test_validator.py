@@ -54,7 +54,6 @@ CLAWBENCH_PATH = REPO_ROOT / "clawbench"
 def scorer():
     return TrajectoryScorer(
         rho_reliability=0.1,
-        score_quantization=0,  # Disable quantization for exact-value tests
         consensus_epsilon=0.02,
     )
 
@@ -349,25 +348,9 @@ class TestTrajectoryScorer:
         assert abs(final - expected_final) < 1e-6
         assert 0.0 <= final <= 1.0
 
-    def test_quantize_score(self):
-        """Score quantization rounds to nearest q."""
-        s = TrajectoryScorer(score_quantization=0.05)
-        assert s.quantize_score(0.87) == 0.85
-        assert s.quantize_score(0.88) == 0.90
-        assert s.quantize_score(0.875) == 0.90  # midpoint rounds up
-        assert s.quantize_score(0.0) == 0.0
-        assert s.quantize_score(1.0) == 1.0
-        assert s.quantize_score(0.924) == 0.90
-        assert s.quantize_score(0.926) == 0.95
-
-    def test_quantize_score_disabled(self):
-        """q=0 means no quantization."""
-        s = TrajectoryScorer(score_quantization=0)
-        assert s.quantize_score(0.873) == 0.873
-
-    def test_compute_final_score_with_quantization(self):
-        """Final score is quantized."""
-        s = TrajectoryScorer(rho_reliability=0.1, score_quantization=0.05)
+    def test_compute_final_score_no_quantization(self):
+        """Final score is continuous (no quantization)."""
+        s = TrajectoryScorer(rho_reliability=0.1)
         agg = AggregatedScore(
             mean_score=0.87,
             variance=0.0,
@@ -375,13 +358,13 @@ class TestTrajectoryScorer:
             total_evaluations=1,
             scenario_scores={"a": 0.87},
         )
-        # 0.87 - 0 = 0.87, quantized to 0.85
-        assert s.compute_final_score(agg) == 0.85
+        # 0.87 - 0 = 0.87, returned as-is
+        assert s.compute_final_score(agg) == 0.87
 
     def test_select_winner_consensus_epsilon_tie(self):
         """Scores within ε → tie broken by earliest timestamp."""
         s = TrajectoryScorer(
-            score_quantization=0, consensus_epsilon=0.02
+            consensus_epsilon=0.02
         )
         # Two miners with nearly identical scores (within ε)
         scores = {0: 0.90, 1: 0.91}
@@ -407,7 +390,7 @@ class TestTrajectoryScorer:
     def test_select_winner_clear_margin_no_tie(self):
         """Scores separated by more than ε → no tie-break."""
         s = TrajectoryScorer(
-            score_quantization=0, consensus_epsilon=0.02
+            consensus_epsilon=0.02
         )
         scores = {0: 0.85, 1: 0.91}
         uid_to_hotkey = {0: "hk_0", 1: "hk_1"}
@@ -1821,7 +1804,6 @@ class TestInactivityWindow:
             config.clawbench_path = Path("/tmp/test_clawbench")
             config.timeout_per_scenario = 120
             config.rho_reliability = 0.1
-            config.score_quantization = 0.05
             config.consensus_epsilon = 0.02
             config.bootstrap_threshold = 10
             config.log_dir = Path("/tmp/test_logs")
