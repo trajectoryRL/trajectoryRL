@@ -159,11 +159,13 @@ class TrajectoryValidator:
         self.cached_scores: Dict[int, float] = {}
         self.cached_per_scenario: Dict[int, Dict[str, float]] = {}
 
-        # Load scenarios
+        # Load scenarios and track content hash for change detection
         self.scenarios = self._load_scenarios()
+        self._scenario_hash = self._scenario_pool_hash()
         logger.info(
             f"Loaded {len(self.scenarios)} scenarios: "
-            f"{list(self.scenarios.keys())}"
+            f"{list(self.scenarios.keys())} "
+            f"(hash={self._scenario_hash[:12]})"
         )
 
         logger.info("Validator initialization complete!")
@@ -226,6 +228,20 @@ class TrajectoryValidator:
             raise ValueError("No scenarios loaded!")
         return scenarios
 
+    def _scenario_pool_hash(self) -> str:
+        """SHA256 of the sorted scenario YAML contents.
+
+        Used to detect when scenario files change on disk (e.g. after a
+        Watchtower image update), so the validator can reload scenarios
+        and invalidate cached scores.
+        """
+        h = hashlib.sha256()
+        for name in sorted(self.config.scenarios):
+            path = self.config.scenarios_path / f"{name}.yaml"
+            if path.exists():
+                h.update(path.read_bytes())
+        return h.hexdigest()
+
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
@@ -262,6 +278,17 @@ class TrajectoryValidator:
                     logger.info("=" * 60)
                     logger.info(f"Epoch {self.current_epoch} starting")
                     logger.info("=" * 60)
+
+                    # Detect scenario file changes (e.g. Watchtower update).
+                    new_hash = self._scenario_pool_hash()
+                    if new_hash != self._scenario_hash:
+                        logger.info(
+                            f"Scenario pool changed "
+                            f"({self._scenario_hash[:12]} → {new_hash[:12]}), "
+                            f"reloading"
+                        )
+                        self.scenarios = self._load_scenarios()
+                        self._scenario_hash = new_hash
 
                     # Clear caches so packs are re-evaluated under the new
                     # epoch seed / context (even if pack_hash is unchanged).

@@ -510,6 +510,90 @@ class TestEpochSeedAndScenarioRotation:
 
 
 # ===================================================================
+# Scenario Pool Versioning Tests
+# ===================================================================
+
+
+class TestScenarioPoolVersioning:
+    """Tests for scenario pool change detection."""
+
+    def test_scenario_hash_deterministic(self):
+        """Same scenario files produce the same hash."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scenarios_dir = Path(tmpdir)
+            (scenarios_dir / "a.yaml").write_text("name: a\nweight: 1.0\n")
+            (scenarios_dir / "b.yaml").write_text("name: b\nweight: 2.0\n")
+
+            config = MagicMock()
+            config.scenarios = ["a", "b"]
+            config.scenarios_path = scenarios_dir
+
+            v = MagicMock()
+            v.config = config
+            h1 = TrajectoryValidator._scenario_pool_hash(v)
+            h2 = TrajectoryValidator._scenario_pool_hash(v)
+            assert h1 == h2
+
+    def test_scenario_hash_changes_on_content_change(self):
+        """Modifying a scenario file changes the hash."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scenarios_dir = Path(tmpdir)
+            f = scenarios_dir / "a.yaml"
+            f.write_text("name: a\nweight: 1.0\n")
+
+            config = MagicMock()
+            config.scenarios = ["a"]
+            config.scenarios_path = scenarios_dir
+
+            v = MagicMock()
+            v.config = config
+            h1 = TrajectoryValidator._scenario_pool_hash(v)
+
+            f.write_text("name: a\nweight: 2.0\n")
+            h2 = TrajectoryValidator._scenario_pool_hash(v)
+            assert h1 != h2
+
+    def test_scenario_hash_changes_on_new_scenario(self):
+        """Adding a new scenario to the list changes the hash."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scenarios_dir = Path(tmpdir)
+            (scenarios_dir / "a.yaml").write_text("name: a\n")
+            (scenarios_dir / "b.yaml").write_text("name: b\n")
+
+            config = MagicMock()
+            config.scenarios = ["a"]
+            config.scenarios_path = scenarios_dir
+
+            v = MagicMock()
+            v.config = config
+            h1 = TrajectoryValidator._scenario_pool_hash(v)
+
+            config.scenarios = ["a", "b"]
+            h2 = TrajectoryValidator._scenario_pool_hash(v)
+            assert h1 != h2
+
+    def test_scenario_hash_order_independent(self):
+        """Hash is stable regardless of scenario list order."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scenarios_dir = Path(tmpdir)
+            (scenarios_dir / "a.yaml").write_text("name: a\n")
+            (scenarios_dir / "b.yaml").write_text("name: b\n")
+
+            config = MagicMock()
+            config.scenarios_path = scenarios_dir
+
+            v = MagicMock()
+            v.config = config
+
+            config.scenarios = ["a", "b"]
+            h1 = TrajectoryValidator._scenario_pool_hash(v)
+
+            config.scenarios = ["b", "a"]
+            h2 = TrajectoryValidator._scenario_pool_hash(v)
+            assert h1 == h2
+
+
+# ===================================================================
 # Epoch Context Tests
 # ===================================================================
 
