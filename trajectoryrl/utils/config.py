@@ -64,7 +64,7 @@ class ValidatorConfig:
     scenarios_path: Optional[Path] = None
 
     # Evaluation config
-    seeds_per_task: int = 3  # Runs per scenario for majority-vote consensus
+    seeds_per_task: int = 1  # Runs per scenario (spec: "once per scenario")
     epoch_interval: int = 86400  # 24 hours (86400 seconds)
     timeout_per_scenario: int = 120  # 2 minutes max per scenario
 
