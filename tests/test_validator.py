@@ -7,6 +7,7 @@ and config without requiring a live Bittensor network.
 import asyncio
 import hashlib
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -1521,6 +1522,70 @@ class TestGitHubVerifier:
 
             assert ts is None
             mock_graphql.assert_not_called()
+
+    # ---------------------------------------------------------------
+    # cleanup_cache (LRU eviction)
+    # ---------------------------------------------------------------
+
+    def test_cleanup_cache_no_eviction_when_under_limit(self):
+        """Cache under limit → no repos evicted."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            verifier = GitHubVerifier(cache_dir=Path(tmpdir))
+
+            # Create a small repo dir (well under 100 MB)
+            repo = Path(tmpdir) / "alice__pack"
+            repo.mkdir()
+            (repo / "data.txt").write_text("x" * 1000)
+
+            verifier.cleanup_cache(max_size_mb=100)
+            assert repo.exists()
+
+    def test_cleanup_cache_evicts_oldest_first(self):
+        """When over limit, oldest repos (by mtime) are evicted first."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            verifier = GitHubVerifier(cache_dir=Path(tmpdir))
+
+            # Create two repo dirs with different mtimes
+            old_repo = Path(tmpdir) / "old__repo"
+            old_repo.mkdir()
+            (old_repo / "data.txt").write_bytes(b"x" * 600_000)
+            # Backdate the old repo
+            os.utime(old_repo, (1000000, 1000000))
+
+            new_repo = Path(tmpdir) / "new__repo"
+            new_repo.mkdir()
+            (new_repo / "data.txt").write_bytes(b"x" * 600_000)
+
+            # Total ~1.2 MB, limit = 1 MB → should evict old_repo
+            verifier.cleanup_cache(max_size_mb=1)
+            assert not old_repo.exists(), "Old repo should be evicted"
+            assert new_repo.exists(), "New repo should be kept"
+
+    def test_cleanup_cache_evicts_multiple(self):
+        """Evicts multiple repos until under limit."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            verifier = GitHubVerifier(cache_dir=Path(tmpdir))
+
+            repos = []
+            for i in range(5):
+                repo = Path(tmpdir) / f"repo{i}__pack"
+                repo.mkdir()
+                (repo / "data.txt").write_bytes(b"x" * 300_000)
+                os.utime(repo, (1000000 + i, 1000000 + i))
+                repos.append(repo)
+
+            # Total ~1.5 MB, limit = 1 MB → should evict at least 2 oldest
+            verifier.cleanup_cache(max_size_mb=1)
+            remaining = [r for r in repos if r.exists()]
+            assert len(remaining) < 5
+            # The newest repos should survive
+            assert repos[4].exists()
+
+    def test_cleanup_cache_empty_dir(self):
+        """Empty cache dir → no error."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            verifier = GitHubVerifier(cache_dir=Path(tmpdir))
+            verifier.cleanup_cache(max_size_mb=100)  # Should not raise
 
 
 # ===================================================================

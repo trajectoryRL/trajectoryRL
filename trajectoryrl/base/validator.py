@@ -95,7 +95,7 @@ class TrajectoryValidator:
         # Initialize GitHub verifier
         logger.info("Initializing GitHub verifier...")
         self.github_verifier = GitHubVerifier(
-            cache_dir=config.log_dir / "git_cache",
+            cache_dir=config.pack_cache_dir,
             github_token=config.github_token,
         )
 
@@ -275,6 +275,11 @@ class TrajectoryValidator:
                     # when the epoch actually finished, not from when the loop
                     # iteration started (epoch eval can take hours).
                     self.last_weight_block = self.subtensor.get_current_block()
+
+                    # Evict stale cloned repos to keep disk usage bounded.
+                    self.github_verifier.cleanup_cache(
+                        self.config.pack_cache_max_size
+                    )
 
                     logger.info(
                         f"Epoch {self.current_epoch} complete. "

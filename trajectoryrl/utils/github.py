@@ -95,6 +95,52 @@ class GitHubVerifier:
         self.github_token = github_token or os.getenv("GITHUB_TOKEN")
         logger.info(f"GitHubVerifier initialized with cache: {self.cache_dir}")
 
+    def cleanup_cache(self, max_size_mb: int = 100) -> None:
+        """Evict least-recently-used cloned repos to stay under the size limit.
+
+        Repos are sorted by modification time (oldest first) and removed
+        until total cache size is under ``max_size_mb``.
+        """
+        if not self.cache_dir.exists():
+            return
+
+        # Collect (path, size_bytes, mtime) for each cached repo dir
+        entries = []
+        for entry in self.cache_dir.iterdir():
+            if not entry.is_dir():
+                continue
+            size = sum(f.stat().st_size for f in entry.rglob("*") if f.is_file())
+            mtime = entry.stat().st_mtime
+            entries.append((entry, size, mtime))
+
+        total_bytes = sum(e[1] for e in entries)
+        max_bytes = max_size_mb * 1024 * 1024
+
+        if total_bytes <= max_bytes:
+            logger.debug(
+                f"Cache size {total_bytes / 1024 / 1024:.1f} MB "
+                f"<= {max_size_mb} MB, no eviction needed"
+            )
+            return
+
+        # Sort by mtime ascending (oldest first = evict first)
+        entries.sort(key=lambda e: e[2])
+
+        evicted = 0
+        for path, size, _ in entries:
+            if total_bytes <= max_bytes:
+                break
+            logger.info(f"Evicting cached repo: {path.name} ({size / 1024 / 1024:.1f} MB)")
+            shutil.rmtree(path, ignore_errors=True)
+            total_bytes -= size
+            evicted += 1
+
+        if evicted:
+            logger.info(
+                f"Cache cleanup: evicted {evicted} repos, "
+                f"remaining {total_bytes / 1024 / 1024:.1f} MB"
+            )
+
     async def verify_submission(
         self,
         repo_url: str,
