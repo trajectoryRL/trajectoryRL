@@ -1,13 +1,13 @@
 # Build and push validator Docker image to GHCR
 #
-# Triggers on push to main when validator-related files change.
+# Triggers on push to prod when validator-related files change.
 # Watchtower on validator machines auto-pulls the new image.
 
 name: Build Validator Image
 
 on:
   push:
-    branches: [main]
+    branches: [prod]
     paths:
       - "neurons/**"
       - "trajectoryrl/**"
