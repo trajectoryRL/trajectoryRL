@@ -125,7 +125,7 @@ def fetch_all_commitments(
         pack_hash, git_commit, repo_url = parsed
 
         # Get commitment block number for first-mover ordering
-        block_number = _get_commitment_block(subtensor, netuid, uid)
+        block_number = _get_commitment_block(subtensor, netuid, hotkey)
 
         commitments[uid] = MinerCommitment(
             uid=uid,
@@ -144,17 +144,17 @@ def fetch_all_commitments(
     return commitments
 
 
-def _get_commitment_block(subtensor, netuid: int, uid: int) -> int:
+def _get_commitment_block(subtensor, netuid: int, hotkey: str) -> int:
     """Get the block number at which a UID's commitment was set.
 
     Tries ``get_commitment_metadata`` first; falls back to current block.
     """
     try:
-        meta = subtensor.get_commitment_metadata(netuid=netuid, uid=uid)
+        meta = subtensor.get_commitment_metadata(netuid=netuid, hotkey=hotkey)
         if meta and hasattr(meta, "block"):
             return meta.block
     except Exception as e:
-        logger.debug(f"UID {uid}: get_commitment_metadata failed ({e}), falling back to current block")
+        logger.debug(f"get_commitment_metadata failed for {hotkey[:8]}… ({e}), falling back to current block")
 
     # Fallback: use current block (less precise but functional).
     # This inflates the apparent first-mover block number so the miner
