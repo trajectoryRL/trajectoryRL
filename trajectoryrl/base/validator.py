@@ -88,7 +88,6 @@ class TrajectoryValidator:
         # Initialize scorer
         self.scorer = TrajectoryScorer(
             rho_reliability=config.rho_reliability,
-            score_quantization=config.score_quantization,
             consensus_epsilon=config.consensus_epsilon,
             bootstrap_threshold=config.bootstrap_threshold,
         )

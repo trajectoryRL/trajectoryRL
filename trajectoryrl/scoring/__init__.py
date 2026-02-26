@@ -37,7 +37,6 @@ class TrajectoryScorer:
     def __init__(
         self,
         rho_reliability: float = 0.1,
-        score_quantization: float = 0.05,
         consensus_epsilon: float = 0.02,
         bootstrap_threshold: int = 10,
     ):
@@ -45,21 +44,17 @@ class TrajectoryScorer:
 
         Args:
             rho_reliability: Weight for variance penalty
-            score_quantization: Round final scores to this grid (e.g., 0.05 →
-                scores snap to 0.00, 0.05, 0.10, …). Reduces validator
-                disagreement caused by LLM non-determinism.
             consensus_epsilon: Scores within ε of each other are treated as
                 tied. Ties go to the first-mover.
             bootstrap_threshold: When active miners < this, use graduated
                 reward curve instead of winner-take-all.
         """
         self.rho_reliability = rho_reliability
-        self.score_quantization = score_quantization
         self.consensus_epsilon = consensus_epsilon
         self.bootstrap_threshold = bootstrap_threshold
 
         logger.info(
-            f"Scorer initialized: ρ={rho_reliability}, q={score_quantization}, "
+            f"Scorer initialized: ρ={rho_reliability}, "
             f"ε={consensus_epsilon}, bootstrap_threshold={bootstrap_threshold}"
         )
 
@@ -155,17 +150,13 @@ class TrajectoryScorer:
         self,
         aggregated: AggregatedScore
     ) -> float:
-        """Compute final score with reliability penalty and quantization.
-
-        Quantization snaps scores to a fixed grid so that independent
-        validators are far more likely to arrive at the same number despite
-        LLM non-determinism in individual runs.
+        """Compute final score with reliability penalty.
 
         Args:
             aggregated: AggregatedScore from multiple evaluations
 
         Returns:
-            Quantized final score in [0, 1]
+            Final score in [0, 1]
         """
         # Apply variance penalty
         reliability_penalty = self.rho_reliability * aggregated.variance
@@ -174,31 +165,12 @@ class TrajectoryScorer:
         # Clamp to [0, 1]
         final = max(0.0, min(1.0, final))
 
-        # Quantize
-        final = self.quantize_score(final)
-
         logger.debug(
             f"Final score: {final:.3f} = "
-            f"quantize({aggregated.mean_score:.3f} - {reliability_penalty:.3f})"
+            f"{aggregated.mean_score:.3f} - {reliability_penalty:.3f}"
         )
 
         return final
-
-    def quantize_score(self, score: float) -> float:
-        """Round score to the nearest quantization step.
-
-        Example with q=0.05: 0.87 → 0.85, 0.88 → 0.90, 0.925 → 0.90
-
-        Args:
-            score: Raw score in [0, 1]
-
-        Returns:
-            Quantized score in [0, 1]
-        """
-        if self.score_quantization <= 0:
-            return score
-        q = self.score_quantization
-        return round(round(score / q) * q, 10)  # round(, 10) avoids float drift
 
     def select_winner(
         self,
@@ -215,16 +187,13 @@ class TrajectoryScorer:
         to encourage early adoption.  Once the miner count reaches the
         threshold, pure winner-take-all resumes.
 
-        Consensus-safe: miners whose quantized scores differ by less than
+        Consensus-safe: miners whose scores differ by less than
         ``consensus_epsilon`` are treated as tied. Ties are broken in favour
         of the earliest submitter (by on-chain block number), which every
         validator can resolve identically.
 
-        Anti-stagnation is handled by epoch-seeded context variation (not
-        by decaying δ).
-
         Args:
-            scores: Dict of miner_uid -> quantized score [0, 1]
+            scores: Dict of miner_uid -> score [0, 1]
             first_mover_data: Dict of hotkey -> (score, block_number).
                 block_number is the on-chain block at which the miner first
                 submitted; lower block number = earlier submission.
@@ -344,7 +313,7 @@ class TrajectoryScorer:
         by earliest block number (same rule as steady-state).
 
         Args:
-            scores: Dict of miner_uid -> quantized score
+            scores: Dict of miner_uid -> score
             first_mover_data: Dict of hotkey -> (score, block_number)
             uid_to_hotkey: Dict of miner_uid -> hotkey
 
