@@ -1,7 +1,6 @@
 """Scoring functions for policy pack evaluation."""
 
 import logging
-import math
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
@@ -346,43 +345,3 @@ class TrajectoryScorer:
         )
 
         return weights
-
-    def normalize_scores_to_weights(
-        self,
-        scores: Dict[int, float],
-        temperature: float = 0.1
-    ) -> Dict[int, float]:
-        """Normalize miner scores to weights using softmax.
-
-        DEPRECATED: Use select_winner() for winner-take-all mechanism.
-
-        Args:
-            scores: Dict of miner_uid -> score [0, 1]
-            temperature: Softmax temperature (lower = more concentrated)
-
-        Returns:
-            Dict of miner_uid -> weight (sums to 1.0)
-        """
-        logger.warning(
-            "normalize_scores_to_weights() is DEPRECATED. "
-            "Use select_winner() for winner-take-all mechanism."
-        )
-
-        if not scores:
-            return {}
-
-        uids = list(scores.keys())
-        raw_scores = np.array([scores[uid] for uid in uids])
-
-        # Softmax normalization
-        exp_scores = np.exp(raw_scores / temperature)
-        weights = exp_scores / exp_scores.sum()
-
-        result = {uid: float(w) for uid, w in zip(uids, weights)}
-
-        logger.info(
-            f"Normalized {len(scores)} scores to weights "
-            f"(temp={temperature}, spread={weights.std():.3f})"
-        )
-
-        return result

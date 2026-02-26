@@ -13,21 +13,18 @@ Architecture (v1.06):
 
 import asyncio
 import hashlib
-import json
 import logging
 import time
 import yaml
 from collections import defaultdict
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import bittensor as bt
-import numpy as np
 
 from ..utils.opp_schema import validate_opp_schema
 from ..utils.config import ValidatorConfig
 from ..utils.clawbench import ClawBenchHarness, EvaluationResult
-from ..scoring import TrajectoryScorer, AggregatedScore
+from ..scoring import TrajectoryScorer
 from ..utils.github import GitHubVerifier
 from ..utils.epoch_context import generate_epoch_context, render_context_preamble
 from ..utils.commitments import MinerCommitment, fetch_all_commitments
