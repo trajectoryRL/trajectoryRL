@@ -12,10 +12,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+import bittensor as bt
 
 logger = logging.getLogger(__name__)
 
@@ -47,15 +50,20 @@ class ScorePublisher:
 
     def __init__(
         self,
-        wallet,
+        wallet_name: str,
+        wallet_hotkey: str,
         fork_repo_url: str,
         local_path: Path,
-        github_token: Optional[str] = None,
+        github_token: str,
+        git_email: str,
+        git_name: str,
     ):
-        self.wallet = wallet
+        self.wallet = bt.Wallet(name=wallet_name, hotkey=wallet_hotkey)
         self.fork_repo_url = fork_repo_url
         self.local_path = Path(local_path)
         self.github_token = github_token
+        self.git_email = git_email
+        self.git_name = git_name
         self._initialized = False
 
     async def _ensure_repo(self):
@@ -93,16 +101,14 @@ class ScorePublisher:
         sig = self.wallet.hotkey.sign(canonical.encode("utf-8"))
         return sig.hex() if isinstance(sig, bytes) else str(sig)
 
-    @staticmethod
-    def verify_signature(payload: dict, signature: str, hotkey_ss58: str) -> bool:
+    def verify_signature(self, payload: dict, signature: str, hotkey_ss58: str) -> bool:
         """Verify sr25519 signature over payload.
 
-        Uses bittensor_wallet.Keypair for verification.
+        Constructs a temporary ``bt.Wallet``-compatible keypair from the
+        given *hotkey_ss58* address for sr25519 verification.
         """
         try:
-            from bittensor_wallet import Keypair
-
-            kp = Keypair(ss58_address=hotkey_ss58)
+            kp = bt.Keypair(ss58_address=hotkey_ss58)
             signable = {k: v for k, v in payload.items() if k != "signature"}
             canonical = json.dumps(signable, sort_keys=True, separators=(",", ":"))
             return kp.verify(canonical.encode("utf-8"), bytes.fromhex(signature))
@@ -162,10 +168,8 @@ class ScorePublisher:
         await _run_git(
             [
                 "git", "-C", str(self.local_path),
-                # Set identity inline so commit succeeds even without a global
-                # git config (common on freshly provisioned validator machines).
-                "-c", "user.email=validator@trajectoryrl.local",
-                "-c", "user.name=TrajectoryRL Validator",
+                "-c", f"user.email={self.git_email}",
+                "-c", f"user.name={self.git_name}",
                 "commit", "-m", f"scores: epoch {epoch} validator {hotkey[:8]}",
             ],
             check=False,
@@ -229,7 +233,7 @@ class ScorePublisher:
                 signature = data["signature"]
 
                 # Verify sr25519 signature to reject forged score files
-                if not ScorePublisher.verify_signature(data, signature, hotkey):
+                if not self.verify_signature(data, signature, hotkey):
                     logger.warning(
                         f"Score file {score_path.name}: invalid signature, skipping"
                     )

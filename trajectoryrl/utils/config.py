@@ -87,6 +87,10 @@ class ValidatorConfig:
     # GitHub verification
     github_token: Optional[str] = None  # GITHUB_TOKEN env var; needed for push timestamp
 
+    # Git identity for score commits (falls back to GITHUB_EMAIL / GITHUB_NAME env vars)
+    git_email: Optional[str] = None
+    git_name: Optional[str] = None
+
     # Validator score publishing (shared score bucket)
     validator_scores_fork_url: Optional[str] = None  # Validator's fork of validator-scores repo
     validator_scores_local_path: Path = field(
@@ -177,5 +181,7 @@ class ValidatorConfig:
             similarity_threshold=float(os.getenv("SIMILARITY_THRESHOLD", "0.80")),
             inactivity_window=int(os.getenv("INACTIVITY_WINDOW", "2")),
             validator_scores_fork_url=os.getenv("VALIDATOR_SCORES_FORK_URL"),
+            git_email=os.getenv("GITHUB_EMAIL", "validator@trajectoryrl.local"),
+            git_name=os.getenv("GITHUB_NAME", "TrajectoryRL Validator"),
             weight_interval_blocks=int(os.getenv("WEIGHT_INTERVAL_BLOCKS", "360")),
         )
