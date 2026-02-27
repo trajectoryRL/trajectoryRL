@@ -20,7 +20,7 @@ TrajectoryRL is a Bittensor subnet where miners compete to optimize AI agent pol
 │  ┌───────────────┐                   ┌───────────────────┐   │
 │  │ Publish       │   on-chain        │ Read commitments  │   │
 │  │ pack.json to  │   commitment      │ from chain        │   │
-│  │ public GitHub │──────────────────▶│                   │   │
+│  │ public GitHub │─────────────────> │                   │   │
 │  │ repo          │                   │ Fetch packs from  │   │
 │  └───────────────┘                   │ GitHub, verify    │   │
 │        │                             │ hash + timestamp  │   │
