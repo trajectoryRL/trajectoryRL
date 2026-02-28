@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -1842,6 +1843,165 @@ class TestScoreConsensus:
         result = ScorePublisher.compute_consensus([], metagraph)
         assert result.num_validators == 0
         assert result.consensus_scores == {}
+
+
+# ===================================================================
+# ScorePublisher Signing & PR Submission Tests
+# ===================================================================
+
+
+class TestScorePublisherSignAndPublish:
+    """Tests for ScorePublisher signing, verification, and PR submission."""
+
+    def _make_publisher(self, tmpdir):
+        from trajectoryrl.utils.score_publisher import ScorePublisher
+
+        mock_wallet = MagicMock()
+        mock_wallet.hotkey.ss58_address = "5FakeHotkey1234567890abcdef"
+        mock_wallet.hotkey.sign.return_value = b"\xab\xcd" * 32
+
+        with patch("trajectoryrl.utils.score_publisher.bt") as mock_bt:
+            mock_bt.Wallet.return_value = mock_wallet
+            pub = ScorePublisher(
+                wallet_name="test",
+                wallet_hotkey="default",
+                fork_repo_url="https://github.com/testuser/validator-scores.git",
+                local_path=Path(tmpdir) / "scores-repo",
+                github_token="ghp_test_token",
+                git_email="test@test.com",
+                git_name="Test User",
+            )
+        return pub
+
+    def _git_ok(self):
+        return subprocess.CompletedProcess([], returncode=0, stdout="", stderr="")
+
+    def test_sign_payload_canonical_and_excludes_signature(self):
+        """sign_payload uses canonical JSON (sorted, compact) and strips
+        the 'signature' field before signing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pub = self._make_publisher(tmpdir)
+            payload = {"z": 2, "a": 1, "signature": "old_sig"}
+            sig = pub.sign_payload(payload)
+
+            int(sig, 16)  # valid hex
+            signed_bytes = pub.wallet.hotkey.sign.call_args[0][0]
+            expected = json.dumps({"a": 1, "z": 2}, sort_keys=True, separators=(",", ":")).encode()
+            assert signed_bytes == expected
+
+    def test_verify_signature_exception_returns_false(self):
+        """Exception during verification returns False gracefully."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pub = self._make_publisher(tmpdir)
+            with patch("trajectoryrl.utils.score_publisher.bt") as mock_bt:
+                mock_bt.Keypair.side_effect = RuntimeError("boom")
+                assert pub.verify_signature({"epoch": 1}, "dead", "5Fake") is False
+
+    def test_publish_scores_writes_signed_file_and_opens_pr(self):
+        """Full publish flow: writes signed JSON, pushes, opens PR."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pub = self._make_publisher(tmpdir)
+            git_calls = []
+
+            async def mock_git(cmd, check=True, timeout=120):
+                git_calls.append(cmd)
+                return self._git_ok()
+
+            with patch("trajectoryrl.utils.score_publisher._run_git", side_effect=mock_git):
+                pub.local_path.mkdir(parents=True, exist_ok=True)
+                ok = asyncio.get_event_loop().run_until_complete(
+                    pub.publish_scores(epoch=5, block_height=50000,
+                                       scores={"0": {"final_score": 0.85}})
+                )
+
+            assert ok is True
+            hotkey = pub.wallet.hotkey.ss58_address
+            data = json.loads(
+                (pub.local_path / "epoch-5" / f"{hotkey}.json").read_text()
+            )
+            assert data["epoch"] == 5 and "signature" in data
+            assert any("gh" in c and "pr" in c and "create" in c for c in git_calls)
+
+    def test_publish_scores_push_failure_returns_false(self):
+        """publish_scores returns False when git push fails."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pub = self._make_publisher(tmpdir)
+            fail = subprocess.CompletedProcess([], returncode=1, stdout="", stderr="rejected")
+
+            async def mock_git(cmd, check=True, timeout=120):
+                return fail if "push" in cmd else self._git_ok()
+
+            with patch("trajectoryrl.utils.score_publisher._run_git", side_effect=mock_git):
+                pub.local_path.mkdir(parents=True, exist_ok=True)
+                ok = asyncio.get_event_loop().run_until_complete(
+                    pub.publish_scores(epoch=5, block_height=50000,
+                                       scores={"0": {"final_score": 0.85}})
+                )
+            assert ok is False
+
+    def _make_pull_mock(self, epoch_dir, files_data):
+        """Mock _run_git that populates epoch_dir on checkout."""
+        async def mock_git(cmd, check=True, timeout=120):
+            if "checkout" in cmd and "upstream/main" in cmd:
+                epoch_dir.mkdir(parents=True, exist_ok=True)
+                for name, payload in files_data.items():
+                    (epoch_dir / name).write_text(json.dumps(payload))
+            return self._git_ok()
+        return mock_git
+
+    def test_pull_all_scores_rejects_invalid_signature(self):
+        """pull_all_scores keeps valid-sig files, drops forged ones."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pub = self._make_publisher(tmpdir)
+            pub.local_path.mkdir(parents=True, exist_ok=True)
+            epoch_dir = pub.local_path / "epoch-1"
+
+            files = {
+                "hk_valid.json": {"validator_hotkey": "hk_valid", "epoch": 1,
+                                  "block_height": 100, "scores": {}, "signature": "ok"},
+                "hk_forged.json": {"validator_hotkey": "hk_forged", "epoch": 1,
+                                   "block_height": 100, "scores": {}, "signature": "bad"},
+            }
+
+            with patch("trajectoryrl.utils.score_publisher._run_git",
+                        side_effect=self._make_pull_mock(epoch_dir, files)), \
+                 patch.object(pub, "verify_signature",
+                              side_effect=lambda d, s, hk: hk == "hk_valid"):
+                results = asyncio.get_event_loop().run_until_complete(
+                    pub.pull_all_scores(epoch=1)
+                )
+
+            assert len(results) == 1 and results[0].validator_hotkey == "hk_valid"
+
+    def test_pull_all_scores_rejects_epoch_mismatch(self):
+        """pull_all_scores skips files whose epoch doesn't match."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pub = self._make_publisher(tmpdir)
+            pub.local_path.mkdir(parents=True, exist_ok=True)
+            epoch_dir = pub.local_path / "epoch-2"
+            files = {"hk.json": {"validator_hotkey": "hk", "epoch": 999,
+                                 "block_height": 100, "scores": {}, "signature": "s"}}
+
+            with patch("trajectoryrl.utils.score_publisher._run_git",
+                        side_effect=self._make_pull_mock(epoch_dir, files)), \
+                 patch.object(pub, "verify_signature", return_value=True):
+                results = asyncio.get_event_loop().run_until_complete(
+                    pub.pull_all_scores(epoch=2)
+                )
+            assert results == []
+
+    def test_pull_all_scores_empty_epoch(self):
+        """No epoch dir on upstream returns empty list."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pub = self._make_publisher(tmpdir)
+            pub.local_path.mkdir(parents=True, exist_ok=True)
+
+            with patch("trajectoryrl.utils.score_publisher._run_git",
+                        new_callable=AsyncMock, return_value=self._git_ok()):
+                results = asyncio.get_event_loop().run_until_complete(
+                    pub.pull_all_scores(epoch=99)
+                )
+            assert results == []
 
 
 # ===================================================================
