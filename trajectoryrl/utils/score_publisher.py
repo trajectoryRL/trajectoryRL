@@ -66,28 +66,46 @@ class ScorePublisher:
         self.git_name = git_name
         self._initialized = False
 
+    def _fork_nwo(self) -> str:
+        """Extract owner/repo from fork URL (``name-with-owner`` format)."""
+        url = self.fork_repo_url.rstrip("/")
+        if url.endswith(".git"):
+            url = url[:-4]
+        parts = url.split("/")
+        return f"{parts[-2]}/{parts[-1]}" if len(parts) >= 2 else ""
+
+    def _auth_url(self, url: str) -> str:
+        """Embed github_token into an HTTPS GitHub URL."""
+        if self.github_token and "github.com" in url:
+            return url.replace(
+                "https://github.com",
+                f"https://x-access-token:{self.github_token}@github.com",
+            )
+        return url
+
     async def _ensure_repo(self):
-        """Clone fork and set up upstream remote if not done."""
+        """Clone fork and set up origin + upstream remotes with auth."""
         if self._initialized:
             return
 
-        if not self.local_path.exists():
-            await _run_git(
-                ["git", "clone", self.fork_repo_url, str(self.local_path)]
-            )
-        # Add upstream if missing
-        result = await _run_git(
-            ["git", "-C", str(self.local_path), "remote", "get-url", "upstream"],
-            check=False,
+        auth_origin = self._auth_url(self.fork_repo_url)
+        auth_upstream = self._auth_url(
+            f"https://github.com/{UPSTREAM_REPO}.git"
         )
+        git = ["git", "-C", str(self.local_path)]
+
+        if not self.local_path.exists():
+            await _run_git(["git", "clone", auth_origin, str(self.local_path)])
+        else:
+            await _run_git(git + ["remote", "set-url", "origin", auth_origin], check=False)
+
+        result = await _run_git(git + ["remote", "get-url", "upstream"], check=False)
         if result.returncode != 0:
-            await _run_git(
-                [
-                    "git", "-C", str(self.local_path),
-                    "remote", "add", "upstream",
-                    f"https://github.com/{UPSTREAM_REPO}.git",
-                ]
-            )
+            await _run_git(git + ["remote", "add", "upstream", auth_upstream])
+        else:
+            await _run_git(git + ["remote", "set-url", "upstream", auth_upstream], check=False)
+
+        await _run_git(git + ["config", "--local", "credential.helper", ""], check=False)
         self._initialized = True
 
     def sign_payload(self, payload: dict) -> str:
@@ -137,58 +155,54 @@ class ScorePublisher:
         }
         payload["signature"] = self.sign_payload(payload)
 
-        # Pull latest upstream
-        await _run_git(
-            ["git", "-C", str(self.local_path), "fetch", "upstream", "main"],
-            check=False,
-        )
-        await _run_git(
-            ["git", "-C", str(self.local_path), "checkout", "main"],
-            check=False,
-        )
-        await _run_git(
-            ["git", "-C", str(self.local_path), "reset", "--hard", "upstream/main"],
-            check=False,
-        )
+        logger.info(f"Publishing scores to {self.fork_repo_url}")
 
-        # Write score file
+        git = ["git", "-C", str(self.local_path)]
+        fork_owner = self._fork_nwo().split("/")[0]
+        branch = f"scores/epoch-{epoch}-{hotkey[:8]}"
+
+        # 1. Sync local main with upstream
+        await _run_git(git + ["checkout", "main"], check=False)
+        await _run_git(git + ["pull", "upstream", "main"], check=False)
+
+        # 2. Create feature branch from main
+        await _run_git(git + ["checkout", "-b", branch], check=False)
+
+        # 3. Write score file
         epoch_dir = self.local_path / f"epoch-{epoch}"
         epoch_dir.mkdir(parents=True, exist_ok=True)
         score_file = epoch_dir / f"{hotkey}.json"
         score_file.write_text(json.dumps(payload, indent=2, sort_keys=True))
 
-        # Commit and push
-        branch = f"scores/epoch-{epoch}-{hotkey}"
+        # 4. Commit
+        await _run_git(git + ["add", str(score_file)])
         await _run_git(
-            ["git", "-C", str(self.local_path), "checkout", "-B", branch]
-        )
-        await _run_git(
-            ["git", "-C", str(self.local_path), "add", str(score_file)]
-        )
-        await _run_git(
-            [
-                "git", "-C", str(self.local_path),
+            git + [
                 "-c", f"user.email={self.git_email}",
                 "-c", f"user.name={self.git_name}",
                 "commit", "-m", f"scores: epoch {epoch} validator {hotkey[:8]}",
             ],
             check=False,
         )
+
+        # 5. Push branch to fork
+        logger.info(f"Pushing branch {branch}")
         result = await _run_git(
-            ["git", "-C", str(self.local_path), "push", "origin", branch, "--force"],
+            git + ["push", "origin", branch, "--force"],
             check=False,
         )
         if result.returncode != 0:
             logger.error(f"Failed to push scores: {result.stderr}")
             return False
 
-        # Open PR via gh CLI
+        # 6. Create PR from fork branch to upstream main
         pr_result = await _run_git(
             [
                 "gh", "pr", "create",
                 "--repo", UPSTREAM_REPO,
-                "--head", f"{self._fork_owner()}:{branch}",
-                "--title", f"scores: epoch {epoch} {hotkey}",
+                "--head", f"{fork_owner}:{branch}",
+                "--base", "main",
+                "--title", branch,
                 "--body", f"Validator {hotkey} epoch {epoch} scores",
             ],
             check=False,
@@ -203,21 +217,26 @@ class ScorePublisher:
         import shutil
         await self._ensure_repo()
 
-        # Fetch latest
+        # Sync fork with upstream, then pull locally
         await _run_git(
-            ["git", "-C", str(self.local_path), "fetch", "upstream", "main"],
+            ["gh", "repo", "sync", self._fork_nwo(), "--branch", "main"],
+            check=False,
+        )
+        await _run_git(
+            ["git", "-C", str(self.local_path), "checkout", "main"],
+            check=False,
+        )
+        await _run_git(
+            ["git", "-C", str(self.local_path), "pull", "origin", "main"],
             check=False,
         )
 
-        # Remove any stale local epoch directory before checking out from
-        # upstream. Without this, a failed/missing upstream checkout leaves
-        # old files in place and the validator reads stale scores silently.
         epoch_dir = self.local_path / f"epoch-{epoch}"
         if epoch_dir.exists():
             shutil.rmtree(epoch_dir)
 
         await _run_git(
-            ["git", "-C", str(self.local_path), "checkout", "upstream/main", "--",
+            ["git", "-C", str(self.local_path), "checkout", "origin/main", "--",
              f"epoch-{epoch}/"],
             check=False,
         )
@@ -322,14 +341,6 @@ class ScorePublisher:
             total_stake=total_stake,
         )
 
-    def _fork_owner(self) -> str:
-        """Extract owner from fork URL."""
-        # https://github.com/owner/repo.git -> owner
-        url = self.fork_repo_url.rstrip("/")
-        if url.endswith(".git"):
-            url = url[:-4]
-        parts = url.split("/")
-        return parts[-2] if len(parts) >= 2 else ""
 
 
 _GIT_TIMEOUT = 120  # seconds; covers slow push/fetch over bad connections
@@ -338,6 +349,7 @@ _GIT_TIMEOUT = 120  # seconds; covers slow push/fetch over bad connections
 async def _run_git(
     cmd: list,
     check: bool = True,
+    cwd: Optional[str] = None,
     timeout: float = _GIT_TIMEOUT,
 ) -> subprocess.CompletedProcess:
     """Run a git/gh command asynchronously with a hard timeout.
@@ -345,17 +357,29 @@ async def _run_git(
     Without a timeout, ``proc.communicate()`` can block the entire asyncio
     event loop forever on network issues (unreachable GitHub, stalled push).
     """
+    cmd_str = " ".join(cmd)
+    logger.debug(f"Running: {cmd_str}")
+
+    env = {
+        **os.environ,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GH_PROMPT_DISABLED": "1",
+        "GH_NO_UPDATE_NOTIFIER": "1",
+    }
     proc = await asyncio.create_subprocess_exec(
         *cmd,
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=env,
+        cwd=cwd,
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
         proc.kill()
         await proc.communicate()
-        msg = f"Git command timed out after {timeout}s: {' '.join(cmd)}"
+        msg = f"Git command timed out after {timeout}s: {cmd_str}"
         logger.error(msg)
         result = subprocess.CompletedProcess(
             cmd, returncode=-1, stdout="", stderr=msg
@@ -369,6 +393,8 @@ async def _run_git(
         stdout=stdout.decode() if stdout else "",
         stderr=stderr.decode() if stderr else "",
     )
+    if result.returncode != 0:
+        logger.debug(f"Command failed (rc={result.returncode}): {cmd_str}\n{result.stderr}")
     if check and result.returncode != 0:
         raise subprocess.CalledProcessError(
             result.returncode, cmd, result.stdout, result.stderr

@@ -28,6 +28,7 @@ dependencies = [
     "numpy>=1.24.0",
     "aiohttp>=3.9.0",
     "httpx>=0.25.0",
+    "python-dotenv>=1.0.0",
 ]
 
 [project.optional-dependencies]
