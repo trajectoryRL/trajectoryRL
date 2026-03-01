@@ -52,23 +52,7 @@ See [INCENTIVE_MECHANISM.md](INCENTIVE_MECHANISM.md) for full scoring, rewards, 
 
 Validators run via Docker with automatic updates from GHCR via Watchtower. When new code is pushed to `prod`, GitHub Actions builds a new image and Watchtower auto-pulls and restarts within 5 minutes.
 
-```bash
-# 1. Create .env.validator
-cat > .env.validator <<'EOF'
-WALLET_NAME=your-wallet
-WALLET_HOTKEY=default
-NETUID=11
-NETWORK=finney
-EOF
-
-# 2. Start validator + Watchtower (auto-updates from GHCR)
-docker compose -f docker/docker-compose.validator.yml --env-file .env.validator up -d
-
-# 3. View logs
-docker compose -f docker/docker-compose.validator.yml logs -f validator
-```
-
-**Prerequisites** (one-time setup on the host, before starting Docker):
+#### 1. Prerequisites (one-time)
 
 ```bash
 # Install btcli
@@ -84,7 +68,59 @@ btcli subnets register --wallet-name my-validator --hotkey default --netuid 11
 btcli stake add --wallet-name my-validator --hotkey default --netuid 11 --amount 100
 ```
 
-The Docker container uses the bittensor Python SDK to set weights — it reads wallet keyfiles from the mounted `~/.bittensor/wallets/` directory. No btcli is needed inside the container.
+#### 2. Score publishing setup (one-time)
+
+Validators publish scores to a shared GitHub repo via PRs. This requires a fork and a GitHub token.
+
+```bash
+# Install and authenticate gh CLI (git identity is resolved from your GitHub account)
+gh auth login
+
+# Fork the shared score repo
+gh repo fork trajectoryRL/validator-scores --clone=false
+
+# Create a GitHub personal access token (classic) with "repo" scope
+# https://github.com/settings/tokens → "Generate new token (classic)" → check "repo" → Generate
+# Note: Fine-grained tokens are NOT supported. You must use a classic token.
+```
+
+#### 3. Configure environment
+
+```bash
+cat > .env.validator <<'EOF'
+WALLET_NAME=my-validator
+WALLET_HOTKEY=default
+NETUID=11
+NETWORK=finney
+ANTHROPIC_API_KEY=sk-ant-...
+GITHUB_TOKEN=ghp_...
+VALIDATOR_SCORES_FORK_URL=https://github.com/<your-username>/validator-scores.git
+EOF
+```
+
+| Variable | Required | Description |
+|----------|:--------:|-------------|
+| `WALLET_NAME` | Yes | Bittensor wallet name |
+| `WALLET_HOTKEY` | Yes | Hotkey name (usually `default`) |
+| `NETUID` | Yes | Subnet UID (`11`) |
+| `NETWORK` | Yes | `finney`, `test`, or `local` |
+| `ANTHROPIC_API_KEY` | Yes | For ClawBench evaluation (Claude Sonnet) |
+| `GITHUB_TOKEN` | Yes | GitHub **classic** Personal Access Token with `repo` scope (fine-grained tokens are not supported) |
+| `VALIDATOR_SCORES_FORK_URL` | Yes | Your fork of `trajectoryRL/validator-scores` |
+
+#### 4. Start validator
+
+```bash
+# Start validator + Watchtower (auto-updates from GHCR)
+docker compose -f docker/docker-compose.validator.yml --env-file .env.validator up -d
+
+# View logs
+docker compose -f docker/docker-compose.validator.yml logs -f validator
+```
+
+The Docker container reads wallet keyfiles from the mounted `~/.bittensor/wallets/` directory. No btcli is needed inside the container. Git commit identity for score publishing is automatically resolved from your GitHub token.
+
+See [VALIDATOR_OPERATIONS.md](VALIDATOR_OPERATIONS.md) for cost model, auto-update details, and operational guidance.
 
 ### For Miners
 

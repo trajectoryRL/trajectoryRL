@@ -1868,8 +1868,6 @@ class TestScorePublisherSignAndPublish:
                 fork_repo_url="https://github.com/testuser/validator-scores.git",
                 local_path=Path(tmpdir) / "scores-repo",
                 github_token="ghp_test_token",
-                git_email="test@test.com",
-                git_name="Test User",
             )
         return pub
 
