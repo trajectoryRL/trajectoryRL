@@ -1,13 +1,16 @@
 # Build and push validator Docker image to GHCR
 #
-# Triggers on push to prod when validator-related files change.
-# Watchtower on validator machines auto-pulls the new image.
+# Triggers:
+#   - push to staging → tags: staging, sha-<commit>
+#   - push to prod    → tags: latest,  sha-<commit>
+#
+# Watchtower on validator machines auto-pulls the relevant tag.
 
 name: Build Validator Image
 
 on:
   push:
-    branches: [prod]
+    branches: [staging, prod]
     paths:
       - "neurons/**"
       - "trajectoryrl/**"
@@ -42,7 +45,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest
+            type=raw,value=${{ github.ref_name == 'prod' && 'latest' || 'staging' }}
             type=sha,prefix=
 
       - name: Build and push

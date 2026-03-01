@@ -1,0 +1,66 @@
+# TrajectoryRL Validator — Staging Compose
+#
+# Pulls the staging image from GHCR (built from the staging branch).
+# Use this to test validator changes before promoting to prod.
+#
+# Setup:
+#   1. Create .env.validator (same as production)
+#   2. docker compose -f docker/docker-compose.validator-staging.yml --env-file .env.validator up -d
+#   3. docker compose -f docker/docker-compose.validator-staging.yml logs -f validator
+#
+# Required .env.validator:
+#   WALLET_NAME=my-validator
+#   WALLET_HOTKEY=default
+#   NETUID=11
+#   NETWORK=finney
+
+services:
+  # --------------------------------------------------------------------------
+  # Validator: staging image (auto-updated by Watchtower from staging tag)
+  # --------------------------------------------------------------------------
+  validator:
+    image: ghcr.io/trajectoryrl/trajectoryrl:staging
+    container_name: trajectoryrl_validator_staging
+    restart: unless-stopped
+    environment:
+      - WALLET_NAME=${WALLET_NAME:-validator}
+      - WALLET_HOTKEY=${WALLET_HOTKEY:-default}
+      - NETUID=${NETUID:-11}
+      - NETWORK=${NETWORK:-finney}
+      - TARGET_UID=${TARGET_UID:-74}
+      - WEIGHT_INTERVAL=${WEIGHT_INTERVAL:-1500}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - VALIDATOR_SCORES_FORK_URL=${VALIDATOR_SCORES_FORK_URL:-}
+      - EPOCH_INTERVAL=${EPOCH_INTERVAL:-720}
+      - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
+    volumes:
+      - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # --------------------------------------------------------------------------
+  # Watchtower: polls GHCR every 5 min, auto-pulls new staging images
+  # --------------------------------------------------------------------------
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: trajectoryrl_watchtower_staging
+    restart: unless-stopped
+    environment:
+      - DOCKER_API_VERSION=1.44
+      - WATCHTOWER_LABEL_ENABLE=true
+      - WATCHTOWER_POLL_INTERVAL=300
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_INCLUDE_STOPPED=true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
