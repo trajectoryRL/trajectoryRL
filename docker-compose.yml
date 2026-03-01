@@ -133,6 +133,8 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       # Model
       - CLAWBENCH_MODEL=${CLAWBENCH_MODEL:-anthropic/claude-sonnet-4-5-20250929}
+      # GitHub CLI auth (for score publishing)
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
     volumes:
       - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
       - workspace:/workspace
@@ -199,6 +201,7 @@ services:
       - PACK_REPO=${PACK_REPO:-}
       - PACK_COMMIT=${PACK_COMMIT:-}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
     volumes:
       - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
       - ./packs:/app/packs:ro

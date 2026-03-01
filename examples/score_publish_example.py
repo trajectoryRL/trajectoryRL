@@ -8,6 +8,7 @@ Prerequisites:
 """
 
 import asyncio
+import logging
 
 import bittensor as bt
 
@@ -16,6 +17,8 @@ from trajectoryrl.utils.score_publisher import ScorePublisher
 
 
 async def main():
+    logging.basicConfig(level=logging.DEBUG)
+    logging.info("Starting score publish example")
     # 1. Load config from environment / .env.validator
     config = ValidatorConfig.from_env()
 

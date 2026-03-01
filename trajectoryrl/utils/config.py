@@ -158,12 +158,22 @@ class ValidatorConfig:
             )
 
     @classmethod
-    def from_env(cls) -> "ValidatorConfig":
+    def from_env(cls, dotenv_path: Optional[Path] = None) -> "ValidatorConfig":
         """Load configuration from environment variables.
+
+        Args:
+            dotenv_path: Optional path to a .env file. Defaults to
+                         ``.env.validator`` in the project root.
 
         Returns:
             ValidatorConfig instance
         """
+        from dotenv import load_dotenv
+
+        if dotenv_path is None:
+            dotenv_path = Path(__file__).parent.parent.parent / ".env.validator"
+        load_dotenv(dotenv_path)
+
         return cls(
             wallet_name=os.getenv("WALLET_NAME", "validator"),
             wallet_hotkey=os.getenv("WALLET_HOTKEY", "default"),
