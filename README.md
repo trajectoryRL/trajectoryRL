@@ -79,8 +79,9 @@ gh auth login
 # Fork the shared score repo
 gh repo fork trajectoryRL/validator-scores --clone=false
 
-# Create a GitHub personal access token with repo scope
-# https://github.com/settings/tokens → Generate new token → select "repo"
+# Create a GitHub personal access token (classic) with "repo" scope
+# https://github.com/settings/tokens → "Generate new token (classic)" → check "repo" → Generate
+# Note: Fine-grained tokens are NOT supported. You must use a classic token.
 ```
 
 #### 3. Configure environment
@@ -104,7 +105,7 @@ EOF
 | `NETUID` | Yes | Subnet UID (`11`) |
 | `NETWORK` | Yes | `finney`, `test`, or `local` |
 | `ANTHROPIC_API_KEY` | Yes | For ClawBench evaluation (Claude Sonnet) |
-| `GITHUB_TOKEN` | Yes | GitHub PAT with `repo` scope for score publishing |
+| `GITHUB_TOKEN` | Yes | GitHub **classic** Personal Access Token with `repo` scope (fine-grained tokens are not supported) |
 | `VALIDATOR_SCORES_FORK_URL` | Yes | Your fork of `trajectoryRL/validator-scores` |
 
 #### 4. Start validator

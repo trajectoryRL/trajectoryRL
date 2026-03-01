@@ -118,9 +118,10 @@ async def main():
                             f"Consensus: {consensus.num_validators} validators, "
                             f"stake={consensus.total_stake:.2f}"
                         )
-                        if consensus.consensus_scores:
-                            uids = list(consensus.consensus_scores.keys())
-                            weights = list(consensus.consensus_scores.values())
+                        #temporary disable
+                        #if consensus.consensus_scores:
+                        #    uids = list(consensus.consensus_scores.keys())
+                        #    weights = list(consensus.consensus_scores.values())
                 except Exception as e:
                     logger.error(f"Score publishing/consensus failed: {e}", exc_info=True)
 
