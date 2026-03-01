@@ -2,12 +2,11 @@
 
 import hashlib
 import json
-import os
 import subprocess
-import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import bittensor as bt
 import pytest
 
 from trajectoryrl.base.miner import TrajectoryMiner
@@ -289,6 +288,29 @@ class TestCommitmentFormat:
                 repo="alice/my-pack",
             )
 
+    def test_dot_git_slash_stripped(self):
+        """alice/my-pack/.git strips cleanly to alice/my-pack."""
+        c = TrajectoryMiner.format_commitment(
+            pack_hash="a" * 64,
+            git_commit_hash="b" * 40,
+            repo="alice/my-pack/.git",
+        )
+        assert c.endswith("|alice/my-pack")
+
+    def test_dot_git_slash_roundtrip(self):
+        """alice/my-pack/.git passes round-trip through parse_commitment."""
+        from trajectoryrl.utils.commitments import parse_commitment
+
+        c = TrajectoryMiner.format_commitment(
+            pack_hash="a" * 64,
+            git_commit_hash="b" * 40,
+            repo="alice/my-pack/.git",
+        )
+        parsed = parse_commitment(c)
+        assert parsed is not None
+        _, _, repo_url = parsed
+        assert repo_url == "https://github.com/alice/my-pack"
+
 
 # ===================================================================
 # Submit Workflow (mocked Bittensor)
@@ -373,6 +395,28 @@ class TestGitPush:
         pack = TrajectoryMiner.build_pack(agents_md="# Test")
         result = TrajectoryMiner.git_push_pack(pack, str(tmp_path))
         assert result is None
+
+    def test_git_commit_includes_identity(self, tmp_path):
+        """git commit command includes -c user.email and -c user.name flags."""
+        (tmp_path / ".git").mkdir()  # Just enough to pass the .git exists check
+
+        pack = TrajectoryMiner.build_pack(agents_md="# Test")
+
+        with patch("trajectoryrl.base.miner.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0, stdout="a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2\n",
+            )
+            TrajectoryMiner.git_push_pack(pack, str(tmp_path))
+
+            # Find the commit call by looking for "commit" in the command
+            commit_cmds = [
+                call[0][0] for call in mock_run.call_args_list
+                if "commit" in call[0][0]
+            ]
+            assert len(commit_cmds) == 1, f"Expected 1 commit call, got {len(commit_cmds)}"
+            cmd = commit_cmds[0]
+            assert "user.email=miner@trajectoryrl.local" in cmd
+            assert "user.name=TrajectoryRL Miner" in cmd
 
     def test_writes_pack_json(self, tmp_path):
         """Pack is written to repo as pack.json."""
@@ -523,3 +567,56 @@ class TestMinerCLI:
 
         result = cli.cmd_validate(args)
         assert result == 1
+
+
+# ===================================================================
+# Tiered Exception Handling
+# ===================================================================
+
+
+class TestSubmitExceptions:
+    """Tests for tiered exception handling in submit_commitment/get_current_commitment."""
+
+    def _make_miner(self):
+        miner = TrajectoryMiner(
+            wallet_name="test", wallet_hotkey="default",
+            netuid=11, network="test",
+        )
+        miner._wallet = MagicMock()
+        miner._subtensor = MagicMock()
+        return miner
+
+    def test_not_registered_error(self):
+        """NotRegisteredError produces actionable btcli guidance."""
+        miner = self._make_miner()
+        miner._subtensor.set_commitment.side_effect = bt.NotRegisteredError()
+
+        with patch("trajectoryrl.base.miner.logger") as mock_logger:
+            result = miner.submit_commitment("a" * 64, "b" * 40, "alice/my-pack")
+            assert result is False
+            log_msg = mock_logger.error.call_args[0][0]
+            assert "not registered" in log_msg.lower()
+            assert "btcli subnet register" in log_msg
+
+    def test_chain_connection_error(self):
+        """ChainConnectionError produces connectivity guidance."""
+        miner = self._make_miner()
+        miner._subtensor.set_commitment.side_effect = bt.ChainConnectionError()
+
+        with patch("trajectoryrl.base.miner.logger") as mock_logger:
+            result = miner.submit_commitment("a" * 64, "b" * 40, "alice/my-pack")
+            assert result is False
+            log_msg = mock_logger.error.call_args[0][0]
+            assert "connect" in log_msg.lower()
+
+    def test_get_commitment_chain_error(self):
+        """get_current_commitment handles ChainConnectionError gracefully."""
+        miner = self._make_miner()
+        miner._wallet.hotkey.ss58_address = "5FakeKey"
+        miner._subtensor.get_all_commitments.side_effect = bt.ChainConnectionError()
+
+        with patch("trajectoryrl.base.miner.logger") as mock_logger:
+            result = miner.get_current_commitment()
+            assert result is None
+            log_msg = mock_logger.error.call_args[0][0]
+            assert "connect" in log_msg.lower()
