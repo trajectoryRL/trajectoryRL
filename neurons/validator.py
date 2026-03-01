@@ -54,7 +54,7 @@ logger = logging.getLogger("coldstart-validator")
 # ---------------------------------------------------------------------------
 # Version — bump this when you want validators to signal a new code version
 # ---------------------------------------------------------------------------
-VERSION = 1
+VERSION = 2
 
 
 async def main():
