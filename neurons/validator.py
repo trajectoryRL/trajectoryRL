@@ -2,16 +2,18 @@
 """TrajectoryRL Validator — Cold-start phase.
 
 Sets weights to a single target UID to anchor consensus while the subnet
-bootstraps.  Designed to be hot-swapped to the full production validator
-by pushing new code to main — Watchtower auto-deploys.
+bootstraps.  Before setting on-chain weights, publishes scores to the
+shared validator-scores repo and computes stake-weighted consensus.
 
 Environment variables:
-    WALLET_NAME     Bittensor wallet name         (default: validator)
-    WALLET_HOTKEY   Hotkey name inside wallet      (default: default)
-    NETUID          Subnet UID                     (default: 11)
-    NETWORK         Subtensor network              (default: finney)
-    TARGET_UID      Miner UID to receive weight    (default: 74)
-    WEIGHT_INTERVAL Seconds between set_weights    (default: 1500)
+    WALLET_NAME               Bittensor wallet name         (default: validator)
+    WALLET_HOTKEY             Hotkey name inside wallet      (default: default)
+    NETUID                    Subnet UID                     (default: 11)
+    NETWORK                   Subtensor network              (default: finney)
+    TARGET_UID                Miner UID to receive weight    (default: 74)
+    WEIGHT_INTERVAL           Seconds between set_weights    (default: 1500)
+    GITHUB_TOKEN              GitHub PAT for score publishing
+    VALIDATOR_SCORES_FORK_URL Fork of trajectoryRL/validator-scores
 """
 
 import asyncio
@@ -19,8 +21,11 @@ import logging
 import os
 import sys
 import time
+from pathlib import Path
 
 import bittensor as bt
+
+from trajectoryrl.utils.score_publisher import ScorePublisher
 
 # ---------------------------------------------------------------------------
 # Config from environment
@@ -31,6 +36,9 @@ NETUID = int(os.environ.get("NETUID", "11"))
 NETWORK = os.environ.get("NETWORK", "finney")
 TARGET_UID = int(os.environ.get("TARGET_UID", "74"))
 WEIGHT_INTERVAL = int(os.environ.get("WEIGHT_INTERVAL", "1500"))  # ~25 min
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+VALIDATOR_SCORES_FORK_URL = os.environ.get("VALIDATOR_SCORES_FORK_URL", "")
+EPOCH_INTERVAL = int(os.environ.get("EPOCH_INTERVAL", "86400"))  # 24h
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -60,18 +68,68 @@ async def main():
     wallet = bt.Wallet(name=WALLET_NAME, hotkey=WALLET_HOTKEY)
     subtensor = bt.Subtensor(network=NETWORK)
 
+    publisher = None
+    if GITHUB_TOKEN and VALIDATOR_SCORES_FORK_URL:
+        publisher = ScorePublisher(
+            wallet_name=WALLET_NAME,
+            wallet_hotkey=WALLET_HOTKEY,
+            fork_repo_url=VALIDATOR_SCORES_FORK_URL,
+            local_path=Path("/tmp/trajectoryrl_validator_scores"),
+            github_token=GITHUB_TOKEN,
+        )
+        logger.info("Score publisher initialized")
+    else:
+        logger.warning(
+            "GITHUB_TOKEN or VALIDATOR_SCORES_FORK_URL not set — "
+            "running in solo mode (no score publishing)"
+        )
+
     logger.info(f"Connected to {NETWORK} | block {subtensor.block}")
 
     while True:
         try:
             t0 = time.time()
-            logger.info(f"Setting weights: UID {TARGET_UID} = 1.0 ...")
+            block = subtensor.block
+            epoch = int(time.time()) // EPOCH_INTERVAL
+            metagraph = subtensor.metagraph(netuid=NETUID)
 
+            scores = {
+                str(TARGET_UID): {"final_score": 1.0, "per_scenario": {}},
+            }
+
+            # Publish scores → pull consensus → derive weights
+            uids = [TARGET_UID]
+            weights = [1.0]
+
+            if publisher:
+                try:
+                    ok = await publisher.publish_scores(
+                        epoch=epoch, block_height=block, scores=scores,
+                    )
+                    if ok:
+                        logger.info(f"Scores published for epoch {epoch}")
+                    else:
+                        logger.warning(f"Score publish returned False for epoch {epoch}")
+
+                    all_scores = await publisher.pull_all_scores(epoch=epoch)
+                    if all_scores:
+                        consensus = ScorePublisher.compute_consensus(all_scores, metagraph)
+                        logger.info(
+                            f"Consensus: {consensus.num_validators} validators, "
+                            f"stake={consensus.total_stake:.2f}"
+                        )
+                        if consensus.consensus_scores:
+                            uids = list(consensus.consensus_scores.keys())
+                            weights = list(consensus.consensus_scores.values())
+                except Exception as e:
+                    logger.error(f"Score publishing/consensus failed: {e}", exc_info=True)
+
+            logger.info(f"Setting weights: {dict(zip(uids, weights))}")
             result = subtensor.set_weights(
                 wallet=wallet,
                 netuid=NETUID,
-                uids=[TARGET_UID],
-                weights=[1.0],
+                uids=uids,
+                weights=weights,
                 wait_for_inclusion=True,
                 wait_for_finalization=False,
             )
@@ -88,7 +146,7 @@ async def main():
                 )
 
         except Exception as e:
-            logger.error(f"set_weights failed: {e}", exc_info=True)
+            logger.error(f"Round failed: {e}", exc_info=True)
 
         logger.info(f"Sleeping {WEIGHT_INTERVAL}s until next round ...")
         await asyncio.sleep(WEIGHT_INTERVAL)

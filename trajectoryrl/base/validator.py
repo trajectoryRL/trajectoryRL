@@ -104,8 +104,6 @@ class TrajectoryValidator:
                 fork_repo_url=config.validator_scores_fork_url,
                 local_path=config.validator_scores_local_path,
                 github_token=config.github_token,
-                git_email=config.git_email,
-                git_name=config.git_name,
             )
             logger.info("Score publisher initialized")
         else:

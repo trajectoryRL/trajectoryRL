@@ -55,15 +55,13 @@ class ScorePublisher:
         fork_repo_url: str,
         local_path: Path,
         github_token: str,
-        git_email: str,
-        git_name: str,
     ):
         self.wallet = bt.Wallet(name=wallet_name, hotkey=wallet_hotkey)
         self.fork_repo_url = fork_repo_url
         self.local_path = Path(local_path)
         self.github_token = github_token
-        self.git_email = git_email
-        self.git_name = git_name
+        self._git_email: Optional[str] = None
+        self._git_name: Optional[str] = None
         self._initialized = False
 
     def _fork_nwo(self) -> str:
@@ -106,7 +104,37 @@ class ScorePublisher:
             await _run_git(git + ["remote", "set-url", "upstream", auth_upstream], check=False)
 
         await _run_git(git + ["config", "--local", "credential.helper", ""], check=False)
+        await self._resolve_git_identity()
         self._initialized = True
+
+    async def _resolve_git_identity(self):
+        """Fetch git commit identity from ``gh api user`` (authenticated user).
+
+        Raises ``RuntimeError`` if the identity cannot be determined — this
+        indicates that ``gh`` is not authenticated or the token lacks the
+        required scope.
+        """
+        if self._git_email and self._git_name:
+            return
+        result = await _run_git(["gh", "api", "user", "--jq", ".login,.email,.name"], check=False)
+        if result.returncode != 0:
+            raise RuntimeError(
+                "Failed to resolve git identity via `gh api user`. "
+                "Ensure the GITHUB_TOKEN has the `read:user` scope and `gh` CLI is available. "
+                f"stderr: {result.stderr.strip()}"
+            )
+        lines = result.stdout.strip().splitlines()
+        login = lines[0] if len(lines) > 0 else None
+        email = lines[1] if len(lines) > 1 and lines[1] != "null" else None
+        name = lines[2] if len(lines) > 2 and lines[2] != "null" else None
+        self._git_email = email or (f"{login}@users.noreply.github.com" if login else None)
+        self._git_name = name or login
+        if not self._git_email or not self._git_name:
+            raise RuntimeError(
+                "Could not determine git email/name from GitHub API response. "
+                f"Got login={login!r}, email={email!r}, name={name!r}. "
+                "Check that your GitHub account has a public name or email configured."
+            )
 
     def sign_payload(self, payload: dict) -> str:
         """Sign the canonical JSON payload with sr25519.
@@ -161,9 +189,13 @@ class ScorePublisher:
         fork_owner = self._fork_nwo().split("/")[0]
         branch = f"scores/epoch-{epoch}-{hotkey[:8]}"
 
-        # 1. Sync local main with upstream
+        # 1. Sync fork main with upstream via GitHub API, then pull locally
+        await _run_git(
+            ["gh", "repo", "sync", self._fork_nwo(), "--branch", "main"],
+            check=False,
+        )
         await _run_git(git + ["checkout", "main"], check=False)
-        await _run_git(git + ["pull", "upstream", "main"], check=False)
+        await _run_git(git + ["pull", "origin", "main"], check=False)
 
         # 2. Create feature branch from main
         await _run_git(git + ["checkout", "-b", branch], check=False)
@@ -178,8 +210,8 @@ class ScorePublisher:
         await _run_git(git + ["add", str(score_file)])
         await _run_git(
             git + [
-                "-c", f"user.email={self.git_email}",
-                "-c", f"user.name={self.git_name}",
+                "-c", f"user.email={self._git_email}",
+                "-c", f"user.name={self._git_name}",
                 "commit", "-m", f"scores: epoch {epoch} validator {hotkey[:8]}",
             ],
             check=False,

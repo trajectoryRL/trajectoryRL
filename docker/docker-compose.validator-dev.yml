@@ -1,0 +1,38 @@
+# TrajectoryRL Validator — Local Development
+#
+# Builds from local source and mounts the project tree for live iteration.
+# No Watchtower, no GHCR — changes take effect on container restart.
+#
+# Usage:
+#   docker compose -f docker/docker-compose.validator-dev.yml --env-file .env.validator up --build
+#   docker compose -f docker/docker-compose.validator-dev.yml logs -f validator
+#   docker compose -f docker/docker-compose.validator-dev.yml down
+
+services:
+  validator:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.validator
+    container_name: trajectoryrl_validator_dev
+    restart: unless-stopped
+    environment:
+      - WALLET_NAME=${WALLET_NAME:-validator}
+      - WALLET_HOTKEY=${WALLET_HOTKEY:-default}
+      - NETUID=${NETUID:-11}
+      - NETWORK=${NETWORK:-finney}
+      - TARGET_UID=${TARGET_UID:-74}
+      - WEIGHT_INTERVAL=${WEIGHT_INTERVAL:-1500}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - VALIDATOR_SCORES_FORK_URL=${VALIDATOR_SCORES_FORK_URL:-}
+      - EPOCH_INTERVAL=${EPOCH_INTERVAL:-720}
+      - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
+    volumes:
+      - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
+      - ../neurons:/app/neurons
+      - ../trajectoryrl:/app/trajectoryrl
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

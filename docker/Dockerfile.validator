@@ -20,11 +20,11 @@ RUN apt-get update && \
 
 WORKDIR /app
 
-# Install bittensor (includes all chain interaction deps)
-RUN pip install --no-cache-dir bittensor
+COPY pyproject.toml requirements.txt ./
+COPY trajectoryrl/ trajectoryrl/
+COPY neurons/ neurons/
 
-# Copy validator entry point
-COPY neurons/validator.py neurons/
+RUN pip install --no-cache-dir -e .
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV WALLET_NAME=validator
