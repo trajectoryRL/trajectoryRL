@@ -51,7 +51,7 @@ class ValidatorConfig:
     clawbench_path: Path = field(
         default_factory=lambda: Path(__file__).parent.parent.parent.parent / "clawbench"
     )
-    clawbench_commit: str = "e50824df75e10989c0adaf398b6897b5284701d5"
+    clawbench_commit: str = "0f2bf473566a64422e50567e22b19372394b24e5"
     scenarios: List[str] = field(
         default_factory=lambda: [
             "client_escalation",
