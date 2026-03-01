@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import shutil
 import subprocess
 import yaml
 from pathlib import Path
@@ -341,7 +342,10 @@ class ClawBenchHarness:
             workspace: Workspace directory path
             context_preamble: Epoch context markdown prepended to AGENTS.md
         """
-        # Create workspace directory
+        # Wipe workspace so stale files from a previous miner's pack
+        # (e.g. SOUL.md, skills/) don't leak into the next evaluation.
+        if workspace.exists():
+            shutil.rmtree(workspace)
         workspace.mkdir(parents=True, exist_ok=True)
         workspace_abs = workspace.resolve()
 
