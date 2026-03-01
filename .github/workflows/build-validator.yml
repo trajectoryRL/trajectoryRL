@@ -14,8 +14,9 @@ on:
     paths:
       - "neurons/**"
       - "trajectoryrl/**"
-      - "docker/Dockerfile.validator"
+      - "docker/**"
       - "pyproject.toml"
+      - ".github/workflows/**"
 
 env:
   REGISTRY: ghcr.io
