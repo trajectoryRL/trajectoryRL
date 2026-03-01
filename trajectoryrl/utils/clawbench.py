@@ -6,7 +6,6 @@ import logging
 import math
 import os
 import subprocess
-import tempfile
 import yaml
 from pathlib import Path
 from typing import Dict, Any, List, Optional
@@ -103,29 +102,25 @@ class ClawBenchHarness:
         )
 
         try:
-            # Use an isolated workspace per evaluation to prevent concurrent
-            # evaluations from overwriting each other's pack files.
-            with tempfile.TemporaryDirectory(
-                prefix="trajectoryrl_eval_",
-                dir=self.workspace_path.parent,
-            ) as tmpdir:
-                workspace = Path(tmpdir)
-                # Write pack files so OpenClaw can read them.
-                self._apply_pack_to_workspace(
-                    pack, workspace, context_preamble
-                )
+            # Write pack files to the shared workspace that the OpenClaw
+            # Docker container actually mounts.  A previous implementation
+            # used a TemporaryDirectory for isolation, but that temp path
+            # was never mounted into the container — OpenClaw kept reading
+            # the stale default AGENTS.md, ignoring the miner's pack.
+            # Evaluations run sequentially so concurrent writes are not an
+            # issue.
+            self._apply_pack_to_workspace(
+                pack, self.workspace_path, context_preamble
+            )
 
-                # Run scenario — user_context is passed to run_episode.py which
-                # handles template substitution in workspace files and pushes
-                # context to the mock server.
-                result = await self._run_scenario(
-                    scenario_name=scenario_name,
-                    workspace=workspace,
-                    seed=seed,
-                    user_context=user_context,
-                )
+            result = await self._run_scenario(
+                scenario_name=scenario_name,
+                workspace=self.workspace_path,
+                seed=seed,
+                user_context=user_context,
+            )
 
-                return result
+            return result
 
         except Exception as e:
             logger.error(f"Evaluation failed: {e}", exc_info=True)
