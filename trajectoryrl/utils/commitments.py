@@ -150,9 +150,9 @@ def _get_commitment_block(subtensor, netuid: int, hotkey: str) -> int:
     Tries ``get_commitment_metadata`` first; falls back to current block.
     """
     try:
-        meta = subtensor.get_commitment_metadata(netuid=netuid, hotkey=hotkey)
-        if meta and hasattr(meta, "block"):
-            return meta.block
+        meta = subtensor.get_commitment_metadata(netuid=netuid, hotkey_ss58=hotkey)
+        if meta and isinstance(meta, dict) and "block" in meta:
+            return int(meta["block"])
     except Exception as e:
         logger.debug(f"get_commitment_metadata failed for {hotkey[:8]}… ({e}), falling back to current block")
 
