@@ -1737,6 +1737,103 @@ class TestCommitmentParsing:
         assert result is not None
 
 
+class TestGetCommitmentBlock:
+    """Tests for _get_commitment_block and fetch_all_commitments integration."""
+
+    def test_get_commitment_block_uses_hotkey_ss58_kwarg(self):
+        """Verify that get_commitment_metadata is called with hotkey_ss58= (not hotkey=)."""
+        from trajectoryrl.utils.commitments import _get_commitment_block
+
+        mock_subtensor = MagicMock()
+        mock_subtensor.get_commitment_metadata.return_value = {"block": 42000}
+
+        result = _get_commitment_block(mock_subtensor, netuid=11, hotkey="5FHneW46...")
+
+        mock_subtensor.get_commitment_metadata.assert_called_once_with(
+            netuid=11, hotkey_ss58="5FHneW46..."
+        )
+        assert result == 42000
+
+    def test_get_commitment_block_dict_access(self):
+        """Verify dict-style access (meta['block']) works, not attribute access."""
+        from trajectoryrl.utils.commitments import _get_commitment_block
+
+        mock_subtensor = MagicMock()
+        # Return a plain dict — no .block attribute, only dict key
+        mock_subtensor.get_commitment_metadata.return_value = {"block": 99999}
+
+        result = _get_commitment_block(mock_subtensor, netuid=11, hotkey="5Ftest...")
+        assert result == 99999
+
+    def test_get_commitment_block_string_block_cast_to_int(self):
+        """Block number returned as string should be cast to int."""
+        from trajectoryrl.utils.commitments import _get_commitment_block
+
+        mock_subtensor = MagicMock()
+        mock_subtensor.get_commitment_metadata.return_value = {"block": "12345"}
+
+        result = _get_commitment_block(mock_subtensor, netuid=11, hotkey="5Ftest...")
+        assert result == 12345
+        assert isinstance(result, int)
+
+    def test_get_commitment_block_fallback_on_exception(self):
+        """Falls back to current block when get_commitment_metadata raises."""
+        from trajectoryrl.utils.commitments import _get_commitment_block
+
+        mock_subtensor = MagicMock()
+        mock_subtensor.get_commitment_metadata.side_effect = Exception("not found")
+        mock_subtensor.get_current_block.return_value = 50000
+
+        result = _get_commitment_block(mock_subtensor, netuid=11, hotkey="5Ftest...")
+        assert result == 50000
+
+    def test_get_commitment_block_fallback_on_none_metadata(self):
+        """Falls back to current block when metadata is None."""
+        from trajectoryrl.utils.commitments import _get_commitment_block
+
+        mock_subtensor = MagicMock()
+        mock_subtensor.get_commitment_metadata.return_value = None
+        mock_subtensor.get_current_block.return_value = 60000
+
+        result = _get_commitment_block(mock_subtensor, netuid=11, hotkey="5Ftest...")
+        assert result == 60000
+
+    def test_get_commitment_block_fallback_on_non_dict_metadata(self):
+        """Falls back when metadata is not a dict (e.g. an object or string)."""
+        from trajectoryrl.utils.commitments import _get_commitment_block
+
+        mock_subtensor = MagicMock()
+        mock_subtensor.get_commitment_metadata.return_value = "unexpected"
+        mock_subtensor.get_current_block.return_value = 70000
+
+        result = _get_commitment_block(mock_subtensor, netuid=11, hotkey="5Ftest...")
+        assert result == 70000
+
+    def test_fetch_all_commitments_uses_correct_block(self):
+        """Integration: fetch_all_commitments passes hotkey to _get_commitment_block correctly."""
+        from trajectoryrl.utils.commitments import fetch_all_commitments
+
+        hotkey = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        raw = "a" * 64 + "|" + "b" * 40 + "|alice/my-pack"
+
+        mock_subtensor = MagicMock()
+        mock_subtensor.get_all_commitments.return_value = {hotkey: raw}
+        mock_subtensor.get_commitment_metadata.return_value = {"block": 42000}
+
+        mock_metagraph = MagicMock()
+        mock_metagraph.hotkeys = [hotkey]
+
+        result = fetch_all_commitments(mock_subtensor, netuid=11, metagraph=mock_metagraph)
+
+        assert 0 in result
+        assert result[0].block_number == 42000
+        assert result[0].hotkey == hotkey
+        # Verify it was called with hotkey_ss58=, not hotkey=
+        mock_subtensor.get_commitment_metadata.assert_called_once_with(
+            netuid=11, hotkey_ss58=hotkey
+        )
+
+
 # ===================================================================
 # Score Consensus Tests
 # ===================================================================
