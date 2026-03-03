@@ -4,13 +4,13 @@
 Subcommands:
     build     Build pack.json from AGENTS.md file
     validate  Validate a pack.json locally
-    submit    Push pack to GitHub + submit on-chain commitment
+    submit    Upload pack + submit on-chain commitment
     status    Check current on-chain commitment
 
 Daemon mode:
-    When invoked with no subcommand and PACK_REPO is set in the environment,
-    runs a long-lived loop that detects pack changes, pushes to GitHub,
-    and submits on-chain commitments automatically.
+    When invoked with no subcommand and PACK_URL is set in the environment,
+    runs a long-lived loop that detects pack changes and submits on-chain
+    commitments automatically.
 
 Examples:
     # Build a pack from your AGENTS.md
@@ -19,23 +19,17 @@ Examples:
     # Validate before submitting
     python neurons/miner.py validate pack.json
 
-    # Submit (pack already pushed to GitHub)
+    # Submit (pack already uploaded to a public HTTP endpoint)
     python neurons/miner.py submit pack.json \\
-        --repo myuser/my-pack \\
-        --git-commit abc123def456... \\
-        --wallet.name miner --wallet.hotkey default
-
-    # Submit with auto-push (local git repo)
-    python neurons/miner.py submit pack.json \\
-        --repo myuser/my-pack \\
-        --repo-path /path/to/local/repo \\
+        --pack-url https://trajrl.com/samples/pack.json \\
         --wallet.name miner --wallet.hotkey default
 
     # Check current commitment
     python neurons/miner.py status --wallet.name miner --wallet.hotkey default
 
     # Run as daemon (Docker / long-running)
-    PACK_REPO=myuser/my-pack REPO_PATH=/app/packs PACK_PATH=/app/packs/pack.json \\
+    PACK_URL=https://trajrl.com/samples/pack.json \\
+    PACK_PATH=/app/packs/pack.json \\
         python neurons/miner.py
 """
 
@@ -102,7 +96,7 @@ def _verify_onchain(miner, expected_hash: str) -> bool:
         logger.warning("Could not parse on-chain commitment: %s", raw)
         return False
 
-    onchain_hash, _, _ = parsed
+    onchain_hash, _ = parsed
     if onchain_hash != expected_hash:
         logger.warning(
             "On-chain hash mismatch: expected %s..., got %s...",
@@ -116,7 +110,7 @@ def _verify_onchain(miner, expected_hash: str) -> bool:
 
 
 async def _run_daemon():
-    """Main daemon loop: detect changes, push, submit."""
+    """Main daemon loop: detect changes, submit."""
     from trajectoryrl.base.miner import TrajectoryMiner
     from trajectoryrl.utils.commitments import parse_commitment
     from trajectoryrl.utils.config import MinerConfig
@@ -131,8 +125,7 @@ async def _run_daemon():
     config = MinerConfig.from_env()
 
     logger.info("Starting miner daemon")
-    logger.info("  pack_repo:       %s", config.pack_repo)
-    logger.info("  repo_path:       %s", config.repo_path)
+    logger.info("  pack_url:        %s", config.pack_url)
     logger.info("  pack_path:       %s", config.pack_path or "(none)")
     logger.info("  agents_md_path:  %s", config.agents_md_path or "(none)")
     logger.info("  check_interval:  %ds", config.check_interval)
@@ -183,25 +176,18 @@ async def _run_daemon():
             logger.info("Pack changed: %s... → %s...",
                         (last_submitted_hash or "none")[:16], pack_hash[:16])
 
-            # 4. Push to GitHub
-            git_commit = TrajectoryMiner.git_push_pack(pack, config.repo_path)
-            if git_commit is None:
-                logger.error("Git push failed, retrying in %ds", config.check_interval)
-                await asyncio.sleep(config.check_interval)
-                continue
-
-            # 5. Submit on-chain commitment
-            success = miner.submit_commitment(pack_hash, git_commit, config.pack_repo)
+            # 4. Submit on-chain commitment
+            success = miner.submit_commitment(pack_hash, config.pack_url)
             if success:
                 last_submitted_hash = pack_hash
                 logger.info(
-                    "Submission complete: hash=%s... commit=%s...",
-                    pack_hash[:16], git_commit[:12],
+                    "Submission complete: hash=%s... url=%s",
+                    pack_hash[:16], config.pack_url,
                 )
             else:
                 logger.error("On-chain submission failed, will retry next cycle")
 
-            # 6. Sleep
+            # 5. Sleep
             await asyncio.sleep(config.check_interval)
 
         except (KeyboardInterrupt, asyncio.CancelledError):
@@ -290,18 +276,14 @@ def cmd_submit(args):
 
     success = miner.submit(
         pack=pack,
-        repo=args.repo,
-        git_commit=args.git_commit,
-        repo_path=args.repo_path,
+        pack_url=args.pack_url,
     )
 
     if success:
         pack_hash = TrajectoryMiner.compute_pack_hash(pack)
         print(f"Submitted successfully!")
         print(f"  Pack hash: {pack_hash}")
-        print(f"  Repo:      {args.repo}")
-        if args.git_commit:
-            print(f"  Commit:    {args.git_commit}")
+        print(f"  Pack URL:  {args.pack_url}")
         return 0
     else:
         print("Submission failed. Check logs for details.")
@@ -328,10 +310,9 @@ def cmd_status(args):
     print(f"Raw commitment: {raw}")
     parsed = parse_commitment(raw)
     if parsed:
-        pack_hash, git_commit, repo_url = parsed
-        print(f"  Pack hash:  {pack_hash}")
-        print(f"  Git commit: {git_commit}")
-        print(f"  Repo:       {repo_url}")
+        pack_hash, pack_url = parsed
+        print(f"  Pack hash: {pack_hash}")
+        print(f"  Pack URL:  {pack_url}")
     else:
         print("  (could not parse commitment)")
 
@@ -384,14 +365,9 @@ def main():
     # --- submit ---
     p_submit = sub.add_parser("submit", help="Submit pack on-chain")
     p_submit.add_argument("pack_path", help="Path to pack.json")
-    p_submit.add_argument("--repo", required=True, help="GitHub repo (owner/repo)")
     p_submit.add_argument(
-        "--git-commit", default=None,
-        help="Git commit hash (if already pushed)",
-    )
-    p_submit.add_argument(
-        "--repo-path", default=None,
-        help="Local git repo path (for auto-push if --git-commit not given)",
+        "--pack-url", required=True,
+        help="Public HTTP(S) URL where pack.json is hosted",
     )
     _add_wallet_args(p_submit)
 
@@ -401,16 +377,16 @@ def main():
 
     args = parser.parse_args()
 
-    # Daemon mode: PACK_REPO set + no subcommand → _run_daemon owns logging
+    # Daemon mode: PACK_URL set + no subcommand → _run_daemon owns logging
     if args.command is None:
-        if os.environ.get("PACK_REPO"):
+        if os.environ.get("PACK_URL"):
             return asyncio.run(_run_daemon())
         logging.basicConfig(
             level=getattr(logging, args.log_level),
             format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
         )
         parser.print_help()
-        print("\n[hint] Set PACK_REPO, REPO_PATH, and PACK_PATH to run as a daemon.")
+        print("\n[hint] Set PACK_URL and PACK_PATH to run as a daemon.")
         return 0
 
     logging.basicConfig(

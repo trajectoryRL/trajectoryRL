@@ -3,11 +3,11 @@
 Miners don't run a server. The workflow is:
     1. Write AGENTS.md (policy document)
     2. Build a pack.json (OPP v1 format)
-    3. Push to a public GitHub repo
+    3. Upload pack.json to a public HTTP endpoint
     4. Submit on-chain commitment via set_commitment
 
 The on-chain commitment is block-timestamped, establishing first-mover
-precedence. Validators read commitments and fetch packs from GitHub.
+precedence. Validators read commitments and fetch packs via HTTP.
 
 Reference: INCENTIVE_MECHANISM.md § Submission Protocol
 """
@@ -15,7 +15,6 @@ Reference: INCENTIVE_MECHANISM.md § Submission Protocol
 import hashlib
 import json
 import logging
-import subprocess
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -26,6 +25,8 @@ from ..utils.commitments import parse_commitment
 
 logger = logging.getLogger(__name__)
 
+MAX_COMMITMENT_BYTES = 256
+
 
 class TrajectoryMiner:
     """TrajectoryRL miner for building and submitting policy packs.
@@ -34,7 +35,7 @@ class TrajectoryMiner:
 
         miner = TrajectoryMiner(wallet_name="miner", wallet_hotkey="default")
         pack = miner.build_pack(agents_md="path/to/AGENTS.md")
-        miner.submit(pack, repo="myuser/my-pack", git_commit="abc123...")
+        miner.submit(pack, pack_url="https://trajrl.com/samples/pack.json")
 
     Example (validate locally)::
 
@@ -105,7 +106,6 @@ class TrajectoryMiner:
         Returns:
             OPP v1 pack dict, ready for JSON serialization.
         """
-        # Read from file if path exists
         agents_content = _read_or_use(agents_md)
         soul_content = _read_or_use(soul_md) if soul_md else None
 
@@ -208,45 +208,32 @@ class TrajectoryMiner:
     @staticmethod
     def format_commitment(
         pack_hash: str,
-        git_commit_hash: str,
-        repo: str,
+        pack_url: str,
     ) -> str:
         """Format a commitment string for on-chain submission.
 
         Args:
             pack_hash: SHA256 hex of pack JSON (64 chars).
-            git_commit_hash: Git commit hash (40 chars).
-            repo: GitHub repo as "owner/repo" or full URL.
+            pack_url: HTTP(S) URL where the pack.json is hosted.
 
         Returns:
-            Pipe-delimited commitment string (≤128 bytes).
+            Pipe-delimited commitment string (≤256 bytes).
 
         Raises:
             ValueError: If inputs are invalid.
         """
         if len(pack_hash) != 64:
             raise ValueError(f"pack_hash must be 64 hex chars, got {len(pack_hash)}")
-        if len(git_commit_hash) != 40:
+        if not pack_url.startswith(("https://", "http://")):
+            raise ValueError(f"pack_url must be an HTTP(S) URL, got: {pack_url}")
+
+        commitment = f"{pack_hash}|{pack_url}"
+        if len(commitment.encode()) > MAX_COMMITMENT_BYTES:
             raise ValueError(
-                f"git_commit_hash must be 40 hex chars, got {len(git_commit_hash)}"
+                f"Commitment too long: {len(commitment.encode())} bytes "
+                f"(max {MAX_COMMITMENT_BYTES}). Use a shorter URL."
             )
 
-        # Use shorthand if full URL provided
-        if repo.startswith("https://github.com/"):
-            repo = repo[len("https://github.com/"):]
-
-        # Strip trailing slashes and .git
-        repo = repo.rstrip("/")
-        if repo.endswith(".git"):
-            repo = repo[:-4].rstrip("/")
-
-        commitment = f"{pack_hash}|{git_commit_hash}|{repo}"
-        if len(commitment.encode()) > 128:
-            raise ValueError(
-                f"Commitment too long: {len(commitment.encode())} bytes (max 128)"
-            )
-
-        # Verify round-trip
         parsed = parse_commitment(commitment)
         if parsed is None:
             raise ValueError(f"Commitment failed round-trip validation: {commitment}")
@@ -256,20 +243,18 @@ class TrajectoryMiner:
     def submit_commitment(
         self,
         pack_hash: str,
-        git_commit_hash: str,
-        repo: str,
+        pack_url: str,
     ) -> bool:
         """Submit on-chain commitment via set_commitment.
 
         Args:
             pack_hash: SHA256 hex of pack JSON.
-            git_commit_hash: Git commit hash of the pack in the repo.
-            repo: GitHub repo ("owner/repo" or full URL).
+            pack_url: HTTP(S) URL where pack.json is publicly accessible.
 
         Returns:
             True if commitment was submitted successfully.
         """
-        commitment = self.format_commitment(pack_hash, git_commit_hash, repo)
+        commitment = self.format_commitment(pack_hash, pack_url)
         logger.info(f"Submitting commitment: {commitment}")
 
         try:
@@ -337,110 +322,22 @@ class TrajectoryMiner:
             return None
 
     # ------------------------------------------------------------------
-    # Git helpers (for push workflow)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def git_push_pack(
-        pack: dict,
-        repo_path: str,
-        commit_message: str = "Update policy pack",
-    ) -> Optional[str]:
-        """Write pack.json to a local git repo, commit, and push.
-
-        Args:
-            pack: OPP v1 pack dict.
-            repo_path: Path to local git repository.
-            commit_message: Git commit message.
-
-        Returns:
-            Git commit hash if successful, None on failure.
-        """
-        repo = Path(repo_path)
-        if not (repo / ".git").exists():
-            logger.error(f"Not a git repository: {repo_path}")
-            return None
-
-        # Write pack.json
-        pack_path = repo / "pack.json"
-        canonical = json.dumps(pack, sort_keys=True, indent=2)
-        pack_path.write_text(canonical)
-
-        # Also write AGENTS.md as standalone for readability
-        agents_md = pack.get("files", {}).get("AGENTS.md", "")
-        if agents_md:
-            (repo / "AGENTS.md").write_text(agents_md)
-
-        try:
-            # Stage files
-            subprocess.run(
-                ["git", "add", "pack.json", "AGENTS.md"],
-                cwd=repo_path, check=True, capture_output=True,
-            )
-
-            # Check if anything actually changed in the index
-            diff_result = subprocess.run(
-                ["git", "diff", "--cached", "--quiet"],
-                cwd=repo_path, capture_output=True,
-            )
-            if diff_result.returncode == 0:
-                # Nothing changed — return current HEAD hash
-                result = subprocess.run(
-                    ["git", "rev-parse", "HEAD"],
-                    cwd=repo_path, check=True, capture_output=True, text=True,
-                )
-                commit_hash = result.stdout.strip()
-                logger.info(
-                    "Pack unchanged, skipping commit (HEAD: %s...)", commit_hash[:12]
-                )
-                return commit_hash
-
-            # Commit and push
-            subprocess.run(
-                [
-                    "git",
-                    "-c", "user.email=miner@trajectoryrl.local",
-                    "-c", "user.name=TrajectoryRL Miner",
-                    "commit", "-m", commit_message,
-                ],
-                cwd=repo_path, check=True, capture_output=True,
-            )
-            subprocess.run(
-                ["git", "push"],
-                cwd=repo_path, check=True, capture_output=True,
-            )
-
-            # Get commit hash
-            result = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=repo_path, check=True, capture_output=True, text=True,
-            )
-            commit_hash = result.stdout.strip()
-            logger.info(f"Pushed pack to {repo_path} (commit: {commit_hash[:12]}...)")
-            return commit_hash
-
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Git operation failed: {e.stderr.decode() if e.stderr else e}")
-            return None
-
-    # ------------------------------------------------------------------
     # Full submit workflow
     # ------------------------------------------------------------------
 
     def submit(
         self,
         pack: dict,
-        repo: str,
-        git_commit: Optional[str] = None,
-        repo_path: Optional[str] = None,
+        pack_url: str,
     ) -> bool:
-        """Full submission workflow: validate, optionally push, commit on-chain.
+        """Full submission workflow: validate + commit on-chain.
+
+        The miner must upload pack.json to the given URL before calling this.
+        Validators will fetch the pack from this URL and verify the hash.
 
         Args:
             pack: OPP v1 pack dict.
-            repo: GitHub repo ("owner/repo" or full URL).
-            git_commit: Git commit hash. If None, pushes pack via repo_path.
-            repo_path: Local git repo path (used if git_commit is None).
+            pack_url: HTTP(S) URL where the pack.json is publicly accessible.
 
         Returns:
             True if everything succeeded.
@@ -455,17 +352,8 @@ class TrajectoryMiner:
         logger.info(f"Pack hash: {pack_hash}")
         logger.info(f"Pack size: {len(json.dumps(pack))} bytes")
 
-        # 2. Push to GitHub if no commit hash provided
-        if git_commit is None:
-            if repo_path is None:
-                logger.error("Must provide either git_commit or repo_path")
-                return False
-            git_commit = self.git_push_pack(pack, repo_path)
-            if git_commit is None:
-                return False
-
-        # 3. Submit on-chain
-        return self.submit_commitment(pack_hash, git_commit, repo)
+        # 2. Submit on-chain
+        return self.submit_commitment(pack_hash, pack_url)
 
 
 def _read_or_use(value: str) -> str:

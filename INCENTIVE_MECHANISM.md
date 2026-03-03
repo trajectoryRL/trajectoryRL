@@ -173,7 +173,7 @@ A **PolicyBundle** (also called an OpenClaw Policy Pack / OPP) is a JSON object 
 - **File content must be strings**: Every value in `files` must be a string (no nested objects)
 - **Dangerous tool check**: If `allow` includes dangerous tools (`exec`, `shell`, `group:runtime`, `admin_*`), `deny` must also contain at least one dangerous tool (defense-in-depth)
 - **Semver version**: `metadata.pack_version` must be valid semver (e.g., `1.0.0`)
-- **Content-addressed**: `sha256(json.dumps(pack, sort_keys=True))` must match the `pack_hash` submitted on-chain
+- **Content-addressed**: `sha256(json.dumps(pack, sort_keys=True))` must match the `pack_hash` in the on-chain commitment
 
 ### What Goes in AGENTS.md
 
@@ -185,40 +185,41 @@ For the reference miner implementation and local testing, see [MINER_OPERATIONS.
 
 ## Submission Protocol
 
-### On-Chain Commitments + Public GitHub
+### On-Chain Commitments + Public HTTP Hosting
 
-Miners publish packs to their own **public GitHub repository** and submit pack metadata **on-chain** via Bittensor's `set_commitment` extrinsic. Validators read submissions directly from the chain and fetch packs from the miner's repo. Miners do not need to run a server or have a public IP.
+Miners upload packs to any **publicly accessible HTTP endpoint** (Amazon S3, Google Cloud Storage, personal web server, etc.) and submit pack metadata **on-chain** via Bittensor's `set_commitment` extrinsic. Validators read submissions directly from the chain and fetch packs via HTTP. Miners do not need to run a server or have a public IP — static file hosting is sufficient.
 
 #### Submission Flow
 
-**Step 1: Publish to GitHub**
-- Create a public GitHub repository
-- Commit PolicyBundle (`pack.json`) to the repo
-- Push to GitHub
+**Step 1: Upload pack to HTTP endpoint**
+- Upload `pack.json` to any publicly accessible HTTP(S) URL:
+  - **Amazon S3**: `https://my-bucket.s3.amazonaws.com/pack.json`
+  - **Google Cloud Storage**: `https://storage.googleapis.com/my-bucket/pack.json`
+  - **Any HTTP server**: `https://example.com/my-pack/pack.json`
+- The URL must return the pack JSON with a `200` status code on GET requests
 
 **Step 2: Commit on-chain**
 - Miner calls `subtensor.set_commitment(netuid=11, data=commitment_string)` with their pack metadata
-- The commitment contains: `pack_hash`, `git_commit_hash`, and `repo_url` (compact-encoded to fit 128-byte limit)
+- The commitment contains: `pack_hash` and `pack_url` (pipe-delimited, ≤256 bytes)
 - The chain records the commitment with a **block-timestamped** entry (unforgeable and deterministic)
-- Commit hash must be reachable from HEAD of the repo
 - Rate limit: one commitment per ~100 blocks (~20 min) per hotkey
 
 **Step 3: Validator verification**
 Validators continuously read miner commitments from the chain via `subtensor.get_all_commitments(netuid=11)`, then verify:
-1. Commitment is parseable and contains required fields (`pack_hash`, `git_commit_hash`, `repo_url`)
-2. Repository is publicly accessible
-3. Git commit hash exists and is valid
-4. Pack content at that commit matches `pack_hash`
-5. PolicyBundle passes schema validation
-6. **NCD similarity** vs. current winner < `similarity_threshold` (0.80), see [Pack Similarity Detection](#7-pack-similarity-detection-ncd)
+1. Commitment is parseable and contains required fields (`pack_hash`, `pack_url`)
+2. Pack URL is publicly accessible (HTTP GET returns 200)
+3. `sha256(json.dumps(pack, sort_keys=True))` matches `pack_hash`
+4. PolicyBundle passes schema validation
+5. **NCD similarity** vs. current winner < `similarity_threshold` (0.80), see [Pack Similarity Detection](#7-pack-similarity-detection-ncd)
 
-**First-mover precedence** is determined by the **on-chain commitment block number**. The pack must exist in the miner's repo at the referenced commit hash. If a miner force-pushes and the commit disappears, their commitment becomes invalid and they score 0.
+**First-mover precedence** is determined by the **on-chain commitment block number**. The pack must be accessible at the committed URL. If a miner deletes or changes the file so the hash no longer matches, their commitment becomes invalid and they score 0.
 
-**Why On-Chain Commitments?**
-- **No server required**: Miners commit once and go offline. No public IP, no uptime requirement
+**Why On-Chain Commitments + HTTP?**
+- **No server required**: Miners upload once to static hosting and go offline. No public IP, no uptime requirement
 - **Deterministic discovery**: All validators read the same chain state, eliminating disagreements from network failures or timeouts
 - **Unforgeable timestamps**: Block-timestamped by the Substrate chain, not by the miner
 - **Simple**: No P2P networking, no retry logic, no timeout handling
+- **Flexible hosting**: Any HTTP(S) endpoint works — S3, GCS, GitHub Pages, personal servers, IPFS gateways, etc.
 
 ---
 
@@ -486,20 +487,20 @@ Every evaluation runs the **full scenario set**. No subset selection or rotation
 
 ### 1. On-Chain Commitments + Content-Addressed Packs
 
-**Enforcement**: All submissions must be git commits in public repos; first-mover precedence determined by **on-chain commitment block number** (unforgeable).
+**Enforcement**: All submissions are content-addressed (SHA256 hash); first-mover precedence determined by **on-chain commitment block number** (unforgeable).
 
 **Prevents**:
-- `git commit --date` / `GIT_COMMITTER_DATE` timestamp forgery (on-chain block timestamp is the source of truth, git dates are ignored)
-- Retroactive pack changes after seeing validator feedback (force-push is self-punishing: referenced commit disappears, score 0)
+- Retroactive pack changes after seeing validator feedback (changing the file breaks the hash → score 0)
 - Claims of earlier innovation without proof (on-chain commitment is permanent and block-timestamped)
+- Timestamp forgery (on-chain block timestamp is the source of truth)
 
 **How it works**:
-- Miner pushes pack to their public GitHub repo
-- Miner calls `set_commitment` on-chain with `pack_hash` + `git_commit_hash` + `repo_url`
+- Miner uploads pack to any public HTTP endpoint (S3, GCS, etc.)
+- Miner calls `set_commitment` on-chain with `pack_hash` + `pack_url`
 - On-chain commitment is block-timestamped by the Substrate chain (unforgeable and deterministic)
-- Validators verify that the referenced commit exists and `sha256(pack.json)` matches `pack_hash`
-- Force-push is self-punishing: if the commit disappears, the miner's commitment becomes invalid (score 0)
-- Public repos allow community audit and verification
+- Validators fetch the pack via HTTP and verify `sha256(json.dumps(pack, sort_keys=True))` matches `pack_hash`
+- Deleting or modifying the hosted file is self-punishing: hash mismatch → score 0
+- Public URLs allow community audit and verification
 
 ### 2. First-Mover Advantage (δ Threshold)
 
@@ -796,7 +797,7 @@ A miner's submission can fail at multiple points in the validation pipeline. The
 | Failure | Score | Weight | Counts as Active? | ClawBench Runs? |
 |---------|:-----:|:------:|:------------------:|:---------------:|
 | **No commitment** on-chain (or unparseable) | 0 | 0.0 | No | Skipped |
-| **Invalid git repo** (404, private, bad commit) | 0 | 0.0 | No | Skipped |
+| **Pack URL inaccessible** (404, timeout, hash mismatch) | 0 | 0.0 | No | Skipped |
 | **Schema validation failure** (missing AGENTS.md, >32KB, bad semver) | 0 | 0.0 | No | Skipped |
 | **NCD similarity** ≥ threshold vs. current winner | 0 | 0.0 | No | Skipped |
 | **ClawBench timeout** (scenario exceeds `timeout_per_scenario`) | 0 for that scenario | Computed | Yes | Partial |
@@ -851,7 +852,7 @@ weight[3rd] = 0.10
 where winner = miner with highest final_score[hotkey] that satisfies:
   - score > previous_best + δ (if not first)
   - ties broken by earliest on-chain commitment block number
-  - public GitHub repo with valid commit
+  - pack accessible at committed HTTP URL, hash matches
   - pack passes OPP v1 schema validation (AGENTS.md required, ≤32KB)
   - pack_similarity(pack, current_winner) < σ (NCD similarity check)
   - miner active within last inactivity_blocks

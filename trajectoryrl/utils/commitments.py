@@ -4,8 +4,13 @@ Miners submit pack metadata via ``subtensor.set_commitment(netuid, data)``.
 Validators read all commitments with ``subtensor.get_all_commitments(netuid)``
 and parse them into structured ``MinerCommitment`` objects.
 
-Commitment wire format (pipe-delimited, ≤128 bytes):
-    {pack_hash_hex}|{git_commit_hash}|{owner/repo}
+Commitment wire format (pipe-delimited, ≤256 bytes):
+    {pack_hash_hex}|{pack_url}
+
+Where:
+    pack_hash_hex: SHA256 hex digest of the canonical pack JSON (64 chars)
+    pack_url: HTTP(S) URL where validators can GET the pack.json
+              (any public HTTP(S) endpoint)
 
 Reference: INCENTIVE_MECHANISM.md § Submission Protocol
 """
@@ -20,8 +25,7 @@ from typing import Dict, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
-_HEX40 = re.compile(r"^[0-9a-f]{40}$")
-_REPO_PATTERN = re.compile(r"^[\w.-]+/[\w.-]+$")
+_HTTP_URL = re.compile(r"^https?://\S+$")
 
 
 @dataclass
@@ -31,50 +35,37 @@ class MinerCommitment:
     uid: int
     hotkey: str
     pack_hash: str  # SHA256 hex, 64 chars
-    git_commit_hash: str  # 40-char hex
-    repo_url: str  # https://github.com/owner/repo
+    pack_url: str  # HTTP(S) URL to pack.json
     block_number: int  # on-chain block when commitment was set
     raw: str  # original commitment string
 
 
-def parse_commitment(raw: str) -> Optional[Tuple[str, str, str]]:
-    """Parse a compact commitment string into (pack_hash, git_commit_hash, repo_url).
+def parse_commitment(raw: str) -> Optional[Tuple[str, str]]:
+    """Parse a compact commitment string into (pack_hash, pack_url).
 
     Supports pipe-delimited format:
-        ``{pack_hash}|{git_commit_hash}|{owner/repo}``
-
-    The ``owner/repo`` shorthand is expanded to a full GitHub URL.
+        ``{pack_hash}|{pack_url}``
 
     Returns:
-        Tuple of (pack_hash, git_commit_hash, repo_url) or None if unparseable.
+        Tuple of (pack_hash, pack_url) or None if unparseable.
     """
     if not raw or not isinstance(raw, str):
         return None
 
     raw = raw.strip()
-    parts = raw.split("|")
-    if len(parts) != 3:
+    parts = raw.split("|", maxsplit=1)
+    if len(parts) != 2:
         return None
 
-    pack_hash, git_commit, repo_short = parts[0].strip(), parts[1].strip(), parts[2].strip()
+    pack_hash, pack_url = parts[0].strip(), parts[1].strip()
 
-    # Validate pack_hash: 64 hex chars
     if not _HEX64.match(pack_hash):
         return None
 
-    # Validate git_commit_hash: 40 hex chars
-    if not _HEX40.match(git_commit):
+    if not _HTTP_URL.match(pack_url):
         return None
 
-    # Expand repo shorthand to full URL
-    if _REPO_PATTERN.match(repo_short):
-        repo_url = f"https://github.com/{repo_short}"
-    elif repo_short.startswith("https://github.com/"):
-        repo_url = repo_short
-    else:
-        return None
-
-    return pack_hash, git_commit, repo_url
+    return pack_hash, pack_url
 
 
 def fetch_all_commitments(
@@ -122,7 +113,7 @@ def fetch_all_commitments(
             logger.debug(f"UID {uid}: unparseable commitment, skipping")
             continue
 
-        pack_hash, git_commit, repo_url = parsed
+        pack_hash, pack_url = parsed
 
         # Get commitment block number for first-mover ordering
         block_number = _get_commitment_block(subtensor, netuid, hotkey)
@@ -131,14 +122,13 @@ def fetch_all_commitments(
             uid=uid,
             hotkey=hotkey,
             pack_hash=pack_hash,
-            git_commit_hash=git_commit,
-            repo_url=repo_url,
+            pack_url=pack_url,
             block_number=block_number,
             raw=raw,
         )
         logger.info(
             f"UID {uid}: commitment found — hash={pack_hash[:12]}… "
-            f"repo={repo_url} block={block_number}"
+            f"url={pack_url} block={block_number}"
         )
 
     return commitments

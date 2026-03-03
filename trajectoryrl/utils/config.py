@@ -84,8 +84,8 @@ class ValidatorConfig:
     # Inactivity tracking
     inactivity_window: int = 2  # Epochs before losing first-mover protection
 
-    # GitHub verification
-    github_token: Optional[str] = None  # GITHUB_TOKEN env var; needed for push timestamp
+    # GitHub token (for score publishing, not pack verification)
+    github_token: Optional[str] = None  # GITHUB_TOKEN env var
 
     # Validator score publishing (shared score bucket)
     validator_scores_fork_url: Optional[str] = None  # Validator's fork of validator-scores repo
@@ -202,8 +202,7 @@ class MinerConfig:
         network: Bittensor network (finney, test, local).
         pack_path: Path to an existing pack.json file.
         agents_md_path: Path to AGENTS.md (build pack on the fly).
-        pack_repo: GitHub repo as "owner/repo" — required for daemon mode.
-        repo_path: Local git clone path — required for daemon mode.
+        pack_url: Public HTTP(S) URL where pack.json is hosted — required for daemon mode.
         check_interval: Seconds between daemon loop iterations.
     """
 
@@ -213,8 +212,7 @@ class MinerConfig:
     network: str = "finney"
     pack_path: Optional[str] = None
     agents_md_path: Optional[str] = None
-    pack_repo: str = ""
-    repo_path: str = ""
+    pack_url: str = ""
     check_interval: int = 3600
 
     def __post_init__(self):
@@ -222,10 +220,11 @@ class MinerConfig:
             raise ValueError(
                 "MinerConfig requires at least one of pack_path or agents_md_path"
             )
-        if not self.pack_repo:
-            raise ValueError("MinerConfig requires pack_repo (e.g. 'owner/repo')")
-        if not self.repo_path:
-            raise ValueError("MinerConfig requires repo_path (local git clone path)")
+        if not self.pack_url:
+            raise ValueError(
+                "MinerConfig requires pack_url "
+                "(e.g. 'https://trajrl.com/samples/pack.json')"
+            )
 
     @classmethod
     def from_env(cls, dotenv_path: Optional[Path] = None) -> "MinerConfig":
@@ -251,7 +250,6 @@ class MinerConfig:
             network=os.getenv("NETWORK", "finney"),
             pack_path=os.getenv("PACK_PATH") or None,
             agents_md_path=os.getenv("AGENTS_MD_PATH") or None,
-            pack_repo=os.getenv("PACK_REPO", ""),
-            repo_path=os.getenv("REPO_PATH", ""),
+            pack_url=os.getenv("PACK_URL", ""),
             check_interval=int(os.getenv("CHECK_INTERVAL", "3600")),
         )
