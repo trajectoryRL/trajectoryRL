@@ -22,7 +22,7 @@ The best pack wins 100% of miner emissions each epoch (or top-3 split 70/20/10 i
 | **Bittensor wallet** | `btcli wallet create --wallet.name miner --wallet.hotkey default` |
 | **Registration** | `btcli subnet register --netuid 11 --wallet.name miner` (dynamic cost, check CLI before registering) |
 | **Python** | 3.10+ |
-| **GitHub account** | Public repo for pack submission |
+| **HTTP hosting** | Any public HTTP(S) endpoint for pack hosting |
 | **LLM API key** | For local ClawBench testing (Anthropic, OpenAI, or local model) |
 
 ---
@@ -69,8 +69,8 @@ The reference miner uses **Claude Opus 4.6** to autonomously generate, test, and
 │  3. Run ClawBench locally, collect per-check results    │
 │  4. Feed failed checks back to Opus 4.6 for iteration   │
 │  5. Repeat until score stabilizes or budget exhausted   │
-│  6. Push winning pack to GitHub                         │
-│  7. Submit on-chain commitment (pack_hash + git info)   │
+│  6. Upload winning pack to public HTTP endpoint          │
+│  7. Submit on-chain commitment (pack_hash + pack_url)   │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -134,38 +134,27 @@ The `--json` output shows per-check pass/fail results. Focus on failed checks wi
 
 ## Submission Workflow
 
-### 1. Push to Public GitHub
+### 1. Upload Pack to Public HTTP Endpoint
 
-```bash
-mkdir my-trajectoryrl-pack && cd my-trajectoryrl-pack
-git init
-# Add your AGENTS.md (and optionally SOUL.md)
-git add AGENTS.md
-git commit -m "v1.0.0: initial policy pack"
-git remote add origin https://github.com/YOUR_USER/my-trajectoryrl-pack.git
-git push -u origin main
-```
+Upload your `pack.json` to any publicly accessible HTTP(S) URL. The only requirement is that `GET <url>` returns the pack JSON with HTTP 200.
 
 ### 2. Submit On-Chain Commitment
 
-After pushing to GitHub, submit your pack metadata on-chain:
+After uploading, submit your pack metadata on-chain:
 
 ```bash
-python neurons/miner.py \
-  --wallet.name miner \
-  --wallet.hotkey default \
-  --netuid 11 \
-  --pack_repo https://github.com/YOUR_USER/my-trajectoryrl-pack \
-  --pack_commit $(git rev-parse HEAD)
+python neurons/miner.py submit pack.json \
+  --pack-url https://trajrl.com/samples/pack.json \
+  --wallet.name miner --wallet.hotkey default
 ```
 
-This calls `subtensor.set_commitment(netuid=11, data=commitment_string)` with your `pack_hash`, `git_commit_hash`, and `repo_url`. The **on-chain commitment block number** establishes first-mover precedence (unforgeable, deterministic).
+This calls `subtensor.set_commitment(netuid=11, data=commitment_string)` with your `pack_hash` and `pack_url`. The **on-chain commitment block number** establishes first-mover precedence (unforgeable, deterministic).
 
 > **Rate limit**: One commitment per ~100 blocks (~20 min) per hotkey — sufficient for daily epochs.
 
 ### 3. Iterate
 
-Epochs run every 24 hours. Push improved packs and submit a new on-chain commitment — the next epoch picks up your latest submission. Validators only re-evaluate when your `pack_hash` changes, so resubmitting the same pack is a no-op.
+Epochs run every 24 hours. Upload improved packs (keeping the same URL or using a new one) and submit a new on-chain commitment — the next epoch picks up your latest submission. Validators only re-evaluate when your `pack_hash` changes, so resubmitting the same pack is a no-op.
 
 ---
 

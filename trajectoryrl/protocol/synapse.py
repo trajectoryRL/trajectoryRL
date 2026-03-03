@@ -42,12 +42,11 @@ class PackRequest(bt.Synapse):
 
 
 class PackResponse(bt.Synapse):
-    """Miner returns their policy pack (GitHub-based submission).
+    """Miner returns their policy pack submission info.
 
     Attributes:
         pack_hash: SHA256 hash of the pack JSON (hex digest)
-        git_commit_hash: Git commit SHA from public repository
-        repo_url: Public GitHub repository URL
+        pack_url: Public HTTP(S) URL where pack.json is hosted
         metadata: Declared pack metadata (not verified by validator)
     """
 
@@ -55,13 +54,9 @@ class PackResponse(bt.Synapse):
         default="",
         description="SHA256 hash of pack content (hex digest)"
     )
-    git_commit_hash: str = Field(
+    pack_url: str = Field(
         default="",
-        description="Git commit SHA from public repository (40-char hex)"
-    )
-    repo_url: str = Field(
-        default="",
-        description="Public GitHub repository URL (e.g., https://github.com/user/repo)"
+        description="Public HTTP(S) URL where pack.json is hosted"
     )
     metadata: Optional[Dict[str, Any]] = Field(
         default=None,
@@ -78,22 +73,12 @@ class PackResponse(bt.Synapse):
             raise ValueError("pack_hash must be lowercase hex")
         return v.lower()
 
-    @field_validator("git_commit_hash")
+    @field_validator("pack_url")
     @classmethod
-    def validate_git_commit_hash(cls, v: str) -> str:
-        """Ensure git_commit_hash is a valid git SHA (40-char hex)."""
-        if v and len(v) != 40:
-            raise ValueError(f"git_commit_hash must be 40 hex chars, got {len(v)}")
-        if v and not all(c in "0123456789abcdef" for c in v.lower()):
-            raise ValueError("git_commit_hash must be lowercase hex")
-        return v.lower()
-
-    @field_validator("repo_url")
-    @classmethod
-    def validate_repo_url(cls, v: str) -> str:
-        """Ensure repo_url is a valid GitHub URL."""
-        if v and not v.startswith(("https://github.com/", "http://github.com/")):
-            raise ValueError("repo_url must be a GitHub URL")
+    def validate_pack_url(cls, v: str) -> str:
+        """Ensure pack_url is a valid HTTP(S) URL."""
+        if v and not v.startswith(("https://", "http://")):
+            raise ValueError("pack_url must be an HTTP(S) URL")
         return v
 
     @staticmethod

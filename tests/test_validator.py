@@ -33,7 +33,7 @@ sys.modules["bittensor"] = _mock_bt
 from trajectoryrl.utils.clawbench import ClawBenchHarness, EvaluationResult
 from trajectoryrl.utils.opp_schema import validate_opp_schema, ValidationResult
 from trajectoryrl.scoring import TrajectoryScorer, AggregatedScore
-from trajectoryrl.utils.github import GitHubVerifier, GitVerificationResult
+from trajectoryrl.utils.github import PackFetcher, PackVerificationResult
 from trajectoryrl.base.validator import TrajectoryValidator
 from trajectoryrl.utils.epoch_context import (
     generate_epoch_context, render_context_preamble,
@@ -1061,532 +1061,213 @@ class TestEvaluationResult:
 
 
 # ===================================================================
-# GitHubVerifier Tests
+# PackFetcher Tests
 # ===================================================================
 
-class TestGitHubVerifier:
+class TestPackFetcher:
 
     def test_init_creates_cache_dir(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            cache = Path(tmpdir) / "git_cache"
-            verifier = GitHubVerifier(cache_dir=cache)
+            cache = Path(tmpdir) / "pack_cache"
+            fetcher = PackFetcher(cache_dir=cache)
             assert cache.exists()
 
-    def test_init_with_token(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(
-                cache_dir=Path(tmpdir), github_token="ghp_test123"
-            )
-            assert verifier.github_token == "ghp_test123"
-
-    def test_verify_commit_exists_invalid(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(cache_dir=Path(tmpdir))
-            # Non-git directory
-            result = asyncio.get_event_loop().run_until_complete(
-                verifier._verify_commit_exists(
-                    Path(tmpdir), "abc123" * 7  # fake hash
-                )
-            )
-            assert result is False
-
-    def test_get_commit_timestamp_invalid(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(cache_dir=Path(tmpdir))
-            result = asyncio.get_event_loop().run_until_complete(
-                verifier._get_commit_timestamp(
-                    Path(tmpdir), "abc123" * 7
-                )
-            )
-            assert result is None
-
-    # ---------------------------------------------------------------
-    # _parse_github_url
-    # ---------------------------------------------------------------
-
-    def test_parse_github_url_basic(self):
-        owner, repo = GitHubVerifier._parse_github_url(
-            "https://github.com/alice/my-pack"
-        )
-        assert owner == "alice"
-        assert repo == "my-pack"
-
-    def test_parse_github_url_trailing_slash(self):
-        owner, repo = GitHubVerifier._parse_github_url(
-            "https://github.com/alice/my-pack/"
-        )
-        assert owner == "alice"
-        assert repo == "my-pack"
-
-    def test_parse_github_url_dot_git(self):
-        owner, repo = GitHubVerifier._parse_github_url(
-            "https://github.com/alice/my-pack.git"
-        )
-        assert owner == "alice"
-        assert repo == "my-pack"
-
-    # ---------------------------------------------------------------
-    # _get_push_timestamp_events_api (mocked)
-    # ---------------------------------------------------------------
-
-    def test_events_api_finds_commit_via_head(self):
-        """Events API finds commit as the head of a PushEvent (fast path)."""
-        commit_sha = "a" * 40
-
-        mock_events = [
-            {
-                "type": "CreateEvent",
-                "created_at": "2026-02-10T10:00:00Z",
-                "payload": {},
-            },
-            {
-                "type": "PushEvent",
-                "created_at": "2026-02-15T14:30:00Z",
-                "payload": {
-                    "repository_id": 123,
-                    "push_id": 456,
-                    "ref": "refs/heads/main",
-                    "head": commit_sha,
-                    "before": "b" * 40,
-                },
-            },
-        ]
+    def test_verify_valid_pack(self):
+        """Valid pack URL + matching hash → verification passes."""
+        pack = {"schema_version": 1, "files": {"AGENTS.md": "# Test"}}
+        pack_json = json.dumps(pack, sort_keys=True)
+        pack_hash = hashlib.sha256(pack_json.encode()).hexdigest()
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(cache_dir=Path(tmpdir))
-
-            with patch("httpx.AsyncClient") as MockClient:
-                mock_resp = MagicMock()
-                mock_resp.status_code = 200
-                mock_resp.json.return_value = mock_events
-
-                mock_client_instance = AsyncMock()
-                mock_client_instance.get.return_value = mock_resp
-                mock_client_instance.__aenter__ = AsyncMock(
-                    return_value=mock_client_instance
-                )
-                mock_client_instance.__aexit__ = AsyncMock(return_value=False)
-                MockClient.return_value = mock_client_instance
-
-                ts = asyncio.get_event_loop().run_until_complete(
-                    verifier._get_push_timestamp_events_api("alice", "repo", commit_sha)
-                )
-
-            assert ts is not None
-            from datetime import datetime, timezone
-            expected = datetime(2026, 2, 15, 14, 30, 0, tzinfo=timezone.utc).timestamp()
-            assert abs(ts - expected) < 1
-
-    def test_events_api_finds_commit_via_compare(self):
-        """Events API finds commit via Compare API when head doesn't match."""
-        commit_sha = "a" * 40
-        head_sha = "c" * 40
-        before_sha = "b" * 40
-
-        mock_events = [
-            {
-                "type": "PushEvent",
-                "created_at": "2026-02-15T14:30:00Z",
-                "payload": {
-                    "ref": "refs/heads/main",
-                    "head": head_sha,
-                    "before": before_sha,
-                },
-            },
-        ]
-
-        # Compare API response lists commits in the push range
-        mock_compare = {
-            "commits": [
-                {"sha": commit_sha},
-                {"sha": head_sha},
-            ]
-        }
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(cache_dir=Path(tmpdir))
-
-            with patch("httpx.AsyncClient") as MockClient:
-                # Events API response
-                mock_events_resp = MagicMock()
-                mock_events_resp.status_code = 200
-                mock_events_resp.json.return_value = mock_events
-
-                # Compare API response
-                mock_compare_resp = MagicMock()
-                mock_compare_resp.status_code = 200
-                mock_compare_resp.json.return_value = mock_compare
-
-                mock_client_instance = AsyncMock()
-                mock_client_instance.get.side_effect = [
-                    mock_events_resp,   # events page 1
-                    mock_compare_resp,  # compare API call
-                ]
-                mock_client_instance.__aenter__ = AsyncMock(
-                    return_value=mock_client_instance
-                )
-                mock_client_instance.__aexit__ = AsyncMock(return_value=False)
-                MockClient.return_value = mock_client_instance
-
-                ts = asyncio.get_event_loop().run_until_complete(
-                    verifier._get_push_timestamp_events_api("alice", "repo", commit_sha)
-                )
-
-            assert ts is not None
-            from datetime import datetime, timezone
-            expected = datetime(2026, 2, 15, 14, 30, 0, tzinfo=timezone.utc).timestamp()
-            assert abs(ts - expected) < 1
-
-    def test_events_api_commit_not_found(self):
-        """Events API has no PushEvent with our commit → returns None."""
-        mock_events = [
-            {
-                "type": "PushEvent",
-                "created_at": "2026-02-15T14:30:00Z",
-                "payload": {
-                    "ref": "refs/heads/main",
-                    "head": "d" * 40,
-                    "before": "e" * 40,
-                },
-            },
-        ]
-
-        # Compare API says commit not in range
-        mock_compare = {"commits": [{"sha": "d" * 40}]}
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(cache_dir=Path(tmpdir))
-
-            with patch("httpx.AsyncClient") as MockClient:
-                mock_events_resp = MagicMock()
-                mock_events_resp.status_code = 200
-
-                mock_compare_resp = MagicMock()
-                mock_compare_resp.status_code = 200
-                mock_compare_resp.json.return_value = mock_compare
-
-                # Page 1 returns events, page 2 returns empty
-                mock_events_resp.json.side_effect = [mock_events, []]
-
-                mock_client_instance = AsyncMock()
-                mock_client_instance.get.side_effect = [
-                    mock_events_resp,   # events page 1
-                    mock_compare_resp,  # compare for the push event
-                    mock_events_resp,   # events page 2 (empty)
-                ]
-                mock_client_instance.__aenter__ = AsyncMock(
-                    return_value=mock_client_instance
-                )
-                mock_client_instance.__aexit__ = AsyncMock(return_value=False)
-                MockClient.return_value = mock_client_instance
-
-                ts = asyncio.get_event_loop().run_until_complete(
-                    verifier._get_push_timestamp_events_api("alice", "repo", "a" * 40)
-                )
-
-            assert ts is None
-
-    def test_events_api_rate_limited(self):
-        """Events API returns 403 rate limit → returns None gracefully."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(cache_dir=Path(tmpdir))
-
-            with patch("httpx.AsyncClient") as MockClient:
-                mock_resp = MagicMock()
-                mock_resp.status_code = 403
-
-                mock_client_instance = AsyncMock()
-                mock_client_instance.get.return_value = mock_resp
-                mock_client_instance.__aenter__ = AsyncMock(
-                    return_value=mock_client_instance
-                )
-                mock_client_instance.__aexit__ = AsyncMock(return_value=False)
-                MockClient.return_value = mock_client_instance
-
-                ts = asyncio.get_event_loop().run_until_complete(
-                    verifier._get_push_timestamp_events_api("alice", "repo", "a" * 40)
-                )
-
-            assert ts is None
-
-    # ---------------------------------------------------------------
-    # _get_push_timestamp_graphql (mocked)
-    # ---------------------------------------------------------------
-
-    def test_graphql_returns_pushed_date(self):
-        """GraphQL API returns valid pushedDate."""
-        graphql_response = {
-            "data": {
-                "repository": {
-                    "object": {
-                        "pushedDate": "2026-02-15T14:30:00Z",
-                        "committedDate": "2026-02-15T14:28:00Z",
-                    }
-                }
-            }
-        }
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(
-                cache_dir=Path(tmpdir), github_token="ghp_test"
-            )
-
-            with patch("httpx.AsyncClient") as MockClient:
-                mock_resp = MagicMock()
-                mock_resp.status_code = 200
-                mock_resp.json.return_value = graphql_response
-
-                mock_client_instance = AsyncMock()
-                mock_client_instance.post.return_value = mock_resp
-                mock_client_instance.__aenter__ = AsyncMock(
-                    return_value=mock_client_instance
-                )
-                mock_client_instance.__aexit__ = AsyncMock(return_value=False)
-                MockClient.return_value = mock_client_instance
-
-                ts = asyncio.get_event_loop().run_until_complete(
-                    verifier._get_push_timestamp_graphql("alice", "repo", "a" * 40)
-                )
-
-            assert ts is not None
-            from datetime import datetime, timezone
-            expected = datetime(2026, 2, 15, 14, 30, 0, tzinfo=timezone.utc).timestamp()
-            assert abs(ts - expected) < 1
-
-    def test_graphql_detects_backdating(self):
-        """GraphQL logs warning when pushedDate diverges from committedDate."""
-        # Committed date is backdated by 1 day
-        graphql_response = {
-            "data": {
-                "repository": {
-                    "object": {
-                        "pushedDate": "2026-02-15T14:30:00Z",
-                        "committedDate": "2026-02-14T10:00:00Z",
-                    }
-                }
-            }
-        }
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(
-                cache_dir=Path(tmpdir), github_token="ghp_test"
-            )
-
-            with patch("httpx.AsyncClient") as MockClient:
-                mock_resp = MagicMock()
-                mock_resp.status_code = 200
-                mock_resp.json.return_value = graphql_response
-
-                mock_client_instance = AsyncMock()
-                mock_client_instance.post.return_value = mock_resp
-                mock_client_instance.__aenter__ = AsyncMock(
-                    return_value=mock_client_instance
-                )
-                mock_client_instance.__aexit__ = AsyncMock(return_value=False)
-                MockClient.return_value = mock_client_instance
-
-                with patch("trajectoryrl.utils.github.logger") as mock_logger:
-                    ts = asyncio.get_event_loop().run_until_complete(
-                        verifier._get_push_timestamp_graphql("alice", "repo", "a" * 40)
-                    )
-
-                    # Should still return the push timestamp
-                    assert ts is not None
-                    # Should have logged a divergence warning
-                    warning_calls = [
-                        str(c) for c in mock_logger.warning.call_args_list
-                    ]
-                    assert any("divergence" in w.lower() for w in warning_calls)
-
-    def test_graphql_commit_not_found(self):
-        """GraphQL returns null object → None."""
-        graphql_response = {
-            "data": {"repository": {"object": None}}
-        }
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(
-                cache_dir=Path(tmpdir), github_token="ghp_test"
-            )
-
-            with patch("httpx.AsyncClient") as MockClient:
-                mock_resp = MagicMock()
-                mock_resp.status_code = 200
-                mock_resp.json.return_value = graphql_response
-
-                mock_client_instance = AsyncMock()
-                mock_client_instance.post.return_value = mock_resp
-                mock_client_instance.__aenter__ = AsyncMock(
-                    return_value=mock_client_instance
-                )
-                mock_client_instance.__aexit__ = AsyncMock(return_value=False)
-                MockClient.return_value = mock_client_instance
-
-                ts = asyncio.get_event_loop().run_until_complete(
-                    verifier._get_push_timestamp_graphql("alice", "repo", "a" * 40)
-                )
-
-            assert ts is None
-
-    # ---------------------------------------------------------------
-    # _get_server_push_timestamp (orchestration)
-    # ---------------------------------------------------------------
-
-    def test_server_push_timestamp_events_api_succeeds(self):
-        """Events API succeeds → returns timestamp without trying GraphQL."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(
-                cache_dir=Path(tmpdir), github_token="ghp_test"
-            )
+            fetcher = PackFetcher(cache_dir=Path(tmpdir))
 
             with patch.object(
-                verifier, "_get_push_timestamp_events_api",
-                new_callable=AsyncMock, return_value=1700000000.0,
-            ) as mock_events, patch.object(
-                verifier, "_get_push_timestamp_graphql",
-                new_callable=AsyncMock,
-            ) as mock_graphql:
-                ts = asyncio.get_event_loop().run_until_complete(
-                    verifier._get_server_push_timestamp(
-                        "https://github.com/alice/repo", "a" * 40
+                fetcher, "_fetch_pack",
+                new_callable=AsyncMock, return_value=pack_json,
+            ):
+                result = asyncio.get_event_loop().run_until_complete(
+                    fetcher.verify_submission(
+                        pack_url="https://trajrl.com/samples/pack.json",
+                        pack_hash=pack_hash,
                     )
                 )
 
-            assert ts == 1700000000.0
-            mock_events.assert_called_once()
-            mock_graphql.assert_not_called()  # Should not fall through
+            assert result.valid is True
+            assert result.pack_content == pack
 
-    def test_server_push_timestamp_falls_through_to_graphql(self):
-        """Events API returns None → falls through to GraphQL."""
+    def test_verify_hash_mismatch(self):
+        """Pack content doesn't match expected hash → verification fails."""
+        pack_json = json.dumps({"schema_version": 1, "files": {"AGENTS.md": "# Test"}}, sort_keys=True)
+
         with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(
-                cache_dir=Path(tmpdir), github_token="ghp_test"
-            )
+            fetcher = PackFetcher(cache_dir=Path(tmpdir))
 
             with patch.object(
-                verifier, "_get_push_timestamp_events_api",
-                new_callable=AsyncMock, return_value=None,
-            ), patch.object(
-                verifier, "_get_push_timestamp_graphql",
-                new_callable=AsyncMock, return_value=1700000000.0,
-            ) as mock_graphql:
-                ts = asyncio.get_event_loop().run_until_complete(
-                    verifier._get_server_push_timestamp(
-                        "https://github.com/alice/repo", "a" * 40
+                fetcher, "_fetch_pack",
+                new_callable=AsyncMock, return_value=pack_json,
+            ):
+                result = asyncio.get_event_loop().run_until_complete(
+                    fetcher.verify_submission(
+                        pack_url="https://trajrl.com/samples/pack.json",
+                        pack_hash="f" * 64,
                     )
                 )
 
-            assert ts == 1700000000.0
-            mock_graphql.assert_called_once()
+            assert result.valid is False
+            assert "mismatch" in result.error.lower()
 
-    def test_server_push_timestamp_both_fail_returns_none(self):
-        """Both APIs fail → returns None (fail-safe rejection)."""
+    def test_verify_fetch_failure(self):
+        """HTTP fetch fails → verification fails."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(
-                cache_dir=Path(tmpdir), github_token="ghp_test"
-            )
+            fetcher = PackFetcher(cache_dir=Path(tmpdir))
 
             with patch.object(
-                verifier, "_get_push_timestamp_events_api",
-                new_callable=AsyncMock, return_value=None,
-            ), patch.object(
-                verifier, "_get_push_timestamp_graphql",
+                fetcher, "_fetch_pack",
                 new_callable=AsyncMock, return_value=None,
             ):
-                ts = asyncio.get_event_loop().run_until_complete(
-                    verifier._get_server_push_timestamp(
-                        "https://github.com/alice/repo", "a" * 40
+                result = asyncio.get_event_loop().run_until_complete(
+                    fetcher.verify_submission(
+                        pack_url="https://trajrl.com/samples/pack.json",
+                        pack_hash="a" * 64,
                     )
                 )
 
-            assert ts is None
+            assert result.valid is False
+            assert "fetch" in result.error.lower() or "failed" in result.error.lower()
 
-    def test_server_push_timestamp_no_token_skips_graphql(self):
-        """No github_token → skips GraphQL entirely."""
+    def test_verify_invalid_json(self):
+        """Non-JSON response → verification fails."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(
-                cache_dir=Path(tmpdir), github_token=None
-            )
+            fetcher = PackFetcher(cache_dir=Path(tmpdir))
 
             with patch.object(
-                verifier, "_get_push_timestamp_events_api",
-                new_callable=AsyncMock, return_value=None,
-            ), patch.object(
-                verifier, "_get_push_timestamp_graphql",
-                new_callable=AsyncMock,
-            ) as mock_graphql:
-                ts = asyncio.get_event_loop().run_until_complete(
-                    verifier._get_server_push_timestamp(
-                        "https://github.com/alice/repo", "a" * 40
+                fetcher, "_fetch_pack",
+                new_callable=AsyncMock, return_value="not json {{{",
+            ):
+                result = asyncio.get_event_loop().run_until_complete(
+                    fetcher.verify_submission(
+                        pack_url="https://trajrl.com/samples/pack.json",
+                        pack_hash="a" * 64,
                     )
                 )
 
-            assert ts is None
-            mock_graphql.assert_not_called()
+            assert result.valid is False
+            assert "json" in result.error.lower()
+
+    def test_cache_hit_skips_fetch(self):
+        """Cached pack with matching hash → no HTTP fetch needed."""
+        pack = {"schema_version": 1, "files": {"AGENTS.md": "# Cached"}}
+        pack_json = json.dumps(pack, sort_keys=True)
+        pack_hash = hashlib.sha256(pack_json.encode()).hexdigest()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fetcher = PackFetcher(cache_dir=Path(tmpdir))
+
+            # Pre-populate cache
+            cache_path = Path(tmpdir) / f"{pack_hash}.json"
+            cache_path.write_text(json.dumps(pack, sort_keys=True))
+
+            with patch.object(
+                fetcher, "_fetch_pack",
+                new_callable=AsyncMock,
+            ) as mock_fetch:
+                result = asyncio.get_event_loop().run_until_complete(
+                    fetcher.verify_submission(
+                        pack_url="https://trajrl.com/samples/pack.json",
+                        pack_hash=pack_hash,
+                    )
+                )
+
+            assert result.valid is True
+            assert result.pack_content == pack
+            mock_fetch.assert_not_called()
+
+    def test_fetch_pack_http_error(self):
+        """HTTP 404 → _fetch_pack returns None."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fetcher = PackFetcher(cache_dir=Path(tmpdir))
+
+            with patch("httpx.AsyncClient") as MockClient:
+                mock_resp = MagicMock()
+                mock_resp.status_code = 404
+
+                mock_client_instance = AsyncMock()
+                mock_client_instance.get.return_value = mock_resp
+                mock_client_instance.__aenter__ = AsyncMock(
+                    return_value=mock_client_instance
+                )
+                mock_client_instance.__aexit__ = AsyncMock(return_value=False)
+                MockClient.return_value = mock_client_instance
+
+                result = asyncio.get_event_loop().run_until_complete(
+                    fetcher._fetch_pack("https://trajrl.com/samples/pack.json")
+                )
+
+            assert result is None
+
+    def test_fetch_pack_success(self):
+        """HTTP 200 with valid content → returns text."""
+        pack_text = '{"schema_version": 1}'
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fetcher = PackFetcher(cache_dir=Path(tmpdir))
+
+            with patch("httpx.AsyncClient") as MockClient:
+                mock_resp = MagicMock()
+                mock_resp.status_code = 200
+                mock_resp.content = pack_text.encode()
+                mock_resp.text = pack_text
+
+                mock_client_instance = AsyncMock()
+                mock_client_instance.get.return_value = mock_resp
+                mock_client_instance.__aenter__ = AsyncMock(
+                    return_value=mock_client_instance
+                )
+                mock_client_instance.__aexit__ = AsyncMock(return_value=False)
+                MockClient.return_value = mock_client_instance
+
+                result = asyncio.get_event_loop().run_until_complete(
+                    fetcher._fetch_pack("https://trajrl.com/samples/pack.json")
+                )
+
+            assert result == pack_text
 
     # ---------------------------------------------------------------
     # cleanup_cache (LRU eviction)
     # ---------------------------------------------------------------
 
     def test_cleanup_cache_no_eviction_when_under_limit(self):
-        """Cache under limit → no repos evicted."""
+        """Cache under limit → no entries evicted."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(cache_dir=Path(tmpdir))
+            fetcher = PackFetcher(cache_dir=Path(tmpdir))
 
-            # Create a small repo dir (well under 100 MB)
-            repo = Path(tmpdir) / "alice__pack"
-            repo.mkdir()
-            (repo / "data.txt").write_text("x" * 1000)
+            cached = Path(tmpdir) / "abc123.json"
+            cached.write_text('{"test": true}')
 
-            verifier.cleanup_cache(max_size_mb=100)
-            assert repo.exists()
+            fetcher.cleanup_cache(max_size_mb=100)
+            assert cached.exists()
 
     def test_cleanup_cache_evicts_oldest_first(self):
-        """When over limit, oldest repos (by mtime) are evicted first."""
+        """When over limit, oldest entries (by mtime) are evicted first."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(cache_dir=Path(tmpdir))
+            fetcher = PackFetcher(cache_dir=Path(tmpdir))
 
-            # Create two repo dirs with different mtimes
-            old_repo = Path(tmpdir) / "old__repo"
-            old_repo.mkdir()
-            (old_repo / "data.txt").write_bytes(b"x" * 600_000)
-            # Backdate the old repo
-            os.utime(old_repo, (1000000, 1000000))
+            old_file = Path(tmpdir) / "old.json"
+            old_file.write_bytes(b"x" * 600_000)
+            os.utime(old_file, (1000000, 1000000))
 
-            new_repo = Path(tmpdir) / "new__repo"
-            new_repo.mkdir()
-            (new_repo / "data.txt").write_bytes(b"x" * 600_000)
+            new_file = Path(tmpdir) / "new.json"
+            new_file.write_bytes(b"x" * 600_000)
 
-            # Total ~1.2 MB, limit = 1 MB → should evict old_repo
-            verifier.cleanup_cache(max_size_mb=1)
-            assert not old_repo.exists(), "Old repo should be evicted"
-            assert new_repo.exists(), "New repo should be kept"
-
-    def test_cleanup_cache_evicts_multiple(self):
-        """Evicts multiple repos until under limit."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(cache_dir=Path(tmpdir))
-
-            repos = []
-            for i in range(5):
-                repo = Path(tmpdir) / f"repo{i}__pack"
-                repo.mkdir()
-                (repo / "data.txt").write_bytes(b"x" * 300_000)
-                os.utime(repo, (1000000 + i, 1000000 + i))
-                repos.append(repo)
-
-            # Total ~1.5 MB, limit = 1 MB → should evict at least 2 oldest
-            verifier.cleanup_cache(max_size_mb=1)
-            remaining = [r for r in repos if r.exists()]
-            assert len(remaining) < 5
-            # The newest repos should survive
-            assert repos[4].exists()
+            fetcher.cleanup_cache(max_size_mb=1)
+            assert not old_file.exists(), "Old file should be evicted"
+            assert new_file.exists(), "New file should be kept"
 
     def test_cleanup_cache_empty_dir(self):
         """Empty cache dir → no error."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(cache_dir=Path(tmpdir))
-            verifier.cleanup_cache(max_size_mb=100)  # Should not raise
+            fetcher = PackFetcher(cache_dir=Path(tmpdir))
+            fetcher.cleanup_cache(max_size_mb=100)
 
 
 # ===================================================================
@@ -1686,53 +1367,53 @@ class TestCommitmentParsing:
 
     def test_valid_commitment(self):
         from trajectoryrl.utils.commitments import parse_commitment
-        raw = "a" * 64 + "|" + "b" * 40 + "|alice/my-pack"
+        raw = "a" * 64 + "|https://trajrl.com/samples/pack.json"
         result = parse_commitment(raw)
         assert result is not None
-        pack_hash, git_commit, repo_url = result
+        pack_hash, pack_url = result
         assert pack_hash == "a" * 64
-        assert git_commit == "b" * 40
-        assert repo_url == "https://github.com/alice/my-pack"
+        assert pack_url == "https://trajrl.com/samples/pack.json"
 
-    def test_full_url_commitment(self):
+    def test_https_url_commitment(self):
         from trajectoryrl.utils.commitments import parse_commitment
-        raw = "a" * 64 + "|" + "b" * 40 + "|https://github.com/alice/my-pack"
+        raw = "a" * 64 + "|https://cdn.example.com/packs/v1/pack.json"
         result = parse_commitment(raw)
         assert result is not None
-        _, _, repo_url = result
-        assert repo_url == "https://github.com/alice/my-pack"
+        _, pack_url = result
+        assert pack_url == "https://cdn.example.com/packs/v1/pack.json"
+
+    def test_http_url_commitment(self):
+        from trajectoryrl.utils.commitments import parse_commitment
+        raw = "a" * 64 + "|http://example.com/pack.json"
+        result = parse_commitment(raw)
+        assert result is not None
+        _, pack_url = result
+        assert pack_url == "http://example.com/pack.json"
 
     def test_empty_commitment(self):
         from trajectoryrl.utils.commitments import parse_commitment
         assert parse_commitment("") is None
         assert parse_commitment(None) is None
 
-    def test_too_few_parts(self):
+    def test_no_separator(self):
         from trajectoryrl.utils.commitments import parse_commitment
-        assert parse_commitment("a" * 64 + "|" + "b" * 40) is None
+        assert parse_commitment("a" * 64) is None
 
     def test_invalid_hex_pack_hash(self):
         from trajectoryrl.utils.commitments import parse_commitment
-        # Too short
-        raw = "a" * 63 + "|" + "b" * 40 + "|alice/my-pack"
+        raw = "a" * 63 + "|https://trajrl.com/samples/pack.json"
         assert parse_commitment(raw) is None
-        # Non-hex chars
-        raw = "g" * 64 + "|" + "b" * 40 + "|alice/my-pack"
+        raw = "g" * 64 + "|https://trajrl.com/samples/pack.json"
         assert parse_commitment(raw) is None
 
-    def test_invalid_hex_git_commit(self):
+    def test_invalid_url_scheme(self):
         from trajectoryrl.utils.commitments import parse_commitment
-        raw = "a" * 64 + "|" + "b" * 39 + "|alice/my-pack"
-        assert parse_commitment(raw) is None
-
-    def test_invalid_repo_format(self):
-        from trajectoryrl.utils.commitments import parse_commitment
-        raw = "a" * 64 + "|" + "b" * 40 + "|not-a-repo"
+        raw = "a" * 64 + "|ftp://example.com/pack.json"
         assert parse_commitment(raw) is None
 
     def test_whitespace_handling(self):
         from trajectoryrl.utils.commitments import parse_commitment
-        raw = "  " + "a" * 64 + " | " + "b" * 40 + " | alice/my-pack  "
+        raw = "  " + "a" * 64 + " | https://trajrl.com/samples/pack.json  "
         result = parse_commitment(raw)
         assert result is not None
 
@@ -1814,7 +1495,7 @@ class TestGetCommitmentBlock:
         from trajectoryrl.utils.commitments import fetch_all_commitments
 
         hotkey = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
-        raw = "a" * 64 + "|" + "b" * 40 + "|alice/my-pack"
+        raw = "a" * 64 + "|https://trajrl.com/samples/pack.json"
 
         mock_subtensor = MagicMock()
         mock_subtensor.get_all_commitments.return_value = {hotkey: raw}
@@ -2111,7 +1792,7 @@ class TestInactivityWindow:
         """Create a minimal validator with mocked Bittensor components."""
         with patch("trajectoryrl.base.validator.bt") as mock_bt, \
              patch("trajectoryrl.base.validator.ClawBenchHarness"), \
-             patch("trajectoryrl.base.validator.GitHubVerifier"), \
+             patch("trajectoryrl.base.validator.PackFetcher"), \
              patch("trajectoryrl.base.validator.yaml") as mock_yaml, \
              patch("trajectoryrl.base.validator.ValidatorConfig") as MockConfig:
 
@@ -2157,6 +1838,7 @@ class TestInactivityWindow:
             validator.last_valid_epoch = {}
             validator.current_epoch = 5
             validator.blocks_per_epoch = 7200
+            validator._hotkey_uid_map = {}
 
             return validator
 
@@ -2167,8 +1849,7 @@ class TestInactivityWindow:
         commitments = {
             0: MinerCommitment(
                 uid=0, hotkey="hk_0", pack_hash="a" * 64,
-                git_commit_hash="b" * 40,
-                repo_url="https://github.com/test/pack",
+                pack_url="https://trajrl.com/samples/pack.json",
                 block_number=1000, raw="raw",
             ),
         }
@@ -2199,8 +1880,7 @@ class TestInactivityWindow:
         commitments = {
             0: MinerCommitment(
                 uid=0, hotkey="hk_0", pack_hash="a" * 64,
-                git_commit_hash="b" * 40,
-                repo_url="https://github.com/test/pack",
+                pack_url="https://trajrl.com/samples/pack.json",
                 block_number=9000, raw="raw",
             ),
         }

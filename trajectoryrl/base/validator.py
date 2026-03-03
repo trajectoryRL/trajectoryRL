@@ -2,7 +2,7 @@
 
 Architecture (v1.06):
     1. Read on-chain commitments (subtensor.get_all_commitments)
-    2. Fetch packs from miners' public GitHub repos
+    2. Fetch packs from miners' public HTTP URLs
     3. Validate schema + NCD similarity check
     4. Run ALL ClawBench scenarios with majority-vote consensus
     5. Publish scores to shared validator-scores repo
@@ -25,7 +25,7 @@ from ..utils.opp_schema import validate_opp_schema
 from ..utils.config import ValidatorConfig
 from ..utils.clawbench import ClawBenchHarness, EvaluationResult
 from ..scoring import TrajectoryScorer
-from ..utils.github import GitHubVerifier
+from ..utils.github import PackFetcher
 from ..utils.epoch_context import generate_epoch_context, render_context_preamble
 from ..utils.commitments import MinerCommitment, fetch_all_commitments
 from ..utils.ncd import is_too_similar, pack_similarity
@@ -39,7 +39,7 @@ class TrajectoryValidator:
 
     The validator:
     1. Reads on-chain commitments from miners
-    2. Fetches and verifies packs from miners' public GitHub repos
+    2. Fetches and verifies packs from miners' public HTTP URLs
     3. Checks NCD similarity against current winner (anti-copy)
     4. Runs ALL ClawBench scenarios with majority-vote consensus
     5. Publishes scores to shared repo and computes stake-weighted consensus
@@ -89,11 +89,10 @@ class TrajectoryValidator:
             bootstrap_threshold=config.bootstrap_threshold,
         )
 
-        # Initialize GitHub verifier
-        logger.info("Initializing GitHub verifier...")
-        self.github_verifier = GitHubVerifier(
+        # Initialize pack fetcher
+        logger.info("Initializing pack fetcher...")
+        self.pack_fetcher = PackFetcher(
             cache_dir=config.pack_cache_dir,
-            github_token=config.github_token,
         )
 
         # Score publisher (optional — solo mode if not configured)
@@ -274,8 +273,8 @@ class TrajectoryValidator:
                     # iteration started (epoch eval can take hours).
                     self.last_weight_block = self.subtensor.get_current_block()
 
-                    # Evict stale cloned repos to keep disk usage bounded.
-                    self.github_verifier.cleanup_cache(
+                    # Evict stale cached packs to keep disk usage bounded.
+                    self.pack_fetcher.cleanup_cache(
                         self.config.pack_cache_max_size
                     )
 
@@ -573,17 +572,15 @@ class TrajectoryValidator:
             )
             return cached_score, cached_breakdown
 
-        # Step 2: Fetch and verify from GitHub
-        verification = await self.github_verifier.verify_submission(
-            repo_url=commitment.repo_url,
-            git_commit_hash=commitment.git_commit_hash,
+        # Step 2: Fetch and verify pack from HTTP URL
+        verification = await self.pack_fetcher.verify_submission(
+            pack_url=commitment.pack_url,
             pack_hash=commitment.pack_hash,
-            on_chain_submission_time=epoch_timestamp or time.time(),
         )
 
         if not verification.valid:
             logger.warning(
-                f"Miner {miner_uid}: Git verification failed: "
+                f"Miner {miner_uid}: Pack verification failed: "
                 f"{verification.error}"
             )
             return 0.0, {}
