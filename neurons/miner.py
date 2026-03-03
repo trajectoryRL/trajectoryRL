@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""TrajectoryRL Miner — CLI entry point.
+"""TrajectoryRL Miner — CLI entry point and submission daemon.
 
 Subcommands:
     build     Build pack.json from AGENTS.md file
     validate  Validate a pack.json locally
     submit    Push pack to GitHub + submit on-chain commitment
     status    Check current on-chain commitment
+
+Daemon mode:
+    When invoked with no subcommand and PACK_REPO is set in the environment,
+    runs a long-lived loop that detects pack changes, pushes to GitHub,
+    and submits on-chain commitments automatically.
 
 Examples:
     # Build a pack from your AGENTS.md
@@ -28,14 +33,188 @@ Examples:
 
     # Check current commitment
     python neurons/miner.py status --wallet.name miner --wallet.hotkey default
+
+    # Run as daemon (Docker / long-running)
+    PACK_REPO=myuser/my-pack REPO_PATH=/app/packs PACK_PATH=/app/packs/pack.json \\
+        python neurons/miner.py
 """
 
 import argparse
+import asyncio
 import json
 import logging
+import os
 import sys
+from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+# ===================================================================
+# Daemon helpers
+# ===================================================================
+
+
+def _load_or_build_pack(config) -> Optional[dict]:
+    """Load pack from file or build from AGENTS.md.
+
+    Args:
+        config: MinerConfig instance.
+
+    Returns:
+        Pack dict, or None on error.
+    """
+    from trajectoryrl.base.miner import TrajectoryMiner
+
+    try:
+        if config.pack_path:
+            return TrajectoryMiner.load_pack(config.pack_path)
+        if config.agents_md_path:
+            return TrajectoryMiner.build_pack(agents_md=config.agents_md_path)
+    except FileNotFoundError:
+        logger.error("File not found: %s", config.pack_path or config.agents_md_path)
+    except json.JSONDecodeError as e:
+        logger.error("Invalid JSON in pack file: %s", e)
+    except Exception as e:
+        logger.error("Failed to load/build pack: %s", e)
+    return None
+
+
+def _verify_onchain(miner, expected_hash: str) -> bool:
+    """Check that the on-chain commitment matches the expected pack hash.
+
+    Args:
+        miner: TrajectoryMiner instance.
+        expected_hash: Expected pack hash hex string.
+
+    Returns:
+        True if on-chain hash matches expected, False otherwise.
+    """
+    from trajectoryrl.utils.commitments import parse_commitment
+
+    raw = miner.get_current_commitment()
+    if raw is None:
+        logger.warning("No on-chain commitment found")
+        return False
+
+    parsed = parse_commitment(raw)
+    if parsed is None:
+        logger.warning("Could not parse on-chain commitment: %s", raw)
+        return False
+
+    onchain_hash, _, _ = parsed
+    if onchain_hash != expected_hash:
+        logger.warning(
+            "On-chain hash mismatch: expected %s..., got %s...",
+            expected_hash[:16],
+            onchain_hash[:16],
+        )
+        return False
+
+    logger.debug("On-chain commitment matches expected hash")
+    return True
+
+
+async def _run_daemon():
+    """Main daemon loop: detect changes, push, submit."""
+    from trajectoryrl.base.miner import TrajectoryMiner
+    from trajectoryrl.utils.commitments import parse_commitment
+    from trajectoryrl.utils.config import MinerConfig
+
+    # Set up logging early so config validation errors are visible
+    log_level = os.environ.get("LOG_LEVEL", "INFO")
+    logging.basicConfig(
+        level=getattr(logging, log_level),
+        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    )
+
+    config = MinerConfig.from_env()
+
+    logger.info("Starting miner daemon")
+    logger.info("  pack_repo:       %s", config.pack_repo)
+    logger.info("  repo_path:       %s", config.repo_path)
+    logger.info("  pack_path:       %s", config.pack_path or "(none)")
+    logger.info("  agents_md_path:  %s", config.agents_md_path or "(none)")
+    logger.info("  check_interval:  %ds", config.check_interval)
+
+    miner = TrajectoryMiner(
+        wallet_name=config.wallet_name,
+        wallet_hotkey=config.wallet_hotkey,
+        netuid=config.netuid,
+        network=config.network,
+    )
+
+    # Read existing on-chain commitment to avoid redundant submission on restart
+    last_submitted_hash: Optional[str] = None
+    try:
+        raw = miner.get_current_commitment()
+        if raw:
+            parsed = parse_commitment(raw)
+            if parsed:
+                last_submitted_hash = parsed[0]
+                logger.info("Existing on-chain hash: %s...", last_submitted_hash[:16])
+    except Exception:
+        logger.debug("Could not read existing commitment, will submit on first cycle")
+
+    while True:
+        try:
+            # 1. Load or build pack
+            pack = _load_or_build_pack(config)
+            if pack is None:
+                logger.error("Could not load pack, retrying in %ds", config.check_interval)
+                await asyncio.sleep(config.check_interval)
+                continue
+
+            # 2. Validate schema
+            result = TrajectoryMiner.validate(pack)
+            if not result.passed:
+                logger.error("Pack validation failed: %s", result.issues)
+                await asyncio.sleep(config.check_interval)
+                continue
+
+            # 3. Compute hash — skip if unchanged
+            pack_hash = TrajectoryMiner.compute_pack_hash(pack)
+            if pack_hash == last_submitted_hash:
+                logger.info("Pack unchanged (hash: %s...), verifying on-chain", pack_hash[:16])
+                _verify_onchain(miner, pack_hash)
+                await asyncio.sleep(config.check_interval)
+                continue
+
+            logger.info("Pack changed: %s... → %s...",
+                        (last_submitted_hash or "none")[:16], pack_hash[:16])
+
+            # 4. Push to GitHub
+            git_commit = TrajectoryMiner.git_push_pack(pack, config.repo_path)
+            if git_commit is None:
+                logger.error("Git push failed, retrying in %ds", config.check_interval)
+                await asyncio.sleep(config.check_interval)
+                continue
+
+            # 5. Submit on-chain commitment
+            success = miner.submit_commitment(pack_hash, git_commit, config.pack_repo)
+            if success:
+                last_submitted_hash = pack_hash
+                logger.info(
+                    "Submission complete: hash=%s... commit=%s...",
+                    pack_hash[:16], git_commit[:12],
+                )
+            else:
+                logger.error("On-chain submission failed, will retry next cycle")
+
+            # 6. Sleep
+            await asyncio.sleep(config.check_interval)
+
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            logger.info("Daemon stopped by user")
+            break
+        except Exception:
+            logger.exception("Unexpected error in daemon loop, retrying in %ds", config.check_interval)
+            await asyncio.sleep(config.check_interval)
+
+
+# ===================================================================
+# CLI subcommands
+# ===================================================================
 
 
 def cmd_build(args):
@@ -159,6 +338,11 @@ def cmd_status(args):
     return 0
 
 
+# ===================================================================
+# Entry point
+# ===================================================================
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="TrajectoryRL Miner — build and submit policy packs",
@@ -217,14 +401,22 @@ def main():
 
     args = parser.parse_args()
 
+    # Daemon mode: PACK_REPO set + no subcommand → _run_daemon owns logging
+    if args.command is None:
+        if os.environ.get("PACK_REPO"):
+            return asyncio.run(_run_daemon())
+        logging.basicConfig(
+            level=getattr(logging, args.log_level),
+            format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        )
+        parser.print_help()
+        print("\n[hint] Set PACK_REPO, REPO_PATH, and PACK_PATH to run as a daemon.")
+        return 0
+
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     )
-
-    if args.command is None:
-        parser.print_help()
-        return 0
 
     handlers = {
         "build": cmd_build,

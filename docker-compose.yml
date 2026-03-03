@@ -198,13 +198,17 @@ services:
       - NETUID=${NETUID:-11}
       - NETWORK=${NETWORK:-finney}
       - PACK_PATH=${PACK_PATH:-/app/packs/pack.json}
+      - AGENTS_MD_PATH=${AGENTS_MD_PATH:-}
+      - CHECK_INTERVAL=${CHECK_INTERVAL:-3600}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # GitHub upload (optional — one upload method, S3/web-server coming soon)
       - PACK_REPO=${PACK_REPO:-}
       - PACK_COMMIT=${PACK_COMMIT:-}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - REPO_PATH=${REPO_PATH:-/app/packs}
       - GITHUB_TOKEN=${GITHUB_TOKEN:-}
     volumes:
       - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
-      - ./packs:/app/packs:ro
+      - ./packs:/app/packs  # no :ro — daemon mode writes pack.json and runs git push
       - ./logs:/app/logs
     networks:
       - trajectoryrl

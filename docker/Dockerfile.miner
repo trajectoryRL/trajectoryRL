@@ -35,8 +35,12 @@ ENV LOG_LEVEL=INFO
 
 # Miner-specific settings
 ENV PACK_PATH=/app/packs/pack.json
+ENV AGENTS_MD_PATH=""
+ENV CHECK_INTERVAL=3600
+# GitHub upload (optional — one upload method, S3/web-server coming soon)
 ENV PACK_REPO=""
 ENV PACK_COMMIT=""
+ENV REPO_PATH=/app/packs
 
 # Run miner
 CMD ["python", "-u", "neurons/miner.py"]

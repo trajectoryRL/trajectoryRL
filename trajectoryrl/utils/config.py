@@ -1,4 +1,4 @@
-"""Validator configuration."""
+"""Validator and miner configuration."""
 
 import os
 import subprocess
@@ -188,4 +188,70 @@ class ValidatorConfig:
             inactivity_window=int(os.getenv("INACTIVITY_WINDOW", "2")),
             validator_scores_fork_url=os.getenv("VALIDATOR_SCORES_FORK_URL"),
             weight_interval_blocks=int(os.getenv("WEIGHT_INTERVAL_BLOCKS", "360")),
+        )
+
+
+@dataclass
+class MinerConfig:
+    """Configuration for TrajectoryRL miner daemon.
+
+    Attributes:
+        wallet_name: Bittensor wallet name.
+        wallet_hotkey: Bittensor hotkey name.
+        netuid: Subnet UID (11 for TrajectoryRL).
+        network: Bittensor network (finney, test, local).
+        pack_path: Path to an existing pack.json file.
+        agents_md_path: Path to AGENTS.md (build pack on the fly).
+        pack_repo: GitHub repo as "owner/repo" — required for daemon mode.
+        repo_path: Local git clone path — required for daemon mode.
+        check_interval: Seconds between daemon loop iterations.
+    """
+
+    wallet_name: str = "miner"
+    wallet_hotkey: str = "default"
+    netuid: int = 11
+    network: str = "finney"
+    pack_path: Optional[str] = None
+    agents_md_path: Optional[str] = None
+    pack_repo: str = ""
+    repo_path: str = ""
+    check_interval: int = 3600
+
+    def __post_init__(self):
+        if not self.pack_path and not self.agents_md_path:
+            raise ValueError(
+                "MinerConfig requires at least one of pack_path or agents_md_path"
+            )
+        if not self.pack_repo:
+            raise ValueError("MinerConfig requires pack_repo (e.g. 'owner/repo')")
+        if not self.repo_path:
+            raise ValueError("MinerConfig requires repo_path (local git clone path)")
+
+    @classmethod
+    def from_env(cls, dotenv_path: Optional[Path] = None) -> "MinerConfig":
+        """Load configuration from environment variables.
+
+        Args:
+            dotenv_path: Optional path to a .env file. Defaults to
+                         ``.env.miner`` in the project root.
+
+        Returns:
+            MinerConfig instance.
+        """
+        from dotenv import load_dotenv
+
+        if dotenv_path is None:
+            dotenv_path = Path(__file__).parent.parent.parent / ".env.miner"
+        load_dotenv(dotenv_path)
+
+        return cls(
+            wallet_name=os.getenv("WALLET_NAME", "miner"),
+            wallet_hotkey=os.getenv("WALLET_HOTKEY", "default"),
+            netuid=int(os.getenv("NETUID", "11")),
+            network=os.getenv("NETWORK", "finney"),
+            pack_path=os.getenv("PACK_PATH") or None,
+            agents_md_path=os.getenv("AGENTS_MD_PATH") or None,
+            pack_repo=os.getenv("PACK_REPO", ""),
+            repo_path=os.getenv("REPO_PATH", ""),
+            check_interval=int(os.getenv("CHECK_INTERVAL", "3600")),
         )
