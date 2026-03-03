@@ -18,11 +18,11 @@ TrajectoryRL is a Bittensor subnet where miners compete to optimize AI agent pol
 │                                                              │
 │  MINERS                              VALIDATORS              │
 │  ┌───────────────┐                   ┌───────────────────┐   │
-│  │ Publish       │   on-chain        │ Read commitments  │   │
+│  │ Upload        │   on-chain        │ Read commitments  │   │
 │  │ pack.json to  │   commitment      │ from chain        │   │
-│  │ public GitHub │─────────────────> │                   │   │
-│  │ repo          │                   │ Fetch packs from  │   │
-│  └───────────────┘                   │ GitHub, verify    │   │
+│  │ public HTTP   │─────────────────> │                   │   │
+│  │ endpoint      │                   │ Fetch packs via   │   │
+│  └───────────────┘                   │ HTTP, verify      │   │
 │        │                             │ hash + timestamp  │   │
 │        │                             │                   │   │
 │        │                             │ Evaluate via      │   │
@@ -38,11 +38,11 @@ TrajectoryRL is a Bittensor subnet where miners compete to optimize AI agent pol
 └──────────────────────────────────────────────────────────────┘
 ```
 
-- **No server required** — Miners publish packs to GitHub and commit metadata on-chain. No public IP, no uptime needed.
+- **No server required** — Miners upload packs to any HTTP endpoint and commit metadata on-chain. No public IP, no uptime needed.
 - **Deterministic evaluation** — [ClawBench](https://github.com/trajectoryRL/clawbench) scenarios with fixed fixtures and regex scoring (no LLM-as-judge randomness)
 - **Content-addressed** — Packs identified by SHA256 hash, verified against on-chain commitment
 - **Winner-take-all** — Best miner gets 100% of rewards; first-mover advantage protects early innovators
-- **Anti-copy** — GitHub push timestamps + NCD similarity detection + first-mover threshold (delta=0.05)
+- **Anti-copy** — On-chain block timestamps + NCD similarity detection + first-mover threshold (delta=0.05)
 
 See [INCENTIVE_MECHANISM.md](INCENTIVE_MECHANISM.md) for full scoring, rewards, and anti-gaming details.
 
