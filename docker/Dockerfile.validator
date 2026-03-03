@@ -1,7 +1,4 @@
-# TrajectoryRL Validator — unified image
-#
-# Phase 1 (cold-start): minimal, just bittensor + set_weights loop
-# Phase 2 (production): add clawbench, openclaw deps — same image name
+# TrajectoryRL Validator
 #
 # Build:
 #   docker build -f docker/Dockerfile.validator -t trajectoryrl-validator .
@@ -10,12 +7,6 @@ FROM python:3.10-slim
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends git curl && \
-    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-      -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-      > /etc/apt/sources.list.d/github-cli.list && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends gh && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -23,6 +14,7 @@ WORKDIR /app
 COPY pyproject.toml requirements.txt ./
 COPY trajectoryrl/ trajectoryrl/
 COPY neurons/ neurons/
+COPY clawbench/ clawbench/
 
 RUN pip install --no-cache-dir -e .
 
@@ -31,7 +23,10 @@ ENV WALLET_NAME=validator
 ENV WALLET_HOTKEY=default
 ENV NETUID=11
 ENV NETWORK=finney
-ENV TARGET_UID=74
-ENV WEIGHT_INTERVAL=1500
+ENV EVAL_INTERVAL_BLOCKS=1200
+ENV WEIGHT_INTERVAL_BLOCKS=360
+ENV EMA_ALPHA=0.3
+ENV INACTIVITY_BLOCKS=14400
+ENV LOG_LEVEL=INFO
 
 CMD ["python", "-u", "neurons/validator.py"]

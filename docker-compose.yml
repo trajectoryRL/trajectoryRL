@@ -126,21 +126,20 @@ services:
       - MOCK_TOOLS_URL=http://mock-tools:3001
       - OPENCLAW_URL=http://openclaw:18789
       - WORKSPACE_PATH=/workspace
-      # Evaluation (720s = 12min for local testing; production uses 86400s = 24h)
-      - EPOCH_INTERVAL=${EPOCH_INTERVAL:-720}
+      # Evaluation
+      - EVAL_INTERVAL_BLOCKS=${EVAL_INTERVAL_BLOCKS:-100}
+      - WEIGHT_INTERVAL_BLOCKS=${WEIGHT_INTERVAL_BLOCKS:-360}
+      - EMA_ALPHA=${EMA_ALPHA:-0.3}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       # API keys
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       # Model
       - CLAWBENCH_MODEL=${CLAWBENCH_MODEL:-anthropic/claude-sonnet-4-5-20250929}
-      # GitHub CLI auth (for score publishing)
-      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
     volumes:
       - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
       - workspace:/workspace
       - ./logs:/app/logs
       - /tmp/trajectoryrl_packs:/tmp/trajectoryrl_packs
-      - ./git_cache:/app/logs/git_cache
     depends_on:
       mock-tools:
         condition: service_healthy

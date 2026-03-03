@@ -1,7 +1,7 @@
 """Tests for TrajectoryRL validator components.
 
 Tests the scoring, ClawBench harness, OPP schema validation,
-and config without requiring a live Bittensor network.
+EMA scoring, and config without requiring a live Bittensor network.
 """
 
 import asyncio
@@ -505,9 +505,6 @@ class TestEpochSeedAndScenarioRotation:
         seed = TrajectoryValidator.compute_epoch_seed(1)
         assert isinstance(seed, int)
         assert seed > 0
-
-    # NOTE: select_epoch_scenarios was removed in v0.2.0.
-    # All scenarios run every epoch (per INCENTIVE_MECHANISM.md v1.06).
 
 
 # ===================================================================
@@ -1296,10 +1293,19 @@ class TestValidatorConfig:
         assert defaults["rho_reliability"].default == 0.1
         assert defaults["delta_threshold"].default == 0.05
         assert defaults["seeds_per_task"].default == 1
-        assert defaults["epoch_interval"].default == 86400
+        assert defaults["eval_interval_blocks"].default == 1200
+        assert defaults["ema_alpha"].default == 0.3
         assert defaults["similarity_threshold"].default == 0.80
-        assert defaults["inactivity_window"].default == 2
+        assert defaults["inactivity_blocks"].default == 14400
         assert defaults["weight_interval_blocks"].default == 360
+
+    def test_no_github_fields(self):
+        """Verify github_token and validator_scores_fork_url are removed."""
+        from trajectoryrl.utils.config import ValidatorConfig
+        defaults = ValidatorConfig.__dataclass_fields__
+        assert "github_token" not in defaults
+        assert "validator_scores_fork_url" not in defaults
+        assert "validator_scores_local_path" not in defaults
 
 
 # ===================================================================
@@ -1516,277 +1522,12 @@ class TestGetCommitmentBlock:
 
 
 # ===================================================================
-# Score Consensus Tests
+# Per-Scenario EMA Tests
 # ===================================================================
 
 
-class TestScoreConsensus:
-    """Tests for stake-weighted consensus computation."""
-
-    def test_equal_stakes(self):
-        from trajectoryrl.utils.score_publisher import (
-            ScorePublisher, ValidatorScoreFile,
-        )
-        files = [
-            ValidatorScoreFile(
-                validator_hotkey="hk_1", epoch=1, block_height=100,
-                scores={"0": {"final_score": 0.8}},
-                signature="sig1",
-            ),
-            ValidatorScoreFile(
-                validator_hotkey="hk_2", epoch=1, block_height=100,
-                scores={"0": {"final_score": 0.9}},
-                signature="sig2",
-            ),
-        ]
-        metagraph = MagicMock()
-        metagraph.hotkeys = ["hk_1", "hk_2"]
-        metagraph.S = [100.0, 100.0]  # equal stake
-
-        result = ScorePublisher.compute_consensus(files, metagraph)
-        assert result.num_validators == 2
-        assert abs(result.consensus_scores[0] - 0.85) < 1e-6  # (0.8+0.9)/2
-
-    def test_unequal_stakes(self):
-        from trajectoryrl.utils.score_publisher import (
-            ScorePublisher, ValidatorScoreFile,
-        )
-        files = [
-            ValidatorScoreFile(
-                validator_hotkey="hk_1", epoch=1, block_height=100,
-                scores={"0": {"final_score": 0.8}},
-                signature="sig1",
-            ),
-            ValidatorScoreFile(
-                validator_hotkey="hk_2", epoch=1, block_height=100,
-                scores={"0": {"final_score": 0.9}},
-                signature="sig2",
-            ),
-        ]
-        metagraph = MagicMock()
-        metagraph.hotkeys = ["hk_1", "hk_2"]
-        metagraph.S = [300.0, 100.0]  # hk_1 has 3x stake
-
-        result = ScorePublisher.compute_consensus(files, metagraph)
-        # weighted: (300*0.8 + 100*0.9) / 400 = (240+90)/400 = 0.825
-        assert abs(result.consensus_scores[0] - 0.825) < 1e-6
-
-    def test_single_validator(self):
-        from trajectoryrl.utils.score_publisher import (
-            ScorePublisher, ValidatorScoreFile,
-        )
-        files = [
-            ValidatorScoreFile(
-                validator_hotkey="hk_1", epoch=1, block_height=100,
-                scores={"0": {"final_score": 0.7}, "1": {"final_score": 0.9}},
-                signature="sig1",
-            ),
-        ]
-        metagraph = MagicMock()
-        metagraph.hotkeys = ["hk_1"]
-        metagraph.S = [100.0]
-
-        result = ScorePublisher.compute_consensus(files, metagraph)
-        assert result.num_validators == 1
-        assert result.consensus_scores[0] == 0.7
-        assert result.consensus_scores[1] == 0.9
-
-    def test_zero_stake_excluded(self):
-        from trajectoryrl.utils.score_publisher import (
-            ScorePublisher, ValidatorScoreFile,
-        )
-        files = [
-            ValidatorScoreFile(
-                validator_hotkey="hk_1", epoch=1, block_height=100,
-                scores={"0": {"final_score": 0.5}},
-                signature="sig1",
-            ),
-            ValidatorScoreFile(
-                validator_hotkey="hk_2", epoch=1, block_height=100,
-                scores={"0": {"final_score": 0.9}},
-                signature="sig2",
-            ),
-        ]
-        metagraph = MagicMock()
-        metagraph.hotkeys = ["hk_1", "hk_2"]
-        metagraph.S = [0.0, 100.0]  # hk_1 has zero stake
-
-        result = ScorePublisher.compute_consensus(files, metagraph)
-        assert result.num_validators == 1  # only hk_2 counted
-        assert result.consensus_scores[0] == 0.9  # only hk_2's score
-
-    def test_empty_input(self):
-        from trajectoryrl.utils.score_publisher import ScorePublisher
-        metagraph = MagicMock()
-        result = ScorePublisher.compute_consensus([], metagraph)
-        assert result.num_validators == 0
-        assert result.consensus_scores == {}
-
-
-# ===================================================================
-# ScorePublisher Signing & PR Submission Tests
-# ===================================================================
-
-
-class TestScorePublisherSignAndPublish:
-    """Tests for ScorePublisher signing, verification, and PR submission."""
-
-    def _make_publisher(self, tmpdir):
-        from trajectoryrl.utils.score_publisher import ScorePublisher
-
-        mock_wallet = MagicMock()
-        mock_wallet.hotkey.ss58_address = "5FakeHotkey1234567890abcdef"
-        mock_wallet.hotkey.sign.return_value = b"\xab\xcd" * 32
-
-        with patch("trajectoryrl.utils.score_publisher.bt") as mock_bt:
-            mock_bt.Wallet.return_value = mock_wallet
-            pub = ScorePublisher(
-                wallet_name="test",
-                wallet_hotkey="default",
-                fork_repo_url="https://github.com/testuser/validator-scores.git",
-                local_path=Path(tmpdir) / "scores-repo",
-                github_token="ghp_test_token",
-            )
-        return pub
-
-    def _git_ok(self):
-        return subprocess.CompletedProcess([], returncode=0, stdout="", stderr="")
-
-    def test_sign_payload_canonical_and_excludes_signature(self):
-        """sign_payload uses canonical JSON (sorted, compact) and strips
-        the 'signature' field before signing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            pub = self._make_publisher(tmpdir)
-            payload = {"z": 2, "a": 1, "signature": "old_sig"}
-            sig = pub.sign_payload(payload)
-
-            int(sig, 16)  # valid hex
-            signed_bytes = pub.wallet.hotkey.sign.call_args[0][0]
-            expected = json.dumps({"a": 1, "z": 2}, sort_keys=True, separators=(",", ":")).encode()
-            assert signed_bytes == expected
-
-    def test_verify_signature_exception_returns_false(self):
-        """Exception during verification returns False gracefully."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            pub = self._make_publisher(tmpdir)
-            with patch("trajectoryrl.utils.score_publisher.bt") as mock_bt:
-                mock_bt.Keypair.side_effect = RuntimeError("boom")
-                assert pub.verify_signature({"epoch": 1}, "dead", "5Fake") is False
-
-    def test_publish_scores_writes_signed_file_and_opens_pr(self):
-        """Full publish flow: writes signed JSON, pushes, opens PR."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            pub = self._make_publisher(tmpdir)
-            git_calls = []
-
-            async def mock_git(cmd, check=True, timeout=120):
-                git_calls.append(cmd)
-                return self._git_ok()
-
-            with patch("trajectoryrl.utils.score_publisher._run_git", side_effect=mock_git):
-                pub.local_path.mkdir(parents=True, exist_ok=True)
-                ok = asyncio.get_event_loop().run_until_complete(
-                    pub.publish_scores(epoch=5, block_height=50000,
-                                       scores={"0": {"final_score": 0.85}})
-                )
-
-            assert ok is True
-            hotkey = pub.wallet.hotkey.ss58_address
-            data = json.loads(
-                (pub.local_path / "epoch-5" / f"{hotkey}.json").read_text()
-            )
-            assert data["epoch"] == 5 and "signature" in data
-            assert any("gh" in c and "pr" in c and "create" in c for c in git_calls)
-
-    def test_publish_scores_push_failure_returns_false(self):
-        """publish_scores returns False when git push fails."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            pub = self._make_publisher(tmpdir)
-            fail = subprocess.CompletedProcess([], returncode=1, stdout="", stderr="rejected")
-
-            async def mock_git(cmd, check=True, timeout=120):
-                return fail if "push" in cmd else self._git_ok()
-
-            with patch("trajectoryrl.utils.score_publisher._run_git", side_effect=mock_git):
-                pub.local_path.mkdir(parents=True, exist_ok=True)
-                ok = asyncio.get_event_loop().run_until_complete(
-                    pub.publish_scores(epoch=5, block_height=50000,
-                                       scores={"0": {"final_score": 0.85}})
-                )
-            assert ok is False
-
-    def _make_pull_mock(self, epoch_dir, files_data):
-        """Mock _run_git that populates epoch_dir on checkout."""
-        async def mock_git(cmd, check=True, timeout=120):
-            if "checkout" in cmd and "upstream/main" in cmd:
-                epoch_dir.mkdir(parents=True, exist_ok=True)
-                for name, payload in files_data.items():
-                    (epoch_dir / name).write_text(json.dumps(payload))
-            return self._git_ok()
-        return mock_git
-
-    def test_pull_all_scores_rejects_invalid_signature(self):
-        """pull_all_scores keeps valid-sig files, drops forged ones."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            pub = self._make_publisher(tmpdir)
-            pub.local_path.mkdir(parents=True, exist_ok=True)
-            epoch_dir = pub.local_path / "epoch-1"
-
-            files = {
-                "hk_valid.json": {"validator_hotkey": "hk_valid", "epoch": 1,
-                                  "block_height": 100, "scores": {}, "signature": "ok"},
-                "hk_forged.json": {"validator_hotkey": "hk_forged", "epoch": 1,
-                                   "block_height": 100, "scores": {}, "signature": "bad"},
-            }
-
-            with patch("trajectoryrl.utils.score_publisher._run_git",
-                        side_effect=self._make_pull_mock(epoch_dir, files)), \
-                 patch.object(pub, "verify_signature",
-                              side_effect=lambda d, s, hk: hk == "hk_valid"):
-                results = asyncio.get_event_loop().run_until_complete(
-                    pub.pull_all_scores(epoch=1)
-                )
-
-            assert len(results) == 1 and results[0].validator_hotkey == "hk_valid"
-
-    def test_pull_all_scores_rejects_epoch_mismatch(self):
-        """pull_all_scores skips files whose epoch doesn't match."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            pub = self._make_publisher(tmpdir)
-            pub.local_path.mkdir(parents=True, exist_ok=True)
-            epoch_dir = pub.local_path / "epoch-2"
-            files = {"hk.json": {"validator_hotkey": "hk", "epoch": 999,
-                                 "block_height": 100, "scores": {}, "signature": "s"}}
-
-            with patch("trajectoryrl.utils.score_publisher._run_git",
-                        side_effect=self._make_pull_mock(epoch_dir, files)), \
-                 patch.object(pub, "verify_signature", return_value=True):
-                results = asyncio.get_event_loop().run_until_complete(
-                    pub.pull_all_scores(epoch=2)
-                )
-            assert results == []
-
-    def test_pull_all_scores_empty_epoch(self):
-        """No epoch dir on upstream returns empty list."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            pub = self._make_publisher(tmpdir)
-            pub.local_path.mkdir(parents=True, exist_ok=True)
-
-            with patch("trajectoryrl.utils.score_publisher._run_git",
-                        new_callable=AsyncMock, return_value=self._git_ok()):
-                results = asyncio.get_event_loop().run_until_complete(
-                    pub.pull_all_scores(epoch=99)
-                )
-            assert results == []
-
-
-# ===================================================================
-# Inactivity Window Tests
-# ===================================================================
-
-
-class TestInactivityWindow:
-    """Tests for miner inactivity tracking and first-mover protection loss."""
+class TestPerScenarioEMA:
+    """Tests for per-scenario EMA scoring (keyed by hotkey)."""
 
     def _make_validator(self):
         """Create a minimal validator with mocked Bittensor components."""
@@ -1796,7 +1537,6 @@ class TestInactivityWindow:
              patch("trajectoryrl.base.validator.yaml") as mock_yaml, \
              patch("trajectoryrl.base.validator.ValidatorConfig") as MockConfig:
 
-            # Mock config
             config = MagicMock()
             config.wallet_name = "test"
             config.wallet_hotkey = "default"
@@ -1809,21 +1549,22 @@ class TestInactivityWindow:
             config.bootstrap_threshold = 10
             config.log_dir = Path("/tmp/test_logs")
             config.log_level = "WARNING"
-            config.github_token = None
-            config.validator_scores_fork_url = None
-            config.scenarios = ["client_escalation"]
+            config.scenarios = ["client_escalation", "morning_brief"]
             config.scenarios_path = Path("/tmp/test_scenarios")
-            config.inactivity_window = 2
-            config.epoch_interval = 86400
+            config.inactivity_blocks = 14400
+            config.eval_interval_blocks = 1200
             config.similarity_threshold = 0.80
             config.weight_interval_blocks = 360
+            config.ema_alpha = 0.3
+            config.ema_state_path = Path("/tmp/test_ema_state.json")
+            config.pack_cache_dir = Path("/tmp/test_packs")
+            config.pack_cache_max_size = 100
+            config.delta_threshold = 0.05
 
-            # Mock subtensor
             mock_subtensor = MagicMock()
             mock_subtensor.get_current_block.return_value = 100000
             mock_bt.Subtensor.return_value = mock_subtensor
 
-            # Mock metagraph
             mock_metagraph = MagicMock()
             mock_metagraph.hotkeys = ["hk_0", "hk_1", "hk_2"]
             mock_metagraph.validator_permit = [False, False, False]
@@ -1834,17 +1575,243 @@ class TestInactivityWindow:
             validator.config = config
             validator.metagraph = mock_metagraph
             validator.subtensor = mock_subtensor
+            validator.ema_scores = {}
+            validator._ema_pack_hash = {}
+            validator.last_eval_block = {}
             validator.first_mover_data = {}
-            validator.last_valid_epoch = {}
-            validator.current_epoch = 5
-            validator.blocks_per_epoch = 7200
             validator._hotkey_uid_map = {}
+            validator._hotkey_packs = {}
+            validator._pack_by_hash = {}
+            validator.current_winner_pack = None
+            validator.current_winner_hotkey = None
+            validator.scenarios = {
+                "client_escalation": {"weight": 1.5},
+                "morning_brief": {"weight": 1.0},
+            }
+            validator.scorer = TrajectoryScorer(
+                rho_reliability=0.1, consensus_epsilon=0.02
+            )
 
             return validator
 
-    def test_active_miner_tracked(self):
-        """Miners with valid commitments are marked active."""
+    def test_ema_first_observation(self):
+        """First observation sets EMA directly (no smoothing)."""
         v = self._make_validator()
+        v._update_ema("hk_0", "hash_a", {
+            "client_escalation": 0.90,
+            "morning_brief": 0.80,
+        })
+        assert v.ema_scores["hk_0"]["client_escalation"] == 0.90
+        assert v.ema_scores["hk_0"]["morning_brief"] == 0.80
+
+    def test_ema_smoothing(self):
+        """Second observation applies EMA smoothing: α*new + (1-α)*old."""
+        v = self._make_validator()
+        v._update_ema("hk_0", "hash_a", {
+            "client_escalation": 1.0,
+            "morning_brief": 0.80,
+        })
+        v._update_ema("hk_0", "hash_a", {
+            "client_escalation": 0.70,
+            "morning_brief": 0.90,
+        })
+        # α=0.3: 0.3*0.70 + 0.7*1.0 = 0.21 + 0.70 = 0.91
+        assert abs(v.ema_scores["hk_0"]["client_escalation"] - 0.91) < 1e-6
+        # α=0.3: 0.3*0.90 + 0.7*0.80 = 0.27 + 0.56 = 0.83
+        assert abs(v.ema_scores["hk_0"]["morning_brief"] - 0.83) < 1e-6
+
+    def test_ema_resets_on_pack_change(self):
+        """When pack_hash changes, EMA resets for that hotkey."""
+        v = self._make_validator()
+        v._update_ema("hk_0", "hash_a", {
+            "client_escalation": 0.90,
+        })
+        assert v.ema_scores["hk_0"]["client_escalation"] == 0.90
+
+        # New pack hash → EMA resets
+        v._update_ema("hk_0", "hash_b", {
+            "client_escalation": 0.70,
+        })
+        # Should be 0.70 (fresh start), not smoothed from 0.90
+        assert v.ema_scores["hk_0"]["client_escalation"] == 0.70
+
+    def test_ema_independent_per_hotkey(self):
+        """EMA state is independent per hotkey."""
+        v = self._make_validator()
+        v._update_ema("hk_0", "hash_a", {"client_escalation": 0.90})
+        v._update_ema("hk_1", "hash_b", {"client_escalation": 0.70})
+
+        assert v.ema_scores["hk_0"]["client_escalation"] == 0.90
+        assert v.ema_scores["hk_1"]["client_escalation"] == 0.70
+
+    def test_compute_final_score_from_ema(self):
+        """Final score from EMA: weighted_mean - ρ*weighted_variance."""
+        v = self._make_validator()
+        v.ema_scores["hk_0"] = {
+            "client_escalation": 0.90,
+            "morning_brief": 0.80,
+        }
+        # weights: client_escalation=1.5, morning_brief=1.0
+        # weighted_mean = (1.5*0.90 + 1.0*0.80) / 2.5 = (1.35 + 0.80) / 2.5 = 0.86
+        # weighted_var = (1.5*(0.90-0.86)^2 + 1.0*(0.80-0.86)^2) / 2.5
+        #             = (1.5*0.0016 + 1.0*0.0036) / 2.5
+        #             = (0.0024 + 0.0036) / 2.5 = 0.0024
+        # final = 0.86 - 0.1*0.0024 = 0.85976
+        final = v.compute_final_score_from_ema("hk_0")
+        assert abs(final - 0.85976) < 1e-4
+
+    def test_compute_final_score_empty_ema(self):
+        """Empty EMA returns 0."""
+        v = self._make_validator()
+        assert v.compute_final_score_from_ema("hk_unknown") == 0.0
+
+    def test_needs_evaluation_new_miner(self):
+        """New miner (never evaluated) needs evaluation."""
+        v = self._make_validator()
+        assert v._needs_evaluation("hk_new", "hash_a", 100000) is True
+
+    def test_needs_evaluation_pack_changed(self):
+        """Pack hash change triggers re-evaluation."""
+        v = self._make_validator()
+        v._ema_pack_hash["hk_0"] = "hash_a"
+        v.last_eval_block["hk_0"] = 99999
+        assert v._needs_evaluation("hk_0", "hash_b", 100000) is True
+
+    def test_needs_evaluation_within_interval(self):
+        """Within eval interval and same pack → no re-evaluation."""
+        v = self._make_validator()
+        v._ema_pack_hash["hk_0"] = "hash_a"
+        v.last_eval_block["hk_0"] = 99500  # 500 blocks ago < 1200
+        assert v._needs_evaluation("hk_0", "hash_a", 100000) is False
+
+    def test_needs_evaluation_interval_exceeded(self):
+        """Past eval interval → needs re-evaluation."""
+        v = self._make_validator()
+        v._ema_pack_hash["hk_0"] = "hash_a"
+        v.last_eval_block["hk_0"] = 98000  # 2000 blocks ago > 1200
+        assert v._needs_evaluation("hk_0", "hash_a", 100000) is True
+
+    def test_ema_persistence_roundtrip(self):
+        """EMA state can be saved and loaded."""
+        v = self._make_validator()
+        v._scenario_config_hash = "test_hash"
+        v.ema_scores = {"hk_0": {"client_escalation": 0.85}}
+        v._ema_pack_hash = {"hk_0": "hash_a"}
+        v.last_eval_block = {"hk_0": 99000}
+        v.first_mover_data = {"hk_0": (0.85, 1000.0)}
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            v.config.ema_state_path = Path(f.name)
+
+        try:
+            v._save_ema_state()
+
+            # Create a fresh validator and load
+            v2 = self._make_validator()
+            v2.config.ema_state_path = v.config.ema_state_path
+            v2._scenario_config_hash = "test_hash"
+            v2._load_ema_state()
+
+            assert v2.ema_scores == {"hk_0": {"client_escalation": 0.85}}
+            assert v2._ema_pack_hash == {"hk_0": "hash_a"}
+            assert v2.last_eval_block == {"hk_0": 99000}
+            assert v2.first_mover_data == {"hk_0": (0.85, 1000.0)}
+        finally:
+            v.config.ema_state_path.unlink(missing_ok=True)
+
+    def test_ema_invalidated_on_scenario_pool_change(self):
+        """Loading EMA state with different scenario config invalidates all state."""
+        v = self._make_validator()
+        v._scenario_config_hash = "old_hash"
+        v.ema_scores = {"hk_0": {"client_escalation": 0.85}}
+        v._ema_pack_hash = {"hk_0": "hash_a"}
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            v.config.ema_state_path = Path(f.name)
+
+        try:
+            v._save_ema_state()
+
+            # Load with different scenario config hash
+            v2 = self._make_validator()
+            v2.config.ema_state_path = v.config.ema_state_path
+            v2._scenario_config_hash = "new_hash"
+            v2._load_ema_state()
+
+            assert v2.ema_scores == {}
+            assert v2._ema_pack_hash == {}
+        finally:
+            v.config.ema_state_path.unlink(missing_ok=True)
+
+
+# ===================================================================
+# Inactivity Tests (Block-Based)
+# ===================================================================
+
+
+class TestInactivityBlocks:
+    """Tests for block-based miner inactivity tracking."""
+
+    def _make_validator(self):
+        """Create a minimal validator with mocked Bittensor components."""
+        with patch("trajectoryrl.base.validator.bt") as mock_bt, \
+             patch("trajectoryrl.base.validator.ClawBenchHarness"), \
+             patch("trajectoryrl.base.validator.PackFetcher"), \
+             patch("trajectoryrl.base.validator.yaml") as mock_yaml, \
+             patch("trajectoryrl.base.validator.ValidatorConfig") as MockConfig:
+
+            config = MagicMock()
+            config.wallet_name = "test"
+            config.wallet_hotkey = "default"
+            config.network = "test"
+            config.netuid = 11
+            config.clawbench_path = Path("/tmp/test_clawbench")
+            config.timeout_per_scenario = 120
+            config.rho_reliability = 0.1
+            config.consensus_epsilon = 0.02
+            config.bootstrap_threshold = 10
+            config.log_dir = Path("/tmp/test_logs")
+            config.log_level = "WARNING"
+            config.scenarios = ["client_escalation"]
+            config.scenarios_path = Path("/tmp/test_scenarios")
+            config.inactivity_blocks = 14400
+            config.eval_interval_blocks = 1200
+            config.similarity_threshold = 0.80
+            config.weight_interval_blocks = 360
+            config.ema_alpha = 0.3
+            config.ema_state_path = Path("/tmp/test_ema_state.json")
+
+            mock_subtensor = MagicMock()
+            mock_subtensor.get_current_block.return_value = 100000
+            mock_bt.Subtensor.return_value = mock_subtensor
+
+            mock_metagraph = MagicMock()
+            mock_metagraph.hotkeys = ["hk_0", "hk_1", "hk_2"]
+            mock_metagraph.validator_permit = [False, False, False]
+            mock_metagraph.S = [100.0, 100.0, 100.0]
+            mock_subtensor.metagraph.return_value = mock_metagraph
+
+            validator = TrajectoryValidator.__new__(TrajectoryValidator)
+            validator.config = config
+            validator.metagraph = mock_metagraph
+            validator.subtensor = mock_subtensor
+            validator.ema_scores = {}
+            validator._ema_pack_hash = {}
+            validator.last_eval_block = {}
+            validator.first_mover_data = {}
+            validator._hotkey_uid_map = {}
+            validator._hotkey_packs = {}
+            validator._pack_by_hash = {}
+            validator.current_winner_pack = None
+            validator.current_winner_hotkey = None
+
+            return validator
+
+    def test_active_miner_within_inactivity_window(self):
+        """Miner evaluated recently is still active."""
+        v = self._make_validator()
+        v.last_eval_block["hk_0"] = 90000  # 10000 blocks ago < 14400
+
         from trajectoryrl.utils.commitments import MinerCommitment
         commitments = {
             0: MinerCommitment(
@@ -1853,28 +1820,50 @@ class TestInactivityWindow:
                 block_number=1000, raw="raw",
             ),
         }
-        active = v._get_active_miners_from_commitments(commitments)
+        active = v._get_active_miners_from_commitments(commitments, 100000)
         assert 0 in active
-        assert v.last_valid_epoch[0] == 5
 
     def test_inactive_miner_loses_first_mover(self):
-        """Miners inactive > window epochs lose first-mover protection."""
+        """Miner inactive > inactivity_blocks loses first-mover protection."""
         v = self._make_validator()
-        v.current_epoch = 10
-        v.last_valid_epoch = {1: 7}  # last seen epoch 7, current=10, gap=3 > window=2
-        v.first_mover_data = {"hk_1": (0.85, 5000.0)}
+        v.last_eval_block["hk_1"] = 80000  # 20000 blocks ago > 14400
+        v.first_mover_data["hk_1"] = (0.85, 5000.0)
 
-        # No commitments this epoch
-        active = v._get_active_miners_from_commitments({})
-        assert len(active) == 0
-        assert "hk_1" not in v.first_mover_data  # Protection lost
+        from trajectoryrl.utils.commitments import MinerCommitment
+        commitments = {
+            1: MinerCommitment(
+                uid=1, hotkey="hk_1", pack_hash="a" * 64,
+                pack_url="https://trajrl.com/samples/pack.json",
+                block_number=1000, raw="raw",
+            ),
+        }
+        active = v._get_active_miners_from_commitments(commitments, 100000)
+        assert 1 not in active
+        assert "hk_1" not in v.first_mover_data
 
-    def test_reactivation_preserves_tracking(self):
-        """Miner returning after inactivity gets fresh tracking."""
+    def test_never_evaluated_miner_is_active(self):
+        """Miner never evaluated (no last_eval_block) is treated as active
+        so it can be evaluated this cycle."""
         v = self._make_validator()
-        v.current_epoch = 10
-        v.last_valid_epoch = {0: 7}  # Was inactive
-        v.first_mover_data = {}  # Already lost protection
+
+        from trajectoryrl.utils.commitments import MinerCommitment
+        commitments = {
+            0: MinerCommitment(
+                uid=0, hotkey="hk_0", pack_hash="a" * 64,
+                pack_url="https://trajrl.com/samples/pack.json",
+                block_number=1000, raw="raw",
+            ),
+        }
+        active = v._get_active_miners_from_commitments(commitments, 100000)
+        assert 0 in active
+
+    def test_reactivation_after_inactivity(self):
+        """Miner returning after inactivity (new eval updates last_eval_block)."""
+        v = self._make_validator()
+        v.last_eval_block["hk_0"] = 80000  # Was inactive
+
+        # After a successful evaluation, last_eval_block is updated
+        v.last_eval_block["hk_0"] = 100000
 
         from trajectoryrl.utils.commitments import MinerCommitment
         commitments = {
@@ -1884,20 +1873,30 @@ class TestInactivityWindow:
                 block_number=9000, raw="raw",
             ),
         }
-        active = v._get_active_miners_from_commitments(commitments)
+        active = v._get_active_miners_from_commitments(commitments, 100000)
         assert 0 in active
-        assert v.last_valid_epoch[0] == 10  # Updated to current epoch
 
-    def test_within_window_keeps_protection(self):
-        """Miner within inactivity window keeps first-mover protection."""
+    def test_validators_filtered_out(self):
+        """UIDs with validator_permit=True are filtered out."""
         v = self._make_validator()
-        v.current_epoch = 10
-        v.last_valid_epoch = {1: 9}  # gap=1, within window=2
-        v.first_mover_data = {"hk_1": (0.85, 5000.0)}
+        v.metagraph.validator_permit = [True, False, False]
 
-        # No commitments this epoch for miner 1
-        active = v._get_active_miners_from_commitments({})
-        assert "hk_1" in v.first_mover_data  # Protection kept
+        from trajectoryrl.utils.commitments import MinerCommitment
+        commitments = {
+            0: MinerCommitment(
+                uid=0, hotkey="hk_0", pack_hash="a" * 64,
+                pack_url="https://trajrl.com/samples/pack.json",
+                block_number=1000, raw="raw",
+            ),
+            1: MinerCommitment(
+                uid=1, hotkey="hk_1", pack_hash="b" * 64,
+                pack_url="https://trajrl.com/samples/pack.json",
+                block_number=2000, raw="raw",
+            ),
+        }
+        active = v._get_active_miners_from_commitments(commitments, 100000)
+        assert 0 not in active  # Validator
+        assert 1 in active      # Miner
 
 
 # ===================================================================

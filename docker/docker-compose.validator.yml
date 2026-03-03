@@ -1,8 +1,6 @@
 # TrajectoryRL Validator — Production Compose
 #
 # Runs the validator from GHCR with Watchtower auto-update.
-# Works for both cold-start and production phases — push new code to prod
-# and Watchtower auto-pulls the new image within 5 minutes.
 #
 # Setup:
 #   1. Create .env.validator in repo root (see below)
@@ -14,9 +12,6 @@
 #   WALLET_HOTKEY=default
 #   NETUID=11
 #   NETWORK=finney
-#   TARGET_UID=74
-#   GITHUB_TOKEN=ghp_...
-#   VALIDATOR_SCORES_FORK_URL=https://github.com/you/validator-scores.git
 
 services:
   # --------------------------------------------------------------------------
@@ -31,10 +26,11 @@ services:
       - WALLET_HOTKEY=${WALLET_HOTKEY:-default}
       - NETUID=${NETUID:-11}
       - NETWORK=${NETWORK:-finney}
-      - TARGET_UID=${TARGET_UID:-74}
-      - WEIGHT_INTERVAL=${WEIGHT_INTERVAL:-1500}
-      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
-      - VALIDATOR_SCORES_FORK_URL=${VALIDATOR_SCORES_FORK_URL:-}
+      - EVAL_INTERVAL_BLOCKS=${EVAL_INTERVAL_BLOCKS:-1200}
+      - WEIGHT_INTERVAL_BLOCKS=${WEIGHT_INTERVAL_BLOCKS:-360}
+      - EMA_ALPHA=${EMA_ALPHA:-0.3}
+      - INACTIVITY_BLOCKS=${INACTIVITY_BLOCKS:-14400}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
     volumes:
       - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
     labels:
