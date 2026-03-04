@@ -1,0 +1,43 @@
+# TrajectoryRL Miner — Local Development
+#
+# Daemon mode:
+#   docker compose -f docker/docker-compose.miner-dev.yml up              # default mode
+#   MODE=demo docker compose -f docker/docker-compose.miner-dev.yml up    # demo mode
+#
+# CLI mode (one-shot):
+#   docker compose -f docker/docker-compose.miner-dev.yml run --rm miner \
+#       submit https://example.com/pack.json
+#
+#   docker compose -f docker/docker-compose.miner-dev.yml run --rm miner status
+#
+#   docker compose -f docker/docker-compose.miner-dev.yml run --rm miner \
+#       build --agents-md /app/packs/AGENTS.md -o /app/packs/pack.json
+#
+#   docker compose -f docker/docker-compose.miner-dev.yml run --rm miner \
+#       validate /app/packs/pack.json
+
+services:
+  miner:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.miner
+    container_name: trajectoryrl_miner_dev
+    restart: unless-stopped
+    command: ["python", "-u", "neurons/miner.py", "run", "--mode", "${MODE:-default}"]
+    environment:
+      - WALLET_NAME=${WALLET_NAME:-miner}
+      - WALLET_HOTKEY=${WALLET_HOTKEY:-default}
+      - NETUID=${NETUID:-11}
+      - NETWORK=${NETWORK:-finney}
+      - CHECK_INTERVAL=${CHECK_INTERVAL:-3600}
+      - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
+    volumes:
+      - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
+      - ../neurons:/app/neurons
+      - ../trajectoryrl:/app/trajectoryrl
+      - ../packs:/app/packs
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

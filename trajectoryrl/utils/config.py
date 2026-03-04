@@ -189,38 +189,25 @@ class ValidatorConfig:
 
 @dataclass
 class MinerConfig:
-    """Configuration for TrajectoryRL miner daemon.
+    """Configuration for TrajectoryRL miner.
 
     Attributes:
-        wallet_name: Bittensor wallet name.
-        wallet_hotkey: Bittensor hotkey name.
-        netuid: Subnet UID (11 for TrajectoryRL).
-        network: Bittensor network (finney, test, local).
-        pack_path: Path to an existing pack.json file.
-        agents_md_path: Path to AGENTS.md (build pack on the fly).
-        pack_url: Public HTTP(S) URL where pack.json is hosted — required for daemon mode.
-        check_interval: Seconds between daemon loop iterations.
+        wallet_name: Wallet name
+        wallet_hotkey: Hotkey name
+        netuid: Subnet UID (11 for TrajectoryRL)
+        network: Bittensor network (finney, test, local)
+        check_interval: Seconds between submission cycles in run mode
+        log_level: Logging level
     """
 
     wallet_name: str = "miner"
     wallet_hotkey: str = "default"
     netuid: int = 11
     network: str = "finney"
-    pack_path: Optional[str] = None
-    agents_md_path: Optional[str] = None
-    pack_url: str = ""
+
     check_interval: int = 3600
 
-    def __post_init__(self):
-        if not self.pack_path and not self.agents_md_path:
-            raise ValueError(
-                "MinerConfig requires at least one of pack_path or agents_md_path"
-            )
-        if not self.pack_url:
-            raise ValueError(
-                "MinerConfig requires pack_url "
-                "(e.g. 'https://trajrl.com/samples/pack.json')"
-            )
+    log_level: str = "INFO"
 
     @classmethod
     def from_env(cls, dotenv_path: Optional[Path] = None) -> "MinerConfig":
@@ -229,23 +216,19 @@ class MinerConfig:
         Args:
             dotenv_path: Optional path to a .env file. Defaults to
                          ``.env.miner`` in the project root.
-
-        Returns:
-            MinerConfig instance.
         """
         from dotenv import load_dotenv
 
         if dotenv_path is None:
             dotenv_path = Path(__file__).parent.parent.parent / ".env.miner"
-        load_dotenv(dotenv_path)
+        if dotenv_path.exists():
+            load_dotenv(dotenv_path)
 
         return cls(
             wallet_name=os.getenv("WALLET_NAME", "miner"),
             wallet_hotkey=os.getenv("WALLET_HOTKEY", "default"),
             netuid=int(os.getenv("NETUID", "11")),
             network=os.getenv("NETWORK", "finney"),
-            pack_path=os.getenv("PACK_PATH") or None,
-            agents_md_path=os.getenv("AGENTS_MD_PATH") or None,
-            pack_url=os.getenv("PACK_URL", ""),
             check_interval=int(os.getenv("CHECK_INTERVAL", "3600")),
+            log_level=os.getenv("LOG_LEVEL", "INFO"),
         )

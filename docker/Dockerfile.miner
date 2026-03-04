@@ -4,35 +4,16 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends git && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
 WORKDIR /app
 
-# Clone repo with submodules
 ARG REPO_URL=https://github.com/trajectoryRL/trajectoryrl.git
 ARG REPO_BRANCH=main
 
 RUN git clone --recursive -b ${REPO_BRANCH} ${REPO_URL} . && \
     git submodule update --init --recursive
 
-# Install Python dependencies
 RUN pip install --no-cache-dir -e .
 
-# Create directories
-RUN mkdir -p /app/logs /app/packs
+RUN mkdir -p /app/packs
 
-# Environment variables (override with docker-compose)
-ENV WALLET_NAME=miner
-ENV WALLET_HOTKEY=default
-ENV NETUID=11
-ENV NETWORK=finney
-ENV LOG_LEVEL=INFO
-
-# Miner-specific settings
-ENV PACK_PATH=/app/packs/pack.json
-ENV AGENTS_MD_PATH=""
-ENV CHECK_INTERVAL=3600
-# HTTP URL where the validator can fetch your pack.json (e.g. S3, GCS, web server)
-ENV PACK_URL=""
-
-# Run miner
 CMD ["python", "-u", "neurons/miner.py"]
