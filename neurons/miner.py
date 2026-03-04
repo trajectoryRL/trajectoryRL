@@ -9,10 +9,11 @@ CLI commands (one-shot):
 
 Run modes (long-running daemon):
     python neurons/miner.py run --mode demo      # submit sample pack periodically
-    python neurons/miner.py run --mode default    # production skeleton (TODO)
+    python neurons/miner.py run --mode default    # LLM generate → build → upload → submit
 
 Config is loaded from .env.miner (or environment variables):
     WALLET_NAME, WALLET_HOTKEY, NETUID, NETWORK, CHECK_INTERVAL, LOG_LEVEL
+    ANTHROPIC_API_KEY, GENERATOR_MODEL, S3_BUCKET, S3_ENDPOINT_URL, S3_REGION, PACK_URL
 """
 
 import argparse
@@ -123,69 +124,119 @@ async def _run_demo(config: MinerConfig):
 
 
 async def _run_default(config: MinerConfig):
-    """Production mining loop — skeleton.
+    """Production mining loop: generate AGENTS.md → build pack → upload → submit.
 
-    Intended workflow each cycle:
-        1. Generate / optimise a policy pack (AGENTS.md, tool_policy, etc.)
-        2. Upload pack.json to a public HTTP endpoint
-        3. Submit on-chain commitment (hash + url)
-        4. Sleep until next cycle
+    Each cycle:
+        1. Generate (or improve) AGENTS.md via LLM
+        2. Build OPP v1 pack
+        3. Validate locally
+        4. Skip if hash unchanged
+        5. Upload to S3 (or use pre-set PACK_URL)
+        6. Submit on-chain commitment
     """
     from trajectoryrl.base.miner import TrajectoryMiner
+    from trajectoryrl.utils.pack_generator import generate_agents_md
+
+    # --- Config validation (fail fast) ---
+    if not config.anthropic_api_key:
+        logger.error("ANTHROPIC_API_KEY is required for default mode")
+        sys.exit(1)
+
+    # Init storage (reads S3_BUCKET from env; raises ValueError if missing)
+    storage = None
+    if not config.pack_url:
+        from trajectoryrl.utils.oss_storage import OSSStorage
+        try:
+            storage = OSSStorage()
+        except ValueError as e:
+            logger.error("S3 not configured and PACK_URL not set: %s", e)
+            sys.exit(1)
 
     miner = _make_miner(config)
     interval = config.check_interval
 
     logger.info("=== Default mode ===")
+    logger.info("  model:    %s", config.generator_model)
+    if storage:
+        logger.info("  upload:   %s (bucket)", storage.bucket)
+    else:
+        logger.info("  pack_url: %s (you must upload pack yourself)", config.pack_url)
     logger.info("  interval: %ds", interval)
 
     last_hash = _get_onchain_hash(miner)
     if last_hash:
         logger.info("  on-chain: %s...", last_hash[:16])
 
-    while True:
-        try:
-            # Step 1: Build or optimise pack
-            # TODO: implement pack generation / optimisation logic
-            pack: Optional[dict] = None
-            pack_url: Optional[str] = None
+    previous_agents_md: Optional[str] = None
 
-            if pack is None or pack_url is None:
-                logger.info("No pack generated yet (TODO), sleeping %ds", interval)
+    try:
+        while True:
+            try:
+                # Step 1: Generate AGENTS.md
+                logger.info("Generating AGENTS.md...")
+                agents_md = await asyncio.to_thread(
+                    generate_agents_md,
+                    api_key=config.anthropic_api_key,
+                    model=config.generator_model,
+                    previous_agents_md=previous_agents_md,
+                )
+
+                # Step 2: Build pack
+                pack = TrajectoryMiner.build_pack(agents_md=agents_md)
+
+                # Step 3: Validate
+                result = TrajectoryMiner.validate(pack)
+                if not result.passed:
+                    logger.error("Pack validation failed: %s", result.issues)
+                    await asyncio.sleep(interval)
+                    continue
+
+                # Step 4: Check if hash changed
+                pack_hash = TrajectoryMiner.compute_pack_hash(pack)
+                if pack_hash == last_hash:
+                    logger.info("Pack unchanged (%s...), sleeping %ds",
+                                pack_hash[:16], interval)
+                    previous_agents_md = agents_md
+                    await asyncio.sleep(interval)
+                    continue
+
+                # Step 5: Upload (or save locally for manual upload)
+                if storage:
+                    pack_url = await asyncio.to_thread(
+                        storage.upload_pack, pack,
+                    )
+                else:
+                    pack_url = config.pack_url
+                    local_path = "pack.json"
+                    TrajectoryMiner.save_pack(pack, local_path)
+                    logger.info(
+                        "Pack saved to %s — upload to %s before "
+                        "validators fetch it",
+                        local_path,
+                        pack_url,
+                    )
+
+                # Step 6: Submit on-chain
+                logger.info("Submitting pack %s...", pack_hash[:16])
+                if miner.submit(pack, pack_url=pack_url):
+                    last_hash = pack_hash
+                    logger.info("Submitted successfully")
+                else:
+                    logger.error("Submission failed, retrying next cycle")
+
+                # Store for next cycle's improvement prompt
+                previous_agents_md = agents_md
+
                 await asyncio.sleep(interval)
-                continue
 
-            # Step 2: Validate
-            result = TrajectoryMiner.validate(pack)
-            if not result.passed:
-                logger.error("Pack validation failed: %s", result.issues)
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                logger.info("Default mode stopped")
+                break
+            except Exception:
+                logger.exception("Error in default loop, retrying in %ds", interval)
                 await asyncio.sleep(interval)
-                continue
-
-            # Step 3: Check if hash changed
-            pack_hash = TrajectoryMiner.compute_pack_hash(pack)
-            if pack_hash == last_hash:
-                logger.info("Pack unchanged (%s...), sleeping %ds",
-                            pack_hash[:16], interval)
-                await asyncio.sleep(interval)
-                continue
-
-            # Step 4: Submit on-chain
-            logger.info("Submitting pack %s...", pack_hash[:16])
-            if miner.submit(pack, pack_url=pack_url):
-                last_hash = pack_hash
-                logger.info("Submitted successfully")
-            else:
-                logger.error("Submission failed, retrying next cycle")
-
-            await asyncio.sleep(interval)
-
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            logger.info("Default mode stopped")
-            break
-        except Exception:
-            logger.exception("Error in default loop, retrying in %ds", interval)
-            await asyncio.sleep(interval)
+    finally:
+        miner.close()
 
 
 # ===================================================================
@@ -328,7 +379,7 @@ def main():
     p_run = sub.add_parser("run", help="Run miner daemon")
     p_run.add_argument(
         "--mode", required=True, choices=["demo", "default"],
-        help="demo: submit sample pack; default: production skeleton",
+        help="demo: submit sample pack; default: LLM generate + upload + submit",
     )
     p_run.add_argument(
         "--interval", type=int, default=None,

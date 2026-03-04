@@ -26,7 +26,7 @@ from ..utils.commitments import parse_commitment
 
 logger = logging.getLogger(__name__)
 
-MAX_COMMITMENT_BYTES = 256
+MAX_COMMITMENT_BYTES = 128
 
 
 class TrajectoryMiner:

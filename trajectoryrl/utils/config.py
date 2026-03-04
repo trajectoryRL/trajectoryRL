@@ -198,6 +198,9 @@ class MinerConfig:
         network: Bittensor network (finney, test, local)
         check_interval: Seconds between submission cycles in run mode
         log_level: Logging level
+        anthropic_api_key: API key for LLM pack generation (default mode)
+        generator_model: Anthropic model for AGENTS.md generation
+        pack_url: Pre-set pack URL (skips S3 upload if set)
     """
 
     wallet_name: str = "miner"
@@ -208,6 +211,13 @@ class MinerConfig:
     check_interval: int = 3600
 
     log_level: str = "INFO"
+
+    # LLM pack generation (default mode)
+    anthropic_api_key: str = ""
+    generator_model: str = "claude-sonnet-4-5-20250929"
+
+    # Pre-built pack URL (skips S3 upload if set)
+    pack_url: str = ""
 
     @classmethod
     def from_env(cls, dotenv_path: Optional[Path] = None) -> "MinerConfig":
@@ -231,4 +241,7 @@ class MinerConfig:
             network=os.getenv("NETWORK", "finney"),
             check_interval=int(os.getenv("CHECK_INTERVAL", "3600")),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
+            anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
+            generator_model=os.getenv("GENERATOR_MODEL", "claude-sonnet-4-5-20250929"),
+            pack_url=os.getenv("PACK_URL", ""),
         )
