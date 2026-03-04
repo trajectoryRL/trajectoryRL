@@ -5,6 +5,7 @@ pyyaml>=6.0
 numpy>=1.24.0
 aiohttp>=3.9.0
 httpx>=0.25.0
+boto3>=1.28.0
 
 # Development
 pytest>=7.4.0

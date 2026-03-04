@@ -1,19 +1,19 @@
 # TrajectoryRL Miner — Local Development
 #
 # Daemon mode:
-#   docker compose -f docker/docker-compose.miner-dev.yml up              # default mode
-#   MODE=demo docker compose -f docker/docker-compose.miner-dev.yml up    # demo mode
+#   docker compose -f docker/docker-compose.miner.yml up              # default mode
+#   MODE=demo docker compose -f docker/docker-compose.miner.yml up    # demo mode
 #
 # CLI mode (one-shot):
-#   docker compose -f docker/docker-compose.miner-dev.yml run --rm miner \
+#   docker compose -f docker/docker-compose.miner.yml run --rm miner \
 #       submit https://example.com/pack.json
 #
-#   docker compose -f docker/docker-compose.miner-dev.yml run --rm miner status
+#   docker compose -f docker/docker-compose.miner.yml run --rm miner status
 #
-#   docker compose -f docker/docker-compose.miner-dev.yml run --rm miner \
+#   docker compose -f docker/docker-compose.miner.yml run --rm miner \
 #       build --agents-md /app/packs/AGENTS.md -o /app/packs/pack.json
 #
-#   docker compose -f docker/docker-compose.miner-dev.yml run --rm miner \
+#   docker compose -f docker/docker-compose.miner.yml run --rm miner \
 #       validate /app/packs/pack.json
 
 services:
@@ -30,6 +30,11 @@ services:
       - NETUID=${NETUID:-11}
       - NETWORK=${NETWORK:-finney}
       - CHECK_INTERVAL=${CHECK_INTERVAL:-3600}
+      - S3_BUCKET=${S3_BUCKET:-}
+      - S3_ENDPOINT_URL=${S3_ENDPOINT_URL:-}
+      - S3_REGION=${S3_REGION:-auto}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
       - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
     volumes:
       - ~/.bittensor/wallets:/root/.bittensor/wallets:ro

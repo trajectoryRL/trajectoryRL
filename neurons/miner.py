@@ -26,7 +26,7 @@ from trajectoryrl.utils.config import MinerConfig
 
 logger = logging.getLogger(__name__)
 
-DEMO_PACK_URL = "https://trajrl.com/samples/pack.json"
+DEMO_PACK_PATH = "pack.json"
 
 
 def _fetch_pack(url: str) -> dict:
@@ -69,23 +69,26 @@ def _make_miner(config: MinerConfig):
 
 
 async def _run_demo(config: MinerConfig):
-    """Periodically fetch the sample pack and submit on-chain."""
+    """Load local pack.json, upload to S3, then submit on-chain periodically."""
     from trajectoryrl.base.miner import TrajectoryMiner
+    from trajectoryrl.utils.oss_storage import OSSStorage
 
     miner = _make_miner(config)
+    storage = OSSStorage()
     interval = config.check_interval
 
     logger.info("=== Demo mode ===")
-    logger.info("  pack_url: %s", DEMO_PACK_URL)
-    logger.info("  interval: %ds", interval)
+    logger.info("  pack_path: %s", DEMO_PACK_PATH)
+    logger.info("  s3_bucket: %s", storage.bucket)
+    logger.info("  interval:  %ds", interval)
 
     last_hash = _get_onchain_hash(miner)
     if last_hash:
-        logger.info("  on-chain: %s...", last_hash[:16])
+        logger.info("  on-chain:  %s...", last_hash[:16])
 
     while True:
         try:
-            pack = _fetch_pack(DEMO_PACK_URL)
+            pack = TrajectoryMiner.load_pack(DEMO_PACK_PATH)
 
             result = TrajectoryMiner.validate(pack)
             if not result.passed:
@@ -93,6 +96,7 @@ async def _run_demo(config: MinerConfig):
                 await asyncio.sleep(interval)
                 continue
 
+            
             pack_hash = TrajectoryMiner.compute_pack_hash(pack)
             if pack_hash == last_hash:
                 logger.info("Pack unchanged (%s...), sleeping %ds",
@@ -100,8 +104,20 @@ async def _run_demo(config: MinerConfig):
                 await asyncio.sleep(interval)
                 continue
 
+            pack_url = storage.upload_pack(pack)
+            logger.info("Uploaded to %s", pack_url)
+
+            downloaded = _fetch_pack(pack_url)
+            dl_hash = TrajectoryMiner.compute_pack_hash(downloaded)
+            if dl_hash != pack_hash:
+                logger.error("Hash mismatch after download: local=%s... remote=%s...",
+                             pack_hash[:16], dl_hash[:16])
+                await asyncio.sleep(interval)
+                continue
+            logger.info("Download verified: hash matches (%s...)", pack_hash[:16])
+
             logger.info("Submitting pack %s...", pack_hash[:16])
-            if miner.submit(pack, pack_url=DEMO_PACK_URL):
+            if miner.submit(pack, pack_url=pack_url):
                 last_hash = pack_hash
                 logger.info("Submitted successfully")
             else:
