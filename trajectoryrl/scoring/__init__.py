@@ -218,76 +218,48 @@ class TrajectoryScorer:
 
         # --- Steady-state: winner-take-all ---
 
-        # Find current best score
-        best_uid = max(scores.keys(), key=lambda uid: scores[uid])
-        best_score = scores[best_uid]
-
-        # Consensus epsilon: if multiple miners are within ε of the best,
-        # treat them as tied and pick the earliest submitter.
         eps = self.consensus_epsilon
-        tied_uids = [
-            uid for uid, s in scores.items()
-            if abs(s - best_score) <= eps
-        ]
 
-        resolved_by_epsilon = False
-        if len(tied_uids) > 1 and first_mover_data:
-            # Break tie by earliest block number (look up by hotkey)
-            tied_with_ts = []
-            for uid in tied_uids:
-                hk = _uid_to_hotkey.get(uid)
-                if hk and hk in first_mover_data:
-                    tied_with_ts.append((uid, first_mover_data[hk][1]))
-            if tied_with_ts:
-                tied_with_ts.sort(key=lambda x: x[1])  # lowest block first
-                best_uid = tied_with_ts[0][0]
-                best_score = scores[best_uid]
-                resolved_by_epsilon = True
-                logger.info(
-                    f"Consensus tie-break: {len(tied_uids)} miners within "
-                    f"ε={eps} of {best_score:.3f} → earliest is Miner {best_uid}"
-                )
+        # First-mover iterative selection: start with the earliest miner
+        # as champion, then iterate through subsequent miners in block
+        # order.  A later miner must beat the current champion's score
+        # by more than δ to take the crown.  This naturally handles
+        # transitive protection (A protects against B which protects
+        # against C) without needing recursive checks.
+        #
+        # Miners without first_mover_data are appended at the end with
+        # infinite block number so they can still participate but never
+        # receive first-mover protection.
 
-        # Apply first-mover protection (constant δ threshold).
-        # Only an EARLIER submitter can block a later challenger.
-        # Skip if winner was already resolved by epsilon tie-break (which
-        # already used block numbers, so re-applying delta would undo it).
-        if first_mover_data and not resolved_by_epsilon:
-            # Look up the current best's block number
-            best_hotkey = _uid_to_hotkey.get(best_uid)
-            best_block = (
-                first_mover_data[best_hotkey][1]
-                if best_hotkey and best_hotkey in first_mover_data
+        # Build (uid, score, block_number) tuples, sorted by block asc
+        uid_entries = []
+        for uid, score in scores.items():
+            hk = _uid_to_hotkey.get(uid)
+            block = (
+                first_mover_data[hk][1]
+                if hk and hk in first_mover_data
                 else float("inf")
             )
+            uid_entries.append((uid, score, block))
 
-            for hotkey, (_, ts) in sorted(
-                first_mover_data.items(),
-                key=lambda x: x[1][1]  # Sort by block number (ascending)
-            ):
-                # Only earlier submitters can block the current best
-                if ts >= best_block:
-                    continue
+        uid_entries.sort(key=lambda e: e[2])  # earliest first
 
-                # Reverse-lookup: find the UID currently using this hotkey
-                uid = next(
-                    (u for u, hk in _uid_to_hotkey.items() if hk == hotkey),
-                    None,
-                )
-                if uid is not None and uid in scores:
-                    # Use current score (not historical best) for protection
-                    # threshold so stale packs lose protection naturally.
-                    current = scores[uid]
-                    required_score = current + delta
-                    if best_score <= required_score:
-                        logger.info(
-                            f"First-mover protection: Miner {uid} (score={current:.3f}) "
-                            f"blocks Miner {best_uid} (score={best_score:.3f}, "
-                            f"required={required_score:.3f})"
-                        )
-                        best_uid = uid
-                        best_score = current
-                        break
+        # The earliest miner is the initial champion
+        best_uid, best_score, _ = uid_entries[0]
+
+        for uid, score, _ in uid_entries[1:]:
+            # Consensus epsilon: scores within ε are treated as tied,
+            # and the earlier miner (current champion) keeps the crown.
+            if score > best_score + eps:
+                # Challenger must also beat δ threshold
+                if score > best_score + delta:
+                    logger.info(
+                        f"First-mover overtake: Miner {uid} (score={score:.3f}) "
+                        f"beats champion Miner {best_uid} (score={best_score:.3f}, "
+                        f"required>{best_score + delta:.3f})"
+                    )
+                    best_uid = uid
+                    best_score = score
 
         # Winner takes all
         weights = {uid: 0.0 for uid in scores.keys()}

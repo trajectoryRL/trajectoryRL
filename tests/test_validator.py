@@ -338,6 +338,34 @@ class TestTrajectoryScorer:
         assert weights[1] == 1.0
         assert weights[0] == 0.0
 
+    def test_select_winner_transitive_first_mover(self, scorer):
+        """First-mover protection must be transitive.
+
+        A(block 100, score=0.76), B(block 200, score=0.80), C(block 300, score=0.84).
+        - B can't beat A: 0.80 <= 0.76 + 0.05 = 0.81
+        - C can beat A: 0.84 > 0.81
+        - So C should win, NOT B.
+
+        Previously, the code found B blocks C (0.84 <= 0.85) and stopped,
+        awarding B the win even though B never legitimately beat A.
+        """
+        scores = {0: 0.76, 1: 0.80, 2: 0.84}
+        uid_to_hotkey = {0: "hk_A", 1: "hk_B", 2: "hk_C"}
+        first_mover_data = {
+            "hk_A": (0.76, 100.0),
+            "hk_B": (0.80, 200.0),
+            "hk_C": (0.84, 300.0),
+        }
+        weights = scorer.select_winner(
+            scores, first_mover_data, delta=0.05, num_active_miners=20,
+            uid_to_hotkey=uid_to_hotkey,
+        )
+
+        # C beats A's protection (0.84 > 0.81), and B never became champion
+        assert weights[2] == 1.0, "C should win (beats A's protection)"
+        assert weights[0] == 0.0
+        assert weights[1] == 0.0
+
     def test_full_scoring_pipeline(self, scorer, sample_results):
         """End-to-end: results -> aggregate -> final score."""
         agg = scorer.aggregate_scores(sample_results)
@@ -368,16 +396,13 @@ class TestTrajectoryScorer:
         s = TrajectoryScorer(
             consensus_epsilon=0.02
         )
-        # Two miners with nearly identical scores (within ε)
+        # Two miners with nearly identical scores (within ε).
+        # Without first_mover_data, miners have no block ordering, so the
+        # iterative approach picks the first in iteration order.
+        # With first_mover_data: miner 0 submitted first (earliest),
+        # miner 1's score (0.91) is within ε of champion (0.90), so it
+        # doesn't overtake — earliest miner keeps the crown.
         scores = {0: 0.90, 1: 0.91}
-        # No first-mover data → pure epsilon tie-break
-        weights = s.select_winner(
-            scores, first_mover_data={}, delta=0.05, num_active_miners=20
-        )
-        # Without first_mover_data, no timestamps to break tie → highest score wins
-        assert weights[1] == 1.0
-
-        # Now with timestamps: miner 0 submitted first
         uid_to_hotkey = {0: "hk_0", 1: "hk_1"}
         first_mover = {"hk_0": (0.90, 100.0), "hk_1": (0.91, 200.0)}
         # Use delta=0 to isolate epsilon behavior from first-mover protection
@@ -1473,6 +1498,18 @@ class TestGetCommitmentBlock:
 
         result = _get_commitment_block(mock_subtensor, netuid=11, hotkey="5Ftest...")
         assert result == 50000
+
+    def test_get_commitment_block_double_failure_returns_large_sentinel(self):
+        """When both get_commitment_metadata and get_current_block fail,
+        returns a large sentinel (not 0) to avoid artificially early timestamps."""
+        from trajectoryrl.utils.commitments import _get_commitment_block
+
+        mock_subtensor = MagicMock()
+        mock_subtensor.get_commitment_metadata.side_effect = Exception("fail")
+        mock_subtensor.get_current_block.side_effect = Exception("also fail")
+
+        result = _get_commitment_block(mock_subtensor, netuid=11, hotkey="5Ftest...")
+        assert result == 2**63, "Should return large sentinel, not 0"
 
     def test_get_commitment_block_fallback_on_none_metadata(self):
         """Falls back to current block when metadata is None."""

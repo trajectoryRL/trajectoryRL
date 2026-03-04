@@ -153,4 +153,7 @@ def _get_commitment_block(subtensor, netuid: int, hotkey: str) -> int:
     try:
         return subtensor.get_current_block()
     except Exception:
-        return 0
+        # Both API calls failed.  Return a large sentinel so the miner
+        # is treated as a late submitter rather than getting an
+        # artificially early timestamp (the previous default of 0).
+        return 2**63
