@@ -182,39 +182,6 @@ services:
         - action: rebuild
           path: ./docker/Dockerfile.validator
 
-  # --------------------------------------------------------------------------
-  # Miner (optional): start with `docker compose --profile miner up -d`
-  # --------------------------------------------------------------------------
-  miner:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.miner
-    container_name: trajectoryrl_miner
-    restart: unless-stopped
-    environment:
-      - WALLET_NAME=${WALLET_NAME:-miner}
-      - WALLET_HOTKEY=${WALLET_HOTKEY:-default}
-      - NETUID=${NETUID:-11}
-      - NETWORK=${NETWORK:-finney}
-      - PACK_PATH=${PACK_PATH:-/app/packs/pack.json}
-      - AGENTS_MD_PATH=${AGENTS_MD_PATH:-}
-      - CHECK_INTERVAL=${CHECK_INTERVAL:-3600}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      # HTTP URL where the validator can fetch your pack.json
-      - PACK_URL=${PACK_URL:-}
-    volumes:
-      - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
-      - ./packs:/app/packs:ro
-      - ./logs:/app/logs
-    networks:
-      - trajectoryrl
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    profiles:
-      - miner
 
 volumes:
   workspace:

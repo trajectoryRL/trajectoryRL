@@ -15,6 +15,7 @@ Reference: INCENTIVE_MECHANISM.md § Submission Protocol
 import hashlib
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -47,15 +48,15 @@ class TrajectoryMiner:
 
     def __init__(
         self,
-        wallet_name: str = "miner",
-        wallet_hotkey: str = "default",
-        netuid: int = 11,
-        network: str = "finney",
+        wallet_name: Optional[str] = None,
+        wallet_hotkey: Optional[str] = None,
+        netuid: Optional[int] = None,
+        network: Optional[str] = None,
     ):
-        self.wallet_name = wallet_name
-        self.wallet_hotkey = wallet_hotkey
-        self.netuid = netuid
-        self.network = network
+        self.wallet_name = wallet_name or os.environ.get("WALLET_NAME", "miner")
+        self.wallet_hotkey = wallet_hotkey or os.environ.get("WALLET_HOTKEY", "default")
+        self.netuid = netuid if netuid is not None else int(os.environ.get("NETUID", "11"))
+        self.network = network or os.environ.get("NETWORK", "finney")
 
         # Lazy-init Bittensor (only needed for on-chain operations)
         self._wallet: Optional[bt.Wallet] = None
@@ -267,16 +268,40 @@ class TrajectoryMiner:
         logger.info(f"Submitting commitment: {commitment}")
 
         try:
-            self.subtensor.set_commitment(
+            result = self.subtensor.set_commitment(
                 wallet=self.wallet,
                 netuid=self.netuid,
                 data=commitment,
             )
+            if result is False or (result is not None and result is not True and not result):
+                logger.error("set_commitment returned failure: %s", result)
+                return False
+
             block = self.subtensor.get_current_block()
             logger.info(
                 "Commitment submitted at block %d (first-mover precedence)",
                 block,
             )
+
+            # Verify the commitment actually landed on-chain
+            stored = self.get_current_commitment()
+            if stored is None:
+                logger.warning(
+                    "Commitment not found on-chain after submission. "
+                    "It may take a few blocks to finalize, or the extrinsic may have failed silently."
+                )
+                return False
+
+            parsed = parse_commitment(stored)
+            if parsed and parsed[0] == pack_hash:
+                logger.info("On-chain verification passed: hash matches")
+            else:
+                logger.warning(
+                    "On-chain commitment mismatch: expected hash %s..., got: %s",
+                    pack_hash[:16], stored[:40] if stored else "(empty)",
+                )
+                return False
+
             return True
         except bt.NotRegisteredError:
             logger.error(
@@ -341,17 +366,13 @@ class TrajectoryMiner:
     ) -> bool:
         """Full submission workflow: validate + commit on-chain.
 
-        The miner must upload pack.json to the given URL before calling this.
-        Validators will fetch the pack from this URL and verify the hash.
-
         Args:
             pack: OPP v1 pack dict.
-            pack_url: HTTP(S) URL where the pack.json is publicly accessible.
+            pack_url: Public URL where pack.json is hosted.
 
         Returns:
             True if everything succeeded.
         """
-        # 1. Validate locally
         result = self.validate(pack)
         if not result.passed:
             logger.error(f"Pack validation failed: {result.issues}")
@@ -361,7 +382,6 @@ class TrajectoryMiner:
         logger.info(f"Pack hash: {pack_hash}")
         logger.info(f"Pack size: {len(json.dumps(pack))} bytes")
 
-        # 2. Submit on-chain
         return self.submit_commitment(pack_hash, pack_url)
 
 
