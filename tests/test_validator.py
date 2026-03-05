@@ -2162,7 +2162,7 @@ class TestScoringIntegration:
         assert 0.0 < final <= 1.0
 
     def test_cost_based_winner_selection(self, scorer):
-        """Cost-based winner: cheapest qualified miner wins."""
+        """Cost-based winner: lowest-cost qualified miner wins."""
         costs = {0: 0.050, 1: 0.030, 2: 0.045}
         qualified = {0: True, 1: True, 2: False}  # miner 2 disqualified
         first_mover = {
@@ -2180,7 +2180,7 @@ class TestScoringIntegration:
             uid_to_hotkey=uid_to_hotkey,
         )
 
-        # Miner 1 is cheapest qualified ($0.030 < $0.050 * 0.90 = $0.045)
+        # Miner 1 has lowest cost and is qualified ($0.030 < $0.050 * 0.90 = $0.045)
         assert weights[1] == 1.0
         assert weights[0] == 0.0
         assert weights[2] == 0.0  # disqualified

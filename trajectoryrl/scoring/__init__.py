@@ -369,7 +369,7 @@ class TrajectoryScorer:
     ) -> Dict[int, float]:
         """Graduated reward curve for bootstrap phase, ranked by cost.
 
-        Top-3 cheapest qualified miners receive 70% / 20% / 10%.
+        Top-3 lowest-cost qualified miners receive 70% / 20% / 10%.
         Ties broken by earliest block number.
 
         Args:
@@ -383,7 +383,7 @@ class TrajectoryScorer:
         """
         BOOTSTRAP_SHARES = [0.70, 0.20, 0.10]
 
-        # Sort by cost asc (cheapest first), break ties by earliest block
+        # Sort by cost asc (lowest first), break ties by earliest block
         def sort_key(uid: int) -> Tuple[float, float]:
             hk = uid_to_hotkey.get(uid)
             ts = first_mover_data[hk][1] if hk and hk in first_mover_data else float("inf")
