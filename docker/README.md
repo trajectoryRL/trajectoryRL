@@ -1,212 +1,187 @@
 # TrajectoryRL Docker Deployment
 
-Docker is the **recommended way** to run TrajectoryRL validators and miners. It ensures consistent environments, automatic ClawBench version pinning, and simplified deployment.
+Docker is the **recommended way** to run TrajectoryRL validators and miners. A single `docker compose up` starts all required services (validator, OpenClaw gateway, mock-tools).
 
-## Quick Start
-
-### Validator
+## Quick Start — Validator
 
 ```bash
-# 1. Clone repo
-git clone --recursive https://github.com/trajectoryRL/trajectoryrl.git
-cd trajectoryrl
+# 1. Clone repo with submodules
+git clone --recurse-submodules https://github.com/trajectoryRL/trajectoryRL.git
+cd trajectoryRL
 
 # 2. Configure
-cp .env.example .env
-# Edit: add ANTHROPIC_API_KEY, WALLET_NAME
+cp .env.example .env.validator
+# Edit .env.validator: set ANTHROPIC_API_KEY, WALLET_NAME, WALLET_HOTKEY
 
-# 3. Start
-docker-compose up -d validator
-
-# 4. View logs
-docker-compose logs -f validator
-```
-
-### Miner
-
-```bash
-# 1. Prepare pack
-mkdir -p packs
-cp /path/to/pack.json packs/
-
-# 2. Configure
-cp .env.example .env
-# Edit: add PACK_URL
-
-# 3. Start
-docker-compose --profile miner up -d miner
+# 3. Start (all services in one command)
+docker compose -f docker/docker-compose.validator.yml --env-file .env.validator up -d
 
 # 4. View logs
-docker-compose logs -f miner
+docker compose -f docker/docker-compose.validator.yml logs -f validator
 ```
+
+This starts 5 services automatically:
+1. **init** — sets up workspace files (runs once, exits)
+2. **init-perms** — fixes workspace permissions (runs once, exits)
+3. **mock-tools** — deterministic tool responses from fixtures (port 3001)
+4. **openclaw-gateway** — OpenClaw with clawbench-tools plugin (port 18790)
+5. **validator** — reads on-chain commitments, evaluates packs, sets weights
 
 ## Configuration
 
-Edit `.env` file:
+Create `.env.validator` in the repo root:
 
 ```bash
-# Bittensor
+# Required
 WALLET_NAME=validator
 WALLET_HOTKEY=default
 NETUID=11
 NETWORK=finney
-
-# Validator
 ANTHROPIC_API_KEY=sk-ant-...
-EPOCH_INTERVAL=720      # 12 minutes for fast testing (production: 86400 = 24h)
-LOG_LEVEL=INFO
 
-# Miner
-PACK_URL=https://your-bucket.s3.amazonaws.com/pack.json
+# Optional
+LOG_LEVEL=INFO                    # DEBUG for development
+EVAL_INTERVAL_BLOCKS=1200         # ~4h (use 100 for dev)
+WEIGHT_INTERVAL_BLOCKS=360        # ~72min
+EMA_ALPHA=0.3
+INACTIVITY_BLOCKS=14400           # ~48h
+```
+
+### Wallet Setup
+
+Wallets must exist at `~/.bittensor/wallets/` (mounted read-only):
+
+```
+~/.bittensor/wallets/{WALLET_NAME}/
+  ├── coldkey
+  ├── coldkeypub.txt
+  └── hotkeys/
+      └── {WALLET_HOTKEY}
+```
+
+## Quick Start — Miner
+
+```bash
+# Configure
+cp .env.miner.example .env.miner
+# Edit: set WALLET_NAME, WALLET_HOTKEY, ANTHROPIC_API_KEY
+
+# Run miner CLI
+docker compose -f docker/docker-compose.miner.yml --env-file .env.miner run miner build
+docker compose -f docker/docker-compose.miner.yml --env-file .env.miner run miner validate
+docker compose -f docker/docker-compose.miner.yml --env-file .env.miner run miner submit
 ```
 
 ## Operations
 
 ```bash
-# Start services
-docker-compose up -d validator                    # Validator only
-docker-compose --profile miner up -d              # Both
+# Start
+docker compose -f docker/docker-compose.validator.yml --env-file .env.validator up -d
 
 # View logs
-docker-compose logs -f validator
-docker-compose logs --tail=100 validator
+docker compose -f docker/docker-compose.validator.yml logs -f validator
+docker compose -f docker/docker-compose.validator.yml logs --tail=100 validator
 
-# Stop services
-docker-compose stop validator
-docker-compose down
+# View all service logs
+docker compose -f docker/docker-compose.validator.yml logs -f
+
+# Stop
+docker compose -f docker/docker-compose.validator.yml down
 
 # Rebuild after updates
 git pull && git submodule update --init --recursive
-docker-compose build validator
-docker-compose up -d validator
+docker compose -f docker/docker-compose.validator.yml --env-file .env.validator up -d --build
 ```
 
 ## Architecture
 
+### Service Dependencies
+
+```
+init → init-perms → mock-tools (healthy) → openclaw-gateway (healthy) → validator
+```
+
+- **mock-tools + openclaw-gateway** run on an internal `sandbox-net` Docker network
+- **validator** uses `network_mode: host` to reach mock-tools (localhost:3001) and OpenClaw (localhost:18790) via published ports
+- A shared `workspace` Docker volume connects init → openclaw-gateway → validator
+
 ### Validator Container
 - Base: Python 3.10-slim
-- ClawBench: Pinned via submodule (see [Updating ClawBench](#updating-clawbench))
+- ClawBench: Baked in via submodule (version-pinned)
 - Volumes:
-  - `~/.bittensor/wallets` → Wallet access (ro)
-  - `./logs` → Persistent logs
+  - `~/.bittensor/wallets` → Wallet access (read-only)
+  - `workspace` → Shared with OpenClaw for AGENTS.md
 
-### Miner Container
-- Base: Python 3.10-slim
-- Volumes:
-  - `~/.bittensor/wallets` → Wallet access (ro)
-  - `./packs` → Policy packs (ro)
-  - `./logs` → Persistent logs
+### OpenClaw Gateway
+- Runs the ClawBench evaluation sandbox
+- Port: 18790
+
+### Mock Tools Server
+- Serves deterministic tool responses from fixtures
+- Port: 3001
 
 ## Troubleshooting
 
 ### Validator won't start
 ```bash
-# Check logs
-docker-compose logs validator
+# Check all service logs
+docker compose -f docker/docker-compose.validator.yml logs
 
-# Common fixes:
-# 1. Missing API key → Add ANTHROPIC_API_KEY to .env
+# Common issues:
+# 1. Missing API key → Add ANTHROPIC_API_KEY to .env.validator
 # 2. Wallet not found → Ensure ~/.bittensor/wallets exists
-# 3. Version mismatch → Rebuild: docker-compose build --no-cache validator
+# 3. OpenClaw permission error → Remove workspace volume and restart:
+#    docker volume rm docker_workspace && docker compose ... up -d
 ```
 
-### Miner submission fails
+### OpenClaw permission denied (SOUL.md / AGENTS.md)
+The init-perms container fixes this automatically. If it persists:
 ```bash
-# Check environment
-docker exec trajectoryrl_miner env | grep PACK
+docker compose -f docker/docker-compose.validator.yml down
+docker volume rm docker_workspace
+docker compose -f docker/docker-compose.validator.yml --env-file .env.validator up -d
+```
 
-# Verify pack file
-docker exec trajectoryrl_miner ls -la /app/packs/
-
-# Ensure PACK_URL is set in .env
+### Scores are all identical / evaluations complete instantly
+This means OpenClaw is failing silently. Check its logs:
+```bash
+docker compose -f docker/docker-compose.validator.yml logs openclaw-gateway
 ```
 
 ### Network issues
 ```bash
-# Test connectivity
-docker exec trajectoryrl_validator ping -c 3 api.bittensor.com
-
-# Check subtensor
+# Test chain connectivity
 docker exec trajectoryrl_validator python -c "import bittensor as bt; print(bt.Subtensor(network='finney'))"
 ```
 
-## Production
+## Updating ClawBench
 
-### Systemd service
-
-```bash
-# /etc/systemd/system/trajectoryrl-validator.service
-[Unit]
-Description=TrajectoryRL Validator
-After=docker.service
-Requires=docker.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-WorkingDirectory=/path/to/trajectoryrl
-ExecStart=/usr/local/bin/docker-compose up -d validator
-ExecStop=/usr/local/bin/docker-compose down
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### Log rotation
+ClawBench is pinned as a git submodule. The validator config also hardcodes
+the commit hash as a safety check. Both must be updated together.
 
 ```bash
-# /etc/logrotate.d/trajectoryrl
-/path/to/trajectoryrl/logs/*.log {
-    daily
-    rotate 7
-    compress
-    missingok
-    notifempty
-}
+# 1. Update the submodule
+cd clawbench && git fetch origin && git checkout origin/main && cd ..
+
+# 2. Update the hash in trajectoryrl/utils/config.py (clawbench_commit)
+git -C clawbench rev-parse HEAD
+# Edit config.py with the new hash
+
+# 3. Stage and commit
+git add clawbench trajectoryrl/utils/config.py
+git commit -m "Update ClawBench submodule"
+
+# 4. Rebuild
+docker compose -f docker/docker-compose.validator.yml --env-file .env.validator up -d --build
 ```
 
 ## Security
 
-1. **Wallet**: Store on encrypted filesystem, use read-only mounts
-2. **API Keys**: Use `.env` file (never commit), rotate periodically
-3. **Network**: Run on isolated network, firewall restrict inbound
-
-## Updating ClawBench
-
-ClawBench is pinned as a git submodule. The Dockerfile also hardcodes the
-commit hash as a safety check. Both must be updated together.
-
-```bash
-# 1. Update the submodule to latest upstream main
-cd clawbench
-git fetch origin
-git checkout origin/main
-cd ..
-
-# 2. Record the new commit hash
-git -C clawbench rev-parse HEAD
-# e.g. e50824df75e10989c0adaf398b6897b5284701d5
-
-# 3. Update the hash in docker/Dockerfile.validator (line ~20)
-#    RUN cd clawbench && git checkout <NEW_HASH>
-
-# 4. Stage both changes
-git add clawbench docker/Dockerfile.validator
-
-# 5. Rebuild and restart
-docker-compose build --no-cache validator
-docker-compose up -d validator
-```
-
-**Important**: The submodule pointer (`git add clawbench`) and the Dockerfile
-hash must always match. If they diverge, the Docker build will check out a
-different version than your local tree.
+1. **Wallet**: Store on encrypted filesystem, mounted read-only
+2. **API Keys**: Use `.env.validator` file (never commit), rotate periodically
+3. **Network**: Validator uses host networking; firewall restrict inbound as needed
 
 ## Support
 
 - GitHub: https://github.com/trajectoryRL/trajectoryRL/issues
 - Website: https://trajrl.com
-
----
-
-**Recommendation**: Always use Docker for production. Manual installation is for development only.

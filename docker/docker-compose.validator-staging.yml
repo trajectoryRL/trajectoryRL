@@ -1,4 +1,4 @@
-# TrajectoryRL Validator — Staging Compose
+# TrajectoryRL Validator — Staging Compose (self-contained)
 #
 # Pulls the staging image from GHCR (built from the staging branch).
 # Use this to test validator changes before promoting to prod.
@@ -13,14 +13,109 @@
 #   WALLET_HOTKEY=default
 #   NETUID=11
 #   NETWORK=finney
+#   ANTHROPIC_API_KEY=sk-ant-...
 
 services:
-  # --------------------------------------------------------------------------
-  # Validator: staging image (auto-updated by Watchtower from staging tag)
-  # --------------------------------------------------------------------------
+  # ==========================================================================
+  # Init Container
+  # Copies AGENTS.md variant and workspace files. Runs once, then exits.
+  # ==========================================================================
+  init:
+    build:
+      context: ../clawbench
+      dockerfile: Dockerfile.init
+    volumes:
+      - ../clawbench/fixtures:/fixtures:ro
+      - ../clawbench/scenarios:/scenarios:ro
+      - workspace:/workspace
+      - ../clawbench/config:/config
+    environment:
+      - SCENARIO=${SCENARIO:-client_escalation}
+      - VARIANT=${VARIANT:-optimized}
+      - CLAWBENCH_MODEL=${CLAWBENCH_MODEL:-anthropic/claude-sonnet-4-5-20250929}
+
+  # Fix workspace permissions after init (OpenClaw runs as node uid=1000)
+  init-perms:
+    image: busybox
+    command: sh -c "chmod -R 777 /workspace"
+    volumes:
+      - workspace:/workspace
+    depends_on:
+      init:
+        condition: service_completed_successfully
+
+  # ==========================================================================
+  # Mock Tools Server
+  # Serves deterministic tool responses from fixtures (port 3001).
+  # ==========================================================================
+  mock-tools:
+    build:
+      context: ../clawbench
+      dockerfile: Dockerfile.mock-tools
+    ports:
+      - "3001:3001"
+    volumes:
+      - ../clawbench/fixtures:/fixtures:ro
+      - ../clawbench/logs:/logs
+    environment:
+      - FIXTURES_PATH=/fixtures
+      - SCENARIO=${SCENARIO:-client_escalation}
+      - LOG_PATH=/logs
+    depends_on:
+      init-perms:
+        condition: service_completed_successfully
+    networks:
+      - sandbox-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3001/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ==========================================================================
+  # OpenClaw Gateway (ClawBench Edition)
+  # Built from openclaw/ with clawbench-tools plugin (port 18790).
+  # ==========================================================================
+  openclaw-gateway:
+    build:
+      context: ../openclaw
+      dockerfile: Dockerfile.clawbench
+    ports:
+      - "${OPENCLAW_PORT:-18790}:18789"
+    volumes:
+      - workspace:/workspace
+      - ../clawbench/config/openclaw.json:/home/node/.openclaw/openclaw.json:ro
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN:-sandbox-token-12345}
+      - CLAWBENCH_MODEL=${CLAWBENCH_MODEL:-anthropic/claude-sonnet-4-5-20250929}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      init-perms:
+        condition: service_completed_successfully
+      mock-tools:
+        condition: service_healthy
+    networks:
+      - sandbox-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ==========================================================================
+  # Validator (staging image)
+  # Reads on-chain commitments, fetches packs, evaluates via ClawBench.
+  # Uses host networking to reach mock-tools (3001) and OpenClaw (18790).
+  # Auto-updated by Watchtower from GHCR staging tag.
+  # ==========================================================================
   validator:
     image: ghcr.io/trajectoryrl/trajectoryrl:staging
     container_name: trajectoryrl_validator_staging
+    network_mode: host
     restart: unless-stopped
     environment:
       - WALLET_NAME=${WALLET_NAME:-validator}
@@ -35,6 +130,10 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
     volumes:
       - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
+      - workspace:/app/clawbench/workspace
+    depends_on:
+      openclaw-gateway:
+        condition: service_healthy
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
     logging:
@@ -63,3 +162,10 @@ services:
       options:
         max-size: "5m"
         max-file: "2"
+
+volumes:
+  workspace:
+
+networks:
+  sandbox-net:
+    driver: bridge

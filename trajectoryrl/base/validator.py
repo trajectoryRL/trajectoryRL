@@ -39,7 +39,10 @@ from ..utils.ncd import is_too_similar, pack_similarity
 logger = logging.getLogger(__name__)
 
 OWNER_UID = 74
-EVAL_START_BLOCK = 8000000
+EVAL_START_BLOCK = 0
+# TODO: Set SHADOW_MODE = False for official mainnet launch.
+# Shadow mode runs real evals and logs results, but always sets weights to owner UID 74.
+SHADOW_MODE = True
 
 
 class TrajectoryValidator:
@@ -894,20 +897,24 @@ class TrajectoryValidator:
             )
 
         # Set weights on chain
-        uids = list(weights_dict.keys())
-        weights = [weights_dict[uid] for uid in uids]
-        try:
-            self.subtensor.set_weights(
-                netuid=self.config.netuid,
-                wallet=self.wallet,
-                uids=uids,
-                weights=weights,
-                wait_for_inclusion=True,
-                wait_for_finalization=False,
-            )
-            logger.info("Weights set successfully")
-        except Exception as e:
-            logger.error(f"Error setting weights: {e}", exc_info=True)
+        if SHADOW_MODE:
+            logger.info("SHADOW MODE: eval complete, setting fallback weights to owner UID")
+            await self._set_fallback_weights()
+        else:
+            uids = list(weights_dict.keys())
+            weights = [weights_dict[uid] for uid in uids]
+            try:
+                self.subtensor.set_weights(
+                    netuid=self.config.netuid,
+                    wallet=self.wallet,
+                    uids=uids,
+                    weights=weights,
+                    wait_for_inclusion=True,
+                    wait_for_finalization=False,
+                )
+                logger.info("Weights set successfully")
+            except Exception as e:
+                logger.error(f"Error setting weights: {e}", exc_info=True)
 
     async def _set_fallback_weights(self):
         """Set weights to subnet owner UID when no miners qualify.
