@@ -22,11 +22,13 @@ class EvaluationResult:
     Attributes:
         scenario_name: Name of the scenario
         score: Normalized score [0, 1]
-        success: Whether the scenario passed
+        success: Whether the scenario passed (qualification gate)
         tool_calls: Number of tool calls made
         response: Agent's final response
         rubric: Detailed scoring rubric results
         error: Error message if evaluation failed
+        cost_usd: Total episode cost in USD (None if unavailable)
+        token_usage: Token breakdown {input, output, cache_read, cache_write}
     """
     scenario_name: str
     score: float
@@ -35,6 +37,8 @@ class EvaluationResult:
     response: str
     rubric: Dict[str, Any]
     error: Optional[str] = None
+    cost_usd: Optional[float] = None
+    token_usage: Optional[Dict[str, int]] = None
 
 
 class ClawBenchHarness:
@@ -218,11 +222,28 @@ class ClawBenchHarness:
         # Median tool calls for stability
         tool_calls = sorted(r.tool_calls for r in valid_runs)[len(valid_runs) // 2]
 
+        # Median cost across valid runs (outlier-resistant)
+        cost_runs = [r.cost_usd for r in valid_runs if r.cost_usd is not None]
+        median_cost = None
+        if cost_runs:
+            cost_runs.sort()
+            median_cost = cost_runs[len(cost_runs) // 2]
+
+        # Median token usage across valid runs
+        median_tokens = None
+        token_runs = [r.token_usage for r in valid_runs if r.token_usage is not None]
+        if token_runs:
+            median_tokens = {}
+            for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"):
+                vals = sorted(t.get(key, 0) for t in token_runs)
+                median_tokens[key] = vals[len(vals) // 2]
+
         # Use response from the run closest to voted score
         closest = min(valid_runs, key=lambda r: abs(r.score - voted_score))
 
+        cost_str = f", cost=${median_cost:.4f}" if median_cost is not None else ""
         logger.info(
-            f"Consensus result: {scenario_name} → score={voted_score:.3f} "
+            f"Consensus result: {scenario_name} → score={voted_score:.3f}{cost_str} "
             f"(individual scores: {[round(r.score, 3) for r in runs]})"
         )
 
@@ -233,6 +254,8 @@ class ClawBenchHarness:
             tool_calls=tool_calls,
             response=closest.response,
             rubric=voted_rubric,
+            cost_usd=median_cost,
+            token_usage=median_tokens,
         )
 
     @staticmethod
@@ -444,11 +467,27 @@ class ClawBenchHarness:
             result_data = self._parse_episode_output(output)
 
             # Extract scoring results
-            score = result_data.get("score", 0.0)
+            # New format: checks_passed/checks_total (no "score" field)
+            checks_passed = result_data.get("checks_passed", 0)
+            checks_total = result_data.get("checks_total", 0)
+            score = checks_passed / checks_total if checks_total > 0 else 0.0
             success = result_data.get("success", False)
             tool_calls = result_data.get("tool_calls", 0)
             response = result_data.get("response", "")
             rubric = result_data.get("rubric", {})
+
+            # Extract cost data (optional field from run_episode.py)
+            cost_usd = None
+            token_usage = None
+            cost_data = result_data.get("cost")
+            if cost_data and isinstance(cost_data, dict):
+                cost_usd = cost_data.get("total_usd")
+                token_usage = {
+                    "input_tokens": cost_data.get("input_tokens", 0),
+                    "output_tokens": cost_data.get("output_tokens", 0),
+                    "cache_read_tokens": cost_data.get("cache_read_tokens", 0),
+                    "cache_write_tokens": cost_data.get("cache_write_tokens", 0),
+                }
 
             return EvaluationResult(
                 scenario_name=scenario_name,
@@ -456,7 +495,9 @@ class ClawBenchHarness:
                 success=success,
                 tool_calls=tool_calls,
                 response=response,
-                rubric=rubric
+                rubric=rubric,
+                cost_usd=cost_usd,
+                token_usage=token_usage,
             )
 
         except asyncio.TimeoutError:
@@ -489,8 +530,8 @@ class ClawBenchHarness:
             Parsed result dictionary
         """
         # run_episode.py outputs JSON when --json flag is used
-        # Format: {"score": 0.9, "success": true, "tool_calls": 12, ...}
-        # Scan lines in reverse; require "score" key to distinguish the
+        # Format: {"success": true, "checks_passed": 25, "checks_total": 25, ...}
+        # Scan lines in reverse; require "success" key to distinguish the
         # result object from stray JSON log lines.
         lines = output.strip().split("\n")
         for line in reversed(lines):
@@ -499,7 +540,7 @@ class ClawBenchHarness:
                 continue
             try:
                 data = json.loads(line)
-                if isinstance(data, dict) and "score" in data:
+                if isinstance(data, dict) and "success" in data:
                     return data
             except json.JSONDecodeError:
                 continue
@@ -507,8 +548,9 @@ class ClawBenchHarness:
         logger.error("Failed to parse episode output: no result JSON found")
         logger.debug(f"Output was: {output}")
         return {
-            "score": 0.0,
             "success": False,
+            "checks_passed": 0,
+            "checks_total": 0,
             "tool_calls": 0,
             "response": "",
             "rubric": {},

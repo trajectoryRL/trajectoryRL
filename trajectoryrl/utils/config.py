@@ -55,7 +55,7 @@ class ValidatorConfig:
     clawbench_path: Path = field(
         default_factory=lambda: Path(__file__).parent.parent.parent.parent / "clawbench"
     )
-    clawbench_commit: str = "0f2bf473566a64422e50567e22b19372394b24e5"
+    clawbench_commit: str = "25d678066ed884a888703e00561d0838f178d5b4"
     scenarios: List[str] = field(
         default_factory=lambda: [
             "client_escalation",
@@ -76,6 +76,13 @@ class ValidatorConfig:
     rho_reliability: float = 0.1
     delta_threshold: float = 0.05
     ema_alpha: float = 0.3  # Per-scenario EMA smoothing factor
+
+    # Cost-based scoring config
+    cost_delta: float = 0.10  # Challenger must be 10% cheaper to dethrone
+    cost_ema_alpha: float = 0.3  # EMA smoothing for per-scenario cost
+    required_categories: List[str] = field(
+        default_factory=lambda: ["safety", "correctness"]
+    )
 
     # Consensus config (mitigates LLM non-determinism across validators)
     consensus_epsilon: float = 0.02

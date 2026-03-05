@@ -101,6 +101,12 @@ class TrajectoryValidator:
         # Per-scenario EMA state: {hotkey: {scenario: ema_value}}
         self.ema_scores: Dict[str, Dict[str, float]] = {}
 
+        # Per-scenario cost EMA: {hotkey: {scenario: ema_cost_usd}}
+        self.ema_costs: Dict[str, Dict[str, float]] = {}
+
+        # Per-scenario qualification (latest, not EMA): {hotkey: {scenario: bool}}
+        self.scenario_qualified: Dict[str, Dict[str, bool]] = {}
+
         # Track the pack_hash that each hotkey's EMA is based on.
         # EMA resets when pack_hash changes.
         self._ema_pack_hash: Dict[str, str] = {}
@@ -164,7 +170,10 @@ class TrajectoryValidator:
                     "Scenario pool changed, invalidating all EMA state"
                 )
                 return
+
             self.ema_scores = data.get("ema_scores", {})
+            self.ema_costs = data.get("ema_costs", {})
+            self.scenario_qualified = data.get("scenario_qualified", {})
             self._ema_pack_hash = data.get("ema_pack_hash", {})
             self.last_eval_block = {
                 k: int(v) for k, v in data.get("last_eval_block", {}).items()
@@ -173,6 +182,7 @@ class TrajectoryValidator:
                 k: (v[0], v[1])
                 for k, v in data.get("first_mover_data", {}).items()
             }
+
             logger.info(
                 f"Loaded EMA state: {len(self.ema_scores)} hotkeys, "
                 f"{len(self.first_mover_data)} first-mover entries"
@@ -185,6 +195,8 @@ class TrajectoryValidator:
         data = {
             "scenario_config_hash": self._scenario_config_hash,
             "ema_scores": self.ema_scores,
+            "ema_costs": self.ema_costs,
+            "scenario_qualified": self.scenario_qualified,
             "ema_pack_hash": self._ema_pack_hash,
             "last_eval_block": self.last_eval_block,
             "first_mover_data": self.first_mover_data,
@@ -205,6 +217,8 @@ class TrajectoryValidator:
         hotkey: str,
         pack_hash: str,
         scenario_scores: Dict[str, float],
+        scenario_costs: Optional[Dict[str, float]] = None,
+        scenario_qualified: Optional[Dict[str, bool]] = None,
     ):
         """Update per-scenario EMA for a miner hotkey.
 
@@ -217,8 +231,11 @@ class TrajectoryValidator:
                 f"resetting EMA"
             )
             self.ema_scores[hotkey] = {}
+            self.ema_costs[hotkey] = {}
+            self.scenario_qualified[hotkey] = {}
             self._ema_pack_hash[hotkey] = pack_hash
 
+        # Score EMA (informational, kept for logging)
         alpha = self.config.ema_alpha
         if hotkey not in self.ema_scores:
             self.ema_scores[hotkey] = {}
@@ -231,6 +248,28 @@ class TrajectoryValidator:
                 self.ema_scores[hotkey][scenario] = (
                     alpha * score + (1 - alpha) * prev
                 )
+
+        # Cost EMA
+        if scenario_costs:
+            cost_alpha = self.config.cost_ema_alpha
+            if hotkey not in self.ema_costs:
+                self.ema_costs[hotkey] = {}
+            for scenario, cost in scenario_costs.items():
+                if cost is None:
+                    continue
+                prev = self.ema_costs[hotkey].get(scenario)
+                if prev is None:
+                    self.ema_costs[hotkey][scenario] = cost
+                else:
+                    self.ema_costs[hotkey][scenario] = (
+                        cost_alpha * cost + (1 - cost_alpha) * prev
+                    )
+
+        # Qualification: latest result, not EMA (binary doesn't smooth well)
+        if scenario_qualified:
+            if hotkey not in self.scenario_qualified:
+                self.scenario_qualified[hotkey] = {}
+            self.scenario_qualified[hotkey].update(scenario_qualified)
 
     def compute_final_score_from_ema(self, hotkey: str) -> float:
         """Compute final_score[hotkey] from smoothed per-scenario EMA values.
@@ -266,6 +305,43 @@ class TrajectoryValidator:
 
         final = mean_score - self.config.rho_reliability * variance
         return max(0.0, min(1.0, final))
+
+    def compute_total_cost_from_ema(self, hotkey: str) -> Optional[float]:
+        """Compute weighted average cost from per-scenario cost EMA.
+
+        Returns None if no cost data available.
+        """
+        ema = self.ema_costs.get(hotkey, {})
+        if not ema:
+            return None
+
+        scenario_weights = {
+            name: cfg.get("weight", 1.0)
+            for name, cfg in self.scenarios.items()
+        }
+
+        total_weight = 0.0
+        weighted_sum = 0.0
+        for scenario, cost in ema.items():
+            w = scenario_weights.get(scenario, 1.0)
+            weighted_sum += w * cost
+            total_weight += w
+
+        if total_weight == 0:
+            return None
+
+        return weighted_sum / total_weight
+
+    def is_fully_qualified(self, hotkey: str) -> bool:
+        """Check if a miner passes the qualification gate on all scenarios."""
+        qualified = self.scenario_qualified.get(hotkey, {})
+        if not qualified:
+            return False
+        # Must have qualification data for all scenarios
+        for scenario_name in self.scenarios:
+            if not qualified.get(scenario_name, False):
+                return False
+        return True
 
     # ------------------------------------------------------------------
     # Setup helpers
@@ -449,20 +525,32 @@ class TrajectoryValidator:
                 )
                 continue
 
-            scenario_scores = await self._evaluate_miner(
+            eval_result = await self._evaluate_miner(
                 uid, commitment, eval_scenarios, epoch_seed,
                 context_preamble, user_context,
             )
 
-            if scenario_scores is not None:
-                self._update_ema(hotkey, commitment.pack_hash, scenario_scores)
+            if eval_result is not None:
+                self._update_ema(
+                    hotkey, commitment.pack_hash,
+                    scenario_scores=eval_result["scores"],
+                    scenario_costs=eval_result.get("costs"),
+                    scenario_qualified=eval_result.get("qualified"),
+                )
                 self.last_eval_block[hotkey] = current_block
                 evaluated_count += 1
 
-                final = self.compute_final_score_from_ema(hotkey)
-                self._update_first_mover(
-                    uid, hotkey, final, float(commitment.block_number)
-                )
+                # First-mover tracks cost (lower = better)
+                total_cost = self.compute_total_cost_from_ema(hotkey)
+                if total_cost is not None:
+                    self._update_first_mover(
+                        uid, hotkey, total_cost, float(commitment.block_number)
+                    )
+                else:
+                    # Fallback: use score-based first-mover if no cost data
+                    final = self.compute_final_score_from_ema(hotkey)
+                    if hotkey not in self.first_mover_data:
+                        self.first_mover_data[hotkey] = (final, float(commitment.block_number))
 
         logger.info(f"Evaluated {evaluated_count} miners this cycle")
 
@@ -552,10 +640,13 @@ class TrajectoryValidator:
         self,
         miner_uid: int,
         hotkey: str,
-        score: float,
+        cost: float,
         block_number: float,
     ) -> None:
-        """Detect re-registration and update first-mover data for a miner."""
+        """Detect re-registration and update first-mover data for a miner.
+
+        Tracks best (lowest) cost. Lower cost = better.
+        """
         prev_uid = self._hotkey_uid_map.get(hotkey)
         if prev_uid is not None and prev_uid != miner_uid:
             logger.info(
@@ -566,16 +657,16 @@ class TrajectoryValidator:
         self._hotkey_uid_map[hotkey] = miner_uid
 
         if hotkey not in self.first_mover_data:
-            self.first_mover_data[hotkey] = (score, block_number)
+            self.first_mover_data[hotkey] = (cost, block_number)
             logger.info(
                 f"Miner {miner_uid}: First submission "
-                f"(score={score:.3f}, block={block_number:.0f})"
+                f"(cost=${cost:.4f}, block={block_number:.0f})"
             )
-        elif score > self.first_mover_data[hotkey][0]:
+        elif cost < self.first_mover_data[hotkey][0]:
             original_block = self.first_mover_data[hotkey][1]
-            self.first_mover_data[hotkey] = (score, original_block)
+            self.first_mover_data[hotkey] = (cost, original_block)
             logger.info(
-                f"Miner {miner_uid}: Score improved to {score:.3f}"
+                f"Miner {miner_uid}: Cost improved to ${cost:.4f}"
             )
 
     # ------------------------------------------------------------------
@@ -590,11 +681,12 @@ class TrajectoryValidator:
         epoch_seed: int,
         context_preamble: str = "",
         user_context: Optional[Dict] = None,
-    ) -> Optional[Dict[str, float]]:
+    ) -> Optional[Dict]:
         """Evaluate a single miner on all scenarios.
 
         Returns:
-            Dict of {scenario_name: score} or None if pre-evaluation checks fail.
+            Dict with keys "scores", "costs", "qualified" mapping
+            scenario_name to values, or None if pre-evaluation checks fail.
         """
         logger.info(
             f"Evaluating miner {miner_uid} "
@@ -641,6 +733,8 @@ class TrajectoryValidator:
 
         # Step 4: Run ALL scenarios
         scenario_scores: Dict[str, float] = {}
+        scenario_costs: Dict[str, float] = {}
+        scenario_qualified: Dict[str, bool] = {}
 
         for scenario_name in eval_scenarios:
             try:
@@ -653,9 +747,15 @@ class TrajectoryValidator:
                     user_context=user_context,
                 )
                 scenario_scores[scenario_name] = result.score
+                scenario_qualified[scenario_name] = result.success
+                if result.cost_usd is not None:
+                    scenario_costs[scenario_name] = result.cost_usd
+
+                cost_str = f", cost=${result.cost_usd:.4f}" if result.cost_usd is not None else ""
+                gate_str = "PASS" if result.success else "FAIL"
                 logger.info(
                     f"Miner {miner_uid}: {scenario_name} -> "
-                    f"score={result.score:.3f}"
+                    f"score={result.score:.3f}{cost_str}, gate={gate_str}"
                 )
             except Exception as e:
                 logger.error(
@@ -663,12 +763,17 @@ class TrajectoryValidator:
                     exc_info=True,
                 )
                 scenario_scores[scenario_name] = 0.0
+                scenario_qualified[scenario_name] = False
 
         if not scenario_scores:
             logger.warning(f"Miner {miner_uid}: No scenario results!")
             return None
 
-        return scenario_scores
+        return {
+            "scores": scenario_scores,
+            "costs": scenario_costs,
+            "qualified": scenario_qualified,
+        }
 
     # ------------------------------------------------------------------
     # Weight setting
@@ -698,8 +803,10 @@ class TrajectoryValidator:
             await self._set_fallback_weights()
             return
 
-        # Build scores from EMA: hotkey -> final_score, then map to UID
+        # Build scores, costs, and qualification from EMA
         scores: Dict[int, float] = {}
+        costs: Dict[int, float] = {}
+        qualified: Dict[int, bool] = {}
         uid_to_hotkey: Dict[int, str] = {}
 
         for uid, commitment in active.items():
@@ -709,6 +816,11 @@ class TrajectoryValidator:
                 scores[uid] = final
                 uid_to_hotkey[uid] = hotkey
 
+                total_cost = self.compute_total_cost_from_ema(hotkey)
+                if total_cost is not None:
+                    costs[uid] = total_cost
+                qualified[uid] = self.is_fully_qualified(hotkey)
+
         if not scores:
             logger.warning("All miners have zero EMA score")
             await self._set_fallback_weights()
@@ -716,13 +828,26 @@ class TrajectoryValidator:
 
         num_active = len(scores)
 
-        weights_dict = self.scorer.select_winner(
-            scores=scores,
-            first_mover_data=self.first_mover_data,
-            delta=self.config.delta_threshold,
-            num_active_miners=num_active,
-            uid_to_hotkey=uid_to_hotkey,
-        )
+        # Use cost-based winner selection if cost data available
+        if costs:
+            weights_dict = self.scorer.select_winner_by_cost(
+                costs=costs,
+                qualified=qualified,
+                first_mover_data=self.first_mover_data,
+                cost_delta=self.config.cost_delta,
+                num_active_miners=num_active,
+                uid_to_hotkey=uid_to_hotkey,
+            )
+        else:
+            # Fallback to score-based selection (transition period)
+            logger.info("No cost data available, using score-based selection")
+            weights_dict = self.scorer.select_winner(
+                scores=scores,
+                first_mover_data=self.first_mover_data,
+                delta=self.config.delta_threshold,
+                num_active_miners=num_active,
+                uid_to_hotkey=uid_to_hotkey,
+            )
 
         # Track current winner for NCD comparison
         if weights_dict:
@@ -746,15 +871,17 @@ class TrajectoryValidator:
         logger.info("=" * 60)
         for uid, weight in sorted(
             weights_dict.items(),
-            key=lambda x: scores.get(x[0], 0),
-            reverse=True,
+            key=lambda x: costs.get(x[0], scores.get(x[0], 0)),
         ):
             marker = ""
             hk = uid_to_hotkey.get(uid, "?")
             if weight > 0:
                 marker = " <- WINNER" if weight == 1.0 else f" <- TOP-{sum(1 for w in weights_dict.values() if w >= weight)}"
+            gate = "PASS" if qualified.get(uid, False) else "FAIL"
+            cost_str = f"${costs[uid]:.4f}" if uid in costs else "n/a"
             logger.info(
                 f"  Miner {uid} ({hk[:8]}): weight={weight:.4f}, "
+                f"cost={cost_str}, gate={gate}, "
                 f"score={scores.get(uid, 0):.3f}{marker}"
             )
 
