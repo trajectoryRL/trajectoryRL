@@ -123,10 +123,6 @@ services:
       - NETUID=${NETUID:-11}
       - NETWORK=${NETWORK:-finney}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - EVAL_INTERVAL_BLOCKS=${EVAL_INTERVAL_BLOCKS:-1200}
-      - WEIGHT_INTERVAL_BLOCKS=${WEIGHT_INTERVAL_BLOCKS:-360}
-      - EMA_ALPHA=${EMA_ALPHA:-0.3}
-      - INACTIVITY_BLOCKS=${INACTIVITY_BLOCKS:-14400}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     volumes:
       - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
