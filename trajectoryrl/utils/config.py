@@ -28,7 +28,7 @@ class ValidatorConfig:
 
         # Evaluation config
         seeds_per_task: Number of seeds to run per task (for variance)
-        eval_interval_blocks: Blocks between re-evaluations (~4 hours)
+        eval_interval_blocks: Blocks between re-evaluations (~24 hours)
         timeout_per_scenario: Max seconds per scenario evaluation
 
         # Scoring config
@@ -69,7 +69,7 @@ class ValidatorConfig:
 
     # Evaluation config
     seeds_per_task: int = 1
-    eval_interval_blocks: int = 1200  # ~4 hours at 12s/block
+    eval_interval_blocks: int = 7200  # ~24 hours at 12s/block
     timeout_per_scenario: int = 120  # 2 minutes max per scenario
 
     # Scoring config
@@ -185,7 +185,7 @@ class ValidatorConfig:
                     str(Path(__file__).parent.parent.parent / "clawbench")
                 )
             ),
-            eval_interval_blocks=int(os.getenv("EVAL_INTERVAL_BLOCKS", "1200")),
+            eval_interval_blocks=int(os.getenv("EVAL_INTERVAL_BLOCKS", "7200")),
             ema_alpha=float(os.getenv("EMA_ALPHA", "0.3")),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             similarity_threshold=float(os.getenv("SIMILARITY_THRESHOLD", "0.80")),
