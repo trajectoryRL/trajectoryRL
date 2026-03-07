@@ -240,6 +240,14 @@ class ClawBenchHarness:
                 vals = sorted(t.get(key, 0) for t in token_runs)
                 median_tokens[key] = vals[len(vals) // 2]
 
+        # Majority-vote the qualification gate (success) independently.
+        # run_episode.py sets success=True only when all safety + correctness
+        # checks pass. We must preserve that strict gate semantics rather than
+        # using voted_score > 0.0, which would qualify miners that fail
+        # safety checks but pass other rubric checks.
+        success_votes = sum(1 for r in valid_runs if r.success)
+        voted_success = success_votes >= quorum
+
         # Use response from the run closest to voted score
         closest = min(valid_runs, key=lambda r: abs(r.score - voted_score))
 
@@ -247,15 +255,18 @@ class ClawBenchHarness:
         median_model_usage = closest.model_usage
 
         cost_str = f", cost=${median_cost:.4f}" if median_cost is not None else ""
+        gate_str = "PASS" if voted_success else "FAIL"
         logger.info(
-            f"Consensus result: {scenario_name} → score={voted_score:.3f}{cost_str} "
-            f"(individual scores: {[round(r.score, 3) for r in runs]})"
+            f"Consensus result: {scenario_name} → score={voted_score:.3f}, "
+            f"gate={gate_str}{cost_str} "
+            f"(individual scores: {[round(r.score, 3) for r in runs]}, "
+            f"gate votes: {success_votes}/{len(valid_runs)})"
         )
 
         return EvaluationResult(
             scenario_name=scenario_name,
             score=voted_score,
-            success=voted_score > 0.0,
+            success=voted_success,
             tool_calls=tool_calls,
             response=closest.response,
             rubric=voted_rubric,

@@ -34,7 +34,7 @@ from ..scoring import TrajectoryScorer
 from ..utils.github import PackFetcher
 from ..utils.epoch_context import generate_epoch_context, render_context_preamble
 from ..utils.commitments import MinerCommitment, fetch_all_commitments
-from ..utils.ncd import is_too_similar, pack_similarity
+from ..utils.ncd import deduplicate_packs
 from ..utils.status_reporter import report_status
 
 logger = logging.getLogger(__name__)
@@ -118,14 +118,10 @@ class TrajectoryValidator:
         # Last eval block for each hotkey (for rate-limiting and inactivity)
         self.last_eval_block: Dict[str, int] = {}
 
-        # Current winner tracking (for NCD comparison)
-        self.current_winner_pack: Optional[dict] = None
-        self.current_winner_hotkey: Optional[str] = None
-
         # Pack content cache: pack_hash -> pack dict
         self._pack_by_hash: Dict[str, dict] = {}
 
-        # Packs by hotkey (populated during evaluation for winner tracking)
+        # Packs by hotkey (populated during evaluation for NCD dedup)
         self._hotkey_packs: Dict[str, dict] = {}
 
         # First-mover tracking: {hotkey: (best_score, first_block_number)}
@@ -531,18 +527,23 @@ class TrajectoryValidator:
             f"context=[{epoch_ctx.user_name}, {epoch_ctx.user_role}]"
         )
 
-        # 1. Sync metagraph
+        # 1. Clear per-cycle pack caches to prevent stale entries from
+        # deregistered miners affecting NCD comparisons in the weight phase.
+        self._hotkey_packs.clear()
+        self._pack_by_hash.clear()
+
+        # 2. Sync metagraph
         logger.info("Syncing metagraph...")
         self.metagraph.sync(subtensor=self.subtensor)
 
-        # 2. Read on-chain commitments
+        # 3. Read on-chain commitments
         logger.info("Reading on-chain commitments...")
         commitments = fetch_all_commitments(
             self.subtensor, self.config.netuid, self.metagraph
         )
         logger.info(f"Found {len(commitments)} valid commitments")
 
-        # 3. Filter to non-validator miners
+        # 4. Filter to non-validator miners
         active_commitments = self._filter_active_commitments(commitments)
         logger.info(f"Active miners: {len(active_commitments)}")
 
@@ -551,13 +552,38 @@ class TrajectoryValidator:
             await self._set_fallback_weights()
             return
 
-        # 4. Determine which miners need evaluation
+        # 5. Pack-hash pre-dedup: for miners with identical pack_hash,
+        # only evaluate the first mover (lowest block_number).
+        # Saves LLM API calls. Full NCD dedup happens in weight phase.
+        # Skipped miners will have no entries in scores/costs/qualified
+        # and receive weight 0 — this is intentional since their pack is
+        # identical to the evaluated first mover.
+        hash_earliest: Dict[str, Tuple[int, int]] = {}
+        for uid, commitment in active_commitments.items():
+            ph = commitment.pack_hash
+            if ph not in hash_earliest or commitment.block_number < hash_earliest[ph][1]:
+                hash_earliest[ph] = (uid, commitment.block_number)
+
+        skip_uids: set = set()
+        for uid, commitment in active_commitments.items():
+            earliest_uid, _ = hash_earliest[commitment.pack_hash]
+            if uid != earliest_uid:
+                skip_uids.add(uid)
+                logger.info(
+                    f"Miner {uid} ({commitment.hotkey[:8]}): skipping eval "
+                    f"(duplicate pack_hash={commitment.pack_hash[:12]})"
+                )
+
+        # 6. Evaluate miners
         eval_scenarios = sorted(self.scenarios.keys())
         evaluated_count = 0
         attempted_count = 0
 
         for uid, commitment in active_commitments.items():
             hotkey = commitment.hotkey
+
+            if uid in skip_uids:
+                continue
 
             needs_eval = self._needs_evaluation(
                 hotkey, commitment.pack_hash, current_block
@@ -773,18 +799,6 @@ class TrajectoryValidator:
             )
             return None
 
-        # Step 3: NCD similarity check vs current winner.
-        # Current winner is exempt (must defend their position).
-        if commitment.hotkey != self.current_winner_hotkey and is_too_similar(
-            pack, self.current_winner_pack, self.config.similarity_threshold
-        ):
-            sim = pack_similarity(pack, self.current_winner_pack)
-            logger.warning(
-                f"Miner {miner_uid}: NCD similarity={sim:.3f} "
-                f">= {self.config.similarity_threshold}, rejected"
-            )
-            return None
-
         self._hotkey_packs[commitment.hotkey] = pack
         self._pack_by_hash[commitment.pack_hash] = pack
 
@@ -935,6 +949,44 @@ class TrajectoryValidator:
             await self._set_fallback_weights()
             return
 
+        # Pairwise NCD dedup: exclude copy-cat miners before winner selection.
+        # Layer 1 (pack_hash grouping) catches exact copies.
+        # Layer 2 (NCD compression) catches paraphrased copies.
+        # Priority: lower on-chain block_number = original.
+        pack_info: Dict[str, Tuple[dict, int, str]] = {}
+        for uid in list(scores.keys()):
+            hotkey = uid_to_hotkey[uid]
+            pack = self._hotkey_packs.get(hotkey)
+            commitment = active.get(uid)
+            if pack is not None and commitment is not None:
+                pack_info[hotkey] = (
+                    pack, commitment.block_number, commitment.pack_hash
+                )
+
+        ncd_excluded = deduplicate_packs(
+            pack_info, self.config.similarity_threshold
+        )
+
+        if ncd_excluded:
+            hotkey_to_uid = {v: k for k, v in uid_to_hotkey.items()}
+            for copier_hk, original_hk in ncd_excluded.items():
+                copier_uid = hotkey_to_uid.get(copier_hk)
+                if copier_uid is not None:
+                    logger.warning(
+                        f"Miner {copier_uid} ({copier_hk[:8]}): "
+                        f"weight zeroed (NCD copy of {original_hk[:8]})"
+                    )
+                    scores.pop(copier_uid, None)
+                    costs.pop(copier_uid, None)
+                    qualified.pop(copier_uid, None)
+                    uid_to_hotkey.pop(copier_uid, None)
+
+        if not scores:
+            logger.warning("All scored miners excluded by NCD dedup")
+            self._build_report_metadata(active, {}, {}, {})
+            await self._set_fallback_weights()
+            return
+
         num_active = len(scores)
 
         # Use cost-based winner selection if cost data available
@@ -957,22 +1009,6 @@ class TrajectoryValidator:
                 num_active_miners=num_active,
                 uid_to_hotkey=uid_to_hotkey,
             )
-
-        # Track current winner for NCD comparison
-        if weights_dict:
-            winner_uid = max(weights_dict, key=weights_dict.get)
-            if weights_dict.get(winner_uid, 0) > 0:
-                winner_hotkey = uid_to_hotkey.get(winner_uid)
-                if winner_hotkey:
-                    winner_pack = self._hotkey_packs.get(winner_hotkey)
-                    if winner_pack is not None:
-                        self.current_winner_hotkey = winner_hotkey
-                        self.current_winner_pack = winner_pack
-                    else:
-                        logger.debug(
-                            f"Winner hotkey {winner_hotkey[:8]} not in local packs, "
-                            f"keeping previous winner state for NCD protection"
-                        )
 
         # Log results
         logger.info("=" * 60)
