@@ -2,9 +2,9 @@
 
 **Subnet**: SN11 (TrajectoryRL)
 
-**Version**: v3.0
+**Version**: v3.1
 
-**Date**: 2026-03-04
+**Date**: 2026-03-07
 
 ---
 
@@ -225,7 +225,7 @@ Validators continuously read miner commitments from the chain via `subtensor.get
 2. Pack URL is publicly accessible (HTTP GET returns 200)
 3. `sha256(json.dumps(pack, sort_keys=True))` matches `pack_hash`
 4. PolicyBundle passes schema validation
-5. **NCD similarity** vs. current winner < `similarity_threshold` (0.80), see [Pack Similarity Detection](#7-pack-similarity-detection-ncd)
+5. **NCD similarity** pairwise dedup among all active miners (see [Pack Similarity Detection](#6-pack-similarity-detection-ncd))
 
 **First-mover precedence** is determined by the **on-chain commitment block number**. The pack must be accessible at the committed URL. If a miner deletes or changes the file so the hash no longer matches, their commitment becomes invalid and they receive weight 0.
 
@@ -451,13 +451,16 @@ Validators run a **continuous evaluation loop** with two cadences:
 ```
 while running:
   1. Sync metagraph, read on-chain commitments
-  2. For each miner hotkey with valid commitment:
+  2. Pack-hash pre-dedup: group miners by pack_hash, skip evaluation
+     for exact copies (only evaluate the first mover per pack_hash)
+  3. For each remaining miner hotkey with valid commitment:
      - If pack_hash changed since last eval: mark for re-evaluation
      - If time since last eval ≥ eval_interval: mark for re-evaluation
-  3. Evaluate marked packs on the full scenario set
+  4. Evaluate marked packs on the full scenario set
      (rate limit: at most 1 eval per hotkey per eval_interval)
-  4. Update per-scenario cost EMA and qualification status
-  5. Every tempo: compute weights from cost + qualification, set_weights via commit-reveal
+  5. Update per-scenario cost EMA and qualification status
+  6. Every tempo: pairwise NCD dedup among all active miners,
+     then compute weights from cost + qualification, set_weights via commit-reveal
 ```
 
 ### Rate-Limiting (Anti-DDoS)
@@ -577,15 +580,17 @@ Every evaluation runs the **full scenario set**. No subset selection or rotation
 
 ### 6. Pack Similarity Detection (NCD)
 
-**Enforcement**: Validators compare each new submission against the current winner's pack using **Normalized Compression Distance (NCD)**, an information-theoretic similarity measure. Packs exceeding the similarity threshold are rejected with weight = 0.
+**Enforcement**: Validators perform **pairwise** similarity comparison among **all** active miners' packs using **Normalized Compression Distance (NCD)**. For each pair of similar packs (similarity ≥ threshold), the later submitter (higher on-chain `block_number`) is excluded with weight = 0. The first mover (lower `block_number`) is always preserved.
 
 **Prevents**:
 - Copy-paste with minor edits (add whitespace, reword a sentence)
 - Synonym substitution attacks
 - Paragraph reordering to evade naive diff checks
-- "Wrapper" packs that embed the winner's policy inside boilerplate
+- "Wrapper" packs that embed another miner's policy inside boilerplate
+- Sybil attacks where one entity runs multiple miners with the same or similar pack
+- Multiple miners using the same pack URL or hosting identical content on different URLs
 
-**Why NCD?** The δ threshold (measure #2) stops copycats who achieve *the same cost*. But a cheater who copies the winner's AGENTS.md, tweaks a few lines, and gets lucky with LLM variance could cross the δ bar. NCD catches the copy *before* evaluation, regardless of cost.
+**Why NCD?** The δ threshold (measure #2) stops copycats who achieve *the same cost*. But a cheater who copies another miner's AGENTS.md, tweaks a few lines, and gets lucky with LLM variance could cross the δ bar. NCD catches the copy regardless of cost.
 
 **How it works**:
 
@@ -597,7 +602,31 @@ NCD(x, y) = (C(x+y) - min(C(x), C(y))) / max(C(x), C(y))
 Where C(·) = len(zlib.compress(·, level=9))
 ```
 
-If two texts are nearly identical, compressing them *together* barely increases the size vs. compressing each alone, because the compressor finds the repeated patterns. The ratio tells you how much genuinely new content the challenger added.
+If two texts are nearly identical, compressing them *together* barely increases the size vs. compressing each alone, because the compressor finds the repeated patterns. The ratio tells you how much genuinely new content exists between the two packs.
+
+**Two-layer dedup**:
+
+Deduplication runs in the **weight-setting phase** (before winner selection) with two layers:
+
+```
+Layer 1: Pack-hash grouping (O(N), catches exact copies)
+  → Group miners by pack_hash
+  → For each group with multiple miners, keep only the one
+    with the lowest on-chain block_number (first mover)
+  → All others get weight = 0
+
+Layer 2: NCD pairwise among unique packs (catches paraphrases)
+  → Pre-compute normalized AGENTS.md + compression for each unique pack
+  → Compare all unique pairs
+  → For similar pairs (similarity ≥ threshold), the later submitter
+    (higher block_number) gets weight = 0
+```
+
+Additionally, during the **evaluation phase**, miners with duplicate `pack_hash` are skipped to save LLM API costs. Only the first mover is evaluated; the rest are excluded before ClawBench runs.
+
+**Priority determination**: On-chain `block_number` from `subtensor.get_commitment_metadata()` determines who submitted first. This is unforgeable and consistent across validators and across evaluation cycles — a miner who committed at block 100 will always be recognized as earlier than one who committed at block 200, regardless of evaluation order or which epoch the comparison happens in.
+
+**Why pairwise instead of winner-only?** A previous design only compared each miner against the current winner. This left a gap: two miners submitting identical packs would both pass the NCD check as long as neither was the winner. The pairwise approach eliminates this gap — every pair of similar packs is detected, and the later submitter is always excluded.
 
 **Implementation**:
 
@@ -628,15 +657,7 @@ def pack_similarity(pack_a: dict, pack_b: dict) -> float:
 SIMILARITY_THRESHOLD = 0.80   # reject if ≥ 80% similar
 ```
 
-**Validation pipeline position** (runs *before* expensive ClawBench evaluation):
-
-```
-Miner submits pack
-  → Schema validation (OPP v1)
-  → NCD similarity check vs. current winner   ← if similarity ≥ 0.80: weight = 0
-  → ClawBench evaluation (only if similarity < 0.80)
-  → Qualification gate + cost ranking
-```
+**Performance**: With 200 miners and ~80 unique packs, Layer 1 is O(N) and Layer 2 requires C(80,2) = 3,160 NCD comparisons. Each comparison is one `zlib.compress` call (~50μs), totaling ~0.15 seconds. This is negligible compared to the hours spent on LLM evaluation.
 
 **Why NCD is hard to game**:
 
@@ -648,15 +669,16 @@ Miner submits pack
 | Insert junk comments | Junk compresses independently of the original; the shared content still compresses together. Also wastes the 32KB pack size budget |
 | Pad with random text | Random data doesn't compress well, inflating `C(challenger)` and `C(concat)` proportionally, so NCD stays high |
 | Wrap winner's policy in boilerplate | The core policy still compresses against the original; boilerplate adds marginal `C(concat)` cost |
+| Host same content on a different URL | NCD compares AGENTS.md content, not URLs. Changing the URL has zero effect on similarity |
 
 **Properties**:
 - **Deterministic**: Fixed `zlib.compress(level=9)`, so every validator computes the same similarity score
 - **Zero dependencies**: Python stdlib (`zlib`, `re`) only
-- **Fast**: ~1ms for two 32KB texts
+- **Fast**: ~1ms per pair for two 32KB texts; full pairwise under 1 second
 - **Well-studied**: NCD is used in academic plagiarism detection, malware classification, and DNA sequence comparison
 
 **Threshold rationale** (σ = 0.80):
-- **≥ 0.80**: Very likely a copy with edits, rejected
+- **≥ 0.80**: Very likely a copy with edits, excluded (later submitter gets weight 0)
 - **0.60–0.80**: Gray zone. Independently developed packs may share common patterns (e.g., "always ask before sending email"). Allowed, but δ threshold still applies
 - **< 0.60**: Clearly distinct, no restriction beyond normal δ
 
@@ -817,7 +839,7 @@ A miner's submission can fail at multiple points in the validation pipeline. The
 | **No commitment** on-chain (or unparseable) | N/A | 0.0 | No | Skipped |
 | **Pack URL inaccessible** (404, timeout, hash mismatch) | N/A | 0.0 | No | Skipped |
 | **Schema validation failure** (missing AGENTS.md, >32KB, bad semver) | N/A | 0.0 | No | Skipped |
-| **NCD similarity** ≥ threshold vs. current winner | N/A | 0.0 | No | Skipped |
+| **NCD similarity** ≥ threshold (pairwise dedup, later submitter excluded) | N/A | 0.0 | No | May run* |
 | **ClawBench timeout** (scenario exceeds `timeout_per_scenario`) | FAIL | 0.0 | Yes | Partial |
 | **Safety/correctness check failed** on any scenario | FAIL | 0.0 | Yes | Full |
 | **All gate checks pass, not Winner** | PASS | 0.0 | Yes | Full |
@@ -825,9 +847,9 @@ A miner's submission can fail at multiple points in the validation pipeline. The
 
 **Key rules**:
 
-1. **Fail-fast**: Schema validation, verification, and NCD similarity are checked *before* running ClawBench. This saves compute since there's no point evaluating an invalid or copied pack.
+1. **Fail-fast**: Schema validation and verification are checked *before* running ClawBench. Exact-copy miners (same `pack_hash`) are skipped during evaluation to save LLM costs. Paraphrased copies are caught by pairwise NCD dedup in the weight-setting phase — their evaluation still runs, but they receive weight 0.
 
-2. **"Active" means valid commitment**: A miner counts as "active" only if their on-chain commitment passes all pre-evaluation checks (schema, NCD) and at least one ClawBench scenario completes. This definition is used for:
+2. **"Active" means valid commitment**: A miner counts as "active" only if their on-chain commitment passes all pre-evaluation checks (schema) and at least one ClawBench scenario completes. This definition is used for:
    - Bootstrap threshold (need ≥10 *active* miners for winner-take-all)
 
 3. **Partial failures disqualify**: If a pack passes schema but 1 of 5 scenarios has a failed safety check, the miner is disqualified from cost competition entirely. This is intentional — safety is non-negotiable.
@@ -872,7 +894,7 @@ where Winner = lowest-cost qualified miner that satisfies:
   - ties broken by earliest on-chain commitment block number
   - pack accessible at committed HTTP URL, hash matches
   - pack passes OPP v1 schema validation (AGENTS.md required, ≤32KB)
-  - pack_similarity(pack, current_winner) < σ (NCD similarity check)
+  - pairwise NCD: no other earlier-submitted pack with similarity ≥ σ
   - miner active within last inactivity_blocks
 ```
 
@@ -916,6 +938,6 @@ Bootstrap:     top-3 qualified get 70/20/10 of miner alpha emissions
 
 ---
 
-**Version**: v3.0
+**Version**: v3.1
 
-**Date**: 2026-03-04
+**Date**: 2026-03-07
