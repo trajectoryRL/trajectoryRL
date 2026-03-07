@@ -41,7 +41,7 @@ ANTHROPIC_API_KEY=sk-ant-...
 
 # Optional
 LOG_LEVEL=INFO                    # DEBUG for development
-EVAL_INTERVAL_BLOCKS=1200         # ~4h (use 100 for dev)
+EVAL_INTERVAL_BLOCKS=7200         # ~24h (use 100 for dev)
 WEIGHT_INTERVAL_BLOCKS=360        # ~72min
 EMA_ALPHA=0.3
 INACTIVITY_BLOCKS=14400           # ~48h

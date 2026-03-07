@@ -246,7 +246,7 @@ class TestPRTestPlan:
 
         config = MagicMock()
         config.netuid = 11
-        config.eval_interval_blocks = 1200
+        config.eval_interval_blocks = 7200
         config.similarity_threshold = 0.80
         config.log_level = "WARNING"
         config.scenarios = ["client_escalation"]

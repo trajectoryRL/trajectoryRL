@@ -432,7 +432,7 @@ Winner-take-all creates extreme risk/reward in steady state. The bootstrap phase
 
 ## Operational Costs
 
-- **Validators**: Bear all LLM inference costs. Repeated evaluation (~6 runs/day per miner) increases cost vs. single evaluation, but remains well within validator earnings. See [VALIDATOR_OPERATIONS.md](VALIDATOR_OPERATIONS.md) for cost projections and sustainability analysis.
+- **Validators**: Bear all LLM inference costs. Daily evaluation (~1 run/day per miner) remains well within validator earnings. See [VALIDATOR_OPERATIONS.md](VALIDATOR_OPERATIONS.md) for cost projections and sustainability analysis.
 - **Miners**: Zero ongoing cost (policy iteration only). See [MINER_OPERATIONS.md](MINER_OPERATIONS.md) for local testing costs and setup.
 
 ---
@@ -443,7 +443,7 @@ Validators run a **continuous evaluation loop** with two cadences:
 
 | Cadence | Default | Purpose |
 |---------|---------|---------|
-| `eval_interval` | 4 hours (~1200 blocks) | Re-evaluate all active packs, update per-scenario EMA |
+| `eval_interval` | 24 hours (~7200 blocks) | Re-evaluate all active packs, update per-scenario EMA |
 | `tempo` | ~72 min (360 blocks, chain-determined) | Set weights on-chain via commit-reveal |
 
 ### Continuous Validator Loop
@@ -478,7 +478,7 @@ Evaluation is rate-limited to **at most one evaluation per miner per `eval_inter
 ┌────────────────────────────────────────────────────────────────────────┐
 │  Continuous Operation                                                  │
 │                                                                        │
-│  ├─ eval_interval (~4h): evaluate all active packs, update EMA         │
+│  ├─ eval_interval (~24h): evaluate all active packs, update EMA        │
 │  │   [Sync] → [Check Commitments] → [Evaluate Marked] → [Update EMA]   │
 │  │   ~1s      ~1-2 min               ~5-30 min           ~instant      │
 │  │                                                                     │
@@ -493,7 +493,7 @@ Evaluation is rate-limited to **at most one evaluation per miner per `eval_inter
 
 | Setting | Value | Description |
 |---------|-------|-------------|
-| `eval_interval` | 4 hours (~1200 blocks) | How often to re-evaluate each active pack |
+| `eval_interval` | 24 hours (~7200 blocks) | How often to re-evaluate each active pack |
 | `timeout_per_scenario` | 120s (2 min) | Max time per scenario run |
 
 ### Benchmark Stability
@@ -723,7 +723,7 @@ Neither layer requires validators to share data with each other. Each validator 
 
 ### Per-Validator: Repeated Evaluation with EMA
 
-Each validator evaluates every active pack every `eval_interval` (default: 4 hours) and maintains per-scenario EMAs keyed by miner hotkey:
+Each validator evaluates every active pack every `eval_interval` (default: 24 hours) and maintains per-scenario EMAs keyed by miner hotkey:
 
 ```
 ema_cost[hotkey][scenario] = α × new_cost + (1 - α) × ema_cost[hotkey][scenario]
@@ -736,10 +736,10 @@ Where:
 
 **EMA reset**: When a miner submits a new pack (`pack_hash` changes), the cost EMA resets for that hotkey at the next scheduled evaluation. Old observations from a different pack are discarded.
 
-**Convergence**: With α = 0.3 and `eval_interval` = 4 hours:
+**Convergence**: With α = 0.3 and `eval_interval` = 24 hours:
 - After 1 observation: raw noisy cost (variance ~5-10%)
-- After 3 observations (~12h): EMA within ~3% of true cost
-- After 5 observations (~20h): EMA within ~1-2% of true cost
+- After 3 observations (~3 days): EMA within ~3% of true cost
+- After 5 observations (~5 days): EMA within ~1-2% of true cost
 
 **Rate-limiting**: At most one evaluation per miner per `eval_interval`, regardless of how often the miner updates their commitment. This prevents DDoS via rapid commitment churn (see [Evaluation Cadence](#evaluation-cadence)).
 
@@ -912,7 +912,7 @@ Bootstrap:     top-3 qualified get 70/20/10 of miner alpha emissions
 | δ (cost first-mover threshold) | 0.10 (10% cheaper) | Yes |
 | α (cost EMA smoothing factor) | 0.3 | Yes |
 | Required categories | safety, correctness | Yes |
-| eval_interval | 4 hours (~1200 blocks) | Yes |
+| eval_interval | 24 hours (~7200 blocks) | Yes |
 | Scenario pool | 5 (all run every eval; pool grows over time) | Yes |
 | Scenario weights | 1.0-1.5 per YAML | Yes |
 | Bootstrap threshold | 10 active miners | Yes |

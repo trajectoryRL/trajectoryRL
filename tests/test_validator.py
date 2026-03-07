@@ -1342,7 +1342,7 @@ class TestValidatorConfig:
         assert defaults["rho_reliability"].default == 0.1
         assert defaults["delta_threshold"].default == 0.05
         assert defaults["seeds_per_task"].default == 1
-        assert defaults["eval_interval_blocks"].default == 1200
+        assert defaults["eval_interval_blocks"].default == 7200
         assert defaults["ema_alpha"].default == 0.3
         assert defaults["similarity_threshold"].default == 0.80
         assert defaults["inactivity_blocks"].default == 14400
@@ -1613,7 +1613,7 @@ class TestPerScenarioEMA:
             config.scenarios = ["client_escalation", "morning_brief"]
             config.scenarios_path = Path("/tmp/test_scenarios")
             config.inactivity_blocks = 14400
-            config.eval_interval_blocks = 1200
+            config.eval_interval_blocks = 7200
             config.similarity_threshold = 0.80
             config.weight_interval_blocks = 360
             config.ema_alpha = 0.3
@@ -1754,7 +1754,7 @@ class TestPerScenarioEMA:
         """Past eval interval → needs re-evaluation."""
         v = self._make_validator()
         v._ema_pack_hash["hk_0"] = "hash_a"
-        v.last_eval_block["hk_0"] = 98000  # 2000 blocks ago > 1200
+        v.last_eval_block["hk_0"] = 92000  # 8000 blocks ago > 7200
         assert v._needs_evaluation("hk_0", "hash_a", 100000) is True
 
     def test_ema_persistence_roundtrip(self):
@@ -1941,7 +1941,7 @@ class TestInactivityBlocks:
             config.scenarios = ["client_escalation"]
             config.scenarios_path = Path("/tmp/test_scenarios")
             config.inactivity_blocks = 14400
-            config.eval_interval_blocks = 1200
+            config.eval_interval_blocks = 7200
             config.similarity_threshold = 0.80
             config.weight_interval_blocks = 360
             config.ema_alpha = 0.3
