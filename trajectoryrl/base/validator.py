@@ -2,7 +2,7 @@
 
 Architecture (v2.0):
     1. Continuous evaluation loop with dual cadence:
-       - eval_interval (~4h): re-evaluate all active packs, update per-scenario EMA
+       - eval_interval (~24h): re-evaluate all active packs, update per-scenario EMA
        - tempo (~72 min): compute weights from EMA scores, set_weights
     2. Read on-chain commitments (subtensor.get_all_commitments)
     3. Fetch packs from miners' public HTTP URLs
@@ -389,7 +389,7 @@ class TrajectoryValidator:
     async def run(self):
         """Main validator loop with dual cadence.
 
-        - eval_interval (~4h / 1200 blocks): evaluate marked packs, update EMA.
+        - eval_interval (~24h / 7200 blocks): evaluate marked packs, update EMA.
         - tempo (~72 min / 360 blocks): compute weights from EMA, set_weights.
         """
         self._report_metadata: Dict[str, Any] = {}
