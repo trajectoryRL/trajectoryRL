@@ -89,6 +89,9 @@ class TrajectoryValidator:
         self.harness = ClawBenchHarness(
             clawbench_path=config.clawbench_path,
             timeout=config.timeout_per_scenario,
+            clawbench_default_model=config.clawbench_default_model,
+            clawbench_api_key=config.clawbench_api_key,
+            clawbench_base_url=config.clawbench_base_url,
         )
 
         self.scorer = TrajectoryScorer(
@@ -478,14 +481,9 @@ class TrajectoryValidator:
     # LLM key check
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _check_llm_keys() -> bool:
-        """Return True if at least one LLM API key is configured."""
-        import os
-        return bool(
-            os.environ.get("ANTHROPIC_API_KEY")
-            or os.environ.get("OPENAI_API_KEY")
-        )
+    def _check_llm_keys(self) -> bool:
+        """Return True if a ClawBench LLM API key is configured."""
+        return bool(self.config.clawbench_api_key)
 
     # ------------------------------------------------------------------
     # Evaluation cycle
@@ -507,8 +505,8 @@ class TrajectoryValidator:
         """
         if not self._check_llm_keys():
             logger.warning(
-                "No LLM API key configured (ANTHROPIC_API_KEY / OPENAI_API_KEY). "
-                "Skipping evaluation, setting fallback weights to owner UID."
+                "CLAWBENCH_LLM_API_KEY not set. "
+                "Skipping evaluation, setting fallback weights to owner UID.",
             )
             await self._set_fallback_weights(
                 reason="No LLM API key configured"

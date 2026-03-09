@@ -13,7 +13,9 @@
 #   WALLET_HOTKEY=default
 #   NETUID=11
 #   NETWORK=finney
-#   ANTHROPIC_API_KEY=sk-ant-...
+#   CLAWBENCH_LLM_API_KEY=...
+#   CLAWBENCH_LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
+#   CLAWBENCH_DEFAULT_MODEL=zhipu/glm-5
 
 services:
   # ==========================================================================
@@ -29,10 +31,13 @@ services:
       - ../clawbench/scenarios:/scenarios:ro
       - workspace:/workspace
       - ../clawbench/config:/config
+      - openclaw-home:/openclaw-home
     environment:
       - SCENARIO=${SCENARIO:-client_escalation}
       - VARIANT=${VARIANT:-optimized}
-      - CLAWBENCH_MODEL=${CLAWBENCH_MODEL:-anthropic/claude-sonnet-4-5-20250929}
+      - CLAWBENCH_DEFAULT_MODEL=${CLAWBENCH_DEFAULT_MODEL:-zhipu/glm-5}
+      - CLAWBENCH_LLM_BASE_URL=${CLAWBENCH_LLM_BASE_URL:-https://open.bigmodel.cn/api/paas/v4}
+      - CLAWBENCH_LLM_API_KEY=${CLAWBENCH_LLM_API_KEY:-}
 
   # Fix workspace permissions after init (OpenClaw runs as node uid=1000)
   init-perms:
@@ -84,12 +89,14 @@ services:
       - "${OPENCLAW_PORT:-18790}:18789"
     volumes:
       - workspace:/workspace
-      - ../clawbench/config/openclaw.json:/home/node/.openclaw/openclaw.json:ro
+      - openclaw-home:/home/node/.openclaw
+    env_file:
+      - ../.env.validator
     environment:
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_API_KEY=${CLAWBENCH_LLM_API_KEY:-}
+      - OPENAI_BASE_URL=${CLAWBENCH_LLM_BASE_URL:-https://open.bigmodel.cn/api/paas/v4}
       - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN:-sandbox-token-12345}
-      - CLAWBENCH_MODEL=${CLAWBENCH_MODEL:-anthropic/claude-sonnet-4-5-20250929}
+      - CLAWBENCH_DEFAULT_MODEL=${CLAWBENCH_DEFAULT_MODEL:-zhipu/glm-5}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -117,13 +124,8 @@ services:
     container_name: trajectoryrl_validator
     network_mode: host
     restart: unless-stopped
-    environment:
-      - WALLET_NAME=${WALLET_NAME:-validator}
-      - WALLET_HOTKEY=${WALLET_HOTKEY:-default}
-      - NETUID=${NETUID:-11}
-      - NETWORK=${NETWORK:-finney}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    env_file:
+      - ../.env.validator
     volumes:
       - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
       - workspace:/app/clawbench/workspace
@@ -161,6 +163,7 @@ services:
 
 volumes:
   workspace:
+  openclaw-home:
 
 networks:
   sandbox-net:

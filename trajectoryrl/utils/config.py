@@ -99,6 +99,11 @@ class ValidatorConfig:
     # Weight cadence (set weights every tempo)
     weight_interval_blocks: int = 360  # 1 tempo ≈ 72 min at 12s/block
 
+    # ClawBench LLM configuration (passed to init container & OpenClaw gateway)
+    clawbench_default_model: str = "zhipu/glm-5"
+    clawbench_api_key: str = ""
+    clawbench_base_url: str = "https://open.bigmodel.cn/api/paas/v4"
+
     # EMA state persistence
     ema_state_path: Path = field(
         default_factory=lambda: Path("/tmp/trajectoryrl_ema_state.json")
@@ -191,6 +196,12 @@ class ValidatorConfig:
             similarity_threshold=float(os.getenv("SIMILARITY_THRESHOLD", "0.80")),
             inactivity_blocks=int(os.getenv("INACTIVITY_BLOCKS", "14400")),
             weight_interval_blocks=int(os.getenv("WEIGHT_INTERVAL_BLOCKS", "360")),
+            clawbench_default_model=os.getenv("CLAWBENCH_DEFAULT_MODEL", "zhipu/glm-5"),
+            clawbench_api_key=os.getenv("CLAWBENCH_LLM_API_KEY", ""),
+            clawbench_base_url=os.getenv(
+                "CLAWBENCH_LLM_BASE_URL",
+                "https://open.bigmodel.cn/api/paas/v4",
+            ),
         )
 
 
@@ -205,8 +216,9 @@ class MinerConfig:
         network: Bittensor network (finney, test, local)
         check_interval: Seconds between submission cycles in run mode
         log_level: Logging level
-        anthropic_api_key: API key for LLM pack generation (default mode)
-        generator_model: Anthropic model for AGENTS.md generation
+        llm_api_key: API key for the OpenAI-compatible LLM endpoint
+        llm_base_url: Base URL for the OpenAI-compatible LLM endpoint
+        llm_model: Model name for AGENTS.md generation (e.g. glm-5)
         pack_url: Pre-set pack URL (skips S3 upload if set)
     """
 
@@ -219,9 +231,10 @@ class MinerConfig:
 
     log_level: str = "INFO"
 
-    # LLM pack generation (default mode)
-    anthropic_api_key: str = ""
-    generator_model: str = "claude-sonnet-4-5-20250929"
+    # LLM pack generation (default mode) — OpenAI-compatible endpoint
+    llm_api_key: str = ""
+    llm_base_url: str = "https://open.bigmodel.cn/api/paas/v4"
+    llm_model: str = "glm-5"
 
     # Pre-built pack URL (skips S3 upload if set)
     pack_url: str = ""
@@ -248,7 +261,11 @@ class MinerConfig:
             network=os.getenv("NETWORK", "finney"),
             check_interval=int(os.getenv("CHECK_INTERVAL", "3600")),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
-            anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
-            generator_model=os.getenv("GENERATOR_MODEL", "claude-sonnet-4-5-20250929"),
+            llm_api_key=os.getenv("LLM_API_KEY", ""),
+            llm_base_url=os.getenv(
+                "LLM_BASE_URL",
+                "https://open.bigmodel.cn/api/paas/v4",
+            ),
+            llm_model=os.getenv("LLM_MODEL", "glm-5"),
             pack_url=os.getenv("PACK_URL", ""),
         )

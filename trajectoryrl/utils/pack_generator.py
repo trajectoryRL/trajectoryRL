@@ -1,8 +1,11 @@
-"""LLM-based AGENTS.md generator using the Anthropic SDK.
+"""LLM-based AGENTS.md generator (multi-provider).
 
 Generates a policy document (AGENTS.md) optimized for ClawBench scenarios.
 The generator understands the scoring rubric, available tools, and scenario
 types, producing a generic policy that scores well across all five scenarios.
+
+Uses an OpenAI-compatible endpoint configured via ``LLM_API_KEY``,
+``LLM_BASE_URL``, and ``LLM_MODEL`` environment variables.
 """
 
 import logging
@@ -101,16 +104,18 @@ Do NOT wrap the output in code fences.
 
 
 def generate_agents_md(
-    api_key: str,
-    model: str = "claude-sonnet-4-5-20250929",
+    model: str = "glm-5",
+    api_key: str = "",
+    base_url: str = "",
     previous_agents_md: Optional[str] = None,
     max_tokens: int = 8192,
 ) -> str:
-    """Generate an AGENTS.md policy document using the Anthropic API.
+    """Generate an AGENTS.md policy document via the unified LLM client.
 
     Args:
-        api_key: Anthropic API key.
-        model: Model to use for generation.
+        model: Model name (e.g. ``glm-5``).
+        api_key: Explicit API key (optional; auto-resolved from env if empty).
+        base_url: Explicit base URL (optional; auto-resolved from env if empty).
         previous_agents_md: If provided, improve this existing policy
             instead of generating from scratch.
         max_tokens: Maximum tokens in the response.
@@ -119,12 +124,9 @@ def generate_agents_md(
         Generated AGENTS.md content string.
 
     Raises:
-        anthropic.APIError: On API failures.
         ValueError: If generated content is empty.
     """
-    import anthropic  # lazy: not needed by demo mode or validators
-
-    client = anthropic.Anthropic(api_key=api_key)
+    from .llm_client import generate
 
     if previous_agents_md:
         user_message = IMPROVE_PROMPT.format(previous_agents_md=previous_agents_md)
@@ -136,14 +138,14 @@ def generate_agents_md(
 
     logger.info("Generating AGENTS.md with model=%s (improve=%s)", model, bool(previous_agents_md))
 
-    response = client.messages.create(
+    content = generate(
         model=model,
-        max_tokens=max_tokens,
         system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_message}],
+        user_message=user_message,
+        max_tokens=max_tokens,
+        api_key=api_key,
+        base_url=base_url,
     )
-
-    content = response.content[0].text
 
     # Strip code fences if the model wrapped the output
     content = re.sub(r"^```(?:markdown|md)?\s*\n", "", content)

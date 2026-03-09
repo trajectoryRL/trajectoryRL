@@ -50,8 +50,9 @@ def _make_config(**overrides):
         network="test",
         check_interval=1,
         log_level="WARNING",
-        anthropic_api_key="sk-ant-test-key",
-        generator_model="claude-sonnet-4-5-20250929",
+        llm_api_key="sk-test-key",
+        llm_base_url="https://open.bigmodel.cn/api/paas/v4",
+        llm_model="glm-5",
         pack_url="",
     )
     defaults.update(overrides)
@@ -373,7 +374,7 @@ class TestConfigValidation:
     """Test fail-fast config checks in _run_default."""
 
     def test_missing_api_key_exits(self):
-        config = _make_config(anthropic_api_key="")
+        config = _make_config(llm_api_key="")
         with pytest.raises(SystemExit):
             asyncio.run(_run_default_sync(config))
 

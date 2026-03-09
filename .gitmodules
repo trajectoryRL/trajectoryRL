@@ -1,6 +1,8 @@
 [submodule "clawbench"]
 	path = clawbench
 	url = https://github.com/trajectoryRL/clawbench.git
+	branch = main
 [submodule "openclaw"]
 	path = openclaw
 	url = https://github.com/trajectoryRL/openclaw.git
+	branch = trajectory-sandbox

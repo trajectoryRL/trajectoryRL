@@ -16,7 +16,8 @@ COPY trajectoryrl/ trajectoryrl/
 COPY neurons/ neurons/
 COPY clawbench/ clawbench/
 
-RUN pip install --no-cache-dir -e .
+RUN pip install --no-cache-dir -e . && \
+    pip install --no-cache-dir -r clawbench/requirements.txt
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV WALLET_NAME=validator

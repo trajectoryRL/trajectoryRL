@@ -202,7 +202,7 @@ miner run --rm miner submit https://example.com/pack.json
 cd clawbench
 pip install -e .
 cp .env.example .env
-# Edit .env — set CLAWBENCH_MODEL (e.g., anthropic/claude-sonnet-4-5-20250929)
+# Edit .env — set CLAWBENCH_DEFAULT_MODEL (e.g., anthropic/claude-sonnet-4-5-20250929)
 ```
 
 Validators use `claude-sonnet-4-5-20250929`. Miners can use any model for local testing since scoring is regex-based. Use a cheaper model for rapid iteration, validate final results with Sonnet 4.5.

@@ -13,7 +13,7 @@ Run modes (long-running daemon):
 
 Config is loaded from .env.miner (or environment variables):
     WALLET_NAME, WALLET_HOTKEY, NETUID, NETWORK, CHECK_INTERVAL, LOG_LEVEL
-    ANTHROPIC_API_KEY, GENERATOR_MODEL, S3_BUCKET, S3_ENDPOINT_URL, S3_REGION, PACK_URL
+    LLM_API_KEY, LLM_MODEL, S3_BUCKET, S3_ENDPOINT_URL, S3_REGION, PACK_URL
 """
 
 import argparse
@@ -148,8 +148,11 @@ async def _run_default(config: MinerConfig):
     from trajectoryrl.utils.status_reporter import report_status
 
     # --- Config validation (fail fast) ---
-    if not config.anthropic_api_key:
-        logger.error("ANTHROPIC_API_KEY is required for default mode")
+    from trajectoryrl.utils.llm_client import has_api_key
+    if not has_api_key():
+        logger.error(
+            "LLM_API_KEY not set. Required for AGENTS.md generation.",
+        )
         sys.exit(1)
 
     # Init storage (reads S3_BUCKET from env; raises ValueError if missing)
@@ -167,7 +170,7 @@ async def _run_default(config: MinerConfig):
     start_time = time.time()
 
     logger.info("=== Default mode ===")
-    logger.info("  model:    %s", config.generator_model)
+    logger.info("  model:    %s", config.llm_model)
     if storage:
         logger.info("  upload:   %s (bucket)", storage.bucket)
     else:
@@ -187,8 +190,9 @@ async def _run_default(config: MinerConfig):
                 logger.info("Generating AGENTS.md...")
                 agents_md = await asyncio.to_thread(
                     generate_agents_md,
-                    api_key=config.anthropic_api_key,
-                    model=config.generator_model,
+                    api_key=config.llm_api_key,
+                    base_url=config.llm_base_url,
+                    model=config.llm_model,
                     previous_agents_md=previous_agents_md,
                 )
 

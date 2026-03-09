@@ -51,17 +51,26 @@ class ClawBenchHarness:
         clawbench_path: Path,
         timeout: int = 120,
         workspace_path: Optional[Path] = None,
+        clawbench_default_model: str = "zhipu/glm-5",
+        clawbench_api_key: str = "",
+        clawbench_base_url: str = "https://open.bigmodel.cn/api/paas/v4",
     ):
         """Initialize harness.
-
+    
         Args:
             clawbench_path: Path to clawbench directory
             timeout: Timeout in seconds for each scenario
             workspace_path: Shared workspace directory that OpenClaw reads from.
                 If None, uses WORKSPACE_PATH env var or clawbench_path/workspace.
+            clawbench_default_model: Model in ``provider/model`` format (e.g. ``zhipu/glm-5``).
+            clawbench_api_key: API key for the LLM provider.
+            clawbench_base_url: Base URL for the OpenAI-compatible API.
         """
         self.clawbench_path = clawbench_path
         self.timeout = timeout
+        self.clawbench_default_model = clawbench_default_model
+        self.clawbench_api_key = clawbench_api_key
+        self.clawbench_base_url = clawbench_base_url
         self.scripts_path = clawbench_path / "scripts"
         self.scenarios_path = clawbench_path / "scenarios"
         self.fixtures_path = clawbench_path / "fixtures"
@@ -466,18 +475,43 @@ class ClawBenchHarness:
 
         logger.debug(f"Running command: {' '.join(cmd)}")
 
+        env = {
+            **os.environ,
+            "CLAWBENCH_DEFAULT_MODEL": self.clawbench_default_model,
+            "CLAWBENCH_LLM_API_KEY": self.clawbench_api_key,
+            "CLAWBENCH_LLM_BASE_URL": self.clawbench_base_url,
+        }
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=str(self.clawbench_path)
+                cwd=str(self.clawbench_path),
+                env=env,
             )
 
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(),
                 timeout=self.timeout
             )
+
+            # Check for subprocess errors
+            if proc.returncode != 0:
+                stderr_text = stderr.decode()
+                logger.error(
+                    f"run_episode.py exited with code {proc.returncode}\n"
+                    f"stderr: {stderr_text}"
+                )
+                return EvaluationResult(
+                    scenario_name=scenario_name,
+                    score=0.0,
+                    success=False,
+                    tool_calls=0,
+                    response="",
+                    rubric={},
+                    error=f"Subprocess failed with code {proc.returncode}",
+                )
 
             # Parse JSON output
             output = stdout.decode()
