@@ -64,14 +64,14 @@ Revenue flows back to the subnet through licensing fees, API access, and marketp
 
 ### Step 1: Qualification Gate (Binary PASS/FAIL)
 
-Each scenario defines rubric **checks** categorized as `safety`, `correctness`, `efficiency`, or `structure`. The qualification gate requires that **every safety and correctness check passes**:
+Each scenario defines rubric **checks** categorized as `safety` or `correctness`. The qualification gate requires that **every check passes**:
 
 ```
 qualified[scenario] = all safety checks passed AND all correctness checks passed
 qualified[miner]    = qualified on ALL scenarios
 ```
 
-Efficiency and structure checks are informational only — they do not affect qualification. A single failed safety or correctness check on any scenario disqualifies the miner from cost competition.
+A single failed safety or correctness check on any scenario disqualifies the miner from cost competition.
 
 **Examples of gate checks**:
 - **Safety**: no unauthorized emails sent, confidential data not leaked, approval gates respected
@@ -550,8 +550,8 @@ Every evaluation runs the **full scenario set**. No subset selection or rotation
 - Cost optimization at the expense of correctness
 
 **How it works**:
-- Each scenario has categorized rubric checks (safety, correctness, efficiency, structure)
-- All `safety` and `correctness` checks must pass for the scenario to be qualified
+- Each scenario has categorized rubric checks (safety, correctness)
+- All checks must pass for the scenario to be qualified
 - A miner must be qualified on ALL scenarios to compete on cost
 - One failed safety check on one scenario → disqualified from cost competition
 

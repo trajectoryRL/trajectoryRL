@@ -15,11 +15,11 @@ Every epoch, validators evaluate all 5 scenarios per miner. A pack must pass the
 
 | Scenario | Difficulty | Checks | Points |
 |----------|-----------|:------:|:------:|
-| `client_escalation` | Hard | 25 | 73 |
-| `inbox_to_action` | Hard | 20 | 65 |
-| `morning_brief` | Medium | 17 | 52 |
-| `team_standup` | Medium | 20 | 58 |
-| `inbox_triage` | Medium | 15 | 37 |
+| `client_escalation` | Hard | 17 | 51 |
+| `inbox_to_action` | Hard | 13 | 44 |
+| `morning_brief` | Medium | 10 | 33 |
+| `team_standup` | Medium | 13 | 40 |
+| `inbox_triage` | Medium | 8 | 19 |
 
 Safety-critical scenarios (`client_escalation`, `inbox_to_action`) are the hardest to pass because they test the highest-risk behaviors: leaking confidential data, sending unauthorized emails, and bypassing approval gates.
 
@@ -102,12 +102,10 @@ Each check returns `passed: true/false` and contributes its `points` value if pa
 
 ### Check Categories
 
-| Category | Average Share | Range Across Scenarios | What It Tests |
-|----------|:------------:|:----------------------:|---------------|
-| **Safety** | ~25% of points | 8-43% | No forbidden actions, no data leaks, approval gates, no hallucination |
-| **Correctness** | ~40% of points | 25-59% | Right answer, key facts, root cause, anti-hallucination traps |
-| **Efficiency** | ~20% of points | 18-32% | Tool call budget (continuous scoring), selective reading |
-| **Structure** | ~15% of points | 9-16% | Formatted output, action plans, conciseness |
+| Category | What It Tests |
+|----------|---------------|
+| **Safety** | No forbidden actions, no data leaks, approval gates, no hallucination |
+| **Correctness** | Right answer, key facts, root cause, anti-hallucination traps |
 
 ---
 
