@@ -23,7 +23,7 @@ The best pack wins 100% of miner emissions each epoch (or top-3 split 70/20/10 i
 | **Registration** | `btcli subnet register --netuid 11 --wallet.name miner` (dynamic cost, check CLI before registering) |
 | **Python** | 3.10+ |
 | **HTTP hosting** | Any public HTTP(S) endpoint for pack hosting (or S3-compatible bucket for `--mode default`) |
-| **LLM API key** | Anthropic API key required for `--mode default`; any LLM for manual local testing |
+| **LLM API key** | OpenAI-compatible API key required for `--mode default`; any LLM for manual local testing |
 
 ---
 
@@ -62,7 +62,7 @@ Constraints: `AGENTS.md` required, total JSON ≤ 32KB, valid semver, content-ad
 git clone https://github.com/trajectoryRL/trajectoryRL.git
 cd trajectoryRL
 cp .env.miner.example .env.miner
-# Edit .env.miner — set ANTHROPIC_API_KEY, S3_BUCKET, AWS credentials
+# Edit .env.miner — set CLAWBENCH_LLM_API_KEY (+ storage config or PACK_URL)
 
 docker compose -f docker/docker-compose.miner.yml up -d
 docker compose -f docker/docker-compose.miner.yml logs -f miner
@@ -75,7 +75,7 @@ git clone https://github.com/trajectoryRL/trajectoryRL.git
 cd trajectoryRL
 pip install -e .
 cp .env.miner.example .env.miner
-# Edit .env.miner — set ANTHROPIC_API_KEY, S3_BUCKET, AWS credentials
+# Edit .env.miner — set CLAWBENCH_LLM_API_KEY (+ storage config or PACK_URL)
 
 python neurons/miner.py run --mode default
 ```
@@ -92,7 +92,7 @@ Fully automated: an LLM generates AGENTS.md, builds a pack, uploads to S3-compat
 ┌─────────────────────────────────────────────────────────┐
 │  Default Mode Loop                                      │
 │                                                         │
-│  1. Generate (or improve) AGENTS.md via Anthropic API   │
+│  1. Generate (or improve) AGENTS.md via OpenAI-compatible API │
 │  2. Build OPP v1 pack                                   │
 │  3. Validate locally (schema + size)                    │
 │  4. Skip if pack hash matches on-chain (no-op)          │
@@ -107,7 +107,7 @@ python neurons/miner.py run --mode default
 python neurons/miner.py run --mode default --interval 1800  # every 30 min
 ```
 
-**Requirements**: `ANTHROPIC_API_KEY` + either `S3_BUCKET` (auto-upload) or `PACK_URL` (you upload manually).
+**Requirements**: `CLAWBENCH_LLM_API_KEY` + either `S3_BUCKET` (auto-upload) or `PACK_URL` (you upload manually).
 
 The generator prompt includes all 5 ClawBench scenario descriptions, available tool surface, rubric check categories, scoring formula (`weighted_mean - 0.1 * variance`), and policy constraints (<28K chars, no hardcoded names/dates). If a previous AGENTS.md exists from the last cycle, it's fed back with an improvement instruction.
 
@@ -135,8 +135,9 @@ cp .env.miner.example .env.miner
 | `WALLET_HOTKEY` | yes | `default` | Bittensor hotkey |
 | `NETUID` | yes | `11` | Subnet ID |
 | `NETWORK` | yes | `finney` | Bittensor network |
-| `ANTHROPIC_API_KEY` | default mode | — | Anthropic API key for LLM generation |
-| `GENERATOR_MODEL` | no | `claude-sonnet-4-5-20250929` | Model for AGENTS.md generation |
+| `CLAWBENCH_LLM_API_KEY` | default mode | — | API key for AGENTS.md generation |
+| `CLAWBENCH_LLM_BASE_URL` | no | `https://open.bigmodel.cn/api/paas/v4` | OpenAI-compatible API base URL |
+| `CLAWBENCH_DEFAULT_MODEL` | no | `glm-5` | Model for AGENTS.md generation |
 | `S3_BUCKET` | default mode* | — | S3-compatible bucket name |
 | `S3_ENDPOINT_URL` | no | — | Custom endpoint for GCS/R2/MinIO |
 | `S3_REGION` | no | `us-east-1` | Bucket region |
@@ -202,10 +203,10 @@ miner run --rm miner submit https://example.com/pack.json
 cd clawbench
 pip install -e .
 cp .env.example .env
-# Edit .env — set CLAWBENCH_DEFAULT_MODEL (e.g., anthropic/claude-sonnet-4-5-20250929)
+# Edit .env — set CLAWBENCH_DEFAULT_MODEL (e.g., zhipu/glm-5)
 ```
 
-Validators use `claude-sonnet-4-5-20250929`. Miners can use any model for local testing since scoring is regex-based. Use a cheaper model for rapid iteration, validate final results with Sonnet 4.5.
+Validators use the model configured by `CLAWBENCH_DEFAULT_MODEL` (commonly `zhipu/glm-5`). Miners can use any model for local testing since scoring is regex-based. Use a cheaper model for rapid iteration, then validate final results with the same model configuration used by validators.
 
 ```bash
 # Single scenario

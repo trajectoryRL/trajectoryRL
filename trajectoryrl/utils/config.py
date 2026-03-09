@@ -261,11 +261,11 @@ class MinerConfig:
             network=os.getenv("NETWORK", "finney"),
             check_interval=int(os.getenv("CHECK_INTERVAL", "3600")),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
-            llm_api_key=os.getenv("LLM_API_KEY", ""),
+            llm_api_key=os.getenv("CLAWBENCH_LLM_API_KEY", ""),
             llm_base_url=os.getenv(
-                "LLM_BASE_URL",
+                "CLAWBENCH_LLM_BASE_URL",
                 "https://open.bigmodel.cn/api/paas/v4",
             ),
-            llm_model=os.getenv("LLM_MODEL", "glm-5"),
+            llm_model=os.getenv("CLAWBENCH_DEFAULT_MODEL", "glm-5"),
             pack_url=os.getenv("PACK_URL", ""),
         )

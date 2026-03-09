@@ -136,31 +136,47 @@ btcli wallet create --wallet-name my-miner
 btcli subnets register --wallet-name my-miner --hotkey default --netuid 11
 ```
 
-#### 2. Quick test (demo mode)
+#### 2. Configure environment
+
+```bash
+cat > .env.miner <<'EOF'
+WALLET_NAME=my-miner
+WALLET_HOTKEY=default
+NETUID=11
+NETWORK=finney
+LLM_API_KEY=your-api-key
+LLM_BASE_URL=https://llm.chutes.ai/v1
+LLM_MODEL=chutes/zai-org/GLM-5-TEE
+EOF
+```
+
+#### 3. Start mining
 
 ```bash
 git clone https://github.com/trajectoryRL/trajectoryRL.git
 cd trajectoryRL
 pip install -e .
 
-# Submit a sample pack to verify wallet + on-chain setup
-python neurons/miner.py run --mode demo
+# Run in default mode: generates AGENTS.md → builds pack → uploads → submits
+python neurons/miner.py run --mode default
 ```
 
-#### 3. Write your own pack
+> **Note**: Simply letting the LLM randomly generate AGENTS.md may not get you a good score. You need to actively optimize and improve your policy pack — study the ClawBench scenarios, understand what makes an agent perform well, and iteratively refine your prompts, tool rules, and stop conditions.
+
+#### 4. Manual operations (optional)
 
 ```bash
-# Build a pack from your AGENTS.md
+# Build pack from your own AGENTS.md
 python neurons/miner.py build --agents-md ./AGENTS.md -o pack.json
 
-# Upload pack.json to any public URL, then submit
-python neurons/miner.py submit https://your-server.com/pack.json
+# Validate pack locally
+python neurons/miner.py validate pack.json
 
-# Check status
+# Check on-chain status
 python neurons/miner.py status
 ```
 
-#### 4. Local testing with ClawBench
+#### 5. Local testing with ClawBench
 
 ```bash
 cd clawbench

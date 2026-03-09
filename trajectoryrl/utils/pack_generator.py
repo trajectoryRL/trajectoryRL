@@ -4,8 +4,8 @@ Generates a policy document (AGENTS.md) optimized for ClawBench scenarios.
 The generator understands the scoring rubric, available tools, and scenario
 types, producing a generic policy that scores well across all five scenarios.
 
-Uses an OpenAI-compatible endpoint configured via ``LLM_API_KEY``,
-``LLM_BASE_URL``, and ``LLM_MODEL`` environment variables.
+Uses an OpenAI-compatible endpoint configured via ``CLAWBENCH_LLM_API_KEY``,
+``CLAWBENCH_LLM_BASE_URL``, and ``CLAWBENCH_DEFAULT_MODEL`` environment variables.
 Default provider is Chutes (https://llm.chutes.ai/v1) with GLM-5.
 """
 
