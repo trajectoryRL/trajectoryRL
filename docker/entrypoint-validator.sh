@@ -18,7 +18,7 @@ export SCENARIOS_DIR="${SCENARIOS_DIR:-/app/clawbench/scenarios}"
 export FIXTURES_DIR="${FIXTURES_DIR:-/app/clawbench/fixtures}"
 export WORKSPACE_DIR="${WORKSPACE_DIR:-/workspace}"
 export CONFIG_DIR="${CONFIG_DIR:-/app/clawbench/config}"
-export OPENCLAW_HOME="${OPENCLAW_HOME:-//openclaw-home}"
+export OPENCLAW_HOME="${OPENCLAW_HOME:-/openclaw-home}"
 
 # OpenClaw reads OPENAI_* env vars for LLM routing
 export OPENAI_API_KEY="${CLAWBENCH_LLM_API_KEY:-}"
