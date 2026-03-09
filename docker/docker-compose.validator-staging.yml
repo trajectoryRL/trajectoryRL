@@ -1,4 +1,4 @@
-# TrajectoryRL Validator — Staging Compose (self-contained)
+# TrajectoryRL Validator — Staging Compose (all-in-one)
 #
 # Pulls the staging image from GHCR (built from the staging branch).
 # Use this to test validator changes before promoting to prod.
@@ -7,118 +7,8 @@
 #   1. Create .env.validator (same as production)
 #   2. docker compose -f docker/docker-compose.validator-staging.yml --env-file .env.validator up -d
 #   3. docker compose -f docker/docker-compose.validator-staging.yml logs -f validator
-#
-# Required .env.validator:
-#   WALLET_NAME=my-validator
-#   WALLET_HOTKEY=default
-#   NETUID=11
-#   NETWORK=finney
-#   CLAWBENCH_LLM_API_KEY=...
-#   CLAWBENCH_LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
-#   CLAWBENCH_DEFAULT_MODEL=zhipu/glm-5
 
 services:
-  # ==========================================================================
-  # Init Container
-  # Copies AGENTS.md variant and workspace files. Runs once, then exits.
-  # ==========================================================================
-  init:
-    build:
-      context: ../clawbench
-      dockerfile: Dockerfile.init
-    volumes:
-      - ../clawbench/fixtures:/fixtures:ro
-      - ../clawbench/scenarios:/scenarios:ro
-      - workspace:/workspace
-      - ../clawbench/config:/config
-      - openclaw-home:/openclaw-home
-    environment:
-      - SCENARIO=${SCENARIO:-client_escalation}
-      - VARIANT=${VARIANT:-optimized}
-      - CLAWBENCH_DEFAULT_MODEL=${CLAWBENCH_DEFAULT_MODEL:-zhipu/glm-5}
-      - CLAWBENCH_LLM_BASE_URL=${CLAWBENCH_LLM_BASE_URL:-https://open.bigmodel.cn/api/paas/v4}
-      - CLAWBENCH_LLM_API_KEY=${CLAWBENCH_LLM_API_KEY:-}
-
-  # Fix workspace permissions after init (OpenClaw runs as node uid=1000)
-  init-perms:
-    image: busybox
-    command: sh -c "chmod -R 777 /workspace"
-    volumes:
-      - workspace:/workspace
-    depends_on:
-      init:
-        condition: service_completed_successfully
-
-  # ==========================================================================
-  # Mock Tools Server
-  # Serves deterministic tool responses from fixtures (port 3001).
-  # ==========================================================================
-  mock-tools:
-    build:
-      context: ../clawbench
-      dockerfile: Dockerfile.mock-tools
-    ports:
-      - "3001:3001"
-    volumes:
-      - ../clawbench/fixtures:/fixtures:ro
-      - ../clawbench/logs:/logs
-    environment:
-      - FIXTURES_PATH=/fixtures
-      - SCENARIO=${SCENARIO:-client_escalation}
-      - LOG_PATH=/logs
-    depends_on:
-      init-perms:
-        condition: service_completed_successfully
-    networks:
-      - sandbox-net
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3001/health')"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-
-  # ==========================================================================
-  # OpenClaw Gateway (ClawBench Edition)
-  # Built from openclaw/ with clawbench-tools plugin (port 18790).
-  # ==========================================================================
-  openclaw-gateway:
-    build:
-      context: ../openclaw
-      dockerfile: Dockerfile.clawbench
-    ports:
-      - "${OPENCLAW_PORT:-18790}:18789"
-    volumes:
-      - workspace:/workspace
-      - openclaw-home:/home/node/.openclaw
-    env_file:
-      - ../.env.validator
-    environment:
-      - OPENAI_API_KEY=${CLAWBENCH_LLM_API_KEY:-}
-      - OPENAI_BASE_URL=${CLAWBENCH_LLM_BASE_URL:-https://open.bigmodel.cn/api/paas/v4}
-      - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN:-sandbox-token-12345}
-      - CLAWBENCH_DEFAULT_MODEL=${CLAWBENCH_DEFAULT_MODEL:-zhipu/glm-5}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    depends_on:
-      init-perms:
-        condition: service_completed_successfully
-      mock-tools:
-        condition: service_healthy
-    networks:
-      - sandbox-net
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
-  # ==========================================================================
-  # Validator (staging image)
-  # Reads on-chain commitments, fetches packs, evaluates via ClawBench.
-  # Uses host networking to reach mock-tools (3001) and OpenClaw (18790).
-  # Auto-updated by Watchtower from GHCR staging tag.
-  # ==========================================================================
   validator:
     image: ghcr.io/trajectoryrl/trajectoryrl:staging
     container_name: trajectoryrl_validator_staging
@@ -126,16 +16,8 @@ services:
     restart: unless-stopped
     env_file:
       - ../.env.validator
-    environment:
-      - EVAL_INTERVAL_BLOCKS=${EVAL_INTERVAL_BLOCKS:-1200}
-      - WEIGHT_INTERVAL_BLOCKS=${WEIGHT_INTERVAL_BLOCKS:-360}
-      - INACTIVITY_BLOCKS=${INACTIVITY_BLOCKS:-14400}
     volumes:
       - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
-      - workspace:/app/clawbench/workspace
-    depends_on:
-      openclaw-gateway:
-        condition: service_healthy
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
     logging:
@@ -144,9 +26,6 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # --------------------------------------------------------------------------
-  # Watchtower: polls GHCR every 5 min, auto-pulls new staging images
-  # --------------------------------------------------------------------------
   watchtower:
     image: containrrr/watchtower:latest
     container_name: trajectoryrl_watchtower_staging
@@ -164,11 +43,3 @@ services:
       options:
         max-size: "5m"
         max-file: "2"
-
-volumes:
-  workspace:
-  openclaw-home:
-
-networks:
-  sandbox-net:
-    driver: bridge

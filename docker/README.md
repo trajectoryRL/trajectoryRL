@@ -1,31 +1,24 @@
 # TrajectoryRL Docker Deployment
 
-Docker is the **recommended way** to run TrajectoryRL validators and miners. A single `docker compose up` starts all required services (validator, OpenClaw gateway, mock-tools).
+Docker is the **recommended way** to run TrajectoryRL validators and miners. A single all-in-one image contains everything needed: validator, mock-tools server, and OpenClaw gateway. Watchtower auto-updates the image from GHCR.
 
 ## Quick Start — Validator
 
 ```bash
-# 1. Clone repo with submodules
-git clone --recurse-submodules https://github.com/trajectoryRL/trajectoryRL.git
+# 1. Clone repo
+git clone https://github.com/trajectoryRL/trajectoryRL.git
 cd trajectoryRL
 
 # 2. Configure
 cp .env.example .env.validator
-# Edit .env.validator: set ANTHROPIC_API_KEY, WALLET_NAME, WALLET_HOTKEY
+# Edit .env.validator: set WALLET_NAME, WALLET_HOTKEY, CLAWBENCH_LLM_API_KEY
 
-# 3. Start (all services in one command)
+# 3. Start
 docker compose -f docker/docker-compose.validator.yml --env-file .env.validator up -d
 
 # 4. View logs
 docker compose -f docker/docker-compose.validator.yml logs -f validator
 ```
-
-This starts 5 services automatically:
-1. **init** — sets up workspace files (runs once, exits)
-2. **init-perms** — fixes workspace permissions (runs once, exits)
-3. **mock-tools** — deterministic tool responses from fixtures (port 3001)
-4. **openclaw-gateway** — OpenClaw with clawbench-tools plugin (port 18790)
-5. **validator** — reads on-chain commitments, evaluates packs, sets weights
 
 ## Configuration
 
@@ -37,7 +30,9 @@ WALLET_NAME=validator
 WALLET_HOTKEY=default
 NETUID=11
 NETWORK=finney
-ANTHROPIC_API_KEY=sk-ant-...
+CLAWBENCH_LLM_API_KEY=...
+CLAWBENCH_LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
+CLAWBENCH_DEFAULT_MODEL=zhipu/glm-5
 
 # Optional
 LOG_LEVEL=INFO                    # DEBUG for development
@@ -82,97 +77,71 @@ docker compose -f docker/docker-compose.validator.yml --env-file .env.validator 
 docker compose -f docker/docker-compose.validator.yml logs -f validator
 docker compose -f docker/docker-compose.validator.yml logs --tail=100 validator
 
-# View all service logs
-docker compose -f docker/docker-compose.validator.yml logs -f
-
 # Stop
 docker compose -f docker/docker-compose.validator.yml down
 
-# Rebuild after updates
-git pull && git submodule update --init --recursive
-docker compose -f docker/docker-compose.validator.yml --env-file .env.validator up -d --build
+# Force update (Watchtower handles this automatically)
+docker compose -f docker/docker-compose.validator.yml pull validator
+docker compose -f docker/docker-compose.validator.yml up -d validator
 ```
 
 ## Architecture
 
-### Service Dependencies
+The all-in-one validator image runs three processes managed by a bash entrypoint:
 
 ```
-init → init-perms → mock-tools (healthy) → openclaw-gateway (healthy) → validator
+┌─────────────────────────────────────────────┐
+│  trajectoryrl-validator container           │
+│                                             │
+│  1. mock-tools   (port 3001)  ─ background  │
+│  2. OpenClaw     (port 18789) ─ background  │
+│  3. validator    (PID 1)      ─ foreground  │
+│                                             │
+│  Shared: /workspace (AGENTS.md, fixtures)   │
+└─────────────────────────────────────────────┘
 ```
 
-- **mock-tools + openclaw-gateway** run on an internal `sandbox-net` Docker network
-- **validator** uses `network_mode: host` to reach mock-tools (localhost:3001) and OpenClaw (localhost:18790) via published ports
-- A shared `workspace` Docker volume connects init → openclaw-gateway → validator
+- **mock-tools**: Deterministic tool responses from fixtures (email, calendar, Slack, tasks)
+- **OpenClaw gateway**: LLM agent orchestrator with clawbench-tools plugin
+- **validator**: Reads on-chain commitments, fetches packs, evaluates via ClawBench, sets weights
 
-### Validator Container
-- Base: Python 3.10-slim
-- ClawBench: Baked in via submodule (version-pinned)
-- Volumes:
-  - `~/.bittensor/wallets` → Wallet access (read-only)
-  - `workspace` → Shared with OpenClaw for AGENTS.md
+Watchtower polls GHCR every 5 minutes and auto-updates the entire image.
 
-### OpenClaw Gateway
-- Runs the ClawBench evaluation sandbox
-- Port: 18790
+### Compose Variants
 
-### Mock Tools Server
-- Serves deterministic tool responses from fixtures
-- Port: 3001
+| File | Use Case |
+|------|----------|
+| `docker-compose.validator.yml` | Production (pulls `ghcr.io/.../trajectoryrl:latest`) |
+| `docker-compose.validator-staging.yml` | Staging (pulls `:staging` tag) |
+| `docker-compose.validator-dev.yml` | Development (builds locally, bind-mounts source) |
 
 ## Troubleshooting
 
 ### Validator won't start
 ```bash
-# Check all service logs
-docker compose -f docker/docker-compose.validator.yml logs
+# Check logs for startup sequence
+docker compose -f docker/docker-compose.validator.yml logs validator
+
+# Look for:
+#   [entrypoint] mock-tools ready
+#   [entrypoint] OpenClaw gateway ready
+#   [entrypoint] Starting validator...
 
 # Common issues:
-# 1. Missing API key → Add ANTHROPIC_API_KEY to .env.validator
+# 1. Missing API key → Add CLAWBENCH_LLM_API_KEY to .env.validator
 # 2. Wallet not found → Ensure ~/.bittensor/wallets exists
-# 3. OpenClaw permission error → Remove workspace volume and restart:
-#    docker volume rm docker_workspace && docker compose ... up -d
-```
-
-### OpenClaw permission denied (SOUL.md / AGENTS.md)
-The init-perms container fixes this automatically. If it persists:
-```bash
-docker compose -f docker/docker-compose.validator.yml down
-docker volume rm docker_workspace
-docker compose -f docker/docker-compose.validator.yml --env-file .env.validator up -d
 ```
 
 ### Scores are all identical / evaluations complete instantly
-This means OpenClaw is failing silently. Check its logs:
+OpenClaw may be failing silently. Check the container logs for OpenClaw errors:
 ```bash
-docker compose -f docker/docker-compose.validator.yml logs openclaw-gateway
+docker compose -f docker/docker-compose.validator.yml logs validator | grep -i "openclaw\|error"
 ```
 
 ### Network issues
 ```bash
 # Test chain connectivity
 docker exec trajectoryrl_validator python -c "import bittensor as bt; print(bt.Subtensor(network='finney'))"
-```
-
-## Updating ClawBench
-
-ClawBench is pinned as a git submodule. The validator config also hardcodes
-the commit hash as a safety check. Both must be updated together.
-
-```bash
-# 1. Update the submodule
-cd clawbench && git fetch origin && git checkout origin/main && cd ..
-
-# 2. Update the hash in trajectoryrl/utils/config.py (clawbench_commit)
-git -C clawbench rev-parse HEAD
-# Edit config.py with the new hash
-
-# 3. Stage and commit
-git add clawbench trajectoryrl/utils/config.py
-git commit -m "Update ClawBench submodule"
-
-# 4. Rebuild
-docker compose -f docker/docker-compose.validator.yml --env-file .env.validator up -d --build
 ```
 
 ## Security
