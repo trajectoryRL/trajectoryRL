@@ -121,6 +121,12 @@ docker compose -f docker/docker-compose.validator.yml logs -f validator
 
 The Docker container reads wallet keyfiles from the mounted `~/.bittensor/wallets/` directory. No btcli is needed inside the container.
 
+> **Tip:** Watchtower checks for new images every 5 minutes. To update immediately:
+> ```bash
+> docker compose -f docker/docker-compose.validator.yml pull
+> docker compose -f docker/docker-compose.validator.yml --env-file .env.validator up -d
+> ```
+
 See [VALIDATOR_OPERATIONS.md](VALIDATOR_OPERATIONS.md) for cost model, auto-update details, and operational guidance.
 
 ### For Miners
