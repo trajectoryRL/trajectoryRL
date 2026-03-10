@@ -623,6 +623,25 @@ class TrajectoryValidator:
 
         logger.info(f"Evaluated {evaluated_count}/{attempted_count} miners this cycle")
 
+        # Log EMA cost summary for all active miners
+        if evaluated_count > 0:
+            logger.info("-" * 40)
+            logger.info("COST EMA SUMMARY (all active miners)")
+            logger.info("-" * 40)
+            for uid, commitment in active_commitments.items():
+                hk = commitment.hotkey
+                ema_cost = self.compute_total_cost_from_ema(hk)
+                if ema_cost is not None:
+                    per_scenario = self.ema_costs.get(hk, {})
+                    scenario_str = ", ".join(
+                        f"{s}=${c:.4f}" for s, c in sorted(per_scenario.items())
+                    )
+                    logger.info(
+                        f"  Miner {uid} ({hk[:8]}): "
+                        f"ema_total=${ema_cost:.4f} ({scenario_str})"
+                    )
+            logger.info("-" * 40)
+
         # All attempted evaluations failed — likely an LLM API issue
         if attempted_count > 0 and evaluated_count == 0:
             logger.error(
@@ -826,6 +845,15 @@ class TrajectoryValidator:
                     f"Miner {miner_uid}: {scenario_name} -> "
                     f"score={result.score:.3f}{cost_str}, gate={gate_str}"
                 )
+                if result.token_usage:
+                    tu = result.token_usage
+                    logger.info(
+                        f"Miner {miner_uid}: {scenario_name}   "
+                        f"tokens: input={tu.get('input_tokens', 0)}, "
+                        f"output={tu.get('output_tokens', 0)}, "
+                        f"cache_read={tu.get('cache_read_tokens', 0)}, "
+                        f"cache_write={tu.get('cache_write_tokens', 0)}"
+                    )
                 if result.model_usage:
                     for m in result.model_usage:
                         logger.info(
@@ -845,6 +873,17 @@ class TrajectoryValidator:
         if not scenario_scores:
             logger.warning(f"Miner {miner_uid}: No scenario results!")
             return None
+
+        # Log per-miner cost summary
+        if scenario_costs:
+            total_cost = sum(scenario_costs.values())
+            cost_details = ", ".join(
+                f"{s}=${c:.4f}" for s, c in scenario_costs.items()
+            )
+            logger.info(
+                f"Miner {miner_uid}: Cost summary: "
+                f"total=${total_cost:.4f} ({cost_details})"
+            )
 
         return {
             "scores": scenario_scores,

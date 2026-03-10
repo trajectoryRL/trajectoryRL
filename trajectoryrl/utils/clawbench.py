@@ -263,12 +263,14 @@ class ClawBenchHarness:
         # Per-model breakdown from the median-cost run (structural, not aggregatable)
         median_model_usage = closest.model_usage
 
-        cost_str = f", cost=${median_cost:.4f}" if median_cost is not None else ""
+        cost_str = f"${median_cost:.4f}" if median_cost is not None else "N/A"
         gate_str = "PASS" if voted_success else "FAIL"
+        individual_costs = [f"${r.cost_usd:.4f}" if r.cost_usd is not None else "N/A" for r in runs]
         logger.info(
             f"Consensus result: {scenario_name} → score={voted_score:.3f}, "
-            f"gate={gate_str}{cost_str} "
+            f"gate={gate_str}, cost={cost_str} "
             f"(individual scores: {[round(r.score, 3) for r in runs]}, "
+            f"individual costs: {individual_costs}, "
             f"gate votes: {success_votes}/{len(valid_runs)})"
         )
 

@@ -38,7 +38,9 @@ ENV OPENCLAW_PREFER_PNPM=1
 RUN pnpm ui:build
 
 # Remove source files to reduce copy size (keep dist + node_modules)
-RUN rm -rf src/ test/ docs/ .git/ vitest.*.ts tsconfig*.json tsdown.config.ts
+# NOTE: Keep docs/reference/templates/ — OpenClaw reads AGENTS.md etc. at runtime
+RUN rm -rf src/ test/ .git/ vitest.*.ts tsconfig*.json tsdown.config.ts && \
+    find docs/ -mindepth 1 -not -path 'docs/reference/templates*' -delete 2>/dev/null || true
 
 # =====================================================================
 # Stage 2: Runtime (Python + Node.js)
@@ -58,6 +60,7 @@ WORKDIR /app
 COPY pyproject.toml requirements.txt ./
 COPY trajectoryrl/ trajectoryrl/
 COPY neurons/ neurons/
+COPY scripts/ scripts/
 COPY clawbench/ clawbench/
 
 RUN pip install --no-cache-dir -e . && \
