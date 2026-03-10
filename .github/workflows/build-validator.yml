@@ -22,6 +22,7 @@ on:
       - "docker/**"
       - "pyproject.toml"
       - ".github/workflows/**"
+      - ".gitmodules"
 
 env:
   REGISTRY: ghcr.io
