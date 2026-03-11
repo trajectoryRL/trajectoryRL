@@ -36,6 +36,7 @@ from ..utils.epoch_context import generate_epoch_context, render_context_preambl
 from ..utils.commitments import MinerCommitment, fetch_all_commitments
 from ..utils.ncd import deduplicate_packs
 from ..utils.status_reporter import report_status
+from .. import __version__
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +72,7 @@ class TrajectoryValidator:
         self._setup_logging()
 
         logger.info("=" * 60)
-        logger.info("TrajectoryRL Validator v2.0.0")
+        logger.info(f"TrajectoryRL Validator v{__version__}")
         logger.info("=" * 60)
 
         logger.info("Initializing Bittensor components...")
