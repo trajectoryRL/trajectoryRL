@@ -240,7 +240,7 @@ Validators continuously read miner commitments from the chain via `subtensor.get
 
 ## Winner-Take-All with First-Mover Advantage
 
-### Core Rule: Winner Takes Half (Steady State)
+### Core Rule: Winner Takes All (Steady State)
 
 **Winner** = lowest-cost qualified miner. In steady state (≥`bootstrap_threshold` active miners, default 10), the Winner receives **50% of miner emissions**. The other **50% is burned** (directed to the subnet owner UID, which the chain burns):
 
@@ -276,7 +276,7 @@ Miner E ($5.60/episode, qualified):  0%
 Owner UID 74:                       50%  (burned)
 ```
 
-Once the 10th active miner submits, the validator automatically switches to winner-takes-half.
+Once the 10th active miner submits, the validator automatically switches to winner-take-all.
 
 | Active Miners | Mode | Distribution (miner / burn) |
 |:------:|------|-------------|
@@ -376,7 +376,7 @@ Owner UID 74:               50% (burned)
 
 **Expected Behavior**:
 - **Early days**: Top-3 rewards (halved) lower the barrier to entry and incentivize experimentation
-- **Growth**: As more miners join, competition intensifies toward winner-takes-half
+- **Growth**: As more miners join, competition intensifies toward winner-take-all
 - **Steady state**: Intense competition to be FIRST to reduce cost; 50% burn creates deflationary pressure on subnet alpha
 - **End game**: Multi-LLM routing packs dramatically undercut single-model costs by dispatching each sub-task to the lowest-cost capable model
 
@@ -435,7 +435,7 @@ Burned (owner UID):     500 tokens (50%)
 
 ### Competitive Strategy
 
-Winner-takes-half with 50% burn creates extreme risk/reward in steady state. The bootstrap phase (top-3 at 35/10/5 + 50% burn) lowers the barrier for early miners. For practical mining strategy, iteration tips, and cost model, see [MINER_OPERATIONS.md](MINER_OPERATIONS.md).
+Winner-take-all with 50% burn creates extreme risk/reward in steady state. The bootstrap phase (top-3 at 35/10/5 + 50% burn) lowers the barrier for early miners. For practical mining strategy, iteration tips, and cost model, see [MINER_OPERATIONS.md](MINER_OPERATIONS.md).
 
 ---
 
@@ -577,7 +577,7 @@ Every evaluation runs the **full scenario set**. No subset selection or rotation
 **How it works**:
 - Zero reward for 2nd place eliminates copy-paste ROI
 - Forces miners to either innovate on cost or exit
-- Creates winner-takes-half tournament dynamics with deflationary burn
+- Creates winner-take-all tournament dynamics with deflationary burn
 
 ### 5. Validator-Side Evaluation
 
