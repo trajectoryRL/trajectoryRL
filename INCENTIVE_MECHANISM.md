@@ -2,9 +2,9 @@
 
 **Subnet**: SN11 (TrajectoryRL)
 
-**Version**: v3.3
+**Version**: v3.2
 
-**Date**: 2026-03-11
+**Date**: 2026-03-07
 
 ---
 
@@ -242,52 +242,49 @@ Validators continuously read miner commitments from the chain via `subtensor.get
 
 ### Core Rule: Winner Takes All (Steady State)
 
-**Winner** = lowest-cost qualified miner. In steady state (≥`bootstrap_threshold` active miners, default 10), the Winner receives **50% of miner emissions**. The other **50% is burned** (directed to the subnet owner UID, which the chain burns):
+**Winner** = lowest-cost qualified miner. In steady state (≥`bootstrap_threshold` active miners, default 10), **only the Winner receives rewards**:
 
 ```
-weight[winner]    = 0.50
-weight[owner_uid] = 0.50  (burned by the chain)
-weight[others]    = 0.0
+weight[winner] = 1.0
+weight[others] = 0.0
 ```
 
 Disqualified miners (any failed safety or correctness check) receive weight 0 regardless of cost.
 
 ### Bootstrap Phase (Early Adoption)
 
-When active miners < `bootstrap_threshold` (default 10), the miner half (50%) uses a **graduated top-3 curve** among qualified miners, ranked by lowest cost. The other 50% is still burned:
+When active miners < `bootstrap_threshold` (default 10), rewards use a **graduated top-3 curve** among qualified miners, ranked by lowest cost:
 
 ```
-weight[1st]       = 0.35  (35%)
-weight[2nd]       = 0.10  (10%)
-weight[3rd]       = 0.05  ( 5%)
-weight[owner_uid] = 0.50  (burned by the chain)
-weight[others]    = 0.0
+weight[1st] = 0.70  (70%)
+weight[2nd] = 0.20  (20%)
+weight[3rd] = 0.10  (10%)
+weight[others] = 0.0
 ```
 
 Ties within a rank are broken by earliest on-chain commitment (same rule as steady-state).
 
 **Example** (bootstrap phase, 5 active miners):
 ```
-Miner A ($2.30/episode, qualified): 35% of miner alpha  ← 1st
-Miner B ($3.10/episode, qualified): 10% of miner alpha  ← 2nd
-Miner C ($4.50/episode, qualified):  5% of miner alpha  ← 3rd
+Miner A ($2.30/episode, qualified): 70% of miner alpha  ← 1st
+Miner B ($3.10/episode, qualified): 20% of miner alpha  ← 2nd
+Miner C ($4.50/episode, qualified): 10% of miner alpha  ← 3rd
 Miner D ($1.80/episode, DISQUALIFIED): 0%  ← failed safety check
 Miner E ($5.60/episode, qualified):  0%
-Owner UID 74:                       50%  (burned)
 ```
 
 Once the 10th active miner submits, the validator automatically switches to winner-take-all.
 
-| Active Miners | Mode | Distribution (miner / burn) |
+| Active Miners | Mode | Distribution |
 |:------:|------|-------------|
-| 1-9 | Bootstrap | Top-3 qualified: 35/10/5 + 50% burn |
-| 10+ | Steady state | Winner: 50% + 50% burn |
+| 1-9 | Bootstrap | Top-3 qualified: 70/20/10 |
+| 10+ | Steady state | Winner-take-all: 100/0/0 |
 
 ### Always Set Weights
 
 Validators **always call `set_weights` every tempo**, never skip. Validators that don't set weights get deregistered by the chain.
 
-**Bootstrap at zero**: The **first miner to submit any valid pack that passes the qualification gate immediately wins 50% of the weight** (the other 50% is burned). This gets beaten quickly as other miners optimize costs. There is no minimum cost threshold. Any qualified pack is eligible to win.
+**Bootstrap at zero**: The **first miner to submit any valid pack that passes the qualification gate immediately wins all the weight**. This gets beaten quickly as other miners optimize costs. There is no minimum cost threshold. Any qualified pack is eligible to win.
 
 If no miner has a valid on-chain commitment (or no miner has cost data), the validator sets **all weight to the subnet owner UID**. This ensures the validator always calls `set_weights` (avoiding deregistration). Note: **miner incentive directed to the owner hotkey is burned** by the chain (not paid to the owner), so this fallback effectively burns miner emissions until a qualifying miner submits. This is a degenerate case that resolves itself as soon as any miner submits a qualifying pack.
 
@@ -359,25 +356,23 @@ Miner C submits at block 5000 (cost: $3.80/episode)
 
 **Steady state** (≥10 miners):
 ```
-Miner C ($3.80, qualified):   50% of miner alpha  ← Winner
-Owner UID 74:                  50% (burned)
-Miner A ($5.00, qualified):    0%
-Miner B ($4.80, qualified):    0%  (not 10% cheaper than Winner)
-Miner D ($1.50, DISQUALIFIED): 0%  (failed safety check)
+Miner C ($3.80, qualified):  100% of miner alpha  ← Winner
+Miner A ($5.00, qualified):           0%
+Miner B ($4.80, qualified):           0%  (not 10% cheaper than Winner)
+Miner D ($1.50, DISQUALIFIED):        0%  (failed safety check)
 ```
 
 **Bootstrap** (<10 miners):
 ```
-Miner C ($3.80, qualified): 35% of miner alpha
-Miner A ($5.00, qualified): 10% of miner alpha
-Miner B ($4.80, qualified):  5% of miner alpha
-Owner UID 74:               50% (burned)
+Miner C ($3.80, qualified): 70% of miner alpha
+Miner A ($5.00, qualified): 20% of miner alpha
+Miner B ($4.80, qualified): 10% of miner alpha
 ```
 
 **Expected Behavior**:
-- **Early days**: Top-3 rewards (halved) lower the barrier to entry and incentivize experimentation
+- **Early days**: Top-3 rewards lower the barrier to entry and incentivize experimentation
 - **Growth**: As more miners join, competition intensifies toward winner-take-all
-- **Steady state**: Intense competition to be FIRST to reduce cost; 50% burn creates deflationary pressure on subnet alpha
+- **Steady state**: Intense competition to be FIRST to reduce cost; public policies create a learning flywheel
 - **End game**: Multi-LLM routing packs dramatically undercut single-model costs by dispatching each sub-task to the lowest-cost capable model
 
 ---
@@ -397,7 +392,7 @@ Network Emissions (Post-Halving, Dec 2025):
 Alpha Emissions (Subnet-Specific):
 ├─ 1 alpha per block, 360 blocks per tempo, ~20 tempos/day
 ├─ Total: ~7,200 alpha/day per subnet
-├─ 41% to miners (50% to winner + 50% burned in steady state; 35/10/5 + 50% burned in bootstrap)
+├─ 41% to miners (100% to winner in steady state; 70/20/10 in bootstrap)
 ├─ 41% to validators and their stakers
 └─ 18% to subnet owner
 
@@ -413,29 +408,25 @@ Current SN11 alpha (as of Feb 2026): ~$2.64 (1 alpha ≈ 0.015 TAO at current po
 
 ### Miner Reward
 
-**50% of miner emissions are burned** (directed to the subnet owner UID, which the chain burns). The remaining 50% goes to miners:
-
-**Steady state** (≥10 miners): Winner gets 50%, 50% burned.
-**Bootstrap** (<10 miners): top-3 qualified split 35/10/5, 50% burned.
+**Steady state** (≥10 miners): all miner alpha goes to the Winner.
+**Bootstrap** (<10 miners): top-3 qualified split 70/20/10.
 
 ```
 Example (steady state):
 Total miner alpha: 1000 tokens
-Winner ($3.80/episode, qualified): 500 tokens (50%)
-Burned (owner UID):                500 tokens (50%)
+Winner ($3.80/episode, qualified): 1000 tokens (100%)
 All other miners: 0 tokens
 
 Example (bootstrap, 5 miners):
 Total miner alpha: 1000 tokens
-1st ($3.80, qualified): 350 tokens (35%)
-2nd ($5.00, qualified): 100 tokens (10%)
-3rd ($5.60, qualified):  50 tokens ( 5%)
-Burned (owner UID):     500 tokens (50%)
+1st ($3.80, qualified): 700 tokens (70%)
+2nd ($5.00, qualified): 200 tokens (20%)
+3rd ($5.60, qualified): 100 tokens (10%)
 ```
 
 ### Competitive Strategy
 
-Winner-take-all with 50% burn creates extreme risk/reward in steady state. The bootstrap phase (top-3 at 35/10/5 + 50% burn) lowers the barrier for early miners. For practical mining strategy, iteration tips, and cost model, see [MINER_OPERATIONS.md](MINER_OPERATIONS.md).
+Winner-take-all creates extreme risk/reward in steady state. The bootstrap phase (top-3 at 70/20/10) lowers the barrier for early miners. For practical mining strategy, iteration tips, and cost model, see [MINER_OPERATIONS.md](MINER_OPERATIONS.md).
 
 ---
 
@@ -566,18 +557,17 @@ Every evaluation runs the **full scenario set**. No subset selection or rotation
 
 ### 4. Winner-Take-All
 
-**Enforcement**: Only the Winner receives miner rewards (weight = 0.50); 50% is burned via owner UID
+**Enforcement**: Only the Winner receives rewards (weight = 1.0)
 
 **Prevents**:
 - "Good enough" submissions that copy leaders
 - Minimal-effort mining for small rewards
 - Sybil attacks (multiple mediocre miners)
-- Alpha inflation (50% burn creates deflationary pressure)
 
 **How it works**:
 - Zero reward for 2nd place eliminates copy-paste ROI
 - Forces miners to either innovate on cost or exit
-- Creates winner-take-all tournament dynamics with deflationary burn
+- Creates winner-take-all tournament dynamics
 
 ### 5. Validator-Side Evaluation
 
@@ -853,7 +843,7 @@ A miner's submission can fail at multiple points in the validation pipeline. The
 | **ClawBench timeout** (scenario exceeds `timeout_per_scenario`) | FAIL | 0.0 | Yes | Partial |
 | **Safety/correctness check failed** on any scenario | FAIL | 0.0 | Yes | Full |
 | **All gate checks pass, not Winner** | PASS | 0.0 | Yes | Full |
-| **All gate checks pass, Winner** | PASS | 0.5 | Yes | Full |
+| **All gate checks pass, Winner** | PASS | 1.0 | Yes | Full |
 
 **Key rules**:
 
@@ -864,7 +854,7 @@ A miner's submission can fail at multiple points in the validation pipeline. The
 
 3. **Partial failures disqualify**: If a pack passes schema but 1 of 5 scenarios has a failed safety check, the miner is disqualified from cost competition entirely. This is intentional — safety is non-negotiable.
 
-4. **Weight = 0.0 vs. omitted**: Miners who are disqualified or not the Winner still receive `weight = 0.0` in the weight vector (not omitted). The owner UID always receives `weight = 0.50` (burned). This is required by Bittensor's `set_weights`, which requires the vector to cover all UIDs in the metagraph.
+4. **Weight = 0.0 vs. omitted**: Miners who are disqualified or not the Winner still receive `weight = 0.0` in the weight vector (not omitted). This is required by Bittensor's `set_weights`, which requires the vector to cover all UIDs in the metagraph.
 
 ---
 
@@ -890,15 +880,13 @@ on_chain_weight = YC3(validator_weights, validator_stakes, bond_history)
 
 ```
 # Steady state (≥ bootstrap_threshold active miners):
-weight[winner]    = 0.50
-weight[owner_uid] = 0.50  (burned)
-weight[others]    = 0.0
+weight[winner] = 1.0
+weight[others] = 0.0
 
 # Bootstrap phase (< bootstrap_threshold active miners):
-weight[1st]       = 0.35
-weight[2nd]       = 0.10
-weight[3rd]       = 0.05
-weight[owner_uid] = 0.50  (burned)
+weight[1st] = 0.70
+weight[2nd] = 0.20
+weight[3rd] = 0.10
 
 where Winner = lowest-cost qualified miner that satisfies:
   - all safety + correctness checks pass on every scenario
@@ -913,15 +901,14 @@ where Winner = lowest-cost qualified miner that satisfies:
 ### Rewards
 
 ```
-Steady state:  Winner gets 50% of miner alpha emissions, 50% burned
-Bootstrap:     top-3 qualified get 35/10/5 of miner alpha emissions, 50% burned
+Steady state:  Winner gets 100% of miner alpha emissions
+Bootstrap:     top-3 qualified get 70/20/10 of miner alpha emissions
 ```
 
 ### Key Parameters
 
 | Parameter | Value | Tunable? |
 |-----------|-------|----------|
-| Burn fraction | 0.50 (50% to owner UID, burned) | Yes |
 | δ (cost first-mover threshold) | 0.10 (10% cheaper) | Yes |
 | α (cost EMA smoothing factor) | 0.3 | Yes |
 | Required categories | safety, correctness | Yes |
@@ -951,6 +938,6 @@ Bootstrap:     top-3 qualified get 35/10/5 of miner alpha emissions, 50% burned
 
 ---
 
-**Version**: v3.3
+**Version**: v3.2
 
-**Date**: 2026-03-11
+**Date**: 2026-03-07
