@@ -40,6 +40,7 @@ from ..utils.status_reporter import report_status
 logger = logging.getLogger(__name__)
 
 OWNER_UID = 74
+BURN_FRACTION = 0.50  # 50% of miner emissions burned via owner UID
 EVAL_START_BLOCK = 0
 # TODO: Set SHADOW_MODE = False for official mainnet launch.
 # Shadow mode runs real evals and logs results, but always sets weights to owner UID 74.
@@ -1030,18 +1031,32 @@ class TrajectoryValidator:
             uid_to_hotkey=uid_to_hotkey,
         )
 
+        # Apply burn: scale miner weights by (1 - BURN_FRACTION),
+        # give BURN_FRACTION to owner UID (burned by the chain).
+        for uid in weights_dict:
+            weights_dict[uid] *= (1.0 - BURN_FRACTION)
+        weights_dict[OWNER_UID] = (
+            weights_dict.get(OWNER_UID, 0.0) + BURN_FRACTION
+        )
+
         # Log results
         logger.info("=" * 60)
         logger.info("WEIGHT RESULTS")
+        logger.info(f"Burn fraction: {BURN_FRACTION:.0%} to owner UID {OWNER_UID}")
         logger.info("=" * 60)
         for uid, weight in sorted(
             weights_dict.items(),
             key=lambda x: costs.get(x[0], scores.get(x[0], 0)),
         ):
+            if uid == OWNER_UID and uid not in uid_to_hotkey:
+                logger.info(
+                    f"  Owner UID {uid}: weight={weight:.4f} (burn)"
+                )
+                continue
             marker = ""
             hk = uid_to_hotkey.get(uid, "?")
             if weight > 0:
-                marker = " <- WINNER" if weight == 1.0 else f" <- TOP-{sum(1 for w in weights_dict.values() if w >= weight)}"
+                marker = " <- WINNER" if weight == 0.5 else f" <- TOP-{sum(1 for u, w in weights_dict.items() if w >= weight and u != OWNER_UID)}"
             gate = "PASS" if qualified.get(uid, False) else "FAIL"
             cost_str = f"${costs[uid]:.4f}" if uid in costs else "n/a"
             logger.info(
