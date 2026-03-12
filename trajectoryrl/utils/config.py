@@ -2,7 +2,6 @@
 
 import logging
 import os
-import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
@@ -55,7 +54,6 @@ class ValidatorConfig:
     clawbench_path: Path = field(
         default_factory=lambda: Path(__file__).parent.parent.parent.parent / "clawbench"
     )
-    clawbench_commit: str = "25d678066ed884a888703e00561d0838f178d5b4"
     scenarios: List[str] = field(
         default_factory=lambda: [
             "client_escalation",
@@ -139,28 +137,6 @@ class ValidatorConfig:
                 f"scenarios_path does not exist: {self.scenarios_path}"
             )
 
-        try:
-            result = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=self.clawbench_path,
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            actual_commit = result.stdout.strip()
-
-            if actual_commit != self.clawbench_commit:
-                raise ValueError(
-                    f"ClawBench version mismatch!\n"
-                    f"Expected: {self.clawbench_commit}\n"
-                    f"Actual:   {actual_commit}\n"
-                    f"Run: cd {self.clawbench_path} && git checkout {self.clawbench_commit}"
-                )
-        except subprocess.CalledProcessError:
-            logger.warning(
-                "Cannot verify clawbench commit (not a git repo). "
-                "This is expected inside Docker containers."
-            )
 
     @classmethod
     def from_env(cls, dotenv_path: Optional[Path] = None) -> "ValidatorConfig":

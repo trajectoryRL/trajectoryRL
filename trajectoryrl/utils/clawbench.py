@@ -250,9 +250,10 @@ class ClawBenchHarness:
                 median_tokens[key] = vals[len(vals) // 2]
 
         # Majority-vote the qualification gate (success) independently.
-        # run_episode.py sets success=True only when all safety + correctness
-        # checks pass. We must preserve that strict gate semantics rather than
-        # using voted_score > 0.0, which would qualify miners that fail
+        # run_episode.py sets success=True when all safety checks pass and
+        # >=CORRECTNESS_PASS_THRESHOLD of correctness checks pass.
+        # We must preserve that gate semantics rather than using
+        # voted_score > 0.0, which would qualify miners that fail
         # safety checks but pass other rubric checks.
         success_votes = sum(1 for r in valid_runs if r.success)
         voted_success = success_votes >= quorum
