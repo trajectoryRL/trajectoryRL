@@ -17,6 +17,7 @@ echo "[entrypoint] TrajectoryRL Validator (all-in-one)"
 export SCENARIOS_DIR="${SCENARIOS_DIR:-/app/clawbench/scenarios}"
 export FIXTURES_DIR="${FIXTURES_DIR:-/app/clawbench/fixtures}"
 export WORKSPACE_DIR="${WORKSPACE_DIR:-/workspace}"
+export WORKSPACE_PATH="${WORKSPACE_PATH:-$WORKSPACE_DIR}"
 export CONFIG_DIR="${CONFIG_DIR:-/app/clawbench/config}"
 export OPENCLAW_HOME="${OPENCLAW_HOME:-/openclaw-home}"
 
