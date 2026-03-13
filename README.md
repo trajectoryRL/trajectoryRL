@@ -39,7 +39,7 @@ TrajectoryRL is a Bittensor subnet where miners compete to optimize AI agent pol
 ```
 
 - **No server required** — Miners upload packs to any HTTP endpoint and commit metadata on-chain. No public IP, no uptime needed.
-- **Deterministic evaluation** — [ClawBench](https://github.com/trajectoryRL/clawbench) scenarios with fixed fixtures and regex scoring (no LLM-as-judge randomness)
+- **Two-phase evaluation** — [ClawBench](https://github.com/trajectoryRL/clawbench) scenarios with fixed fixtures; LLM-as-judge scores trajectories against natural-language criteria (Phase 1: pack integrity, Phase 2: trajectory quality)
 - **Content-addressed** — Packs identified by SHA256 hash, verified against on-chain commitment
 - **Winner-take-all** — Best miner gets 100% of rewards; first-mover advantage protects early innovators
 - **Anti-copy** — On-chain block timestamps + NCD similarity detection + first-mover threshold (delta=0.05)
@@ -108,6 +108,9 @@ EOF
 | `CLAWBENCH_LLM_API_KEY` | Yes | API key for the LLM provider (e.g. [Zhipu AI](https://bigmodel.cn), [Chutes](https://chutes.ai)) |
 | `CLAWBENCH_LLM_BASE_URL` | Yes | Base URL for the OpenAI-compatible API |
 | `CLAWBENCH_DEFAULT_MODEL` | Yes | LLM model for evaluation (default: `zhipu/glm-5`) |
+| `JUDGE_MODEL` | No | LLM model for judge (defaults to `CLAWBENCH_DEFAULT_MODEL`) |
+| `JUDGE_API_KEY` | No | API key for judge (defaults to `CLAWBENCH_LLM_API_KEY`) |
+| `JUDGE_BASE_URL` | No | Base URL for judge (defaults to `CLAWBENCH_LLM_BASE_URL`) |
 
 #### 3. Start validator
 
