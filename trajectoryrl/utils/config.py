@@ -35,9 +35,7 @@ class ValidatorConfig:
         timeout_per_scenario: Max seconds per scenario evaluation
 
         # Scoring config
-        rho_reliability: Weight for variance penalty (0-1)
         delta_threshold: First-mover advantage threshold (0-1)
-        ema_alpha: EMA smoothing factor for per-scenario scores
 
         # Pack caching
         pack_cache_dir: Directory for caching downloaded packs
@@ -75,9 +73,7 @@ class ValidatorConfig:
     timeout_per_scenario: int = 300  # 5 minutes max per scenario
 
     # Scoring config
-    rho_reliability: float = 0.1
     delta_threshold: float = 0.05
-    ema_alpha: float = 0.3  # Per-scenario EMA smoothing factor
 
     # Cost-based scoring config
     cost_delta: float = 0.10  # Challenger must be 10% cheaper to dethrone
@@ -105,6 +101,12 @@ class ValidatorConfig:
     clawbench_default_model: str = DEFAULT_CLAWBENCH_MODEL
     clawbench_api_key: str = ""
     clawbench_base_url: str = DEFAULT_LLM_BASE_URL
+
+    # LLM Judge configuration (Phase 1 integrity + Phase 2 trajectory)
+    # Defaults to same LLM as ClawBench episodes if left empty.
+    judge_model: str = ""
+    judge_api_key: str = ""
+    judge_base_url: str = ""
 
     # EMA state persistence
     ema_state_path: Path = field(
@@ -177,6 +179,10 @@ class ValidatorConfig:
             clawbench_default_model=os.getenv("CLAWBENCH_DEFAULT_MODEL", DEFAULT_CLAWBENCH_MODEL),
             clawbench_api_key=os.getenv("CLAWBENCH_LLM_API_KEY", ""),
             clawbench_base_url=os.getenv("CLAWBENCH_LLM_BASE_URL", DEFAULT_LLM_BASE_URL),
+            # --- LLM Judge (optional, falls back to clawbench LLM if empty) ---
+            judge_model=os.getenv("JUDGE_MODEL", ""),
+            judge_api_key=os.getenv("JUDGE_API_KEY", ""),
+            judge_base_url=os.getenv("JUDGE_BASE_URL", ""),
             # --- Operational ---
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             # --- IM parameters are hardcoded (dataclass defaults) ---

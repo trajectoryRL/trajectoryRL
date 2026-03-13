@@ -41,6 +41,7 @@ class EvaluationResult:
     cost_usd: Optional[float] = None
     token_usage: Optional[Dict[str, int]] = None
     model_usage: Optional[List[Dict[str, Any]]] = None
+    trajectory: Optional[List[Dict[str, Any]]] = None
 
 
 class ClawBenchHarness:
@@ -531,6 +532,9 @@ class ClawBenchHarness:
             response = result_data.get("response", "")
             rubric = result_data.get("rubric", {})
 
+            # Extract raw trajectory for LLM judge (Phase 2)
+            trajectory = result_data.get("tool_calls_raw", [])
+
             # Extract cost data (optional field from run_episode.py)
             cost_usd = None
             token_usage = None
@@ -559,6 +563,7 @@ class ClawBenchHarness:
                 cost_usd=cost_usd,
                 token_usage=token_usage,
                 model_usage=model_usage,
+                trajectory=trajectory,
             )
 
         except asyncio.TimeoutError:
