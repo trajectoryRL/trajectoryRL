@@ -384,6 +384,18 @@ class TrajectoryValidator:
     # Main loop
     # ------------------------------------------------------------------
 
+    async def _heartbeat_loop(self):
+        """Send validator heartbeat every 10 minutes, independent of eval cycle."""
+        while True:
+            try:
+                await heartbeat(
+                    self.wallet,
+                    last_set_weights_at=self._last_set_weights_at,
+                )
+            except Exception as e:
+                logger.warning("Heartbeat error: %s", e)
+            await asyncio.sleep(600)
+
     async def run(self):
         """Main validator loop with dual cadence.
 
@@ -391,7 +403,8 @@ class TrajectoryValidator:
         - tempo (~72 min / 360 blocks): compute weights from EMA, set_weights.
         """
         self._start_time = time.time()
-        self._last_heartbeat_time: float = 0.0
+
+        asyncio.create_task(self._heartbeat_loop())
 
         logger.info("Starting validator main loop...")
         logger.info(
@@ -452,13 +465,6 @@ class TrajectoryValidator:
                     await self._compute_and_set_weights(current_block)
                     self.last_weight_block = current_block
 
-                now = time.time()
-                if now - self._last_heartbeat_time >= 600:
-                    await heartbeat(
-                        self.wallet,
-                        last_set_weights_at=self._last_set_weights_at,
-                    )
-                    self._last_heartbeat_time = now
                 await asyncio.sleep(60)
 
             except KeyboardInterrupt:
