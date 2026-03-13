@@ -94,7 +94,7 @@ class PackIntegrityJudge:
         model: str = "",
         api_key: str = "",
         base_url: str = "",
-        max_tokens: int = 2048,
+        max_tokens: int = 4096,
     ):
         self.model = model
         self.api_key = api_key
