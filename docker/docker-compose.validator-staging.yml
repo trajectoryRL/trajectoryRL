@@ -18,6 +18,7 @@ services:
       - ../.env.validator
     volumes:
       - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
+      - trajectoryrl_data_staging:/var/lib/trajectoryrl
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
     logging:
@@ -25,6 +26,9 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  trajectoryrl_data_staging:
 
   watchtower:
     image: containrrr/watchtower:latest

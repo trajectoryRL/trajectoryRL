@@ -8,6 +8,10 @@ from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_LLM_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
+DEFAULT_LLM_MODEL = "glm-5"
+DEFAULT_CLAWBENCH_MODEL = f"zhipu/{DEFAULT_LLM_MODEL}"
+
 
 @dataclass
 class ValidatorConfig:
@@ -98,18 +102,18 @@ class ValidatorConfig:
     weight_interval_blocks: int = 360  # 1 tempo ≈ 72 min at 12s/block
 
     # ClawBench LLM configuration (passed to init container & OpenClaw gateway)
-    clawbench_default_model: str = "zhipu/glm-5"
+    clawbench_default_model: str = DEFAULT_CLAWBENCH_MODEL
     clawbench_api_key: str = ""
-    clawbench_base_url: str = "https://open.bigmodel.cn/api/paas/v4"
+    clawbench_base_url: str = DEFAULT_LLM_BASE_URL
 
     # EMA state persistence
     ema_state_path: Path = field(
-        default_factory=lambda: Path("/tmp/trajectoryrl_ema_state.json")
+        default_factory=lambda: Path("/var/lib/trajectoryrl/ema_state.json")
     )
 
     # Pack caching
     pack_cache_dir: Path = field(
-        default_factory=lambda: Path("/tmp/trajectoryrl_packs")
+        default_factory=lambda: Path("/var/lib/trajectoryrl/packs")
     )
     pack_cache_max_size: int = 100  # MB
 
@@ -172,12 +176,9 @@ class ValidatorConfig:
             similarity_threshold=float(os.getenv("SIMILARITY_THRESHOLD", "0.80")),
             inactivity_blocks=int(os.getenv("INACTIVITY_BLOCKS", "14400")),
             weight_interval_blocks=int(os.getenv("WEIGHT_INTERVAL_BLOCKS", "360")),
-            clawbench_default_model=os.getenv("CLAWBENCH_DEFAULT_MODEL", "zhipu/glm-5"),
+            clawbench_default_model=os.getenv("CLAWBENCH_DEFAULT_MODEL", DEFAULT_CLAWBENCH_MODEL),
             clawbench_api_key=os.getenv("CLAWBENCH_LLM_API_KEY", ""),
-            clawbench_base_url=os.getenv(
-                "CLAWBENCH_LLM_BASE_URL",
-                "https://open.bigmodel.cn/api/paas/v4",
-            ),
+            clawbench_base_url=os.getenv("CLAWBENCH_LLM_BASE_URL", DEFAULT_LLM_BASE_URL),
         )
 
 
@@ -209,8 +210,8 @@ class MinerConfig:
 
     # LLM pack generation (default mode) — OpenAI-compatible endpoint
     llm_api_key: str = ""
-    llm_base_url: str = "https://open.bigmodel.cn/api/paas/v4"
-    llm_model: str = "glm-5"
+    llm_base_url: str = DEFAULT_LLM_BASE_URL
+    llm_model: str = DEFAULT_LLM_MODEL
 
     # Pre-built pack URL (skips S3 upload if set)
     pack_url: str = ""
@@ -238,10 +239,7 @@ class MinerConfig:
             check_interval=int(os.getenv("CHECK_INTERVAL", "3600")),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             llm_api_key=os.getenv("CLAWBENCH_LLM_API_KEY", ""),
-            llm_base_url=os.getenv(
-                "CLAWBENCH_LLM_BASE_URL",
-                "https://open.bigmodel.cn/api/paas/v4",
-            ),
-            llm_model=os.getenv("CLAWBENCH_DEFAULT_MODEL", "glm-5"),
+            llm_base_url=os.getenv("CLAWBENCH_LLM_BASE_URL", DEFAULT_LLM_BASE_URL),
+            llm_model=os.getenv("CLAWBENCH_DEFAULT_MODEL", DEFAULT_LLM_MODEL),
             pack_url=os.getenv("PACK_URL", ""),
         )

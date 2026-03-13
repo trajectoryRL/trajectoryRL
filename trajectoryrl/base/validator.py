@@ -213,6 +213,7 @@ class TrajectoryValidator:
             "first_mover_data": self.first_mover_data,
         }
         try:
+            self.config.ema_state_path.parent.mkdir(parents=True, exist_ok=True)
             self.config.ema_state_path.write_text(
                 json.dumps(data, indent=2, sort_keys=True)
             )
