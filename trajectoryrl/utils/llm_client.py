@@ -57,6 +57,9 @@ def generate(
         Generated text content.
     """
     model = model or os.environ.get("CLAWBENCH_DEFAULT_MODEL", "glm-5")
+    # Strip provider prefix (e.g. "zhipu/glm-5" -> "glm-5")
+    if "/" in model:
+        model = model.split("/", 1)[1]
     key = resolve_api_key(api_key)
     if not key:
         raise ValueError("No API key. Set CLAWBENCH_LLM_API_KEY or pass api_key argument.")
