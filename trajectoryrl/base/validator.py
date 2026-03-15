@@ -578,7 +578,24 @@ class TrajectoryValidator:
                 )
 
         # 6. Evaluate miners
-        eval_scenarios = sorted(self.scenarios.keys())
+        # Order scenarios hardest-first so weak packs fail fast and we
+        # skip the remaining (cheaper) scenarios, saving LLM tokens.
+        # Difficulty ranking based on empirical pass-rate data.
+        _SCENARIO_DIFFICULTY_ORDER = [
+            "morning_brief",
+            "inbox_to_action",
+            "client_escalation",
+            "team_standup",
+            "inbox_triage",
+        ]
+        eval_scenarios = sorted(
+            self.scenarios.keys(),
+            key=lambda s: (
+                _SCENARIO_DIFFICULTY_ORDER.index(s)
+                if s in _SCENARIO_DIFFICULTY_ORDER
+                else len(_SCENARIO_DIFFICULTY_ORDER)
+            ),
+        )
         evaluated_count = 0
         attempted_count = 0
 
@@ -932,7 +949,15 @@ class TrajectoryValidator:
                         f"{result.error}"
                     )
                     scenario_qualified[scenario_name] = False
-                    continue
+                    remaining = [s for s in eval_scenarios if s not in scenario_qualified]
+                    if remaining:
+                        logger.info(
+                            f"Miner {miner_uid}: fail-fast, "
+                            f"skipping {len(remaining)} remaining scenarios"
+                        )
+                        for s in remaining:
+                            scenario_qualified[s] = False
+                    break
 
                 if result.cost_usd is not None:
                     scenario_costs[scenario_name] = result.cost_usd
@@ -1009,12 +1034,34 @@ class TrajectoryValidator:
                             f"${m.get('cost_usd', 0):.4f} "
                             f"({m.get('count', 0)} calls)"
                         )
+
+                # Fail fast: any scenario failure → skip remaining
+                if not qualified:
+                    remaining = [s for s in eval_scenarios if s not in scenario_qualified]
+                    if remaining:
+                        logger.info(
+                            f"Miner {miner_uid}: fail-fast on {scenario_name}, "
+                            f"skipping {len(remaining)} remaining scenarios"
+                        )
+                        for s in remaining:
+                            scenario_qualified[s] = False
+                    break
+
             except Exception as e:
                 logger.error(
                     f"Miner {miner_uid}: {scenario_name} failed: {e}",
                     exc_info=True,
                 )
                 scenario_qualified[scenario_name] = False
+                remaining = [s for s in eval_scenarios if s not in scenario_qualified]
+                if remaining:
+                    logger.info(
+                        f"Miner {miner_uid}: fail-fast on {scenario_name} exception, "
+                        f"skipping {len(remaining)} remaining scenarios"
+                    )
+                    for s in remaining:
+                        scenario_qualified[s] = False
+                break
 
         if not scenario_qualified:
             logger.warning(f"Miner {miner_uid}: No scenario results!")
