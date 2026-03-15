@@ -1109,11 +1109,6 @@ class TrajectoryValidator:
                 # Score = 1.0 if qualified, 0.0 otherwise (for report compat)
                 scores[uid] = 1.0 if is_qualified else 0.0
 
-                total_cost = self.compute_total_cost_from_ema(hotkey)
-                if total_cost is not None:
-                    costs[uid] = total_cost
-                qualified[uid] = self.is_fully_qualified(hotkey)
-
         if not scores:
             logger.warning("All miners have zero EMA score")
             await self._set_fallback_weights()
