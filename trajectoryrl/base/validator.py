@@ -444,6 +444,9 @@ class TrajectoryValidator:
                     )
                     logger.info("=" * 60)
 
+                    # Sync ClawBench to latest before evaluation
+                    await self._sync_clawbench()
+
                     await self._run_evaluation_cycle(current_block)
                     last_eval_sync_block = self.subtensor.get_current_block()
                     self.last_weight_block = last_eval_sync_block
@@ -473,6 +476,51 @@ class TrajectoryValidator:
             except Exception as e:
                 logger.error(f"Error in main loop: {e}", exc_info=True)
                 await asyncio.sleep(60)
+
+    # ------------------------------------------------------------------
+    # ClawBench auto-sync
+    # ------------------------------------------------------------------
+
+    async def _sync_clawbench(self) -> None:
+        """Pull latest ClawBench from GitHub before evaluation.
+
+        If the clawbench directory is a git repo (set up by entrypoint),
+        does a fast-forward pull from origin/main.  On any failure, logs
+        a warning and continues with the current version.
+        """
+        clawbench_path = self.config.clawbench_path
+        if not (clawbench_path / ".git").exists():
+            logger.debug(
+                "ClawBench .git not found at %s — skipping auto-sync",
+                clawbench_path,
+            )
+            return
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "pull", "--ff-only", "origin", "main",
+                cwd=str(clawbench_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=30
+            )
+            if proc.returncode == 0:
+                result = stdout.decode().strip()
+                if "Already up to date" not in result:
+                    logger.info("ClawBench updated: %s", result)
+                else:
+                    logger.debug("ClawBench already up to date")
+            else:
+                logger.warning(
+                    "ClawBench sync failed (rc=%d): %s",
+                    proc.returncode,
+                    stderr.decode().strip(),
+                )
+        except asyncio.TimeoutError:
+            logger.warning("ClawBench sync timed out (30s) — using current version")
+        except Exception as e:
+            logger.warning("ClawBench sync error: %s", e)
 
     # ------------------------------------------------------------------
     # LLM key check
