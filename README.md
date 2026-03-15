@@ -136,6 +136,8 @@ See [VALIDATOR_OPERATIONS.md](VALIDATOR_OPERATIONS.md) for cost model, auto-upda
 
 Mining means writing **policy packs** — system prompts, tool usage rules, and stop conditions — that make AI agents perform tasks safely and cheaply. No GPU, no server, no uptime required.
 
+> **IP Notice:** All policy packs submitted to TrajectoryRL are published to public repositories and licensed under the [MIT License](LICENSE). By submitting a pack, you agree that your submission is freely available for anyone — including TrajectoryRL, other miners, and third parties — to use, modify, and redistribute. Do not submit content you are not willing to release publicly under MIT.
+
 #### 1. Prerequisites (one-time)
 
 ```bash
@@ -217,7 +219,9 @@ See [MINER_OPERATIONS.md](MINER_OPERATIONS.md) for full details: automated mode,
 
 ## License
 
-MIT © 2026 TrajectoryRL Team
+This project is licensed under the [MIT License](LICENSE).
+
+All miner-submitted policy packs are public and released under the same MIT License. By participating as a miner, you acknowledge that your submissions become open-source contributions available to everyone.
 
 ---
 
