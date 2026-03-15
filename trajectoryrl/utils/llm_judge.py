@@ -166,13 +166,15 @@ class PackIntegrityJudge:
             return self._parse_integrity_output(raw)
 
         except Exception as e:
-            logger.error("Pack integrity check failed: %s", e, exc_info=True)
-            # On error, pass the pack through — don't block evaluation
-            # due to judge failure. The trajectory judge (Phase 2) will
-            # still catch gaming attacks.
+            logger.critical(
+                "SECURITY: Pack integrity judge unavailable — rejecting pack "
+                "(fail-closed). Fix the LLM API connection. Error: %s",
+                e,
+                exc_info=True,
+            )
             return IntegrityResult(
-                passed=True,
-                summary="Integrity check failed (judge error); passing through to Phase 2",
+                passed=False,
+                summary=f"Integrity judge error (fail-closed): {e}",
                 error=str(e),
             )
 
