@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 _BASE_URL = os.getenv("TRAJECTORYRL_API_BASE_URL", "https://trajrl.com")
 DEFAULT_HEARTBEAT_URL = f"{_BASE_URL}/api/validators/heartbeat"
 DEFAULT_SUBMIT_URL = f"{_BASE_URL}/api/scores/submit"
+DEFAULT_PRE_EVAL_URL = f"{_BASE_URL}/api/miners/pre-eval"
 
 
 async def heartbeat(
@@ -21,6 +22,7 @@ async def heartbeat(
     *,
     heartbeat_url: str = DEFAULT_HEARTBEAT_URL,
     last_set_weights_at: Optional[int] = None,
+    last_eval_at: Optional[int] = None,
 ) -> bool:
     """Send a validator heartbeat to the dashboard API.
 
@@ -28,6 +30,7 @@ async def heartbeat(
         wallet: bt.Wallet with accessible hotkey for signing.
         heartbeat_url: Dashboard heartbeat endpoint.
         last_set_weights_at: Unix timestamp of most recent set_weights call.
+        last_eval_at: Unix timestamp of most recent completed full eval cycle.
 
     Returns:
         True on success (HTTP 200), False otherwise.
@@ -52,6 +55,8 @@ async def heartbeat(
     }
     if last_set_weights_at is not None:
         payload["last_set_weights_at"] = last_set_weights_at
+    if last_eval_at is not None:
+        payload["last_eval_at"] = last_eval_at
 
     try:
         async with httpx.AsyncClient() as client:
@@ -66,6 +71,43 @@ async def heartbeat(
     except Exception as e:
         logger.warning("Heartbeat error: %s", e)
         return False
+
+
+async def pre_eval(
+    miner_hotkey: str,
+    pack_hash: str,
+    pack_url: Optional[str] = None,
+    *,
+    pre_eval_url: str = DEFAULT_PRE_EVAL_URL,
+) -> Optional[Dict[str, Any]]:
+    """Call the pre-eval API to check whether a miner's submission is allowed.
+
+    Args:
+        miner_hotkey: Miner hotkey to check.
+        pack_hash: Pack hash submitted by the miner.
+        pack_url: Pack download URL (required by the server if this hash is new).
+        pre_eval_url: Pre-eval API endpoint.
+
+    Returns:
+        Parsed response dict on success, or None if the request failed.
+        Callers should treat None as "allowed" (fail-open on network errors).
+    """
+    params: Dict[str, Any] = {"hotkey": miner_hotkey, "hash": pack_hash}
+    if pack_url is not None:
+        params["pack_url"] = pack_url
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(pre_eval_url, params=params, timeout=10)
+        if resp.status_code == 200:
+            return resp.json()
+        logger.warning(
+            "Pre-eval check failed: %d %s", resp.status_code, resp.text[:200]
+        )
+        return None
+    except Exception as e:
+        logger.warning("Pre-eval check error: %s", e)
+        return None
 
 
 async def submit_eval(

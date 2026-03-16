@@ -22,6 +22,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
 import yaml
 from collections import defaultdict
@@ -38,7 +39,7 @@ from ..utils.github import PackFetcher
 from ..utils.epoch_context import generate_epoch_context, render_context_preamble
 from ..utils.commitments import MinerCommitment, fetch_all_commitments
 from ..utils.ncd import deduplicate_packs
-from ..utils.status_reporter import heartbeat, submit_eval
+from ..utils.status_reporter import heartbeat, pre_eval, submit_eval
 from ..utils.llm_judge import PackIntegrityJudge, TrajectoryJudge
 from .. import __version__
 
@@ -168,6 +169,9 @@ class TrajectoryValidator:
 
         # Timestamp of the most recent successful set_weights call
         self._last_set_weights_at: Optional[int] = None
+
+        # Timestamp of the most recent completed full evaluation cycle
+        self._last_eval_at: Optional[int] = None
 
         # Last computed weights, cached for mid-eval tempo replays
         self._last_weights_uids: Optional[List[int]] = None
@@ -390,6 +394,7 @@ class TrajectoryValidator:
                 await heartbeat(
                     self.wallet,
                     last_set_weights_at=self._last_set_weights_at,
+                    last_eval_at=self._last_eval_at,
                 )
             except Exception as e:
                 logger.warning("Heartbeat error: %s", e)
@@ -448,6 +453,7 @@ class TrajectoryValidator:
                     await self._sync_clawbench()
 
                     await self._run_evaluation_cycle(current_block)
+                    self._last_eval_at = int(time.time())
                     last_eval_sync_block = self.subtensor.get_current_block()
                     self.last_weight_block = last_eval_sync_block
 
@@ -662,6 +668,54 @@ class TrajectoryValidator:
                     f"within eval interval"
                 )
                 continue
+
+            # Pre-eval gate: ask the server whether this miner's submission
+            # is allowed before spending LLM tokens on a full evaluation.
+            # Controlled by TRAJECTORYRL_PRE_EVAL_ENABLED (default: 1).
+            # Fail-open on network/API errors so validators are self-sufficient.
+            if os.getenv("TRAJECTORYRL_PRE_EVAL_ENABLED", "1") != "0":
+                pre_eval_result = await pre_eval(
+                    hotkey,
+                    commitment.pack_hash,
+                    commitment.pack_url,
+                )
+                if pre_eval_result is not None and not pre_eval_result.get("allowed", True):
+                    reason = pre_eval_result.get("reason", "unknown")
+                    logger.info(
+                        f"Miner {uid} ({hotkey[:8]}): pre-eval rejected "
+                        f"(reason={reason}) — skipping eval"
+                    )
+                    _stage = "integrity_check" if reason == "hardcoded" else "pack_fetch"
+                    _detail = (
+                        f"pre-eval rejected: {reason}"
+                        + (
+                            f", banned_until={pre_eval_result['banned_until']}"
+                            if "banned_until" in pre_eval_result
+                            else ""
+                        )
+                    )
+                    asyncio.ensure_future(
+                        submit_eval(
+                            self.wallet,
+                            miner_hotkey=hotkey,
+                            miner_uid=uid,
+                            block_height=current_block,
+                            score=0.0,
+                            ema_score=0.0,
+                            cost=0.0,
+                            ema_cost=0.0,
+                            weight=0.0,
+                            qualified=False,
+                            pack_url=commitment.pack_url,
+                            pack_hash=commitment.pack_hash,
+                            llm_base_url=self._judge_base_url,
+                            llm_model=self._judge_model,
+                            rejected=True,
+                            rejection_stage=_stage,
+                            rejection_detail=_detail,
+                        )
+                    )
+                    continue
 
             attempted_count += 1
             eval_result = await self._evaluate_miner(
