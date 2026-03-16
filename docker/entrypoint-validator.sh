@@ -30,7 +30,33 @@ export OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN:-sandbox-token-12345}"
 export OPENCLAW_URL="${OPENCLAW_URL:-http://localhost:18789}"
 export MOCK_TOOLS_URL="${MOCK_TOOLS_URL:-http://localhost:3001}"
 
-# ── 2. Init workspace (one-shot) ────────────────────────────────
+# ── 2. Sync ClawBench from GitHub ───────────────────────────────
+# The Dockerfile COPYs clawbench without .git, so we clone a proper
+# repo on first start.  On subsequent restarts (if /app/clawbench/.git
+# exists from a volume mount), we just pull.
+CLAWBENCH_REPO="${CLAWBENCH_REPO:-https://github.com/trajectoryRL/clawbench.git}"
+CLAWBENCH_BRANCH="${CLAWBENCH_BRANCH:-main}"
+
+if [ ! -d /app/clawbench/.git ]; then
+    echo "[entrypoint] Cloning ClawBench ($CLAWBENCH_BRANCH)..."
+    if git clone --depth 1 -b "$CLAWBENCH_BRANCH" "$CLAWBENCH_REPO" /app/clawbench_tmp; then
+        # Preserve any local config the Dockerfile may have added
+        rm -rf /app/clawbench
+        mv /app/clawbench_tmp /app/clawbench
+        # Install any new Python deps from the fresh clone
+        pip install --no-cache-dir -q -r /app/clawbench/requirements.txt 2>/dev/null || true
+        pip install --no-cache-dir -q -r /app/clawbench/requirements-mock.txt 2>/dev/null || true
+        echo "[entrypoint] ClawBench cloned successfully"
+    else
+        echo "[entrypoint] WARNING: ClawBench clone failed — using COPY'd version"
+    fi
+else
+    echo "[entrypoint] Pulling latest ClawBench..."
+    (cd /app/clawbench && git pull --ff-only origin "$CLAWBENCH_BRANCH") || \
+        echo "[entrypoint] WARNING: ClawBench pull failed — using current version"
+fi
+
+# ── 3. Init workspace (one-shot) ────────────────────────────────
 echo "[entrypoint] Initializing workspace..."
 mkdir -p "$WORKSPACE_DIR" "$OPENCLAW_HOME"
 python /app/clawbench/scripts/init_workspace.py
@@ -38,7 +64,7 @@ python /app/clawbench/scripts/init_workspace.py
 chmod -R 777 "$WORKSPACE_DIR"
 echo "[entrypoint] Workspace ready"
 
-# ── 3. Start mock-tools server (background) ─────────────────────
+# ── 4. Start mock-tools server (background) ─────────────────────
 echo "[entrypoint] Starting mock-tools on port 3001..."
 python -m mock_tools.server &
 MOCK_PID=$!
@@ -55,7 +81,7 @@ for i in $(seq 1 30); do
     sleep 1
 done
 
-# ── 4. Start OpenClaw gateway (background) ──────────────────────
+# ── 5. Start OpenClaw gateway (background) ──────────────────────
 echo "[entrypoint] Starting OpenClaw gateway on port 18789..."
 cd /app/openclaw
 node dist/index.js gateway --allow-unconfigured --bind loopback &
@@ -74,7 +100,7 @@ for i in $(seq 1 60); do
     sleep 1
 done
 
-# ── 5. Signal handling ──────────────────────────────────────────
+# ── 6. Signal handling ──────────────────────────────────────────
 cleanup() {
     echo "[entrypoint] Shutting down..."
     kill "$MOCK_PID" "$OPENCLAW_PID" 2>/dev/null || true
@@ -82,6 +108,6 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# ── 6. Start validator (foreground) ─────────────────────────────
+# ── 7. Start validator (foreground) ─────────────────────────────
 echo "[entrypoint] Starting validator..."
 exec python -u neurons/validator.py "$@"

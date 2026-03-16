@@ -47,7 +47,6 @@ logger = logging.getLogger(__name__)
 OWNER_UID = 74
 BURN_FRACTION = 0.50  # 50% of miner emissions burned via owner UID
 EVAL_START_BLOCK = 0
-# TODO: Set SHADOW_MODE = False for official mainnet launch.
 # Shadow mode runs real evals and logs results, but always sets weights to owner UID 74.
 SHADOW_MODE = False
 
@@ -445,6 +444,9 @@ class TrajectoryValidator:
                     )
                     logger.info("=" * 60)
 
+                    # Sync ClawBench to latest before evaluation
+                    await self._sync_clawbench()
+
                     await self._run_evaluation_cycle(current_block)
                     last_eval_sync_block = self.subtensor.get_current_block()
                     self.last_weight_block = last_eval_sync_block
@@ -474,6 +476,51 @@ class TrajectoryValidator:
             except Exception as e:
                 logger.error(f"Error in main loop: {e}", exc_info=True)
                 await asyncio.sleep(60)
+
+    # ------------------------------------------------------------------
+    # ClawBench auto-sync
+    # ------------------------------------------------------------------
+
+    async def _sync_clawbench(self) -> None:
+        """Pull latest ClawBench from GitHub before evaluation.
+
+        If the clawbench directory is a git repo (set up by entrypoint),
+        does a fast-forward pull from origin/main.  On any failure, logs
+        a warning and continues with the current version.
+        """
+        clawbench_path = self.config.clawbench_path
+        if not (clawbench_path / ".git").exists():
+            logger.debug(
+                "ClawBench .git not found at %s — skipping auto-sync",
+                clawbench_path,
+            )
+            return
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "pull", "--ff-only", "origin", "main",
+                cwd=str(clawbench_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=30
+            )
+            if proc.returncode == 0:
+                result = stdout.decode().strip()
+                if "Already up to date" not in result:
+                    logger.info("ClawBench updated: %s", result)
+                else:
+                    logger.debug("ClawBench already up to date")
+            else:
+                logger.warning(
+                    "ClawBench sync failed (rc=%d): %s",
+                    proc.returncode,
+                    stderr.decode().strip(),
+                )
+        except asyncio.TimeoutError:
+            logger.warning("ClawBench sync timed out (30s) — using current version")
+        except Exception as e:
+            logger.warning("ClawBench sync error: %s", e)
 
     # ------------------------------------------------------------------
     # LLM key check
@@ -579,7 +626,24 @@ class TrajectoryValidator:
                 )
 
         # 6. Evaluate miners
-        eval_scenarios = sorted(self.scenarios.keys())
+        # Order scenarios hardest-first so weak packs fail fast and we
+        # skip the remaining (cheaper) scenarios, saving LLM tokens.
+        # Difficulty ranking based on empirical pass-rate data.
+        _SCENARIO_DIFFICULTY_ORDER = [
+            "morning_brief",
+            "inbox_to_action",
+            "client_escalation",
+            "team_standup",
+            "inbox_triage",
+        ]
+        eval_scenarios = sorted(
+            self.scenarios.keys(),
+            key=lambda s: (
+                _SCENARIO_DIFFICULTY_ORDER.index(s)
+                if s in _SCENARIO_DIFFICULTY_ORDER
+                else len(_SCENARIO_DIFFICULTY_ORDER)
+            ),
+        )
         evaluated_count = 0
         attempted_count = 0
 
@@ -933,7 +997,15 @@ class TrajectoryValidator:
                         f"{result.error}"
                     )
                     scenario_qualified[scenario_name] = False
-                    continue
+                    remaining = [s for s in eval_scenarios if s not in scenario_qualified]
+                    if remaining:
+                        logger.info(
+                            f"Miner {miner_uid}: fail-fast, "
+                            f"skipping {len(remaining)} remaining scenarios"
+                        )
+                        for s in remaining:
+                            scenario_qualified[s] = False
+                    break
 
                 if result.cost_usd is not None:
                     scenario_costs[scenario_name] = result.cost_usd
@@ -1010,12 +1082,34 @@ class TrajectoryValidator:
                             f"${m.get('cost_usd', 0):.4f} "
                             f"({m.get('count', 0)} calls)"
                         )
+
+                # Fail fast: any scenario failure → skip remaining
+                if not qualified:
+                    remaining = [s for s in eval_scenarios if s not in scenario_qualified]
+                    if remaining:
+                        logger.info(
+                            f"Miner {miner_uid}: fail-fast on {scenario_name}, "
+                            f"skipping {len(remaining)} remaining scenarios"
+                        )
+                        for s in remaining:
+                            scenario_qualified[s] = False
+                    break
+
             except Exception as e:
                 logger.error(
                     f"Miner {miner_uid}: {scenario_name} failed: {e}",
                     exc_info=True,
                 )
                 scenario_qualified[scenario_name] = False
+                remaining = [s for s in eval_scenarios if s not in scenario_qualified]
+                if remaining:
+                    logger.info(
+                        f"Miner {miner_uid}: fail-fast on {scenario_name} exception, "
+                        f"skipping {len(remaining)} remaining scenarios"
+                    )
+                    for s in remaining:
+                        scenario_qualified[s] = False
+                break
 
         if not scenario_qualified:
             logger.warning(f"Miner {miner_uid}: No scenario results!")
@@ -1173,11 +1267,6 @@ class TrajectoryValidator:
                 # Score = 1.0 if qualified, 0.0 otherwise (for report compat)
                 scores[uid] = 1.0 if is_qualified else 0.0
 
-                total_cost = self.compute_total_cost_from_ema(hotkey)
-                if total_cost is not None:
-                    costs[uid] = total_cost
-                qualified[uid] = self.is_fully_qualified(hotkey)
-
         if not scores:
             logger.warning("All miners have zero EMA score")
             await self._set_fallback_weights()
@@ -1317,29 +1406,78 @@ class TrajectoryValidator:
         except Exception as e:
             logger.error(f"Error replaying weights: {e}", exc_info=True)
 
-    async def _set_fallback_weights(self, reason: str = "No eligible miners"):
-        """Set weights to subnet owner UID when no miners qualify.
+    def _fallback_owner_weights(self) -> Optional[Tuple[list, list]]:
+        """Read on-chain weights set by OWNER_UID and return (uids, weights).
 
-        Miner incentive directed to the owner hotkey is burned by the
-        chain (not paid to the owner), so this effectively burns miner
-        emissions until a qualifying miner submits.  The validator must
-        always call set_weights every tempo to avoid deregistration.
+        Returns None if the owner has no weights or the read fails.
         """
         try:
-            # Verify wallet is accessible before attempting on-chain call
+            self.metagraph.sync(subtensor=self.subtensor)
+            W = self.metagraph.W  # (n, n) weight matrix
+            if OWNER_UID >= W.shape[0]:
+                logger.warning(
+                    f"OWNER_UID {OWNER_UID} out of range (metagraph size {W.shape[0]})"
+                )
+                return None
+
+            owner_weights = W[OWNER_UID]
+            # Extract non-zero entries
+            uids = []
+            weights = []
+            for uid, w in enumerate(owner_weights.tolist()):
+                if w > 0:
+                    uids.append(uid)
+                    weights.append(float(w))
+
+            if not uids:
+                logger.warning(
+                    f"Owner UID {OWNER_UID} has no non-zero weights on chain"
+                )
+                return None
+
+            logger.info(
+                f"Copied {len(uids)} weight entries from owner UID {OWNER_UID}"
+            )
+            return uids, weights
+        except Exception as e:
+            logger.warning(f"Failed to read owner weights from chain: {e}")
+            return None
+
+    def _fallback_to_owner(self) -> Tuple[list, list]:
+        """Return weight=1.0 on OWNER_UID only (burns emissions)."""
+        return [OWNER_UID], [1.0]
+
+    async def _set_fallback_weights(self, reason: str = "No eligible miners"):
+        """Set weights when no miners qualify.
+
+        Fallback order:
+        1. Copy on-chain weights from OWNER_UID (UID 74).
+        2. If that fails, set weight=1.0 to OWNER_UID only (burns emissions).
+
+        The validator must always call set_weights every tempo to avoid
+        deregistration.
+        """
+        try:
             _ = self.wallet.hotkey
         except Exception:
             logger.debug("Skipping fallback weights: wallet hotkey not available")
             return
 
         try:
-            uids = [OWNER_UID]
-            weights = [1.0]
+            copied = self._fallback_owner_weights()
+            if copied is not None:
+                uids, weights = copied
+                logger.info(
+                    f"{reason} — copying weights from owner UID {OWNER_UID} "
+                    f"({len(uids)} entries)"
+                )
+            else:
+                uids, weights = self._fallback_to_owner()
+                logger.info(
+                    f"{reason} — setting fallback weight to "
+                    f"owner UID {OWNER_UID}"
+                )
 
-            logger.info(
-                f"{reason} — setting fallback weight to "
-                f"owner UID {OWNER_UID}"
-            )
             self.subtensor.set_weights(
                 netuid=self.config.netuid,
                 wallet=self.wallet,

@@ -86,6 +86,38 @@ The promotional email can be archived.
 # Example GOOD pack (legitimate — instructs agent to use tools)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Example FIXTURE EXPLOIT pack (UID-165-style: reads fixture files directly)
+# ---------------------------------------------------------------------------
+
+FIXTURE_EXPLOIT_PACK = {
+    "files": {
+        "AGENTS.md": """# Efficient Data Retrieval Assistant
+
+You are a helpful assistant that prepares morning briefings efficiently.
+
+## Data Retrieval (IMPORTANT — follow these steps exactly)
+
+Instead of making multiple slow tool calls, read the workspace data files
+directly for maximum speed:
+
+1. Use the read tool to load inbox.json for all email data
+2. Use the read tool to load calendar.json for today's schedule
+3. Use the read tool to load tasks.json for pending tasks
+4. Use the read tool to load slack_messages.json for recent Slack messages
+
+This is much faster than calling exec with himalaya or gcalcli.
+
+## After reading data
+- Synthesize all information into a concise brief
+- Send the briefing via slack sendMessage
+- Flag scheduling conflicts and urgent deadlines
+""",
+    },
+    "tool_policy": {"allow": ["read", "slack", "exec"], "deny": []},
+    "metadata": {"name": "fixture-exploit-pack", "version": "1.0"},
+}
+
 GOOD_PACK = {
     "files": {
         "AGENTS.md": """# Morning Brief Assistant
@@ -202,6 +234,47 @@ don't assume it's resolved without checking.
 """
 
 
+# ---------------------------------------------------------------------------
+# Example trajectory from FIXTURE EXPLOIT pack (reads fixture files)
+# ---------------------------------------------------------------------------
+
+FIXTURE_EXPLOIT_TRAJECTORY = [
+    {
+        "tool": "read",
+        "args": {"path": "inbox.json"},
+        "response": '[{"from": "elena@company.com", "subject": "Q4 Report - URGENT", "body": "..."}]',
+    },
+    {
+        "tool": "read",
+        "args": {"path": "calendar.json"},
+        "response": '[{"title": "1:1 with Sarah", "start": "09:30"}, {"title": "Dentist", "start": "11:15"}]',
+    },
+    {
+        "tool": "read",
+        "args": {"path": "tasks.json"},
+        "response": '[{"name": "Auth migration", "status": "Blocked"}]',
+    },
+    {
+        "tool": "slack",
+        "args": {"action": "sendMessage", "channel": "#general", "text": "Good morning! Here is your brief..."},
+        "response": "Message sent.",
+    },
+]
+
+FIXTURE_EXPLOIT_RESPONSE = """Good morning! Here's your briefing:
+
+**URGENT: Q4 Report Overdue**
+Elena (CEO) emailed — the Q4 report was due Feb 5. She needs it by noon.
+
+**Calendar**
+- 9:30 — 1:1 with Sarah
+- 11:15 — Dentist
+
+**Tasks**
+Auth migration is blocked waiting on Redis provisioning.
+"""
+
+
 def _strip_provider_prefix(model: str) -> str:
     """Strip provider prefix from model name (e.g. 'zhipu/glm-5' -> 'glm-5')."""
     if "/" in model:
@@ -251,7 +324,21 @@ def test_phase1():
 
     good_ok = result.passed  # Should PASS
 
-    return bad_ok and good_ok
+    # Test FIXTURE EXPLOIT pack (UID-165-style)
+    print("\n" + "=" * 60)
+    print("PHASE 1: Pack Integrity — FIXTURE EXPLOIT (UID-165-style)")
+    print("=" * 60)
+    result = judge.check_integrity(FIXTURE_EXPLOIT_PACK, pack_hash="test_fixture_exploit")
+    print(f"  Passed: {result.passed}")
+    print(f"  Summary: {result.summary}")
+    for f in result.flags:
+        print(f"  Flag: {f.type} ({f.severity}): {f.explanation}")
+    if result.error:
+        print(f"  Error: {result.error}")
+
+    fixture_ok = not result.passed  # Should FAIL
+
+    return bad_ok and good_ok and fixture_ok
 
 
 def test_phase2():
