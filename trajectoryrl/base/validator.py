@@ -646,24 +646,36 @@ class TrajectoryValidator:
         )
         evaluated_count = 0
         attempted_count = 0
+        total_eligible = len(active_commitments) - len(skip_uids)
+        total_scenarios = len(eval_scenarios)
+        logger.info(
+            f"=== Eval cycle: {total_eligible} eligible miners, "
+            f"{total_scenarios} scenarios each ==="
+        )
 
+        miner_idx = 0
         for uid, commitment in active_commitments.items():
             hotkey = commitment.hotkey
 
             if uid in skip_uids:
                 continue
 
+            miner_idx += 1
             needs_eval = self._needs_evaluation(
                 hotkey, commitment.pack_hash, current_block
             )
             if not needs_eval:
-                logger.debug(
-                    f"Miner {uid} ({hotkey[:8]}): skipping, "
-                    f"within eval interval"
+                logger.info(
+                    f"[{miner_idx}/{total_eligible}] Miner {uid} ({hotkey[:8]}): "
+                    f"skipping, within eval interval"
                 )
                 continue
 
             attempted_count += 1
+            logger.info(
+                f"[{miner_idx}/{total_eligible}] Evaluating miner {uid} "
+                f"({hotkey[:8]}) ..."
+            )
             eval_result = await self._evaluate_miner(
                 uid, commitment, eval_scenarios, epoch_seed,
                 context_preamble, user_context,
@@ -684,6 +696,13 @@ class TrajectoryValidator:
                 )
                 self.last_eval_block[hotkey] = current_block
                 evaluated_count += 1
+                q = eval_result.get("qualified", {})
+                passed = sum(1 for v in q.values() if v)
+                logger.info(
+                    f"[{miner_idx}/{total_eligible}] Miner {uid} done: "
+                    f"{passed}/{len(q)} scenarios passed "
+                    f"({evaluated_count} evaluated so far)"
+                )
 
                 # Store latest token & model usage for metadata reporting
                 if eval_result.get("token_usage"):
@@ -704,6 +723,12 @@ class TrajectoryValidator:
                     self._update_first_mover(
                         uid, hotkey, total_cost, float(commitment.block_number)
                     )
+
+            else:
+                logger.info(
+                    f"[{miner_idx}/{total_eligible}] Miner {uid} eval returned None "
+                    f"(pack fetch/integrity failed)"
+                )
 
             # Mid-eval tempo refresh: replay the last computed weights so
             # the validator stays active on-chain without exposing partial
@@ -980,7 +1005,12 @@ class TrajectoryValidator:
         scenario_model_usage: Dict[str, List[Dict[str, Any]]] = {}
         scenario_judge_details: Dict[str, Dict[str, Any]] = {}
 
-        for scenario_name in eval_scenarios:
+        total_scenarios = len(eval_scenarios)
+        for scenario_idx, scenario_name in enumerate(eval_scenarios, 1):
+            logger.info(
+                f"Miner {miner_uid}: scenario [{scenario_idx}/{total_scenarios}] "
+                f"{scenario_name} ..."
+            )
             try:
                 # Single episode per scenario (no consensus voting in v4.0)
                 result = await self.harness.evaluate_pack(
