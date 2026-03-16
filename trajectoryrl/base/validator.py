@@ -1487,6 +1487,7 @@ class TrajectoryValidator:
                 wait_for_finalization=False,
             )
             logger.info(f"Fallback weights set (owner UID {OWNER_UID})")
+            self._last_set_weights_at = int(time.time())
         except Exception as e:
             logger.error(f"Error setting fallback weights: {e}", exc_info=True)
 
