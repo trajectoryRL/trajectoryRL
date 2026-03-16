@@ -235,6 +235,8 @@ print(f"Score: {result.overall_score}, Gate: {result.qualification_gate}")
 
 > **Important**: The judge model must produce output in the `content` field. Reasoning models like GLM-5-TEE put output in `reasoning_content` which the judge parser cannot read. Use a standard chat model (e.g., `deepseek-ai/DeepSeek-V3`) for the judge.
 
+> **Note on score variation**: Validators choose their own judge model via `JUDGE_MODEL` env var. Different judge models may score the same trajectory differently, and misconfigured judges (e.g., reasoning models without the `thinkingFormat` fix) may score everything as 0. Your local scores may not match validator scores. See [issue #98](https://github.com/trajectoryRL/trajectoryRL/issues/98) for discussion.
+
 ---
 
 ## Local Testing
