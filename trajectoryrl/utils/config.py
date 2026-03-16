@@ -70,7 +70,7 @@ class ValidatorConfig:
     # Evaluation config
     seeds_per_task: int = 1
     eval_interval_blocks: int = 7200  # ~24 hours at 12s/block
-    timeout_per_scenario: int = 600  # 5 minutes max per scenario
+    timeout_per_scenario: int = 600  # 10 minutes max per scenario
 
     # Scoring config
     delta_threshold: float = 0.05
