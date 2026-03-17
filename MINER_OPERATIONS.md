@@ -248,26 +248,54 @@ cd clawbench
 pip install -r requirements.txt
 cp .env.example .env
 # Edit .env — set CLAWBENCH_LLM_API_KEY and CLAWBENCH_DEFAULT_MODEL
-```
 
-### Running Episodes
-
-```bash
 # Start the Docker stack
 SCENARIO=client_escalation docker compose up --build -d
+```
 
-# Single scenario (regex checks — for quick debugging)
+### eval_pack.py — Test Like a Validator (Recommended)
+
+The `scripts/eval_pack.py` tool evaluates your pack the same way a validator does: with epoch context variation, LLM judge scoring, and cost tracking.
+
+```bash
+# Evaluate a pack JSON file (all scenarios)
+python scripts/eval_pack.py --pack pack.json -v
+
+# Evaluate just an AGENTS.md file
+python scripts/eval_pack.py --agents-md my_policy.md -v
+
+# Specific scenarios only
+python scripts/eval_pack.py --pack pack.json -s inbox_triage client_escalation -v
+
+# Multiple runs per scenario (like production validators)
+python scripts/eval_pack.py --pack pack.json -n 3 -v
+
+# Save results to JSON
+python scripts/eval_pack.py --pack pack.json -v -o results.json
+
+# Use a specific seed (deterministic epoch context)
+python scripts/eval_pack.py --pack pack.json --seed 42 -v
+```
+
+This is the **best way to predict your validator score**. It includes:
+- Epoch context variation (random persona, date, company per seed)
+- LLM judge scoring (the 5 criteria validators actually use)
+- Cost tracking (used for winner selection among qualified miners)
+
+### run_episode.py — Quick Debugging
+
+For faster iteration, `run_episode.py` runs individual scenarios with regex-based checks:
+
+```bash
+# Single scenario
 python scripts/run_episode.py --scenario inbox_triage --wait --json
 
 # Test your own AGENTS.md
 mkdir -p /tmp/workspace && cp /path/to/your/AGENTS.md /tmp/workspace/
 python scripts/run_episode.py --scenario inbox_triage --workspace /tmp/workspace --wait --json
-
-# All scenarios
-python scripts/run_batch.py
 ```
 
-The `--json` output shows regex-based checks. These are useful for debugging tool usage issues but **do not reflect your actual validator score** — see "How Scoring Works" above.
+> **Note**: The regex checks from `run_episode.py --json` are useful for debugging tool usage but **do not reflect your actual validator score** — see "How Scoring Works" above.
 
 ### Known Issues with GLM-5-TEE (Reasoning Models)
 
