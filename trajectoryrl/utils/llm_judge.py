@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 # Maximum characters of tool response to include in judge context.
 # Prevents context overflow from large fixture dumps.
-MAX_TOOL_RESPONSE_CHARS = 2000
+MAX_TOOL_RESPONSE_CHARS = 4000
 
 # Maximum characters for the full trajectory section.
 MAX_TRAJECTORY_CHARS = 60000
