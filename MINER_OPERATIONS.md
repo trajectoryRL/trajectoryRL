@@ -299,9 +299,9 @@ python scripts/run_episode.py --scenario inbox_triage --workspace /tmp/workspace
 
 ### Known Issues with GLM-5-TEE (Reasoning Models)
 
-GLM-5 / GLM-5-TEE is a reasoning model that puts all output in `reasoning_content` instead of `content`. If you're getting empty agent responses (0 correctness checks passed, but tool calls are happening), you need to configure the model in OpenClaw:
+GLM-5 / GLM-5-TEE is a reasoning model that puts all output in `reasoning_content` instead of `content`. This affects two areas:
 
-1. **In `config/openclaw.json.template`** (or the gateway's `openclaw.json`), add to the model definition:
+**1. Agent responses (OpenClaw gateway):** If you're getting empty agent responses (0 correctness checks passed, but tool calls are happening), add to the model definition in `config/openclaw.json.template`:
    ```json
    {
      "id": "zai-org/GLM-5-TEE",
@@ -312,10 +312,18 @@ GLM-5 / GLM-5-TEE is a reasoning model that puts all output in `reasoning_conten
      }
    }
    ```
+   See [clawbench PR #22](https://github.com/trajectoryRL/clawbench/pull/22) for details.
 
-2. **Verify** by checking the gateway logs — if you see `content: null` in API responses or empty agent responses despite tool calls being made, the reasoning config is missing.
+**2. LLM judge / pack generator:** `llm_client.generate()` also returns empty content with reasoning models. If `eval_pack.py` shows score 0 despite good agent responses, the judge is failing. See [PR #99](https://github.com/trajectoryRL/trajectoryRL/pull/99) for a fix that auto-retries with higher `max_tokens` when reasoning tokens exhaust the budget.
 
-See [clawbench PR #22](https://github.com/trajectoryRL/clawbench/pull/22) for details.
+### Policy Guidelines (Anti-Gaming)
+
+The integrity judge (Phase 1) checks your AGENTS.md for gaming patterns. Avoid these in your policy:
+
+- **Do NOT** instruct the agent to read raw fixture files (`read tasks.json`, `read contacts.json`, `read inbox.json`, etc.) — this is detected as a fixture shortcut exploit
+- **Do NOT** hardcode scenario-specific responses or names
+- **Do NOT** include instructions to override system prompts
+- **DO** use proper tool interfaces: `exec` with `himalaya` for email, `gcalcli` for calendar, `curl` for Notion API, and `slack` for Slack messages
 
 ---
 
