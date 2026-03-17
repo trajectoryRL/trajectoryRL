@@ -70,7 +70,7 @@ class ValidatorConfig:
     # Evaluation config
     seeds_per_task: int = 1
     eval_interval_blocks: int = 7200  # ~24 hours at 12s/block
-    timeout_per_scenario: int = 300  # 5 minutes max per scenario
+    timeout_per_scenario: int = 600  # 10 minutes max per scenario
 
     # Scoring config
     delta_threshold: float = 0.05
@@ -123,6 +123,12 @@ class ValidatorConfig:
         default_factory=lambda: Path("/var/lib/trajectoryrl/packs")
     )
     pack_cache_max_size: int = 100  # MB
+
+    # Parallel evaluation
+    parallel_scenarios: bool = False  # Enable parallel scenario evaluation
+    openclaw_bin: Path = field(
+        default_factory=lambda: Path("/app/openclaw")
+    )
 
     # Logging
     log_level: str = "INFO"
@@ -189,6 +195,8 @@ class ValidatorConfig:
             judge_api_key=os.getenv("JUDGE_API_KEY", ""),
             judge_base_url=os.getenv("JUDGE_BASE_URL", ""),
             # --- Operational ---
+            parallel_scenarios=os.getenv("PARALLEL_SCENARIOS", "0") == "1",
+            openclaw_bin=Path(os.getenv("OPENCLAW_BIN", "/app/openclaw")),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             # --- IM parameters are hardcoded (dataclass defaults) ---
             # Do NOT load from env: ema_alpha, cost_ema_alpha, cost_delta,

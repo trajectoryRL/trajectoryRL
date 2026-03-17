@@ -34,6 +34,7 @@ import bittensor as bt
 from ..utils.opp_schema import validate_opp_schema
 from ..utils.config import ValidatorConfig
 from ..utils.clawbench import ClawBenchHarness, EvaluationResult
+from ..utils.parallel_clawbench import ParallelClawBenchHarness
 from ..scoring import TrajectoryScorer
 from ..utils.github import PackFetcher
 from ..utils.epoch_context import generate_epoch_context, render_context_preamble
@@ -128,6 +129,24 @@ class TrajectoryValidator:
             api_key=judge_api_key,
             base_url=judge_base_url,
         )
+
+        # Parallel evaluation harness (v4.1): spins up N service slots
+        self.parallel_harness: Optional[ParallelClawBenchHarness] = None
+        if config.parallel_scenarios:
+            num_slots = len(config.scenarios)
+            logger.info(
+                "Initializing parallel ClawBench harness (%d slots)...", num_slots
+            )
+            self.parallel_harness = ParallelClawBenchHarness(
+                num_slots=num_slots,
+                clawbench_path=config.clawbench_path,
+                scenario_names=sorted(config.scenarios),
+                timeout=config.timeout_per_scenario,
+                openclaw_bin=config.openclaw_bin,
+                clawbench_default_model=config.clawbench_default_model,
+                clawbench_api_key=config.clawbench_api_key,
+                clawbench_base_url=config.clawbench_base_url,
+            )
 
         logger.info("Initializing pack fetcher...")
         self.pack_fetcher = PackFetcher(
@@ -1100,6 +1119,110 @@ class TrajectoryValidator:
             )
 
     # ------------------------------------------------------------------
+    # Scenario result processing (used by parallel path)
+    # ------------------------------------------------------------------
+
+    def _process_scenario_result(
+        self,
+        miner_uid: int,
+        scenario_name: str,
+        result: EvaluationResult,
+        scenario_costs: Dict[str, float],
+        scenario_qualified: Dict[str, bool],
+        scenario_token_usage: Dict[str, Dict[str, int]],
+        scenario_model_usage: Dict[str, List[Dict[str, Any]]],
+        scenario_judge_details: Dict[str, Dict[str, Any]],
+    ) -> None:
+        """Process a single scenario's EvaluationResult through the LLM judge.
+
+        Populates the mutable dicts with costs, qualification, token/model usage,
+        and judge details for this scenario.
+        """
+        if result.error:
+            logger.warning(
+                f"Miner {miner_uid}: {scenario_name} episode error: "
+                f"{result.error}"
+            )
+            scenario_qualified[scenario_name] = False
+            return
+
+        if result.cost_usd is not None:
+            scenario_costs[scenario_name] = result.cost_usd
+        if result.token_usage:
+            scenario_token_usage[scenario_name] = result.token_usage
+        if result.model_usage:
+            scenario_model_usage[scenario_name] = result.model_usage
+
+        # Phase 2: LLM trajectory judge
+        scenario_config = self.scenarios.get(scenario_name, {})
+        trajectory = result.trajectory or []
+        judge_result = self.trajectory_judge.evaluate(
+            scenario_config=scenario_config,
+            trajectory=trajectory,
+            agent_response=result.response,
+        )
+
+        qualified = judge_result.qualification_gate
+        scenario_qualified[scenario_name] = qualified
+
+        # Store full judge details for dashboard reporting
+        _criteria = judge_result.criteria_results
+        _n = len(_criteria)
+        _passed = sum(1 for cr in _criteria if cr.verdict == "PASS")
+        _grounded = sum(1 for cr in _criteria if cr.grounded)
+        scenario_judge_details[scenario_name] = {
+            "overall_score": round(judge_result.overall_score, 4),
+            "safety_passed": judge_result.safety_passed,
+            "correctness_passed": judge_result.correctness_passed,
+            "qualification_gate": qualified,
+            "verdict": f"{_passed}/{_n}",
+            "grounded": f"{_grounded}/{_n}",
+            "error": judge_result.error,
+        }
+
+        cost_str = (
+            f", cost=${result.cost_usd:.4f}"
+            if result.cost_usd is not None
+            else ""
+        )
+        gate_str = "PASS" if qualified else "FAIL"
+        logger.info(
+            f"Miner {miner_uid}: {scenario_name} -> "
+            f"judge={judge_result.overall_score:.3f}{cost_str}, "
+            f"gate={gate_str}, tool_calls={result.tool_calls}"
+        )
+        if result.token_usage:
+            tu = result.token_usage
+            logger.info(
+                f"Miner {miner_uid}: {scenario_name}   "
+                f"tokens: input={tu.get('input_tokens', 0)}, "
+                f"output={tu.get('output_tokens', 0)}, "
+                f"cache_read={tu.get('cache_read_tokens', 0)}, "
+                f"cache_write={tu.get('cache_write_tokens', 0)}"
+            )
+
+        if judge_result.error:
+            logger.warning(
+                f"Miner {miner_uid}: {scenario_name} judge error: "
+                f"{judge_result.error}"
+            )
+
+        # Log per-criterion details
+        for cr in judge_result.criteria_results:
+            if cr.verdict != "PASS":
+                logger.info(
+                    f"  FAIL {cr.id}: {cr.justification}"
+                )
+        if result.model_usage:
+            for m in result.model_usage:
+                logger.info(
+                    f"Miner {miner_uid}: {scenario_name}   "
+                    f"{m.get('model', '?')}: "
+                    f"${m.get('cost_usd', 0):.4f} "
+                    f"({m.get('count', 0)} calls)"
+                )
+
+    # ------------------------------------------------------------------
     # Miner evaluation
     # ------------------------------------------------------------------
 
@@ -1206,141 +1329,178 @@ class TrajectoryValidator:
         scenario_model_usage: Dict[str, List[Dict[str, Any]]] = {}
         scenario_judge_details: Dict[str, Dict[str, Any]] = {}
 
-        total_scenarios = len(eval_scenarios)
-        for scenario_idx, scenario_name in enumerate(eval_scenarios, 1):
+        if self.parallel_harness is not None:
+            # ── Parallel evaluation: episode + judge per scenario ──
+            # Each scenario runs its episode then immediately runs the LLM
+            # judge, all in parallel. No scenario waits for others.
             logger.info(
-                f"Miner {miner_uid}: scenario [{scenario_idx}/{total_scenarios}] "
-                f"{scenario_name} ..."
+                f"Miner {miner_uid}: running {len(eval_scenarios)} scenarios "
+                f"in parallel (episode + judge per slot)..."
             )
-            try:
-                # Single episode per scenario (no consensus voting in v4.0)
-                result = await self.harness.evaluate_pack(
+
+            async def _eval_and_judge(scenario_name: str) -> None:
+                result = await self.parallel_harness.evaluate_scenario(
                     pack=pack,
                     scenario_name=scenario_name,
                     seed=epoch_seed,
                     context_preamble=context_preamble,
                     user_context=user_context,
                 )
+                # Run blocking judge call in a thread so it doesn't block
+                # the event loop (other scenarios' episodes keep running)
+                await asyncio.to_thread(
+                    self._process_scenario_result,
+                    miner_uid=miner_uid,
+                    scenario_name=scenario_name,
+                    result=result,
+                    scenario_costs=scenario_costs,
+                    scenario_qualified=scenario_qualified,
+                    scenario_token_usage=scenario_token_usage,
+                    scenario_model_usage=scenario_model_usage,
+                    scenario_judge_details=scenario_judge_details,
+                )
 
-                if result.error:
-                    logger.warning(
-                        f"Miner {miner_uid}: {scenario_name} episode error: "
-                        f"{result.error}"
+            await asyncio.gather(
+                *[_eval_and_judge(s) for s in eval_scenarios]
+            )
+
+        else:
+            # ── Sequential evaluation: fail-fast on first failure ──
+            total_scenarios = len(eval_scenarios)
+            for scenario_idx, scenario_name in enumerate(eval_scenarios, 1):
+                logger.info(
+                    f"Miner {miner_uid}: scenario [{scenario_idx}/{total_scenarios}] "
+                    f"{scenario_name} ..."
+                )
+                try:
+                    # Single episode per scenario (no consensus voting in v4.0)
+                    result = await self.harness.evaluate_pack(
+                        pack=pack,
+                        scenario_name=scenario_name,
+                        seed=epoch_seed,
+                        context_preamble=context_preamble,
+                        user_context=user_context,
+                    )
+
+                    if result.error:
+                        logger.warning(
+                            f"Miner {miner_uid}: {scenario_name} episode error: "
+                            f"{result.error}"
+                        )
+                        scenario_qualified[scenario_name] = False
+                        remaining = [s for s in eval_scenarios if s not in scenario_qualified]
+                        if remaining:
+                            logger.info(
+                                f"Miner {miner_uid}: fail-fast, "
+                                f"skipping {len(remaining)} remaining scenarios"
+                            )
+                            for s in remaining:
+                                scenario_qualified[s] = False
+                        break
+
+                    if result.cost_usd is not None:
+                        scenario_costs[scenario_name] = result.cost_usd
+                    if result.token_usage:
+                        scenario_token_usage[scenario_name] = result.token_usage
+                    if result.model_usage:
+                        scenario_model_usage[scenario_name] = result.model_usage
+
+                    # Phase 2: LLM trajectory judge
+                    scenario_config = self.scenarios.get(scenario_name, {})
+                    trajectory = result.trajectory or []
+                    judge_result = self.trajectory_judge.evaluate(
+                        scenario_config=scenario_config,
+                        trajectory=trajectory,
+                        agent_response=result.response,
+                    )
+
+                    qualified = judge_result.qualification_gate
+                    scenario_qualified[scenario_name] = qualified
+
+                    # Store full judge details for dashboard reporting
+                    _criteria = judge_result.criteria_results
+                    _n = len(_criteria)
+                    _passed = sum(1 for cr in _criteria if cr.verdict == "PASS")
+                    _grounded = sum(1 for cr in _criteria if cr.grounded)
+                    scenario_judge_details[scenario_name] = {
+                        "overall_score": round(judge_result.overall_score, 4),
+                        "safety_passed": judge_result.safety_passed,
+                        "correctness_passed": judge_result.correctness_passed,
+                        "qualification_gate": qualified,
+                        "verdict": f"{_passed}/{_n}",
+                        "grounded": f"{_grounded}/{_n}",
+                        "error": judge_result.error,
+                    }
+
+                    cost_str = (
+                        f", cost=${result.cost_usd:.4f}"
+                        if result.cost_usd is not None
+                        else ""
+                    )
+                    gate_str = "PASS" if qualified else "FAIL"
+                    logger.info(
+                        f"Miner {miner_uid}: {scenario_name} -> "
+                        f"judge={judge_result.overall_score:.3f}{cost_str}, "
+                        f"gate={gate_str}, tool_calls={result.tool_calls}"
+                    )
+                    if result.token_usage:
+                        tu = result.token_usage
+                        logger.info(
+                            f"Miner {miner_uid}: {scenario_name}   "
+                            f"tokens: input={tu.get('input_tokens', 0)}, "
+                            f"output={tu.get('output_tokens', 0)}, "
+                            f"cache_read={tu.get('cache_read_tokens', 0)}, "
+                            f"cache_write={tu.get('cache_write_tokens', 0)}"
+                        )
+
+                    if judge_result.error:
+                        logger.warning(
+                            f"Miner {miner_uid}: {scenario_name} judge error: "
+                            f"{judge_result.error}"
+                        )
+
+                    # Log per-criterion details
+                    for cr in judge_result.criteria_results:
+                        if cr.verdict != "PASS":
+                            logger.info(
+                                f"  FAIL {cr.id}: {cr.justification}"
+                            )
+                    if result.model_usage:
+                        for m in result.model_usage:
+                            logger.info(
+                                f"Miner {miner_uid}: {scenario_name}   "
+                                f"{m.get('model', '?')}: "
+                                f"${m.get('cost_usd', 0):.4f} "
+                                f"({m.get('count', 0)} calls)"
+                            )
+
+                    # Fail fast: any scenario failure → skip remaining
+                    if not qualified:
+                        remaining = [s for s in eval_scenarios if s not in scenario_qualified]
+                        if remaining:
+                            logger.info(
+                                f"Miner {miner_uid}: fail-fast on {scenario_name}, "
+                                f"skipping {len(remaining)} remaining scenarios"
+                            )
+                            for s in remaining:
+                                scenario_qualified[s] = False
+                        break
+
+                except Exception as e:
+                    logger.error(
+                        f"Miner {miner_uid}: {scenario_name} failed: {e}",
+                        exc_info=True,
                     )
                     scenario_qualified[scenario_name] = False
                     remaining = [s for s in eval_scenarios if s not in scenario_qualified]
                     if remaining:
                         logger.info(
-                            f"Miner {miner_uid}: fail-fast, "
+                            f"Miner {miner_uid}: fail-fast on {scenario_name} exception, "
                             f"skipping {len(remaining)} remaining scenarios"
                         )
                         for s in remaining:
                             scenario_qualified[s] = False
                     break
-
-                if result.cost_usd is not None:
-                    scenario_costs[scenario_name] = result.cost_usd
-                if result.token_usage:
-                    scenario_token_usage[scenario_name] = result.token_usage
-                if result.model_usage:
-                    scenario_model_usage[scenario_name] = result.model_usage
-
-                # Phase 2: LLM trajectory judge
-                scenario_config = self.scenarios.get(scenario_name, {})
-                trajectory = result.trajectory or []
-                judge_result = self.trajectory_judge.evaluate(
-                    scenario_config=scenario_config,
-                    trajectory=trajectory,
-                    agent_response=result.response,
-                )
-
-                qualified = judge_result.qualification_gate
-                scenario_qualified[scenario_name] = qualified
-
-                # Store full judge details for dashboard reporting
-                _criteria = judge_result.criteria_results
-                _n = len(_criteria)
-                _passed = sum(1 for cr in _criteria if cr.verdict == "PASS")
-                _grounded = sum(1 for cr in _criteria if cr.grounded)
-                scenario_judge_details[scenario_name] = {
-                    "overall_score": round(judge_result.overall_score, 4),
-                    "safety_passed": judge_result.safety_passed,
-                    "correctness_passed": judge_result.correctness_passed,
-                    "qualification_gate": qualified,
-                    "verdict": f"{_passed}/{_n}",
-                    "grounded": f"{_grounded}/{_n}",
-                    "error": judge_result.error,
-                }
-
-                cost_str = (
-                    f", cost=${result.cost_usd:.4f}"
-                    if result.cost_usd is not None
-                    else ""
-                )
-                gate_str = "PASS" if qualified else "FAIL"
-                logger.info(
-                    f"Miner {miner_uid}: {scenario_name} -> "
-                    f"judge={judge_result.overall_score:.3f}{cost_str}, "
-                    f"gate={gate_str}, tool_calls={result.tool_calls}"
-                )
-                if result.token_usage:
-                    tu = result.token_usage
-                    logger.info(
-                        f"Miner {miner_uid}: {scenario_name}   "
-                        f"tokens: input={tu.get('input_tokens', 0)}, "
-                        f"output={tu.get('output_tokens', 0)}, "
-                        f"cache_read={tu.get('cache_read_tokens', 0)}, "
-                        f"cache_write={tu.get('cache_write_tokens', 0)}"
-                    )
-
-                if judge_result.error:
-                    logger.warning(
-                        f"Miner {miner_uid}: {scenario_name} judge error: "
-                        f"{judge_result.error}"
-                    )
-
-                # Log per-criterion details
-                for cr in judge_result.criteria_results:
-                    if cr.verdict != "PASS":
-                        logger.info(
-                            f"  FAIL {cr.id}: {cr.justification}"
-                        )
-                if result.model_usage:
-                    for m in result.model_usage:
-                        logger.info(
-                            f"Miner {miner_uid}: {scenario_name}   "
-                            f"{m.get('model', '?')}: "
-                            f"${m.get('cost_usd', 0):.4f} "
-                            f"({m.get('count', 0)} calls)"
-                        )
-
-                # Fail fast: any scenario failure → skip remaining
-                if not qualified:
-                    remaining = [s for s in eval_scenarios if s not in scenario_qualified]
-                    if remaining:
-                        logger.info(
-                            f"Miner {miner_uid}: fail-fast on {scenario_name}, "
-                            f"skipping {len(remaining)} remaining scenarios"
-                        )
-                        for s in remaining:
-                            scenario_qualified[s] = False
-                    break
-
-            except Exception as e:
-                logger.error(
-                    f"Miner {miner_uid}: {scenario_name} failed: {e}",
-                    exc_info=True,
-                )
-                scenario_qualified[scenario_name] = False
-                remaining = [s for s in eval_scenarios if s not in scenario_qualified]
-                if remaining:
-                    logger.info(
-                        f"Miner {miner_uid}: fail-fast on {scenario_name} exception, "
-                        f"skipping {len(remaining)} remaining scenarios"
-                    )
-                    for s in remaining:
-                        scenario_qualified[s] = False
-                break
 
         if not scenario_qualified:
             logger.warning(f"Miner {miner_uid}: No scenario results!")

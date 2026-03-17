@@ -7,6 +7,11 @@
 #   3. validator    (Python, foreground — PID 1 via exec)
 #
 # On startup, runs init_workspace.py once to set up fixtures + config.
+#
+# Parallel mode (PARALLEL_SCENARIOS=1):
+#   Steps 3-5 (init workspace, mock-tools, OpenClaw) are SKIPPED.
+#   The ParallelClawBenchHarness in the validator Python code manages
+#   N independent service slots, each with its own ports + workspace.
 
 set -euo pipefail
 
@@ -54,6 +59,21 @@ else
     echo "[entrypoint] Pulling latest ClawBench..."
     (cd /app/clawbench && git pull --ff-only origin "$CLAWBENCH_BRANCH") || \
         echo "[entrypoint] WARNING: ClawBench pull failed — using current version"
+fi
+
+# ── Parallel mode check ──────────────────────────────────────────
+# When PARALLEL_SCENARIOS=1, the Python ParallelClawBenchHarness manages
+# its own mock-tools + OpenClaw instances (one per scenario, on different
+# ports). Skip the single-instance startup below.
+PARALLEL_SCENARIOS="${PARALLEL_SCENARIOS:-0}"
+# Configurable main script (default: neurons/validator.py)
+VALIDATOR_SCRIPT="${VALIDATOR_SCRIPT:-neurons/validator.py}"
+
+if [ "$PARALLEL_SCENARIOS" = "1" ]; then
+    echo "[entrypoint] Parallel mode: skipping single-instance service startup"
+    echo "[entrypoint] ParallelClawBenchHarness will start N service slots"
+    echo "[entrypoint] Starting: $VALIDATOR_SCRIPT (parallel mode)..."
+    exec python -u "$VALIDATOR_SCRIPT" "$@"
 fi
 
 # ── 3. Init workspace (one-shot) ────────────────────────────────
@@ -109,5 +129,5 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # ── 7. Start validator (foreground) ─────────────────────────────
-echo "[entrypoint] Starting validator..."
-exec python -u neurons/validator.py "$@"
+echo "[entrypoint] Starting: $VALIDATOR_SCRIPT..."
+exec python -u "$VALIDATOR_SCRIPT" "$@"

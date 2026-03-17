@@ -1,0 +1,48 @@
+# TrajectoryRL — Parallel Evaluation Test
+#
+# Tests parallel scenario evaluation using the same all-in-one image.
+# Uses PARALLEL_SCENARIOS=1 to skip single-instance service startup
+# and let ParallelClawBenchHarness manage N service slots.
+#
+# Usage:
+#   # Build and run with a pack file:
+#   docker compose -f docker/docker-compose.parallel-test.yml --env-file .env up --build
+#
+#   # View logs:
+#   docker compose -f docker/docker-compose.parallel-test.yml logs -f
+#
+#   # Clean up:
+#   docker compose -f docker/docker-compose.parallel-test.yml down
+
+services:
+  parallel-test:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.validator
+    container_name: trajectoryrl_parallel_test
+    network_mode: host
+    env_file:
+      - ../.env
+    environment:
+      # Enable parallel evaluation
+      - PARALLEL_SCENARIOS=1
+      - OPENCLAW_BIN=/app/openclaw
+      # Run the test script instead of the full validator
+      - VALIDATOR_SCRIPT=/app/eval_parallel_test.py
+      # ClawBench config
+      - CLAWBENCH_PATH=/app/clawbench
+      - CLAWBENCH_DEFAULT_MODEL=${CLAWBENCH_DEFAULT_MODEL:-zhipu/glm-5}
+      - CLAWBENCH_LLM_BASE_URL=${CLAWBENCH_LLM_BASE_URL:-https://open.bigmodel.cn/api/paas/v4}
+      - CLAWBENCH_LLM_API_KEY=${CLAWBENCH_LLM_API_KEY:-}
+      # Logging
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      # Mount pack file (place your pack.json in the repo root)
+      - ../pack.json:/pack.json:ro
+    # Pass pack path as argument (forwarded by entrypoint via $@)
+    command: ["/pack.json"]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
