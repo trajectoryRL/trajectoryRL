@@ -901,6 +901,11 @@ class TrajectoryValidator:
                             rejection_detail=_detail,
                         )
                     )
+                    # Clear EMA state so weight phase doesn't score this miner
+                    # using stale historical data from before the rejection.
+                    self.ema_costs.pop(hotkey, None)
+                    self.scenario_qualified.pop(hotkey, None)
+                    self._ema_pack_hash.pop(hotkey, None)
                     continue
 
             # Check eval cache before spending LLM tokens.
