@@ -19,6 +19,11 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
 
+# Reasoning models may need more tokens since they spend tokens on
+# thinking before producing the actual answer.
+MAX_REASONING_RETRIES = 1
+REASONING_RETRY_MULTIPLIER = 4
+
 
 def resolve_api_key(api_key: str = "") -> str:
     """Resolve API key.
@@ -85,12 +90,52 @@ def _generate_openai_compat(
         kwargs["base_url"] = base_url
 
     client = OpenAI(**kwargs)
-    response = client.chat.completions.create(
-        model=model,
-        max_tokens=max_tokens,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user_message},
-        ],
-    )
-    return response.choices[0].message.content
+    current_max_tokens = max_tokens
+
+    for attempt in range(1 + MAX_REASONING_RETRIES):
+        response = client.chat.completions.create(
+            model=model,
+            max_tokens=current_max_tokens,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_message},
+            ],
+        )
+
+        choice = response.choices[0]
+        message = choice.message
+        content = message.content
+        reasoning = getattr(message, "reasoning_content", None)
+        finish_reason = choice.finish_reason
+
+        # Happy path: model returned content
+        if content:
+            return content
+
+        # Reasoning model detection: has reasoning but no content
+        if reasoning and not content:
+            if finish_reason == "length" and attempt < MAX_REASONING_RETRIES:
+                # Token budget exhausted by reasoning — retry with more tokens
+                new_max = current_max_tokens * REASONING_RETRY_MULTIPLIER
+                logger.warning(
+                    "Reasoning model used all %d tokens on thinking "
+                    "(finish_reason=length, reasoning=%d chars, content=empty). "
+                    "Retrying with max_tokens=%d.",
+                    current_max_tokens, len(reasoning), new_max,
+                )
+                current_max_tokens = new_max
+                continue
+            else:
+                # Either retry exhausted or finish_reason != length
+                # Fall back to reasoning_content
+                logger.warning(
+                    "LLM returned empty content but has reasoning_content "
+                    "(%d chars, finish_reason=%s). This model may require "
+                    "higher max_tokens or a non-reasoning model. "
+                    "Falling back to reasoning_content.",
+                    len(reasoning), finish_reason,
+                )
+                return reasoning
+
+        # No content and no reasoning
+        return content or ""
