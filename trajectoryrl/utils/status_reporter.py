@@ -73,6 +73,15 @@ async def heartbeat(
         return False
 
 
+# Cache keyed by (miner_hotkey, pack_hash) → last valid pre-eval response.
+_pre_eval_cache: Dict[tuple, Dict[str, Any]] = {}
+
+
+def _is_valid_pre_eval_response(data: Any) -> bool:
+    """Check that the response has the expected pre-eval format."""
+    return isinstance(data, dict) and "allowed" in data
+
+
 async def pre_eval(
     miner_hotkey: str,
     pack_hash: str,
@@ -82,6 +91,10 @@ async def pre_eval(
 ) -> Optional[Dict[str, Any]]:
     """Call the pre-eval API to check whether a miner's submission is allowed.
 
+    Uses a local cache so that when the API is unreachable or returns an
+    unexpected format, the last known-good response is used instead of
+    blindly failing open.
+
     Args:
         miner_hotkey: Miner hotkey to check.
         pack_hash: Pack hash submitted by the miner.
@@ -89,9 +102,10 @@ async def pre_eval(
         pre_eval_url: Pre-eval API endpoint.
 
     Returns:
-        Parsed response dict on success, or None if the request failed.
-        Callers should treat None as "allowed" (fail-open on network errors).
+        Parsed response dict on success or from cache, or None only if the
+        request failed AND no cached result exists (fail-open).
     """
+    cache_key = (miner_hotkey, pack_hash)
     params: Dict[str, Any] = {"hotkey": miner_hotkey, "hash": pack_hash}
     if pack_url is not None:
         params["pack_url"] = pack_url
@@ -101,15 +115,40 @@ async def pre_eval(
             resp = await client.get(pre_eval_url, params=params, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
-            logger.info("Pre-eval check passed: %s", data)
-            return data
-        logger.warning(
-            "Pre-eval check failed: %d %s", resp.status_code, resp.text[:200]
-        )
-        return None
+            if _is_valid_pre_eval_response(data):
+                _pre_eval_cache[cache_key] = data
+                logger.info("Pre-eval check passed: %s", data)
+                return data
+            logger.warning(
+                "Pre-eval returned unexpected format: %s", data
+            )
+        else:
+            logger.warning(
+                "Pre-eval check failed: %d %s",
+                resp.status_code,
+                resp.text[:200],
+            )
     except Exception as e:
         logger.warning("Pre-eval check error: %s", e)
-        return None
+
+    # API failed or returned bad data — fall back to cache.
+    cached = _pre_eval_cache.get(cache_key)
+    if cached is not None:
+        logger.info(
+            "Using cached pre-eval result for %s/%s: %s",
+            miner_hotkey[:8],
+            pack_hash[:12],
+            cached,
+        )
+        return cached
+
+    # No cache available — fail-open.
+    logger.warning(
+        "No cached pre-eval for %s/%s — failing open",
+        miner_hotkey[:8],
+        pack_hash[:12],
+    )
+    return None
 
 
 async def submit_eval(
