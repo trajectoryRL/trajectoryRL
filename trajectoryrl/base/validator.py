@@ -55,6 +55,10 @@ _EVAL_CACHE_MAX_RETRIES = int(os.getenv("TRAJECTORYRL_CACHE_MAX_RETRIES", "3"))
 _EVAL_CACHE_TTL_DAYS = int(os.getenv("TRAJECTORYRL_CACHE_TTL_DAYS", "14"))
 _EVAL_CACHE_ENABLED = os.getenv("TRAJECTORYRL_EVAL_CACHE_ENABLED", "1") != "0"
 
+_EVAL_CACHE_MAX_RETRIES = int(os.getenv("TRAJECTORYRL_CACHE_MAX_RETRIES", "3"))
+_EVAL_CACHE_TTL_DAYS = int(os.getenv("TRAJECTORYRL_CACHE_TTL_DAYS", "14"))
+_EVAL_CACHE_ENABLED = os.getenv("TRAJECTORYRL_EVAL_CACHE_ENABLED", "1") != "0"
+
 
 class TrajectoryValidator:
     """TrajectoryRL validator that evaluates policy packs using ClawBench.
@@ -193,6 +197,12 @@ class TrajectoryValidator:
 
         # Load persisted EMA state
         self._load_ema_state()
+
+        # Eval result cache: pack_hash -> {status, result, failure_count, ...}
+        # Keyed by miner-submitted pack_hash; avoids re-running ClawBench + LLM
+        # judge for packs that have already been evaluated this cycle.
+        self._eval_cache: Dict[str, dict] = {}
+        self._load_eval_cache()
 
         # Eval result cache: pack_hash -> {status, result, failure_count, ...}
         # Keyed by miner-submitted pack_hash; avoids re-running ClawBench + LLM
@@ -614,6 +624,7 @@ class TrajectoryValidator:
                     )
                     self._save_ema_state()
                     self._save_eval_cache()
+                    self._save_eval_cache()
 
                 # --- Tempo cadence: re-set weights ---
                 current_block = self.subtensor.get_current_block()
@@ -631,6 +642,7 @@ class TrajectoryValidator:
             except KeyboardInterrupt:
                 logger.info("Received interrupt, shutting down...")
                 self._save_ema_state()
+                self._save_eval_cache()
                 self._save_eval_cache()
                 break
             except Exception as e:
