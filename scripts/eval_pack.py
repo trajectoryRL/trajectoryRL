@@ -400,8 +400,8 @@ def main():
                    help="Runs per scenario for consensus (default: 1)")
     p.add_argument("--seed", type=int, default=None,
                    help="Epoch seed (default: from current time)")
-    p.add_argument("--timeout", type=int, default=120,
-                   help="Timeout per scenario (default: 120s)")
+    p.add_argument("--timeout", type=int, default=600,
+                   help="Timeout per scenario (default: 600s)")
     p.add_argument("--model", help="LLM model override")
     p.add_argument("--api-key", help="LLM API key override")
     p.add_argument("--base-url", help="LLM base URL override")
