@@ -1275,6 +1275,11 @@ class TrajectoryValidator:
                     rejection_detail=integrity.summary,
                 )
             )
+            # Clear EMA so weight phase doesn't score this miner using
+            # stale data accumulated before the hardcoding was detected.
+            self.ema_costs.pop(commitment.hotkey, None)
+            self.scenario_qualified.pop(commitment.hotkey, None)
+            self._ema_pack_hash.pop(commitment.hotkey, None)
             return None
 
         if integrity.flags:
