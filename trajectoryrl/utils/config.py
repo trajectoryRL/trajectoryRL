@@ -69,7 +69,9 @@ class ValidatorConfig:
 
     # Evaluation config
     seeds_per_task: int = 1
-    eval_interval_blocks: int = 7200  # ~24 hours at 12s/block
+    eval_interval_blocks: int = 7200  # ~24 hours at 12s/block (used by _needs_evaluation)
+    eval_utc_hour: int = 0           # UTC hour to trigger daily eval cycle (0 = midnight)
+    eval_on_startup: bool = False    # Run eval immediately on validator startup
     timeout_per_scenario: int = 300  # 5 minutes max per scenario
 
     # Scoring config
@@ -188,6 +190,7 @@ class ValidatorConfig:
             judge_base_url=os.getenv("JUDGE_BASE_URL", ""),
             # --- Operational ---
             log_level=os.getenv("LOG_LEVEL", "INFO"),
+            eval_on_startup=os.getenv("EVAL_ON_STARTUP", "0") == "1",
             # --- IM parameters are hardcoded (dataclass defaults) ---
             # Do NOT load from env: ema_alpha, cost_ema_alpha, cost_delta,
             # rho_reliability, consensus_epsilon, bootstrap_threshold,

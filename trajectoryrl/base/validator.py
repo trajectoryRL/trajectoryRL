@@ -19,6 +19,7 @@ Each validator operates independently — YC3 aggregates on-chain.
 """
 
 import asyncio
+import datetime
 import hashlib
 import json
 import logging
@@ -180,6 +181,12 @@ class TrajectoryValidator:
 
         # Timestamp of the most recent completed full evaluation cycle
         self._last_eval_at: Optional[int] = None
+
+        # UTC date of the most recent completed eval cycle (for daily scheduling)
+        self._last_eval_date: Optional[datetime.date] = None
+
+        # Set to True on startup when eval_on_startup=True; cleared after first eval
+        self._startup_eval_pending: bool = config.eval_on_startup
 
         # Last computed weights, cached for mid-eval tempo replays
         self._last_weights_uids: Optional[List[int]] = None
@@ -565,7 +572,7 @@ class TrajectoryValidator:
     async def run(self):
         """Main validator loop with dual cadence.
 
-        - eval_interval (~24h / 7200 blocks): evaluate marked packs, update EMA.
+        - Daily eval: evaluate all miner packs once per day at UTC eval_utc_hour.
         - tempo (~72 min / 360 blocks): compute weights from EMA, set_weights.
         """
         self._start_time = time.time()
@@ -574,15 +581,12 @@ class TrajectoryValidator:
 
         logger.info("Starting validator main loop...")
         logger.info(
-            f"Eval interval: {self.config.eval_interval_blocks} blocks "
-            f"(~{self.config.eval_interval_blocks * 12 // 3600}h)"
+            f"Eval schedule: daily at UTC {self.config.eval_utc_hour:02d}:00"
         )
         logger.info(
             f"Weight interval: {self.config.weight_interval_blocks} blocks "
             f"(~{self.config.weight_interval_blocks * 12 // 60}min)"
         )
-
-        last_eval_sync_block: int = 0
 
         while True:
             try:
@@ -601,13 +605,13 @@ class TrajectoryValidator:
                     await asyncio.sleep(60)
                     continue
 
-                # --- Eval cadence: evaluate new/changed packs ---
-                blocks_since_eval = current_block - last_eval_sync_block
-                if blocks_since_eval >= self.config.eval_interval_blocks:
+                # --- Eval cadence: daily at fixed UTC hour ---
+                if self._should_run_eval_today():
+                    now_utc = datetime.datetime.utcnow()
                     logger.info("=" * 60)
                     logger.info(
-                        f"Evaluation cycle at block {current_block} "
-                        f"({blocks_since_eval} blocks since last)"
+                        f"Daily evaluation cycle at block {current_block} "
+                        f"(UTC {now_utc.strftime('%Y-%m-%d %H:%M')})"
                     )
                     logger.info("=" * 60)
 
@@ -616,8 +620,9 @@ class TrajectoryValidator:
 
                     await self._run_evaluation_cycle(current_block)
                     self._last_eval_at = int(time.time())
-                    last_eval_sync_block = self.subtensor.get_current_block()
-                    self.last_weight_block = last_eval_sync_block
+                    self._last_eval_date = datetime.datetime.utcnow().date()
+                    self._startup_eval_pending = False
+                    self.last_weight_block = self.subtensor.get_current_block()
 
                     self.pack_fetcher.cleanup_cache(
                         self.config.pack_cache_max_size
@@ -1049,6 +1054,23 @@ class TrajectoryValidator:
 
         # 5. Set weights from EMA scores
         await self._compute_and_set_weights(current_block)
+
+    def _should_run_eval_today(self) -> bool:
+        """Return True if an eval should be triggered now.
+
+        Fires when:
+        - eval_on_startup=True and no eval has run yet this process, OR
+        - UTC hour >= eval_utc_hour and today's eval has not yet completed.
+        """
+        if self._startup_eval_pending:
+            return True
+        now = datetime.datetime.utcnow()
+        if now.hour < self.config.eval_utc_hour:
+            return False
+        today = now.date()
+        if self._last_eval_date is not None and self._last_eval_date >= today:
+            return False
+        return True
 
     def _needs_evaluation(
         self, hotkey: str, pack_hash: str, current_block: int

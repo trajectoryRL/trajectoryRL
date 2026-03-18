@@ -117,6 +117,21 @@ For full details on qualification gate, cost ranking, and YC3 configuration, see
 
 ---
 
+## Startup Options
+
+### `EVAL_ON_STARTUP`
+
+Triggers one full evaluation cycle immediately when the validator starts, without waiting for the next scheduled UTC 00:00 window. Useful after a restart or manual intervention when you don't want to wait until midnight.
+
+```bash
+docker compose -f docker/docker-compose.validator.yml --env-file .env.validator \
+  up -d -e EVAL_ON_STARTUP=1 validator
+```
+
+After the startup eval completes, the validator resumes its normal daily schedule (UTC 00:00). If the startup eval finishes before midnight, the daily eval will still fire at 00:00 as usual.
+
+---
+
 ## Automatic Updates
 
 The validator image is hosted on GHCR (GitHub Container Registry). Watchtower runs alongside the validator and automatically pulls new images when updates are pushed to `prod`, typically within 5 minutes.
