@@ -24,7 +24,9 @@ from .llm_client import generate
 logger = logging.getLogger(__name__)
 
 # Maximum characters of tool response to include in judge context.
-# Prevents context overflow from large fixture dumps.
+# 4000 balances grounding visibility vs token cost. Scenarios like
+# team_standup have 25 Slack messages (~8K chars) — 2000 cut off
+# incident details and caused false "ungrounded" failures.
 MAX_TOOL_RESPONSE_CHARS = 4000
 
 # Maximum characters for the full trajectory section.
@@ -397,13 +399,21 @@ class TrajectoryJudge:
             else:
                 args_str = str(args)
 
-            # Truncate long responses
+            # Truncate long responses — keep head + tail so the judge
+            # sees both early and late data (incidents, follow-ups tend
+            # to appear at the end of Slack/task board responses).
             if isinstance(response, dict):
                 resp_str = json.dumps(response, default=str, ensure_ascii=False)
             else:
                 resp_str = str(response)
             if len(resp_str) > MAX_TOOL_RESPONSE_CHARS:
-                resp_str = resp_str[:MAX_TOOL_RESPONSE_CHARS] + f"... [truncated, {len(resp_str)} total chars]"
+                head_size = MAX_TOOL_RESPONSE_CHARS * 2 // 3
+                tail_size = MAX_TOOL_RESPONSE_CHARS - head_size
+                resp_str = (
+                    resp_str[:head_size]
+                    + f"\n... [truncated {len(resp_str) - head_size - tail_size} chars] ...\n"
+                    + resp_str[-tail_size:]
+                )
 
             parts.append(
                 f"### Call {i}: {tool}\n"
