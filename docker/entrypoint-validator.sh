@@ -22,6 +22,11 @@ export WORKSPACE_DIR="${WORKSPACE_DIR:-/workspace}"
 export WORKSPACE_PATH="${WORKSPACE_PATH:-$WORKSPACE_DIR}"
 export CONFIG_DIR="${CONFIG_DIR:-/app/clawbench/config}"
 export OPENCLAW_HOME="${OPENCLAW_HOME:-/openclaw-home}"
+# Tell init_workspace.py where the gateway reads its config from.
+# The gateway resolves $HOME/.openclaw/openclaw.json (HOME=/root in
+# this container).  Without this, init writes to /openclaw-home/ which
+# the gateway never reads.
+export OPENCLAW_CONFIG_DIR="${OPENCLAW_CONFIG_DIR:-/root/.openclaw}"
 
 # OpenClaw reads OPENAI_* env vars for LLM routing
 export OPENAI_API_KEY="${CLAWBENCH_LLM_API_KEY:-}"
