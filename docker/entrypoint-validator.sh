@@ -21,11 +21,20 @@ export FIXTURES_DIR="${FIXTURES_DIR:-/app/clawbench/fixtures}"
 export WORKSPACE_DIR="${WORKSPACE_DIR:-/workspace}"
 export WORKSPACE_PATH="${WORKSPACE_PATH:-$WORKSPACE_DIR}"
 export CONFIG_DIR="${CONFIG_DIR:-/app/clawbench/config}"
-export OPENCLAW_HOME="${OPENCLAW_HOME:-/openclaw-home}"
+# Do NOT set OPENCLAW_HOME here.  OpenClaw uses OPENCLAW_HOME to
+# resolve its config directory ($OPENCLAW_HOME/.openclaw/).  Setting it
+# to /openclaw-home makes the gateway look for config in
+# /openclaw-home/.openclaw/ instead of $HOME/.openclaw/ (/root/.openclaw/).
+# init_workspace.py writes to OPENCLAW_CONFIG_DIR which defaults to
+# $HOME/.openclaw/ — matching where the gateway reads.
+export OPENCLAW_CONFIG_DIR="${OPENCLAW_CONFIG_DIR:-/root/.openclaw}"
 
-# OpenClaw reads OPENAI_* env vars for LLM routing
-export OPENAI_API_KEY="${CLAWBENCH_LLM_API_KEY:-}"
-export OPENAI_BASE_URL="${CLAWBENCH_LLM_BASE_URL:-https://open.bigmodel.cn/api/paas/v4}"
+# Do NOT set OPENAI_API_KEY / OPENAI_BASE_URL here.  OpenClaw's
+# provider-detection logic maps OPENAI_API_KEY to the "openai" provider
+# and overrides the model to anthropic/claude, ignoring the providers
+# section in openclaw.json.  The generated config already contains the
+# API key and base URL per provider (substituted from CLAWBENCH_LLM_*
+# env vars by init_workspace.py), so OPENAI_* env vars are not needed.
 export OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN:-sandbox-token-12345}"
 
 # All-in-one defaults (no Docker port mapping)
@@ -60,7 +69,7 @@ fi
 
 # ── 3. Init workspace (one-shot) ────────────────────────────────
 log "Initializing workspace..."
-mkdir -p "$WORKSPACE_DIR" "$OPENCLAW_HOME"
+mkdir -p "$WORKSPACE_DIR" "$OPENCLAW_CONFIG_DIR"
 python /app/clawbench/scripts/init_workspace.py
 
 chmod -R 777 "$WORKSPACE_DIR"
