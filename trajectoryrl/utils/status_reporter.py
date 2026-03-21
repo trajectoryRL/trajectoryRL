@@ -15,6 +15,8 @@ _BASE_URL = os.getenv("TRAJECTORYRL_API_BASE_URL", "https://trajrl.com")
 DEFAULT_HEARTBEAT_URL = f"{_BASE_URL}/api/validators/heartbeat"
 DEFAULT_SUBMIT_URL = f"{_BASE_URL}/api/scores/submit"
 DEFAULT_PRE_EVAL_URL = f"{_BASE_URL}/api/miners/pre-eval"
+DEFAULT_LOGS_UPLOAD_URL = f"{_BASE_URL}/api/validators/logs/upload"
+DEFAULT_CYCLE_LOGS_URL = f"{_BASE_URL}/api/validators/logs/cycle"
 
 
 async def heartbeat(
@@ -142,10 +144,15 @@ async def pre_eval(
             data = resp.json()
             if _is_valid_pre_eval_response(data):
                 _pre_eval_cache[cache_key] = data
-                logger.info("Pre-eval check passed: %s", data)
+                logger.info(
+                    "Pre-eval check passed: allowed=%s reason=%s",
+                    data.get("allowed"),
+                    data.get("reason", ""),
+                )
                 return data
             logger.warning(
-                "Pre-eval returned unexpected format: %s", data
+                "Pre-eval returned unexpected format (keys=%s)",
+                list(data.keys()) if isinstance(data, dict) else type(data).__name__,
             )
         else:
             logger.warning(
@@ -160,10 +167,10 @@ async def pre_eval(
     cached = _pre_eval_cache.get(cache_key)
     if cached is not None:
         logger.info(
-            "Using cached pre-eval result for %s/%s: %s",
+            "Using cached pre-eval result for %s/%s: allowed=%s",
             miner_hotkey[:8],
             pack_hash[:12],
-            cached,
+            cached.get("allowed"),
         )
         return cached
 
@@ -174,6 +181,155 @@ async def pre_eval(
         pack_hash[:12],
     )
     return None
+
+
+async def upload_eval_logs(
+    wallet,
+    *,
+    eval_id: str,
+    miner_hotkey: str,
+    miner_uid: int,
+    block_height: int,
+    pack_hash: str,
+    log_archive: bytes,
+    upload_url: str = DEFAULT_LOGS_UPLOAD_URL,
+) -> bool:
+    """Upload eval log archive to the dashboard API.
+
+    Fire-and-forget: failures are logged and silently discarded.
+    Must never block or affect the validator's eval loop.
+
+    Args:
+        wallet: bt.Wallet with accessible hotkey for signing.
+        eval_id: Eval run identifier (YYYYMMDD_HHMMSS format).
+        miner_hotkey: Hotkey of the evaluated miner.
+        miner_uid: UID of the evaluated miner.
+        block_height: Block height of this eval.
+        pack_hash: SHA-256 hash of the pack being evaluated.
+        log_archive: Gzipped tar archive bytes containing eval log files.
+        upload_url: Dashboard log upload endpoint.
+
+    Returns:
+        True on success (HTTP 200), False otherwise.
+    """
+    try:
+        hotkey_kp = wallet.hotkey
+    except Exception:
+        logger.debug("Skipping log upload: wallet hotkey not available")
+        return False
+    hotkey_addr = hotkey_kp.ss58_address
+    timestamp = int(time.time())
+
+    message = f"trajectoryrl-logs:{hotkey_addr}:{timestamp}"
+    sig = hotkey_kp.sign(message.encode())
+    signature = "0x" + (sig if isinstance(sig, bytes) else bytes(sig)).hex()
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                upload_url,
+                data={
+                    "validator_hotkey": hotkey_addr,
+                    "eval_id": eval_id,
+                    "miner_hotkey": miner_hotkey,
+                    "miner_uid": str(miner_uid),
+                    "block_height": str(block_height),
+                    "pack_hash": pack_hash,
+                    "timestamp": str(timestamp),
+                    "signature": signature,
+                },
+                files={
+                    "log_archive": (
+                        "logs.tar.gz",
+                        log_archive,
+                        "application/gzip",
+                    ),
+                },
+                timeout=30,
+            )
+        if resp.status_code == 200:
+            logger.debug(
+                "Eval logs uploaded (miner=%s...)", miner_hotkey[:8]
+            )
+            return True
+        logger.warning(
+            "Eval log upload failed: %d %s",
+            resp.status_code,
+            resp.text[:200],
+        )
+        return False
+    except Exception as e:
+        logger.warning("Eval log upload error: %s", e)
+        return False
+
+
+async def upload_cycle_logs(
+    wallet,
+    *,
+    eval_id: str,
+    block_height: int,
+    log_archive: bytes,
+    upload_url: str = DEFAULT_CYCLE_LOGS_URL,
+) -> bool:
+    """Upload eval cycle log archive to the dashboard API.
+
+    Fire-and-forget: failures are logged and silently discarded.
+    Must never block or affect the validator's eval loop.
+
+    Args:
+        wallet: bt.Wallet with accessible hotkey for signing.
+        eval_id: Eval cycle identifier (YYYYMMDD_HHMMSS format).
+        block_height: Block height at cycle start.
+        log_archive: Gzipped tar archive bytes containing the cycle log.
+        upload_url: Dashboard cycle log upload endpoint.
+
+    Returns:
+        True on success (HTTP 200), False otherwise.
+    """
+    try:
+        hotkey_kp = wallet.hotkey
+    except Exception:
+        logger.debug("Skipping cycle log upload: wallet hotkey not available")
+        return False
+    hotkey_addr = hotkey_kp.ss58_address
+    timestamp = int(time.time())
+
+    message = f"trajectoryrl-logs:{hotkey_addr}:{timestamp}"
+    sig = hotkey_kp.sign(message.encode())
+    signature = "0x" + (sig if isinstance(sig, bytes) else bytes(sig)).hex()
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                upload_url,
+                data={
+                    "validator_hotkey": hotkey_addr,
+                    "eval_id": eval_id,
+                    "block_height": str(block_height),
+                    "timestamp": str(timestamp),
+                    "signature": signature,
+                },
+                files={
+                    "log_archive": (
+                        "cycle.tar.gz",
+                        log_archive,
+                        "application/gzip",
+                    ),
+                },
+                timeout=30,
+            )
+        if resp.status_code == 200:
+            logger.debug("Cycle logs uploaded")
+            return True
+        logger.warning(
+            "Cycle log upload failed: %d %s",
+            resp.status_code,
+            resp.text[:200],
+        )
+        return False
+    except Exception as e:
+        logger.warning("Cycle log upload error: %s", e)
+        return False
 
 
 async def submit_eval(

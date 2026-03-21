@@ -90,7 +90,7 @@ class PackFetcher:
         max_bytes = max_size_mb * 1024 * 1024
 
         if total_bytes <= max_bytes:
-            logger.debug(
+            logger.info(
                 f"Cache size {total_bytes / 1024 / 1024:.1f} MB "
                 f"<= {max_size_mb} MB, no eviction needed"
             )
@@ -230,7 +230,7 @@ class PackFetcher:
             cache_path.touch()
             return pack
         except Exception as e:
-            logger.debug(f"Cache read failed for {pack_hash[:12]}…: {e}")
+            logger.info(f"Cache read failed for {pack_hash[:12]}…: {e}")
             return None
 
     def _save_to_cache(self, pack_hash: str, pack: dict) -> None:
@@ -240,7 +240,7 @@ class PackFetcher:
             with open(cache_path, "w") as f:
                 json.dump(pack, f, sort_keys=True)
         except Exception as e:
-            logger.debug(f"Cache write failed for {pack_hash[:12]}…: {e}")
+            logger.info(f"Cache write failed for {pack_hash[:12]}…: {e}")
 
 
 # Backward-compatible aliases

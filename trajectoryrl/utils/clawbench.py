@@ -206,7 +206,7 @@ class ClawBenchHarness:
                 user_context=user_context,
             )
             runs.append(result)
-            logger.debug(
+            logger.info(
                 f"  Run {i}: score={result.score:.3f}, "
                 f"success={result.success}, checks={len(result.rubric)}"
             )
@@ -414,7 +414,7 @@ class ClawBenchHarness:
         try:
             workspace.chmod(0o755)
         except OSError:
-            logger.debug(f"Could not chmod workspace dir: {workspace}")
+            logger.info(f"Could not chmod workspace dir: {workspace}")
         workspace_abs = workspace.resolve()
 
         # Write files from pack.
@@ -441,8 +441,8 @@ class ClawBenchHarness:
                 file_path.parent.chmod(0o755)
                 file_path.chmod(0o644)
             except OSError:
-                logger.debug(f"Could not chmod generated file: {file_path}")
-            logger.debug(f"Wrote {filename} ({len(content)} chars)")
+                logger.info(f"Could not chmod generated file: {file_path}")
+            logger.info(f"Wrote {filename} ({len(content)} chars)")
 
         logger.info(f"Applied pack to workspace: {workspace}")
 
@@ -492,7 +492,7 @@ class ClawBenchHarness:
         if user_context:
             cmd.extend(["--user-context", json.dumps(user_context)])
 
-        logger.debug(f"Running command: {' '.join(cmd)}")
+        logger.info(f"Running command: {' '.join(cmd)}")
 
         env = {
             **os.environ,
@@ -633,7 +633,7 @@ class ClawBenchHarness:
                 continue
 
         logger.error("Failed to parse episode output: no result JSON found")
-        logger.debug(f"Output was: {output}")
+        logger.info(f"Output was: {output}")
         return {
             "success": False,
             "checks_passed": 0,

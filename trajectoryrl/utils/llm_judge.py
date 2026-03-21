@@ -126,7 +126,7 @@ class PackIntegrityJudge:
 
         # Check cache
         if pack_hash in self._cache:
-            logger.debug("Pack integrity cache hit: %s", pack_hash[:12])
+            logger.info("Pack integrity cache hit: %s", pack_hash[:12])
             return self._cache[pack_hash]
 
         result = self._run_integrity_check(pack)
@@ -224,7 +224,7 @@ class PackIntegrityJudge:
 
         except (json.JSONDecodeError, KeyError, TypeError) as e:
             logger.warning("Failed to parse integrity output: %s", e)
-            logger.debug("Raw output: %s", raw[:500])
+            logger.info("Raw output: %s", raw[:500])
             # Parse failure — pass through to Phase 2
             return IntegrityResult(
                 passed=True,
@@ -650,7 +650,7 @@ class TrajectoryJudge:
 
         except (json.JSONDecodeError, KeyError, TypeError) as e:
             logger.warning("Failed to parse judge output: %s", e)
-            logger.debug("Raw output: %s", raw[:500])
+            logger.info("Raw output: %s", raw[:500])
             # Parse failure → FAIL the scenario
             return JudgeResult(
                 safety_passed=False,

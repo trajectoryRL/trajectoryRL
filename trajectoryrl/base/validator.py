@@ -40,7 +40,9 @@ from ..utils.github import PackFetcher
 from ..utils.epoch_context import generate_epoch_context, render_context_preamble
 from ..utils.commitments import MinerCommitment, fetch_all_commitments
 from ..utils.ncd import deduplicate_packs
-from ..utils.status_reporter import heartbeat, pre_eval, submit_eval
+from ..utils.status_reporter import (
+    heartbeat, pre_eval, submit_eval, upload_eval_logs, upload_cycle_logs,
+)
 from ..utils.llm_judge import PackIntegrityJudge, TrajectoryJudge
 from .. import __version__
 
@@ -97,7 +99,7 @@ class TrajectoryValidator:
         self.subtensor = bt.Subtensor(network=config.network)
         self.metagraph = self.subtensor.metagraph(config.netuid)
 
-        logger.info(f"Wallet: {self.wallet}")
+        logger.info(f"Wallet hotkey: {self.wallet.hotkey.ss58_address[:16]}...")
         logger.info(f"Network: {config.network}")
         logger.info(f"Netuid: {config.netuid}")
 
@@ -495,14 +497,13 @@ class TrajectoryValidator:
 
     def _setup_logging(self):
         log_format = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+        self._validator_log_path = self.config.log_dir / f"validator_{int(time.time())}.log"
         logging.basicConfig(
             level=getattr(logging, self.config.log_level),
             format=log_format,
             handlers=[
                 logging.StreamHandler(),
-                logging.FileHandler(
-                    self.config.log_dir / f"validator_{int(time.time())}.log"
-                ),
+                logging.FileHandler(self._validator_log_path),
             ],
         )
 
@@ -744,6 +745,8 @@ class TrajectoryValidator:
         self.last_weight_block = current_block
 
         cycle_start = time.time()
+        cycle_log_offset = self._get_validator_log_offset()
+        cycle_eval_id = time.strftime("%Y%m%d_%H%M%S")
 
         # Epoch seed for context variation
         epoch = current_block // self.config.eval_interval_blocks
@@ -936,6 +939,7 @@ class TrajectoryValidator:
                     f"[{miner_idx}/{total_eligible}] Evaluating miner {uid} "
                     f"({hotkey[:8]}) ..."
                 )
+                eval_dir, vlog_offset, mlog_offset = self._prepare_eval_log_capture(cycle_eval_id, hotkey)
                 eval_start = time.time()
                 eval_result = await self._evaluate_miner(
                     uid, commitment, eval_scenarios, epoch_seed,
@@ -944,6 +948,14 @@ class TrajectoryValidator:
                 )
                 eval_elapsed = time.time() - eval_start
                 self._update_eval_cache(commitment.pack_hash, eval_result)
+
+                # Upload eval logs to dashboard (fire-and-forget)
+                asyncio.ensure_future(
+                    self._fire_upload_eval_logs(
+                        cycle_eval_id, uid, commitment, eval_scenarios,
+                        eval_dir, vlog_offset, mlog_offset, current_block,
+                    )
+                )
 
             if eval_result is not None:
                 ema_reset = self._ema_pack_hash.get(hotkey) != commitment.pack_hash
@@ -1047,10 +1059,18 @@ class TrajectoryValidator:
                 "Possible LLM API key issue or service outage. "
                 "Setting fallback weights to owner UID."
             )
+            asyncio.ensure_future(
+                self._fire_upload_cycle_logs(cycle_eval_id, cycle_log_offset, current_block)
+            )
             await self._set_fallback_weights(
                 reason="All evaluations failed (LLM error)"
             )
             return
+
+        # Upload cycle-level validator log (fire-and-forget)
+        asyncio.ensure_future(
+            self._fire_upload_cycle_logs(cycle_eval_id, cycle_log_offset, current_block)
+        )
 
         # 5. Set weights from EMA scores
         await self._compute_and_set_weights(current_block)
@@ -1530,6 +1550,199 @@ class TrajectoryValidator:
             llm_base_url=self._judge_base_url,
             llm_model=self._judge_model,
         )
+
+    # ------------------------------------------------------------------
+    # Eval log upload
+    # ------------------------------------------------------------------
+
+    _MAX_LOG_ARCHIVE_BYTES = 10 * 1024 * 1024  # 10 MB
+
+    def _get_validator_log_offset(self) -> int:
+        """Return the current byte offset of the main validator log file."""
+        try:
+            return (
+                self._validator_log_path.stat().st_size
+                if self._validator_log_path.exists() else 0
+            )
+        except OSError:
+            return 0
+
+    def _prepare_eval_log_capture(self, eval_id: str, hotkey: str) -> Tuple[Path, int, int]:
+        """Prepare for log capture before an eval run.
+
+        Creates a unique eval directory, truncates mock-tools JSONL log
+        files, and records file offsets for the main validator log and the
+        per-miner log so only new content is captured.
+
+        Args:
+            eval_id: Cycle-level eval identifier (YYYYMMDD_HHMMSS).
+            hotkey: Miner hotkey.
+
+        Returns:
+            (eval_dir, validator_log_offset, miner_log_offset) tuple.
+        """
+        eval_dir = self.config.log_dir / "evals" / eval_id / hotkey[:16]
+        eval_dir.mkdir(parents=True, exist_ok=True)
+
+        for pattern in ("*_calls.jsonl", "*_all_requests.jsonl"):
+            for path in self.config.log_dir.glob(pattern):
+                try:
+                    path.write_text("")
+                except OSError:
+                    pass
+
+        try:
+            vlog_offset = (
+                self._validator_log_path.stat().st_size
+                if self._validator_log_path.exists() else 0
+            )
+        except OSError:
+            vlog_offset = 0
+
+        miner_log = self._miner_log_dir / f"{hotkey[:16]}.log"
+        try:
+            mlog_offset = miner_log.stat().st_size if miner_log.exists() else 0
+        except OSError:
+            mlog_offset = 0
+
+        return eval_dir, vlog_offset, mlog_offset
+
+    def _collect_eval_logs(
+        self,
+        hotkey: str,
+        eval_scenarios: List[str],
+        eval_dir: Path,
+        validator_log_offset: int,
+        miner_log_offset: int,
+    ) -> Optional[bytes]:
+        """Snapshot log files into *eval_dir* and package as tar.gz.
+
+        Copies the main validator log segment, per-miner log segment, and
+        per-scenario JSONL files into the eval directory so they persist
+        locally for debugging, then creates an in-memory tar.gz archive
+        for upload.
+
+        Args:
+            hotkey: Miner hotkey (used to locate per-miner log).
+            eval_scenarios: Scenario names evaluated in this run.
+            eval_dir: Unique eval directory created by _prepare_eval_log_capture.
+            validator_log_offset: Main validator log byte offset before eval.
+            miner_log_offset: Per-miner log byte offset before eval.
+
+        Returns:
+            Gzipped tar archive bytes, or None on failure / over-size.
+        """
+        import io
+        import shutil
+        import tarfile
+
+        try:
+            for src_path, dst_name, offset in (
+                (self._validator_log_path, "validator.log", validator_log_offset),
+                (self._miner_log_dir / f"{hotkey[:16]}.log", "miner.log", miner_log_offset),
+            ):
+                if src_path.exists():
+                    with open(src_path, "rb") as f:
+                        f.seek(offset)
+                        segment = f.read()
+                    if segment:
+                        (eval_dir / dst_name).write_bytes(segment)
+
+            for scenario in eval_scenarios:
+                for suffix in ("_calls.jsonl", "_all_requests.jsonl"):
+                    src = self.config.log_dir / f"{scenario}{suffix}"
+                    if src.exists() and src.stat().st_size > 0:
+                        shutil.copy2(str(src), str(eval_dir / f"{scenario}{suffix}"))
+
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+                for child in sorted(eval_dir.iterdir()):
+                    tar.add(str(child), arcname=child.name)
+
+            archive = buf.getvalue()
+            if len(archive) > self._MAX_LOG_ARCHIVE_BYTES:
+                logger.warning(
+                    "Log archive too large (%d bytes), skipping upload",
+                    len(archive),
+                )
+                return None
+            return archive
+        except Exception as e:
+            logger.warning("Failed to collect eval logs: %s", e)
+            return None
+
+    async def _fire_upload_eval_logs(
+        self,
+        eval_id: str,
+        uid: int,
+        commitment: "MinerCommitment",
+        eval_scenarios: List[str],
+        eval_dir: Path,
+        validator_log_offset: int,
+        miner_log_offset: int,
+        block_height: int,
+    ) -> None:
+        """Collect and upload eval logs. Fire-and-forget."""
+        log_archive = self._collect_eval_logs(
+            commitment.hotkey, eval_scenarios, eval_dir,
+            validator_log_offset, miner_log_offset,
+        )
+        if log_archive:
+            await upload_eval_logs(
+                self.wallet,
+                eval_id=eval_id,
+                miner_hotkey=commitment.hotkey,
+                miner_uid=uid,
+                block_height=block_height,
+                pack_hash=commitment.pack_hash,
+                log_archive=log_archive,
+            )
+
+    async def _fire_upload_cycle_logs(
+        self,
+        eval_id: str,
+        cycle_log_offset: int,
+        block_height: int,
+    ) -> None:
+        """Upload the full eval cycle validator log. Fire-and-forget."""
+        import io
+        import tarfile
+
+        try:
+            if not self._validator_log_path.exists():
+                return
+            with open(self._validator_log_path, "rb") as f:
+                f.seek(cycle_log_offset)
+                segment = f.read()
+            if not segment:
+                return
+
+            cycle_dir = self.config.log_dir / "evals" / eval_id
+            cycle_dir.mkdir(parents=True, exist_ok=True)
+            (cycle_dir / "validator.log").write_bytes(segment)
+
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+                tar.add(
+                    str(cycle_dir / "validator.log"),
+                    arcname="validator.log",
+                )
+            archive = buf.getvalue()
+            if len(archive) > self._MAX_LOG_ARCHIVE_BYTES:
+                logger.warning(
+                    "Cycle log archive too large (%d bytes), skipping",
+                    len(archive),
+                )
+                return
+
+            await upload_cycle_logs(
+                self.wallet,
+                eval_id=eval_id,
+                block_height=block_height,
+                log_archive=archive,
+            )
+        except Exception as e:
+            logger.warning("Cycle log upload error: %s", e)
 
     # ------------------------------------------------------------------
     # Weight setting
