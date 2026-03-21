@@ -4,8 +4,12 @@
 # Multi-stage build compiles OpenClaw (Node.js) then bundles with Python runtime.
 #
 # Triggers:
-#   - push to staging → tags: staging, sha-<commit>
-#   - push to prod    → tags: latest,  sha-<commit>
+#   - push to staging branch → image tags: staging, sha-<commit>
+#   - push tag v*   (prod)   → image tags: latest,  sha-<commit>, <git-tag>
+#
+# Deploy to prod:
+#   git tag v1.0.0
+#   git push origin v1.0.0
 #
 # Watchtower on validator machines auto-pulls the relevant tag.
 
@@ -13,7 +17,7 @@ name: Build Validator Image
 
 on:
   push:
-    branches: [staging, prod]
+    branches: [staging]
     paths:
       - "neurons/**"
       - "trajectoryrl/**"
@@ -23,6 +27,8 @@ on:
       - "pyproject.toml"
       - ".github/workflows/**"
       - ".gitmodules"
+    tags:
+      - "v*"
 
 env:
   REGISTRY: ghcr.io
@@ -57,7 +63,8 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=${{ github.ref_name == 'prod' && 'latest' || 'staging' }}
+            type=raw,value=${{ startsWith(github.ref, 'refs/tags/') && 'latest' || 'staging' }}
+            type=ref,event=tag
             type=sha,prefix=
 
       - name: Build and push
