@@ -126,7 +126,7 @@ class TrajectoryMiner:
             files.update(extra_files)
 
         if tool_allow is None:
-            tool_allow = ["exec", "slack", "memory_search", "memory_get", "read"]
+            tool_allow = ["exec", "slack", "memory_search", "memory_get"]
         if tool_deny is None:
             tool_deny = ["admin_*", "shell"]
 
