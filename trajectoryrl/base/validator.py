@@ -187,6 +187,12 @@ class TrajectoryValidator:
         # Set to True on startup when eval_on_startup=True; cleared after first eval
         self._startup_eval_pending: bool = config.eval_on_startup
 
+        # When True, tempo weight refreshes use fallback weights instead of
+        # computing from (potentially stale) EMA data.  Set when the eval
+        # cycle exits via a fallback path (no LLM key, all evals failed,
+        # no active miners) and cleared after a successful eval cycle.
+        self._eval_fallback_active: bool = False
+
         # Last computed weights, cached for mid-eval tempo replays
         self._last_weights_uids: Optional[List[int]] = None
         self._last_weights: Optional[List[float]] = None
@@ -630,7 +636,12 @@ class TrajectoryValidator:
                         f"Tempo weight refresh at block {current_block} "
                         f"({blocks_since_weights} blocks since last)"
                     )
-                    await self._compute_and_set_weights(current_block)
+                    if self._eval_fallback_active:
+                        await self._set_fallback_weights(
+                            reason="Eval cycle in fallback mode"
+                        )
+                    else:
+                        await self._compute_and_set_weights(current_block)
                     self.last_weight_block = current_block
 
                 await asyncio.sleep(60)
@@ -772,6 +783,7 @@ class TrajectoryValidator:
                 "CLAWBENCH_LLM_API_KEY not set. "
                 "Skipping evaluation, setting fallback weights to owner UID.",
             )
+            self._eval_fallback_active = True
             await self._set_fallback_weights(
                 reason="No LLM API key configured"
             )
@@ -829,6 +841,7 @@ class TrajectoryValidator:
 
         if not active_commitments:
             logger.warning("No active miners with valid commitments!")
+            self._eval_fallback_active = True
             await self._set_fallback_weights()
             return
 
@@ -1146,6 +1159,7 @@ class TrajectoryValidator:
                 "Possible LLM API key issue or service outage. "
                 "Setting fallback weights to owner UID."
             )
+            self._eval_fallback_active = True
             asyncio.ensure_future(
                 self._fire_upload_cycle_logs(cycle_eval_id, cycle_log_offset, current_block)
             )
@@ -1158,6 +1172,10 @@ class TrajectoryValidator:
         asyncio.ensure_future(
             self._fire_upload_cycle_logs(cycle_eval_id, cycle_log_offset, current_block)
         )
+
+        # Eval completed successfully — clear fallback flag so tempo
+        # refreshes use real computed weights.
+        self._eval_fallback_active = False
 
         # 5. Set weights from EMA scores
         await self._compute_and_set_weights(current_block)
