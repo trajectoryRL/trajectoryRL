@@ -53,7 +53,7 @@ trajectoryrl-validator = "neurons.validator:main"
 trajectoryrl-miner = "neurons.miner:main"
 
 [tool.setuptools.dynamic]
-version = {attr = "trajectoryrl.__version__"}
+version = {file = "VERSION"}
 
 [tool.setuptools.packages.find]
 include = ["trajectoryrl*", "neurons*"]
