@@ -34,6 +34,7 @@ class EvaluationResult:
         input_message: User message sent to OpenClaw
         raw_llm_response: Full OpenClaw API response dict
         all_requests: All mock_tool requests including failures
+        session_key: OpenClaw session key for transcript retrieval
     """
     scenario_name: str
     score: float
@@ -49,6 +50,7 @@ class EvaluationResult:
     input_message: Optional[str] = None
     raw_llm_response: Optional[Dict[str, Any]] = None
     all_requests: Optional[List[Dict[str, Any]]] = None
+    session_key: Optional[str] = None
 
 
 class ClawBenchHarness:
@@ -577,6 +579,7 @@ class ClawBenchHarness:
             input_message = result_data.get("input_message")
             raw_llm_response = result_data.get("openclaw_raw_response")
             all_requests = result_data.get("all_requests")
+            session_key = result_data.get("session_key")
 
             logger.info(
                 f"Evaluation result for {scenario_name}: "
@@ -598,6 +601,7 @@ class ClawBenchHarness:
                 input_message=input_message,
                 raw_llm_response=raw_llm_response,
                 all_requests=all_requests,
+                session_key=session_key,
             )
 
         except asyncio.TimeoutError:

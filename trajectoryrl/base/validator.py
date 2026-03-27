@@ -1067,7 +1067,7 @@ class TrajectoryValidator:
                 # Upload eval logs to dashboard (fire-and-forget)
                 asyncio.ensure_future(
                     self._fire_upload_eval_logs(
-                        cycle_eval_id, uid, commitment, eval_scenarios,
+                        cycle_eval_id, uid, commitment, eval_scenarios, eval_result,
                         eval_dir, vlog_offset, mlog_offset, current_block,
                     )
                 )
@@ -1508,6 +1508,7 @@ class TrajectoryValidator:
         scenario_token_usage: Dict[str, Dict[str, int]] = {}
         scenario_model_usage: Dict[str, List[Dict[str, Any]]] = {}
         scenario_judge_details: Dict[str, Dict[str, Any]] = {}
+        scenario_session_keys: Dict[str, str] = {}
 
         total_scenarios = len(eval_scenarios)
         for scenario_idx, scenario_name in enumerate(eval_scenarios, 1):
@@ -1546,6 +1547,8 @@ class TrajectoryValidator:
                     scenario_token_usage[scenario_name] = result.token_usage
                 if result.model_usage:
                     scenario_model_usage[scenario_name] = result.model_usage
+                if result.session_key:
+                    scenario_session_keys[scenario_name] = result.session_key
 
                 # Phase 2: LLM trajectory judge
                 scenario_config = self.scenarios.get(scenario_name, {})
@@ -1658,6 +1661,7 @@ class TrajectoryValidator:
             "token_usage": scenario_token_usage,
             "model_usage": scenario_model_usage,
             "judge_details": scenario_judge_details,
+            "session_keys": scenario_session_keys,
         }
 
     # ------------------------------------------------------------------
@@ -1854,6 +1858,7 @@ class TrajectoryValidator:
         eval_dir: Path,
         validator_log_offset: int,
         miner_log_offset: int,
+        session_keys: Dict[str, str],
     ) -> Optional[bytes]:
         """Snapshot log files into *eval_dir* and package as tar.gz.
 
@@ -1868,6 +1873,7 @@ class TrajectoryValidator:
             eval_dir: Unique eval directory created by _prepare_eval_log_capture.
             validator_log_offset: Main validator log byte offset before eval.
             miner_log_offset: Per-miner log byte offset before eval.
+            session_keys: Mapping of scenario name to OpenClaw session key.
 
         Returns:
             Gzipped tar archive bytes, or None on failure / over-size.
@@ -1887,6 +1893,16 @@ class TrajectoryValidator:
                         segment = f.read()
                     if segment:
                         (eval_dir / dst_name).write_bytes(segment)
+
+            # Copy OpenClaw session transcript files (full LLM conversation logs)
+            openclaw_sessions_dir = Path("/root/.openclaw/agents/main/sessions")
+            for scenario, session_key in session_keys.items():
+                if session_key:
+                    src = openclaw_sessions_dir / f"{session_key}.jsonl"
+                    if src.exists() and src.stat().st_size > 0:
+                        dst = eval_dir / f"{scenario}_conversation.jsonl"
+                        shutil.copy2(str(src), str(dst))
+                        logger.info(f"Copied session transcript for {scenario}: {session_key}")
 
             for scenario in eval_scenarios:
                 for suffix in ("_calls.jsonl", "_all_requests.jsonl"):
@@ -1917,15 +1933,17 @@ class TrajectoryValidator:
         uid: int,
         commitment: "MinerCommitment",
         eval_scenarios: List[str],
+        eval_result: Optional[Dict],
         eval_dir: Path,
         validator_log_offset: int,
         miner_log_offset: int,
         block_height: int,
     ) -> None:
         """Collect and upload eval logs. Fire-and-forget."""
+        session_keys = eval_result.get("session_keys", {}) if eval_result else {}
         log_archive = self._collect_eval_logs(
             commitment.hotkey, eval_scenarios, eval_dir,
-            validator_log_offset, miner_log_offset,
+            validator_log_offset, miner_log_offset, session_keys,
         )
         if log_archive:
             await upload_eval_logs(
