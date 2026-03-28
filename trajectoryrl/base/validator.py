@@ -38,11 +38,34 @@ from ..utils.clawbench import ClawBenchHarness, EvaluationResult
 from ..scoring import TrajectoryScorer
 from ..utils.github import PackFetcher
 from ..utils.epoch_context import generate_epoch_context, render_context_preamble
-from ..utils.commitments import MinerCommitment, fetch_all_commitments
+from ..utils.eval_window import (
+    WindowConfig, WindowPhase, EvaluationWindow,
+    compute_window, is_new_window, can_evaluate,
+    should_submit, should_aggregate,
+)
+from ..utils.consensus import (
+    ConsensusPayload, ConsensusPointer,
+    CONSENSUS_PROTOCOL_VERSION,
+)
+from ..utils.consensus_store import (
+    ConsensusStore, IPFSBackend, TrajRLAPIBackend,
+)
+from ..utils.consensus_filter import (
+    run_filter_pipeline, ValidatedSubmission,
+)
+from ..scoring import compute_consensus_costs
+from ..utils.incumbent import (
+    IncumbentState, select_winner_with_incumbent,
+    save_incumbent_state, load_incumbent_state,
+)
+from ..utils.commitments import (
+    MinerCommitment, fetch_all_commitments,
+    ValidatorConsensusCommitment, fetch_validator_consensus_commitments,
+    format_consensus_commitment,
+)
 from ..utils.ncd import deduplicate_packs
 from ..utils.status_reporter import (
     heartbeat, pre_eval, submit_eval, upload_eval_logs, upload_cycle_logs,
-    fetch_weight_override,
 )
 from ..utils.llm_judge import PackIntegrityJudge, TrajectoryJudge
 from .. import __version__
@@ -185,8 +208,40 @@ class TrajectoryValidator:
         # Timestamp of the most recent completed full evaluation cycle
         self._last_eval_at: Optional[int] = None
 
-        # UTC date of the most recent completed eval cycle (for daily scheduling)
+        # UTC date of the most recent completed eval cycle (legacy daily scheduling)
         self._last_eval_date: Optional[datetime.date] = None
+
+        # Block-based window tracking (replaces _last_eval_date for consensus protocol)
+        self._last_eval_window: int = -1
+        self._window_config = WindowConfig(
+            window_length=config.eval_interval_blocks,
+            global_anchor=config.global_anchor_block,
+            publish_pct=config.window_publish_pct,
+            aggregate_pct=config.window_aggregate_pct,
+        )
+        # Whether this window's evaluation results have been submitted to CAS
+        self._window_submitted: bool = False
+        # Whether this window's consensus aggregation has been performed
+        self._window_aggregated: bool = False
+
+        # Consensus CAS store (IPFS + API)
+        self._consensus_store = ConsensusStore(
+            ipfs=IPFSBackend(api_url=config.ipfs_api_url, api_token=config.ipfs_api_jwt_token),
+            api=TrajRLAPIBackend(
+                base_url=config.consensus_api_url,
+                validator_hotkey=self.wallet.hotkey.ss58_address,
+            ),
+        )
+
+        # Latest consensus results from aggregation (used by weight setting)
+        self._consensus_costs: Dict[str, float] = {}
+        self._consensus_qualified: Dict[str, bool] = {}
+
+        # Incumbent advantage state
+        self._incumbent_state_path = os.path.join(
+            getattr(config, "log_dir", "/tmp"), "incumbent_state.json"
+        )
+        self._incumbent_state = load_incumbent_state(self._incumbent_state_path)
 
         # Set to True on startup when eval_on_startup=True; cleared after first eval
         self._startup_eval_pending: bool = config.eval_on_startup
@@ -256,6 +311,10 @@ class TrajectoryValidator:
                 for k, v in data.get("first_mover_data", {}).items()
             }
             self.champion_hotkey = data.get("champion_hotkey")
+            self._last_eval_window = data.get("last_eval_window", -1)
+
+            self._consensus_costs = data.get("consensus_costs", {})
+            self._consensus_qualified = data.get("consensus_qualified", {})
 
             # Load integrity judge cache if present
             integrity_cache = data.get("integrity_cache")
@@ -279,6 +338,9 @@ class TrajectoryValidator:
             "last_eval_block": self.last_eval_block,
             "first_mover_data": self.first_mover_data,
             "champion_hotkey": self.champion_hotkey,
+            "last_eval_window": self._last_eval_window,
+            "consensus_costs": self._consensus_costs,
+            "consensus_qualified": self._consensus_qualified,
             "integrity_cache": self.integrity_judge.dump_cache(),
         }
         try:
@@ -573,11 +635,187 @@ class TrajectoryValidator:
                 logger.warning("Heartbeat error: %s", e)
             await asyncio.sleep(600)
 
-    async def run(self):
-        """Main validator loop with dual cadence.
+    async def _submit_consensus_payload(self, window: EvaluationWindow):
+        """Build and upload consensus payload to CAS, then write pointer on-chain."""
+        from trajectoryrl import __version__
 
-        - Daily eval: evaluate all miner packs once per day at UTC eval_utc_hour.
-        - tempo (~72 min / 360 blocks): compute weights from EMA, set_weights.
+        costs_by_hotkey: Dict[str, float] = {}
+        qualified_by_hotkey: Dict[str, bool] = {}
+
+        for hotkey, scenario_costs in self.ema_costs.items():
+            if scenario_costs:
+                total_cost = sum(scenario_costs.values()) / len(scenario_costs)
+                costs_by_hotkey[hotkey] = total_cost
+            scenario_q = self.scenario_qualified.get(hotkey, {})
+            qualified_by_hotkey[hotkey] = (
+                bool(scenario_q) and all(scenario_q.values())
+            )
+
+        if not costs_by_hotkey:
+            logger.warning(
+                "Window %d: no evaluation data to submit", window.window_number
+            )
+            return
+
+        payload = ConsensusPayload(
+            protocol_version=self.config.consensus_protocol_version,
+            window_number=window.window_number,
+            validator_hotkey=self.wallet.hotkey.ss58_address,
+            software_version=__version__,
+            costs=costs_by_hotkey,
+            qualified=qualified_by_hotkey,
+            timestamp=int(time.time()),
+        )
+
+        content_address = await self._consensus_store.upload_payload(payload)
+        if content_address is None:
+            logger.error(
+                "Window %d: failed to upload consensus payload",
+                window.window_number,
+            )
+            return
+
+        commitment_str = format_consensus_commitment(
+            protocol_version=self.config.consensus_protocol_version,
+            window_number=window.window_number,
+            content_address=content_address,
+        )
+        try:
+            self.subtensor.set_commitment(
+                wallet=self.wallet,
+                netuid=self.config.netuid,
+                data=commitment_str,
+            )
+            logger.info(
+                "Window %d: consensus pointer written on-chain "
+                "(address=%s, %d miners, commitment=%s)",
+                window.window_number, content_address[:24],
+                len(costs_by_hotkey), commitment_str[:60],
+            )
+        except Exception as e:
+            logger.error(
+                "Window %d: failed to write consensus pointer on-chain: %s",
+                window.window_number, e,
+            )
+
+    async def _run_consensus_aggregation(self, window: EvaluationWindow):
+        """Read on-chain consensus pointers, download payloads, filter, aggregate."""
+        chain_commitments = fetch_validator_consensus_commitments(
+            self.subtensor, self.config.netuid, self.metagraph,
+        )
+        if not chain_commitments:
+            logger.warning(
+                "Window %d: no consensus commitments on chain, using local results",
+                window.window_number,
+            )
+            return
+
+        submissions = []
+        for vc in chain_commitments:
+            pointer = ConsensusPointer(
+                protocol_version=vc.protocol_version,
+                window_number=vc.window_number,
+                content_address=vc.content_address,
+                validator_hotkey=vc.validator_hotkey,
+            )
+            payload = await self._consensus_store.download_payload(
+                vc.content_address
+            )
+            if payload is not None:
+                submissions.append((pointer, payload))
+
+        if not submissions:
+            logger.warning(
+                "Window %d: all payload downloads failed (%d commitments), "
+                "using local results",
+                window.window_number, len(chain_commitments),
+            )
+            return
+
+        metagraph = self.subtensor.metagraph(netuid=self.config.netuid)
+        validator_stakes: Dict[str, float] = {}
+        for neuron in metagraph.neurons:
+            if neuron.is_null:
+                continue
+            validator_stakes[neuron.hotkey] = float(neuron.stake)
+
+        from trajectoryrl import __version__
+        min_stake = getattr(self.config, "min_validator_stake", 0.0)
+        validated, stats = run_filter_pipeline(
+            submissions=submissions,
+            expected_window=window.window_number,
+            validator_stakes=validator_stakes,
+            min_stake=min_stake,
+            local_version=__version__,
+            expected_protocol=self.config.consensus_protocol_version,
+        )
+
+        if not validated:
+            logger.warning(
+                "Window %d: all submissions filtered out (%s), using local results",
+                window.window_number, stats.summary(),
+            )
+            return
+
+        consensus_costs, consensus_qualified = compute_consensus_costs(validated)
+
+        self._consensus_costs = consensus_costs
+        self._consensus_qualified = consensus_qualified
+
+        # Apply incumbent advantage + update historical best
+        winner_hk, updated_state = select_winner_with_incumbent(
+            consensus_costs=consensus_costs,
+            consensus_qualified=consensus_qualified,
+            state=self._incumbent_state,
+            window_number=window.window_number,
+            season_length=self.config.season_length,
+            cost_delta=self.config.cost_delta,
+        )
+        self._incumbent_state = updated_state
+        save_incumbent_state(updated_state, self._incumbent_state_path)
+
+        if winner_hk:
+            self.champion_hotkey = winner_hk
+            logger.info(
+                "Window %d: consensus winner = %s (incumbent=%s)",
+                window.window_number, winner_hk[:8],
+                "yes" if winner_hk == updated_state.incumbent_hotkey else "new",
+            )
+
+        logger.info(
+            "Window %d: consensus aggregation complete — %d miners, "
+            "%d validators contributed (%s)",
+            window.window_number, len(consensus_costs),
+            stats.passed, stats.summary(),
+        )
+
+        self._save_ema_state()
+
+    def _should_start_evaluation(self, current_block: int) -> bool:
+        """Return True if a new evaluation cycle should start.
+
+        Block-based: fires when we enter a new evaluation window and are
+        in the evaluation phase.  Also fires on startup if eval_on_startup
+        is set and no eval has run yet.
+        """
+        if self._startup_eval_pending:
+            return True
+
+        window = compute_window(current_block, self._window_config)
+        if window.phase != WindowPhase.EVALUATION:
+            return False
+        return window.window_number > self._last_eval_window
+
+    async def run(self):
+        """Main validator loop with block-based window phases.
+
+        Window phases (per eval_interval_blocks window):
+          - evaluation (0% - 80%):   run ClawBench, compute local cost EMA
+          - propagation (80% - 90%): submit results to CAS, wait for others
+          - aggregation (90% - 100%): read submissions, consensus, select winner
+
+        Independent cadence:
+          - tempo (~72 min / 360 blocks): set_weights using latest consensus
         """
         self._start_time = time.time()
 
@@ -585,7 +823,11 @@ class TrajectoryValidator:
 
         logger.info("Starting validator main loop...")
         logger.info(
-            f"Eval schedule: daily at UTC {self.config.eval_utc_hour:02d}:00"
+            f"Eval window: {self._window_config.window_length} blocks "
+            f"(~{self._window_config.window_length * 12 // 3600:.0f}h), "
+            f"anchor={self._window_config.global_anchor}, "
+            f"publish={self._window_config.publish_pct:.0%}, "
+            f"aggregate={self._window_config.aggregate_pct:.0%}"
         )
         logger.info(
             f"Weight interval: {self.config.weight_interval_blocks} blocks "
@@ -595,6 +837,7 @@ class TrajectoryValidator:
         while True:
             try:
                 current_block = self.subtensor.get_current_block()
+                window = compute_window(current_block, self._window_config)
 
                 # --- Pre-launch phase: fallback weights only ---
                 if current_block < EVAL_START_BLOCK:
@@ -604,29 +847,30 @@ class TrajectoryValidator:
                             f"Pre-launch phase (block {current_block} < "
                             f"{EVAL_START_BLOCK}), setting fallback weights"
                         )
-                        if not await self._apply_weight_override():
-                            await self._set_fallback_weights()
+                        await self._set_fallback_weights()
                         self.last_weight_block = current_block
                     await asyncio.sleep(60)
                     continue
 
-                # --- Eval cadence: daily at fixed UTC hour ---
-                if self._should_run_eval_today():
-                    now_utc = datetime.datetime.utcnow()
+                # --- Window phase: evaluation ---
+                if self._should_start_evaluation(current_block):
                     logger.info("=" * 60)
                     logger.info(
-                        f"Daily evaluation cycle at block {current_block} "
-                        f"(UTC {now_utc.strftime('%Y-%m-%d %H:%M')})"
+                        f"Evaluation window {window.window_number} at block "
+                        f"{current_block} (phase={window.phase.value}, "
+                        f"offset={window.block_offset}/{self._window_config.window_length})"
                     )
                     logger.info("=" * 60)
 
-                    # Sync ClawBench to latest before evaluation
                     await self._sync_clawbench()
 
                     await self._run_evaluation_cycle(current_block)
                     self._last_eval_at = int(time.time())
+                    self._last_eval_window = window.window_number
                     self._last_eval_date = datetime.datetime.utcnow().date()
                     self._startup_eval_pending = False
+                    self._window_submitted = False
+                    self._window_aggregated = False
                     self.last_weight_block = self.subtensor.get_current_block()
 
                     self.pack_fetcher.cleanup_cache(
@@ -635,21 +879,43 @@ class TrajectoryValidator:
                     self._save_ema_state()
                     self._save_eval_cache()
 
-                # --- Tempo cadence: re-set weights ---
+                # --- Window phase: submission (T_publish) ---
+                if (window.phase == WindowPhase.PROPAGATION
+                        and not self._window_submitted
+                        and self._last_eval_window == window.window_number):
+                    logger.info(
+                        f"Window {window.window_number}: T_publish reached "
+                        f"at block {current_block}, submitting evaluation results"
+                    )
+                    await self._submit_consensus_payload(window)
+                    self._window_submitted = True
+
+                # --- Window phase: aggregation (T_aggregate) ---
+                if (window.phase == WindowPhase.AGGREGATION
+                        and not self._window_aggregated
+                        and self._last_eval_window == window.window_number):
+                    logger.info(
+                        f"Window {window.window_number}: T_aggregate reached "
+                        f"at block {current_block}, running consensus aggregation"
+                    )
+                    await self._run_consensus_aggregation(window)
+                    self._window_aggregated = True
+
+                # --- Tempo cadence: re-set weights (independent of window) ---
                 current_block = self.subtensor.get_current_block()
                 blocks_since_weights = current_block - self.last_weight_block
                 if blocks_since_weights >= self.config.weight_interval_blocks:
                     logger.info(
                         f"Tempo weight refresh at block {current_block} "
-                        f"({blocks_since_weights} blocks since last)"
+                        f"({blocks_since_weights} blocks since last, "
+                        f"window={window.window_number} phase={window.phase.value})"
                     )
-                    if not await self._apply_weight_override():
-                        if self._eval_fallback_active:
-                            await self._set_fallback_weights(
-                                reason="Eval cycle in fallback mode"
-                            )
-                        else:
-                            await self._compute_and_set_weights(current_block)
+                    if self._eval_fallback_active:
+                        await self._set_fallback_weights(
+                            reason="Eval cycle in fallback mode"
+                        )
+                    else:
+                        await self._compute_and_set_weights(current_block)
                     self.last_weight_block = current_block
 
                 await asyncio.sleep(60)
@@ -819,7 +1085,7 @@ class TrajectoryValidator:
         # eval cycle. This caches the computed weights for mid-eval replays,
         # so the validator stays active on-chain even if eval takes longer
         # than one tempo window.
-        logger.info("Setting weights from previous eval before starting eval cycle")
+        logger.info("Setting weights from consensus before starting eval cycle")
         await self._compute_and_set_weights(current_block)
         self.last_weight_block = current_block
 
@@ -1139,8 +1405,7 @@ class TrajectoryValidator:
                     f"Mid-eval tempo refresh at block {mid_block} "
                     f"({mid_block - self.last_weight_block} blocks since last set_weights)"
                 )
-                if not await self._apply_weight_override():
-                    await self._replay_last_weights()
+                await self._replay_last_weights()
                 self.last_weight_block = mid_block
 
         parts = [f"{evaluated_count} evaluated"]
@@ -1193,7 +1458,7 @@ class TrajectoryValidator:
         # refreshes use real computed weights.
         self._eval_fallback_active = False
 
-        # 5. Set weights from EMA scores
+        # 5. Set weights from consensus costs (or fallback if no consensus yet)
         await self._compute_and_set_weights(current_block)
 
     def _should_run_eval_today(self) -> bool:
@@ -2035,79 +2300,12 @@ class TrajectoryValidator:
     # Weight setting
     # ------------------------------------------------------------------
 
-    async def _apply_weight_override(self) -> bool:
-        """Check for a forced weight override and apply it if active.
-
-        Only activated in exceptional circumstances (e.g. consensus
-        divergence) to save validator vtrust by forcing a known-good
-        winner UID from the server side.
-
-        Returns True if an override was applied (caller should skip normal
-        weight setting), False otherwise.
-        """
-        from datetime import datetime, timezone
-
-        override = await fetch_weight_override(self.wallet)
-        if override is None:
-            return False
-
-        expires_str = override.get("expiresAt")
-        winner_uid = override.get("winnerUid")
-        if expires_str is None or winner_uid is None:
-            return False
-
-        try:
-            expires_at = datetime.fromisoformat(
-                expires_str.replace("+00", "+00:00")
-            )
-            if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(tzinfo=timezone.utc)
-            now = datetime.now(timezone.utc)
-            if now >= expires_at:
-                logger.info(
-                    "Weight override expired at %s, ignoring", expires_str
-                )
-                return False
-        except Exception as e:
-            logger.warning("Failed to parse override expiresAt: %s", e)
-            return False
-
-        if winner_uid == OWNER_UID:
-            uids = [OWNER_UID]
-            weights = [1.0]
-            logger.info(
-                "Weight override: winnerUid=%d is owner UID, "
-                "setting weight 1.0 to owner UID %d",
-                winner_uid, OWNER_UID,
-            )
-        else:
-            uids = [int(winner_uid), OWNER_UID]
-            weights = [0.5, 0.5]
-            logger.info(
-                "Weight override: setting weight 0.5 to winnerUid %d "
-                "and 0.5 to owner UID %d",
-                winner_uid, OWNER_UID,
-            )
-
-        try:
-            self.subtensor.set_weights(
-                netuid=self.config.netuid,
-                wallet=self.wallet,
-                uids=uids,
-                weights=weights,
-                wait_for_inclusion=True,
-                wait_for_finalization=False,
-            )
-            logger.info("Weight override applied successfully")
-            self._last_set_weights_at = int(time.time())
-            self._last_weights_uids = uids
-            self._last_weights = weights
-        except Exception as e:
-            logger.error("Error applying weight override: %s", e, exc_info=True)
-        return True
-
     async def _compute_and_set_weights(self, current_block: int):
-        """Compute weights from EMA scores, set on-chain, and cache the result.
+        """Compute weights from consensus or local EMA, set on-chain, and cache.
+
+        After consensus aggregation completes (_window_aggregated=True and
+        _consensus_costs is populated), uses stake-weighted consensus costs
+        and qualification. Otherwise falls back to local EMA state.
 
         Maps hotkey -> UID via metagraph, applies winner selection,
         and calls set_weights. The resulting uids/weights are cached in
@@ -2131,24 +2329,38 @@ class TrajectoryValidator:
             await self._set_fallback_weights()
             return
 
-        # Build costs and qualification from EMA state
-        scores: Dict[int, float] = {}  # kept for report metadata compatibility
+        if not self._consensus_costs:
+            logger.info(
+                "No consensus data yet — using fallback weights until "
+                "first consensus aggregation completes"
+            )
+            await self._set_fallback_weights(
+                reason="No consensus data (pre-first-aggregation)"
+            )
+            return
+
+        scores: Dict[int, float] = {}
         costs: Dict[int, float] = {}
         qualified: Dict[int, bool] = {}
         uid_to_hotkey: Dict[int, str] = {}
 
+        hotkey_to_uid: Dict[str, int] = {}
         for uid, commitment in active.items():
-            hotkey = commitment.hotkey
-            total_cost = self.compute_total_cost_from_ema(hotkey)
-            is_qualified = self.is_fully_qualified(hotkey)
+            hotkey_to_uid[commitment.hotkey] = uid
+            uid_to_hotkey[uid] = commitment.hotkey
 
-            # Only include miners that have been evaluated (have cost data)
-            if total_cost is not None:
-                costs[uid] = total_cost
-                qualified[uid] = is_qualified
-                uid_to_hotkey[uid] = hotkey
-                # Score = 1.0 if qualified, 0.0 otherwise (for report compat)
-                scores[uid] = 1.0 if is_qualified else 0.0
+        for hotkey, consensus_cost in self._consensus_costs.items():
+            uid = hotkey_to_uid.get(hotkey)
+            if uid is None:
+                continue
+            costs[uid] = consensus_cost
+            qualified[uid] = self._consensus_qualified.get(hotkey, False)
+            scores[uid] = 1.0 if qualified[uid] else 0.0
+
+        logger.info(
+            "Weight setting using consensus costs (%d miners from %d active)",
+            len(costs), len(active),
+        )
 
         if not scores:
             logger.warning("All miners have zero EMA score")
@@ -2187,7 +2399,7 @@ class TrajectoryValidator:
 
         # Log results
         logger.info("=" * 60)
-        logger.info("WEIGHT RESULTS")
+        logger.info("WEIGHT RESULTS (source: CONSENSUS)")
         logger.info(f"Burn fraction: {BURN_FRACTION:.0%} to owner UID {OWNER_UID}")
         logger.info("=" * 60)
         for uid, weight in sorted(

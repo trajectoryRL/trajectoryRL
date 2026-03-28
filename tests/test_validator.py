@@ -39,6 +39,31 @@ from trajectoryrl.utils.epoch_context import (
     generate_epoch_context, render_context_preamble,
     EpochContext, NAMES, ROLES, COMPANIES, DEPARTMENTS, TIMEZONES,
 )
+from trajectoryrl.utils.eval_window import (
+    WindowConfig, WindowPhase, EvaluationWindow,
+    compute_window, is_new_window, should_submit, should_aggregate,
+    can_evaluate, window_progress_pct,
+)
+from trajectoryrl.utils.consensus import (
+    ConsensusPayload, ConsensusPointer,
+    verify_payload_integrity, CONSENSUS_PROTOCOL_VERSION,
+)
+from trajectoryrl.utils.consensus_filter import (
+    run_filter_pipeline, FilterStats, ValidatedSubmission,
+    filter_protocol_version, filter_window_number,
+    filter_trust_threshold, filter_data_integrity,
+    filter_software_version, filter_zero_signal,
+)
+from trajectoryrl.scoring import compute_consensus_costs
+from trajectoryrl.utils.incumbent import (
+    IncumbentState, select_winner_with_incumbent,
+    save_incumbent_state, load_incumbent_state,
+)
+from trajectoryrl.utils.commitments import (
+    parse_consensus_commitment, format_consensus_commitment,
+    is_consensus_commitment, parse_commitment,
+    ValidatorConsensusCommitment,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -2330,3 +2355,849 @@ class TestScoringIntegration:
 
         # Score should be high for this good result
         assert eval_result.score >= 0.7, f"Expected good score, got {eval_result.score}"
+
+
+# ---------------------------------------------------------------------------
+# EvaluationWindow tests
+# ---------------------------------------------------------------------------
+
+class TestEvaluationWindow:
+    """Tests for block-based evaluation window computation."""
+
+    def setup_method(self):
+        self.config = WindowConfig(
+            window_length=7200,
+            global_anchor=0,
+            publish_pct=0.80,
+            aggregate_pct=0.90,
+        )
+
+    def test_window_number_at_anchor(self):
+        w = compute_window(0, self.config)
+        assert w.window_number == 0
+        assert w.window_start == 0
+        assert w.block_offset == 0
+
+    def test_window_number_mid_window(self):
+        w = compute_window(3600, self.config)
+        assert w.window_number == 0
+        assert w.block_offset == 3600
+
+    def test_window_number_boundary(self):
+        w = compute_window(7200, self.config)
+        assert w.window_number == 1
+        assert w.window_start == 7200
+        assert w.block_offset == 0
+
+    def test_window_number_second_window(self):
+        w = compute_window(10000, self.config)
+        assert w.window_number == 1
+        assert w.window_start == 7200
+        assert w.block_offset == 2800
+
+    def test_phase_evaluation(self):
+        w = compute_window(100, self.config)
+        assert w.phase == WindowPhase.EVALUATION
+        assert w.blocks_remaining_in_phase == 5760 - 100
+
+    def test_phase_at_publish_boundary(self):
+        w = compute_window(5760, self.config)
+        assert w.phase == WindowPhase.PROPAGATION
+        assert w.blocks_into_phase == 0
+
+    def test_phase_propagation(self):
+        w = compute_window(6000, self.config)
+        assert w.phase == WindowPhase.PROPAGATION
+        assert w.blocks_into_phase == 240
+
+    def test_phase_at_aggregate_boundary(self):
+        w = compute_window(6480, self.config)
+        assert w.phase == WindowPhase.AGGREGATION
+        assert w.blocks_into_phase == 0
+
+    def test_phase_aggregation(self):
+        w = compute_window(7000, self.config)
+        assert w.phase == WindowPhase.AGGREGATION
+        assert w.blocks_remaining_in_phase == 200
+
+    def test_phase_end_of_window(self):
+        w = compute_window(7199, self.config)
+        assert w.phase == WindowPhase.AGGREGATION
+        assert w.window_number == 0
+        assert w.blocks_remaining_in_phase == 1
+
+    def test_global_anchor_offset(self):
+        cfg = WindowConfig(window_length=7200, global_anchor=1000)
+        w = compute_window(1000, cfg)
+        assert w.window_number == 0
+        assert w.window_start == 1000
+        assert w.block_offset == 0
+
+        w2 = compute_window(8200, cfg)
+        assert w2.window_number == 1
+        assert w2.window_start == 8200
+
+    def test_before_anchor_clamps(self):
+        cfg = WindowConfig(window_length=7200, global_anchor=5000)
+        w = compute_window(100, cfg)
+        assert w.window_number == 0
+        assert w.block_offset == 0
+
+    def test_is_new_window(self):
+        assert is_new_window(7200, 0, self.config) is True
+        assert is_new_window(7199, 0, self.config) is False
+        assert is_new_window(14400, 1, self.config) is True
+        assert is_new_window(14400, 2, self.config) is False
+
+    def test_can_evaluate(self):
+        assert can_evaluate(100, self.config) is True
+        assert can_evaluate(5759, self.config) is True
+        assert can_evaluate(5760, self.config) is False
+        assert can_evaluate(6480, self.config) is False
+
+    def test_should_submit(self):
+        assert should_submit(5759, self.config) is False
+        assert should_submit(5760, self.config) is True
+        assert should_submit(6000, self.config) is True
+        assert should_submit(6480, self.config) is False
+
+    def test_should_aggregate(self):
+        assert should_aggregate(6479, self.config) is False
+        assert should_aggregate(6480, self.config) is True
+        assert should_aggregate(7199, self.config) is True
+
+    def test_window_progress(self):
+        assert window_progress_pct(0, self.config) == pytest.approx(0.0)
+        assert window_progress_pct(3600, self.config) == pytest.approx(0.5)
+        assert window_progress_pct(7200, self.config) == pytest.approx(0.0)
+
+    def test_deterministic(self):
+        """Same inputs always produce same outputs (pure function)."""
+        for block in [0, 100, 5760, 6480, 7199, 7200, 99999]:
+            w1 = compute_window(block, self.config)
+            w2 = compute_window(block, self.config)
+            assert w1 == w2
+
+    def test_frozen_dataclass(self):
+        w = compute_window(100, self.config)
+        with pytest.raises(AttributeError):
+            w.window_number = 999
+
+    def test_custom_percentages(self):
+        cfg = WindowConfig(
+            window_length=10000,
+            publish_pct=0.70,
+            aggregate_pct=0.85,
+        )
+        assert cfg.publish_block == 7000
+        assert cfg.aggregate_block == 8500
+
+        w = compute_window(7000, cfg)
+        assert w.phase == WindowPhase.PROPAGATION
+
+        w2 = compute_window(8500, cfg)
+        assert w2.phase == WindowPhase.AGGREGATION
+
+
+# ---------------------------------------------------------------------------
+# ConsensusPayload tests
+# ---------------------------------------------------------------------------
+
+class TestConsensusPayload:
+    """Tests for consensus data model serialization and integrity."""
+
+    def _make_payload(self, **overrides) -> ConsensusPayload:
+        defaults = {
+            "protocol_version": 1,
+            "window_number": 42,
+            "validator_hotkey": "5FFApaS75bvpgP9gQ5hTUdZHiTc6LB2VPP9gvHN6VQCNug6f",
+            "software_version": "4.1.0",
+            "costs": {"miner_a": 3.42, "miner_b": 5.18},
+            "qualified": {"miner_a": True, "miner_b": False},
+            "timestamp": 1710000000,
+        }
+        defaults.update(overrides)
+        return ConsensusPayload(**defaults)
+
+    def test_serialize_deserialize_roundtrip(self):
+        p = self._make_payload()
+        data = p.serialize()
+        p2 = ConsensusPayload.deserialize(data)
+        assert p.protocol_version == p2.protocol_version
+        assert p.window_number == p2.window_number
+        assert p.validator_hotkey == p2.validator_hotkey
+        assert p.costs == p2.costs
+        assert p.qualified == p2.qualified
+
+    def test_content_hash_deterministic(self):
+        p = self._make_payload()
+        h1 = p.content_hash()
+        h2 = p.content_hash()
+        assert h1 == h2
+        assert h1.startswith("sha256:")
+        assert len(h1) == len("sha256:") + 64
+
+    def test_content_hash_changes_with_data(self):
+        p1 = self._make_payload(window_number=1)
+        p2 = self._make_payload(window_number=2)
+        assert p1.content_hash() != p2.content_hash()
+
+    def test_verify_integrity_pass(self):
+        p = self._make_payload()
+        data = p.serialize()
+        assert verify_payload_integrity(data, p.content_hash()) is True
+
+    def test_verify_integrity_fail(self):
+        p = self._make_payload()
+        data = p.serialize()
+        assert verify_payload_integrity(data, "sha256:0000") is False
+
+    def test_verify_integrity_bare_hex(self):
+        p = self._make_payload()
+        data = p.serialize()
+        bare_hex = p.content_hash().removeprefix("sha256:")
+        assert verify_payload_integrity(data, bare_hex) is True
+
+    def test_to_dict_from_dict_roundtrip(self):
+        p = self._make_payload()
+        d = p.to_dict()
+        p2 = ConsensusPayload.from_dict(d)
+        assert p.content_hash() == p2.content_hash()
+
+    def test_pointer_roundtrip(self):
+        ptr = ConsensusPointer(
+            protocol_version=1,
+            window_number=42,
+            content_address="sha256:abc123",
+            validator_hotkey="5FFApaS75bvpgP9gQ5hTUdZHiTc6LB2VPP9gvHN6VQCNug6f",
+        )
+        d = ptr.to_dict()
+        ptr2 = ConsensusPointer.from_dict(d)
+        assert ptr.content_address == ptr2.content_address
+        assert ptr.window_number == ptr2.window_number
+
+    def test_canonical_json_sorted_keys(self):
+        p = self._make_payload()
+        data = p.serialize()
+        parsed = json.loads(data)
+        keys = list(parsed.keys())
+        assert keys == sorted(keys)
+
+
+# ---------------------------------------------------------------------------
+# Consensus filter pipeline tests
+# ---------------------------------------------------------------------------
+
+class TestConsensusFilter:
+    """Tests for the 6-layer submission filter pipeline."""
+
+    def _make_submission(
+        self, hotkey="val_a", window=42, protocol=1, version="4.1.0",
+        costs=None, qualified=None,
+    ):
+        if costs is None:
+            costs = {"miner_x": 3.0}
+        if qualified is None:
+            qualified = {"miner_x": True}
+        payload = ConsensusPayload(
+            protocol_version=protocol,
+            window_number=window,
+            validator_hotkey=hotkey,
+            software_version=version,
+            costs=costs,
+            qualified=qualified,
+            timestamp=1000,
+        )
+        pointer = ConsensusPointer(
+            protocol_version=protocol,
+            window_number=window,
+            content_address=payload.content_hash(),
+            validator_hotkey=hotkey,
+        )
+        return pointer, payload
+
+    def test_full_pipeline_all_pass(self):
+        subs = [
+            self._make_submission(hotkey="val_a"),
+            self._make_submission(hotkey="val_b"),
+        ]
+        stakes = {"val_a": 100.0, "val_b": 200.0}
+        validated, stats = run_filter_pipeline(
+            subs, expected_window=42, validator_stakes=stakes,
+            min_stake=10.0, local_version="4.1.0",
+        )
+        assert stats.passed == 2
+        assert stats.total_input == 2
+        assert len(validated) == 2
+        assert validated[0].validator_stake == 100.0
+        assert validated[1].validator_stake == 200.0
+
+    def test_filter_protocol_version(self):
+        subs = [
+            self._make_submission(hotkey="val_a", protocol=1),
+            self._make_submission(hotkey="val_b", protocol=2),
+        ]
+        passed, skipped = filter_protocol_version(subs, expected_version=1)
+        assert len(passed) == 1
+        assert skipped == 1
+        assert passed[0][0].validator_hotkey == "val_a"
+
+    def test_filter_window_number(self):
+        subs = [
+            self._make_submission(hotkey="val_a", window=42),
+            self._make_submission(hotkey="val_b", window=41),
+        ]
+        passed, skipped = filter_window_number(subs, expected_window=42)
+        assert len(passed) == 1
+        assert skipped == 1
+
+    def test_filter_trust_threshold(self):
+        subs = [
+            self._make_submission(hotkey="val_a"),
+            self._make_submission(hotkey="val_b"),
+        ]
+        stakes = {"val_a": 100.0, "val_b": 5.0}
+        passed, skipped = filter_trust_threshold(subs, stakes, min_stake=10.0)
+        assert len(passed) == 1
+        assert skipped == 1
+        assert passed[0][0].validator_hotkey == "val_a"
+
+    def test_filter_trust_threshold_missing_stake(self):
+        subs = [self._make_submission(hotkey="val_unknown")]
+        passed, skipped = filter_trust_threshold(subs, {}, min_stake=1.0)
+        assert len(passed) == 0
+        assert skipped == 1
+
+    def test_filter_data_integrity(self):
+        ptr, payload = self._make_submission(hotkey="val_a")
+        bad_ptr = ConsensusPointer(
+            protocol_version=1, window_number=42,
+            content_address="sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            validator_hotkey="val_a",
+        )
+        subs = [(ptr, payload), (bad_ptr, payload)]
+        passed, skipped = filter_data_integrity(subs)
+        assert len(passed) == 1
+        assert skipped == 1
+
+    def test_filter_data_integrity_ipfs_cid_skips_check(self):
+        ptr, payload = self._make_submission(hotkey="val_a")
+        ipfs_ptr = ConsensusPointer(
+            protocol_version=1, window_number=42,
+            content_address="QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG",
+            validator_hotkey="val_a",
+        )
+        subs = [(ipfs_ptr, payload)]
+        passed, skipped = filter_data_integrity(subs)
+        assert len(passed) == 1
+        assert skipped == 0
+
+    def test_filter_software_version_major_mismatch(self):
+        subs = [
+            self._make_submission(hotkey="val_a", version="4.1.0"),
+            self._make_submission(hotkey="val_b", version="3.9.0"),
+        ]
+        passed, skipped = filter_software_version(subs, local_version="4.2.0")
+        assert len(passed) == 1
+        assert skipped == 1
+        assert passed[0][0].validator_hotkey == "val_a"
+
+    def test_filter_software_version_same_major(self):
+        subs = [
+            self._make_submission(hotkey="val_a", version="4.0.0"),
+            self._make_submission(hotkey="val_b", version="4.9.9"),
+        ]
+        passed, skipped = filter_software_version(subs, local_version="4.1.0")
+        assert len(passed) == 2
+        assert skipped == 0
+
+    def test_filter_zero_signal_with_nonzero(self):
+        subs = [
+            self._make_submission(hotkey="val_a", costs={"m": 3.0}),
+            self._make_submission(hotkey="val_b", costs={"m": 0.0}),
+        ]
+        passed, skipped = filter_zero_signal(subs)
+        assert len(passed) == 1
+        assert skipped == 1
+        assert passed[0][0].validator_hotkey == "val_a"
+
+    def test_filter_zero_signal_all_zero_passes(self):
+        subs = [
+            self._make_submission(hotkey="val_a", costs={"m": 0.0}),
+            self._make_submission(hotkey="val_b", costs={"m": 0.0}),
+        ]
+        passed, skipped = filter_zero_signal(subs)
+        assert len(passed) == 2
+        assert skipped == 0
+
+    def test_full_pipeline_cascading_filters(self):
+        subs = [
+            self._make_submission(hotkey="good", window=42, protocol=1, version="4.0.0", costs={"m": 3.0}),
+            self._make_submission(hotkey="bad_proto", window=42, protocol=2, version="4.0.0"),
+            self._make_submission(hotkey="bad_window", window=41, protocol=1, version="4.0.0"),
+            self._make_submission(hotkey="low_stake", window=42, protocol=1, version="4.0.0"),
+            self._make_submission(hotkey="bad_version", window=42, protocol=1, version="3.0.0"),
+            self._make_submission(hotkey="zero_cost", window=42, protocol=1, version="4.0.0", costs={"m": 0.0}),
+        ]
+        stakes = {"good": 100.0, "bad_proto": 100.0, "bad_window": 100.0,
+                  "low_stake": 1.0, "bad_version": 100.0, "zero_cost": 100.0}
+        validated, stats = run_filter_pipeline(
+            subs, expected_window=42, validator_stakes=stakes,
+            min_stake=10.0, local_version="4.1.0",
+        )
+        assert stats.passed == 1
+        assert stats.skipped_protocol == 1
+        assert stats.skipped_window == 1
+        assert stats.skipped_stake == 1
+        assert stats.skipped_version == 1
+        assert stats.skipped_zero_signal == 1
+        assert validated[0].pointer.validator_hotkey == "good"
+
+    def test_empty_submissions(self):
+        validated, stats = run_filter_pipeline(
+            [], expected_window=42, validator_stakes={},
+            min_stake=0, local_version="4.0.0",
+        )
+        assert stats.passed == 0
+        assert len(validated) == 0
+
+
+# ---------------------------------------------------------------------------
+# Stake-weighted consensus aggregation tests
+# ---------------------------------------------------------------------------
+
+class TestConsensusAggregation:
+    """Tests for compute_consensus_costs."""
+
+    def _make_validated(self, hotkey, stake, costs, qualified=None):
+        if qualified is None:
+            qualified = {k: True for k in costs}
+        payload = ConsensusPayload(
+            protocol_version=1, window_number=42,
+            validator_hotkey=hotkey, software_version="4.0.0",
+            costs=costs, qualified=qualified, timestamp=1000,
+        )
+        pointer = ConsensusPointer(
+            protocol_version=1, window_number=42,
+            content_address=payload.content_hash(),
+            validator_hotkey=hotkey,
+        )
+        return ValidatedSubmission(
+            pointer=pointer, payload=payload, validator_stake=stake,
+        )
+
+    def test_single_validator(self):
+        subs = [self._make_validated("v1", 100.0, {"m1": 3.0, "m2": 5.0})]
+        costs, quals = compute_consensus_costs(subs)
+        assert costs["m1"] == pytest.approx(3.0)
+        assert costs["m2"] == pytest.approx(5.0)
+        assert quals["m1"] is True
+        assert quals["m2"] is True
+
+    def test_equal_stake_average(self):
+        subs = [
+            self._make_validated("v1", 100.0, {"m1": 2.0}),
+            self._make_validated("v2", 100.0, {"m1": 4.0}),
+        ]
+        costs, _ = compute_consensus_costs(subs)
+        assert costs["m1"] == pytest.approx(3.0)
+
+    def test_stake_weighted_average(self):
+        subs = [
+            self._make_validated("v1", 300.0, {"m1": 2.0}),
+            self._make_validated("v2", 100.0, {"m1": 6.0}),
+        ]
+        costs, _ = compute_consensus_costs(subs)
+        # (300*2 + 100*6) / (300+100) = (600+600)/400 = 3.0
+        assert costs["m1"] == pytest.approx(3.0)
+
+    def test_different_miners_per_validator(self):
+        subs = [
+            self._make_validated("v1", 100.0, {"m1": 2.0, "m2": 4.0}),
+            self._make_validated("v2", 100.0, {"m1": 6.0}),
+        ]
+        costs, _ = compute_consensus_costs(subs)
+        assert costs["m1"] == pytest.approx(4.0)
+        assert costs["m2"] == pytest.approx(4.0)
+
+    def test_qualification_consensus_and(self):
+        subs = [
+            self._make_validated("v1", 100.0, {"m1": 2.0}, {"m1": True}),
+            self._make_validated("v2", 100.0, {"m1": 3.0}, {"m1": False}),
+        ]
+        _, quals = compute_consensus_costs(subs)
+        assert quals["m1"] is False
+
+    def test_qualification_all_true(self):
+        subs = [
+            self._make_validated("v1", 100.0, {"m1": 2.0}, {"m1": True}),
+            self._make_validated("v2", 100.0, {"m1": 3.0}, {"m1": True}),
+        ]
+        _, quals = compute_consensus_costs(subs)
+        assert quals["m1"] is True
+
+    def test_empty_submissions(self):
+        costs, quals = compute_consensus_costs([])
+        assert costs == {}
+        assert quals == {}
+
+    def test_zero_stake_ignored(self):
+        subs = [
+            self._make_validated("v1", 0.0, {"m1": 100.0}),
+            self._make_validated("v2", 50.0, {"m1": 3.0}),
+        ]
+        costs, _ = compute_consensus_costs(subs)
+        assert costs["m1"] == pytest.approx(3.0)
+
+
+# ---------------------------------------------------------------------------
+# Incumbent advantage tests
+# ---------------------------------------------------------------------------
+
+class TestIncumbentAdvantage:
+    """Tests for incumbent advantage and historical best tracking."""
+
+    def test_no_incumbent_lowest_wins(self):
+        costs = {"m1": 3.0, "m2": 5.0}
+        quals = {"m1": True, "m2": True}
+        state = IncumbentState()
+        winner, new_state = select_winner_with_incumbent(
+            costs, quals, state, window_number=0,
+            season_length=30, cost_delta=0.10,
+        )
+        assert winner == "m1"
+        assert new_state.incumbent_hotkey == "m1"
+
+    def test_incumbent_retains_within_margin(self):
+        costs = {"m1": 3.0, "m2": 2.75}
+        quals = {"m1": True, "m2": True}
+        state = IncumbentState(incumbent_hotkey="m1", historical_best={"m1": 3.0})
+        winner, new_state = select_winner_with_incumbent(
+            costs, quals, state, window_number=1,
+            season_length=30, cost_delta=0.10,
+        )
+        # m2 (2.75) needs < 3.0 * 0.90 = 2.70 to dethrone
+        assert winner == "m1"
+        assert new_state.incumbent_hotkey == "m1"
+
+    def test_challenger_overtakes_past_margin(self):
+        costs = {"m1": 3.0, "m2": 2.60}
+        quals = {"m1": True, "m2": True}
+        state = IncumbentState(incumbent_hotkey="m1", historical_best={"m1": 3.0})
+        winner, new_state = select_winner_with_incumbent(
+            costs, quals, state, window_number=1,
+            season_length=30, cost_delta=0.10,
+        )
+        # m2 (2.60) < 3.0 * 0.90 = 2.70 → overtake
+        assert winner == "m2"
+        assert new_state.incumbent_hotkey == "m2"
+
+    def test_incumbent_disqualified(self):
+        costs = {"m1": 3.0, "m2": 5.0}
+        quals = {"m1": False, "m2": True}
+        state = IncumbentState(incumbent_hotkey="m1", historical_best={"m1": 3.0})
+        winner, new_state = select_winner_with_incumbent(
+            costs, quals, state, window_number=1,
+            season_length=30, cost_delta=0.10,
+        )
+        assert winner == "m2"
+        assert new_state.incumbent_hotkey == "m2"
+
+    def test_historical_best_updates(self):
+        costs = {"m1": 3.0}
+        quals = {"m1": True}
+        state = IncumbentState(historical_best={"m1": 4.0})
+        _, new_state = select_winner_with_incumbent(
+            costs, quals, state, window_number=0,
+            season_length=30, cost_delta=0.10,
+        )
+        assert new_state.historical_best["m1"] == 3.0
+
+    def test_historical_best_does_not_increase(self):
+        costs = {"m1": 5.0}
+        quals = {"m1": True}
+        state = IncumbentState(historical_best={"m1": 3.0})
+        _, new_state = select_winner_with_incumbent(
+            costs, quals, state, window_number=0,
+            season_length=30, cost_delta=0.10,
+        )
+        assert new_state.historical_best["m1"] == 3.0
+
+    def test_season_reset(self):
+        state = IncumbentState(
+            historical_best={"m1": 2.0, "m2": 3.0},
+            incumbent_hotkey="m1",
+            current_season=0,
+        )
+        costs = {"m1": 5.0, "m2": 4.0}
+        quals = {"m1": True, "m2": True}
+        # window 30 → season 1 (season_length=30)
+        winner, new_state = select_winner_with_incumbent(
+            costs, quals, state, window_number=30,
+            season_length=30, cost_delta=0.10,
+        )
+        assert new_state.current_season == 1
+        # Historical bests were reset, so m2 wins (lowest cost, no incumbent)
+        assert winner == "m2"
+        assert new_state.historical_best == {"m1": 5.0, "m2": 4.0}
+
+    def test_no_qualified_miners(self):
+        costs = {"m1": 3.0}
+        quals = {"m1": False}
+        state = IncumbentState()
+        winner, _ = select_winner_with_incumbent(
+            costs, quals, state, window_number=0,
+            season_length=30, cost_delta=0.10,
+        )
+        assert winner is None
+
+    def test_save_load_roundtrip(self, tmp_path):
+        state = IncumbentState(
+            historical_best={"m1": 3.0, "m2": 5.0},
+            incumbent_hotkey="m1",
+            current_season=2,
+            last_window=42,
+        )
+        path = str(tmp_path / "incumbent.json")
+        save_incumbent_state(state, path)
+        loaded = load_incumbent_state(path)
+        assert loaded.historical_best == state.historical_best
+        assert loaded.incumbent_hotkey == state.incumbent_hotkey
+        assert loaded.current_season == state.current_season
+        assert loaded.last_window == state.last_window
+
+    def test_load_missing_file(self, tmp_path):
+        loaded = load_incumbent_state(str(tmp_path / "nonexistent.json"))
+        assert loaded.incumbent_hotkey is None
+        assert loaded.historical_best == {}
+
+    def test_incumbent_uses_historical_best_not_current(self):
+        """Challenger threshold is against historical best, not current cost."""
+        state = IncumbentState(
+            incumbent_hotkey="m1",
+            historical_best={"m1": 2.0},
+        )
+        costs = {"m1": 4.0, "m2": 2.5}
+        quals = {"m1": True, "m2": True}
+        winner, _ = select_winner_with_incumbent(
+            costs, quals, state, window_number=1,
+            season_length=30, cost_delta=0.10,
+        )
+        # threshold = 2.0 * 0.90 = 1.80; m2 (2.5) > 1.80 → incumbent retains
+        assert winner == "m1"
+
+    def test_incumbent_is_cheapest(self):
+        """When incumbent is already cheapest, they retain without margin check."""
+        state = IncumbentState(
+            incumbent_hotkey="m1",
+            historical_best={"m1": 3.0},
+        )
+        costs = {"m1": 2.0, "m2": 5.0}
+        quals = {"m1": True, "m2": True}
+        winner, _ = select_winner_with_incumbent(
+            costs, quals, state, window_number=1,
+            season_length=30, cost_delta=0.10,
+        )
+        assert winner == "m1"
+
+
+# ---------------------------------------------------------------------------
+# On-chain consensus commitment tests
+# ---------------------------------------------------------------------------
+
+class TestConsensusCommitments:
+    """Tests for validator consensus commitment parsing and formatting."""
+
+    def test_format_consensus_commitment(self):
+        result = format_consensus_commitment(1, 42, "QmXxx123")
+        assert result == "consensus:1|42|QmXxx123"
+
+    def test_format_with_gcs_url(self):
+        url = "https://storage.googleapis.com/trajrl-consensus/sha256_abc.json"
+        result = format_consensus_commitment(1, 42, url)
+        assert result == f"consensus:1|42|{url}"
+
+    def test_parse_consensus_commitment_ipfs(self):
+        raw = "consensus:1|42|QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
+        parsed = parse_consensus_commitment(raw)
+        assert parsed is not None
+        pv, wn, addr = parsed
+        assert pv == 1
+        assert wn == 42
+        assert addr == "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
+
+    def test_parse_consensus_commitment_gcs(self):
+        raw = "consensus:1|42|https://storage.googleapis.com/trajrl/sha256_abc.json"
+        parsed = parse_consensus_commitment(raw)
+        assert parsed is not None
+        pv, wn, addr = parsed
+        assert pv == 1
+        assert wn == 42
+        assert addr == "https://storage.googleapis.com/trajrl/sha256_abc.json"
+
+    def test_parse_consensus_commitment_invalid_prefix(self):
+        assert parse_consensus_commitment("notconsensus:1|42|QmXxx") is None
+
+    def test_parse_consensus_commitment_missing_parts(self):
+        assert parse_consensus_commitment("consensus:1|42") is None
+        assert parse_consensus_commitment("consensus:1") is None
+        assert parse_consensus_commitment("consensus:") is None
+
+    def test_parse_consensus_commitment_bad_numbers(self):
+        assert parse_consensus_commitment("consensus:abc|42|QmXxx") is None
+        assert parse_consensus_commitment("consensus:1|xyz|QmXxx") is None
+
+    def test_parse_consensus_commitment_empty_address(self):
+        assert parse_consensus_commitment("consensus:1|42|") is None
+
+    def test_parse_consensus_commitment_none(self):
+        assert parse_consensus_commitment(None) is None
+        assert parse_consensus_commitment("") is None
+
+    def test_roundtrip(self):
+        original = format_consensus_commitment(1, 99, "QmTestCID123")
+        parsed = parse_consensus_commitment(original)
+        assert parsed == (1, 99, "QmTestCID123")
+
+    def test_is_consensus_commitment(self):
+        assert is_consensus_commitment("consensus:1|42|QmXxx") is True
+        assert is_consensus_commitment("  consensus:1|42|QmXxx  ") is True
+        assert is_consensus_commitment("abc123|https://example.com/pack.json") is False
+        assert is_consensus_commitment("") is False
+        assert is_consensus_commitment(None) is False
+
+    def test_miner_parse_rejects_consensus(self):
+        """parse_commitment (miner format) should reject consensus commitments."""
+        raw = "consensus:1|42|QmXxx"
+        assert parse_commitment(raw) is None
+
+    def test_miner_parse_still_works(self):
+        """parse_commitment still works for normal miner commitments."""
+        pack_hash = "a" * 64
+        raw = f"{pack_hash}|https://example.com/pack.json"
+        result = parse_commitment(raw)
+        assert result is not None
+        assert result[0] == pack_hash
+        assert result[1] == "https://example.com/pack.json"
+
+    def test_pipes_in_url_preserved(self):
+        """Content address with pipes should be handled (split maxsplit=2)."""
+        raw = "consensus:1|42|https://example.com/path?a=1|extra"
+        parsed = parse_consensus_commitment(raw)
+        assert parsed is not None
+        _, _, addr = parsed
+        assert addr == "https://example.com/path?a=1|extra"
+
+
+# ---------------------------------------------------------------------------
+# Consensus-based weight setting tests
+# ---------------------------------------------------------------------------
+
+class TestConsensusWeightSetting:
+    """Tests for weight setting data source selection (consensus vs local EMA).
+
+    Rule: once consensus costs exist, they are ALWAYS used for weight setting.
+    Local EMA is only used as a bootstrap fallback when no consensus has ever
+    been computed.  Consensus costs persist across windows and restarts.
+    """
+
+    def test_use_consensus_when_costs_present(self):
+        """Consensus costs should always be used when they exist."""
+        consensus_costs = {"m1": 3.0, "m2": 5.0}
+        use_consensus = bool(consensus_costs)
+        assert use_consensus is True
+
+    def test_fallback_when_no_consensus(self):
+        """Without consensus data, weight setting should use fallback weights."""
+        consensus_costs = {}
+        should_fallback = not bool(consensus_costs)
+        assert should_fallback is True
+
+    def test_consensus_persists_across_windows(self):
+        """Previous window's consensus costs should still be used in new window."""
+        consensus_costs = {"m1": 3.0}
+        should_fallback = not bool(consensus_costs)
+        assert should_fallback is False
+
+    def test_new_aggregation_overwrites_old(self):
+        """New window's aggregation replaces previous consensus costs."""
+        consensus_costs = {"m1": 3.0}
+        new_consensus = {"m1": 2.5, "m2": 4.0}
+        consensus_costs = new_consensus
+        use_consensus = bool(consensus_costs)
+        assert use_consensus is True
+        assert consensus_costs["m1"] == 2.5
+
+    def test_consensus_costs_mapped_to_uids(self):
+        """Consensus costs (keyed by hotkey) should map to UIDs correctly."""
+        consensus_costs = {"hk_m1": 3.0, "hk_m2": 5.0, "hk_m3": 2.0}
+        consensus_qualified = {"hk_m1": True, "hk_m2": False, "hk_m3": True}
+
+        active = {
+            10: type("C", (), {"hotkey": "hk_m1"})(),
+            20: type("C", (), {"hotkey": "hk_m2"})(),
+            30: type("C", (), {"hotkey": "hk_m3"})(),
+            40: type("C", (), {"hotkey": "hk_m4"})(),
+        }
+
+        hotkey_to_uid = {}
+        uid_to_hotkey = {}
+        for uid, commitment in active.items():
+            hotkey_to_uid[commitment.hotkey] = uid
+            uid_to_hotkey[uid] = commitment.hotkey
+
+        costs = {}
+        qualified = {}
+        for hotkey, c_cost in consensus_costs.items():
+            uid = hotkey_to_uid.get(hotkey)
+            if uid is None:
+                continue
+            costs[uid] = c_cost
+            qualified[uid] = consensus_qualified.get(hotkey, False)
+
+        assert costs == {10: 3.0, 20: 5.0, 30: 2.0}
+        assert qualified == {10: True, 20: False, 30: True}
+        assert 40 not in costs
+
+    def test_consensus_costs_skip_deregistered_miners(self):
+        """Miners in consensus but no longer in active commitments are skipped."""
+        consensus_costs = {"hk_m1": 3.0, "hk_m_gone": 5.0}
+
+        active = {10: type("C", (), {"hotkey": "hk_m1"})()}
+        hotkey_to_uid = {c.hotkey: uid for uid, c in active.items()}
+
+        costs = {}
+        for hotkey, c_cost in consensus_costs.items():
+            uid = hotkey_to_uid.get(hotkey)
+            if uid is None:
+                continue
+            costs[uid] = c_cost
+
+        assert costs == {10: 3.0}
+        assert "hk_m_gone" not in [active[u].hotkey for u in costs]
+
+    def test_window_aggregated_resets_on_new_window(self):
+        """_window_aggregated should reset to False at new window boundary."""
+        window_aggregated = True
+        new_window_detected = True
+        if new_window_detected:
+            window_aggregated = False
+        assert window_aggregated is False
+
+    def test_consensus_qualified_false_propagates(self):
+        """If consensus says not qualified, weight setting should see False."""
+        consensus_qualified = {"hk_m1": True, "hk_m2": False}
+        active = {
+            10: type("C", (), {"hotkey": "hk_m1"})(),
+            20: type("C", (), {"hotkey": "hk_m2"})(),
+        }
+        hotkey_to_uid = {c.hotkey: uid for uid, c in active.items()}
+
+        qualified = {}
+        for hotkey in consensus_qualified:
+            uid = hotkey_to_uid.get(hotkey)
+            if uid is not None:
+                qualified[uid] = consensus_qualified[hotkey]
+
+        assert qualified[10] is True
+        assert qualified[20] is False

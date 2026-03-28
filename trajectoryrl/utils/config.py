@@ -69,10 +69,15 @@ class ValidatorConfig:
 
     # Evaluation config
     seeds_per_task: int = 1
-    eval_interval_blocks: int = 7200  # ~24 hours at 12s/block (used by _needs_evaluation)
+    eval_interval_blocks: int = 7200  # ~24 hours at 12s/block (window length)
     eval_utc_hour: int = 0           # UTC hour to trigger daily eval cycle (0 = midnight)
     eval_on_startup: bool = True     # Run eval immediately on validator startup
     timeout_per_scenario: int = 300  # 5 minutes max per scenario
+
+    # Evaluation window config (block-aligned consensus protocol)
+    global_anchor_block: int = 0     # anchor block for window alignment
+    window_publish_pct: float = 0.80  # T_publish: 80% of window for evaluation
+    window_aggregate_pct: float = 0.90  # T_aggregate: 90% (10% propagation interval)
 
     # Scoring config
     delta_threshold: float = 0.05
@@ -86,6 +91,16 @@ class ValidatorConfig:
 
     # Consensus config (mitigates LLM non-determinism across validators)
     consensus_epsilon: float = 0.02
+    consensus_protocol_version: int = 1
+
+    # Consensus CAS: IPFS primary, trajrl.com API fallback
+    ipfs_api_url: str = "http://localhost:5001"
+    ipfs_api_jwt_token: str = ""
+    consensus_api_url: str = "https://api.trajrl.com"
+    min_validator_stake: float = 0.0  # minimum stake for consensus participation
+
+    # Incumbent advantage + season tracking
+    season_length: int = 30         # number of evaluation windows per season
 
     # Bootstrap config (graduated rewards until enough miners join)
     bootstrap_threshold: int = 10
@@ -191,6 +206,10 @@ class ValidatorConfig:
             # --- Operational ---
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             eval_on_startup=os.getenv("EVAL_ON_STARTUP", "1") == "1",
+            # --- Consensus CAS ---
+            ipfs_api_url=os.getenv("IPFS_API_URL", "http://localhost:5001"),
+            ipfs_api_jwt_token=os.getenv("IPFS_API_JWT_TOKEN", ""),
+            consensus_api_url=os.getenv("CONSENSUS_API_URL", "https://api.trajrl.com"),
             # --- IM parameters are hardcoded (dataclass defaults) ---
             # Do NOT load from env: ema_alpha, cost_ema_alpha, cost_delta,
             # rho_reliability, consensus_epsilon, bootstrap_threshold,

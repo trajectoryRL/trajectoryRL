@@ -4,13 +4,16 @@ Miners submit pack metadata via ``subtensor.set_commitment(netuid, data)``.
 Validators read all commitments with ``subtensor.get_all_commitments(netuid)``
 and parse them into structured ``MinerCommitment`` objects.
 
-Commitment wire format (pipe-delimited, ≤256 bytes):
+Two commitment formats coexist on the same ``set_commitment`` / ``get_all_commitments`` channel:
+
+Miner commitment (pipe-delimited, ≤256 bytes):
     {pack_hash_hex}|{pack_url}
 
-Where:
-    pack_hash_hex: SHA256 hex digest of the canonical pack JSON (64 chars)
-    pack_url: HTTP(S) URL where validators can GET the pack.json
-              (any public HTTP(S) endpoint)
+Validator consensus commitment (pipe-delimited, ≤256 bytes):
+    consensus:{protocol_version}|{window_number}|{content_address}
+
+The ``consensus:`` prefix distinguishes validator consensus pointers from
+miner pack commitments.
 
 Reference: INCENTIVE_MECHANISM.md § Submission Protocol
 """
@@ -20,12 +23,15 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _HTTP_URL = re.compile(r"^https?://\S+$")
+
+
+_CONSENSUS_PREFIX = "consensus:"
 
 
 @dataclass
@@ -40,11 +46,83 @@ class MinerCommitment:
     raw: str  # original commitment string
 
 
+@dataclass
+class ValidatorConsensusCommitment:
+    """Parsed on-chain consensus pointer from a validator.
+
+    Written by validators after uploading evaluation payloads to CAS.
+    Other validators discover these by reading ``get_all_commitments``
+    and filtering for the ``consensus:`` prefix.
+    """
+
+    protocol_version: int
+    window_number: int
+    content_address: str  # IPFS CID or GCS URL
+    validator_hotkey: str
+    block_number: int
+    raw: str
+
+
+def is_consensus_commitment(raw: str) -> bool:
+    """Check if a raw commitment string is a validator consensus pointer."""
+    return isinstance(raw, str) and raw.strip().startswith(_CONSENSUS_PREFIX)
+
+
+def parse_consensus_commitment(raw: str) -> Optional[Tuple[int, int, str]]:
+    """Parse a validator consensus commitment string.
+
+    Format: ``consensus:{protocol_version}|{window_number}|{content_address}``
+
+    Returns:
+        Tuple of (protocol_version, window_number, content_address)
+        or None if unparseable.
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+
+    raw = raw.strip()
+    if not raw.startswith(_CONSENSUS_PREFIX):
+        return None
+
+    body = raw[len(_CONSENSUS_PREFIX):]
+    parts = body.split("|", maxsplit=2)
+    if len(parts) != 3:
+        return None
+
+    try:
+        protocol_version = int(parts[0].strip())
+        window_number = int(parts[1].strip())
+    except (ValueError, TypeError):
+        return None
+
+    content_address = parts[2].strip()
+    if not content_address:
+        return None
+
+    return protocol_version, window_number, content_address
+
+
+def format_consensus_commitment(
+    protocol_version: int,
+    window_number: int,
+    content_address: str,
+) -> str:
+    """Build a consensus commitment string for ``set_commitment``.
+
+    Returns:
+        Formatted string: ``consensus:{protocol_version}|{window_number}|{content_address}``
+    """
+    return f"{_CONSENSUS_PREFIX}{protocol_version}|{window_number}|{content_address}"
+
+
 def parse_commitment(raw: str) -> Optional[Tuple[str, str]]:
-    """Parse a compact commitment string into (pack_hash, pack_url).
+    """Parse a miner commitment string into (pack_hash, pack_url).
 
     Supports pipe-delimited format:
         ``{pack_hash}|{pack_url}``
+
+    Consensus commitments (``consensus:`` prefix) are not miner
+    commitments and return None.
 
     Returns:
         Tuple of (pack_hash, pack_url) or None if unparseable.
@@ -53,6 +131,9 @@ def parse_commitment(raw: str) -> Optional[Tuple[str, str]]:
         return None
 
     raw = raw.strip()
+    if raw.startswith(_CONSENSUS_PREFIX):
+        return None
+
     parts = raw.split("|", maxsplit=1)
     if len(parts) != 2:
         return None
@@ -141,6 +222,65 @@ def fetch_all_commitments(
         logger.info("Fetched 0 commitments")
 
     return commitments
+
+
+def fetch_validator_consensus_commitments(
+    subtensor,
+    netuid: int,
+    metagraph,
+) -> List[ValidatorConsensusCommitment]:
+    """Read all validator consensus commitments from the chain.
+
+    Calls ``get_all_commitments`` and filters for entries with the
+    ``consensus:`` prefix.  Only entries from registered validators
+    (not miners) are returned.
+
+    Returns:
+        List of ValidatorConsensusCommitment from all validators.
+    """
+    results: List[ValidatorConsensusCommitment] = []
+
+    try:
+        raw_commitments = subtensor.get_all_commitments(netuid=netuid)
+    except Exception as e:
+        logger.error(f"Failed to read on-chain commitments: {e}")
+        return results
+
+    if not raw_commitments:
+        return results
+
+    for hotkey, raw in raw_commitments.items():
+        if not is_consensus_commitment(raw):
+            continue
+
+        parsed = parse_consensus_commitment(raw)
+        if parsed is None:
+            logger.debug(
+                "Validator %s: unparseable consensus commitment, skipping",
+                hotkey[:8],
+            )
+            continue
+
+        protocol_version, window_number, content_address = parsed
+        block_number = _get_commitment_block(subtensor, netuid, hotkey)
+
+        results.append(ValidatorConsensusCommitment(
+            protocol_version=protocol_version,
+            window_number=window_number,
+            content_address=content_address,
+            validator_hotkey=hotkey,
+            block_number=block_number,
+            raw=raw,
+        ))
+        logger.debug(
+            "Validator %s: consensus commitment — v%d window=%d addr=%s",
+            hotkey[:8], protocol_version, window_number, content_address[:24],
+        )
+
+    logger.info(
+        "Fetched %d validator consensus commitments", len(results),
+    )
+    return results
 
 
 def _get_commitment_block(subtensor, netuid: int, hotkey: str) -> int:

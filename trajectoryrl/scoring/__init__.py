@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 
 from ..utils.clawbench import EvaluationResult
+from ..utils.consensus_filter import ValidatedSubmission
 
 logger = logging.getLogger(__name__)
 
@@ -525,3 +526,66 @@ class TrajectoryScorer:
         )
 
         return weights
+
+
+def compute_consensus_costs(
+    validated_submissions: List[ValidatedSubmission],
+) -> Tuple[Dict[str, float], Dict[str, bool]]:
+    """Compute stake-weighted consensus costs and qualification across validators.
+
+    For each miner, the consensus cost is:
+        consensus_cost[miner] = Σ(stake_i × cost_i) / Σ(stake_i)
+
+    where the sum is over all validated submissions that include that miner.
+
+    Qualification is consensus-AND: a miner is qualified only if ALL
+    validators that evaluated it report qualified=True.
+
+    Args:
+        validated_submissions: Submissions that passed the filter pipeline,
+            each with an attached validator_stake.
+
+    Returns:
+        Tuple of (consensus_costs, consensus_qualified):
+          - consensus_costs: Dict[miner_hotkey -> weighted avg cost]
+          - consensus_qualified: Dict[miner_hotkey -> bool]
+    """
+    if not validated_submissions:
+        return {}, {}
+
+    miner_weighted_cost: Dict[str, float] = {}
+    miner_total_stake: Dict[str, float] = {}
+    miner_qualified: Dict[str, bool] = {}
+
+    for sub in validated_submissions:
+        stake = sub.validator_stake
+        if stake <= 0:
+            continue
+
+        for miner_hk, cost in sub.payload.costs.items():
+            if miner_hk not in miner_weighted_cost:
+                miner_weighted_cost[miner_hk] = 0.0
+                miner_total_stake[miner_hk] = 0.0
+                miner_qualified[miner_hk] = True
+
+            miner_weighted_cost[miner_hk] += stake * cost
+            miner_total_stake[miner_hk] += stake
+
+            q = sub.payload.qualified.get(miner_hk, False)
+            if not q:
+                miner_qualified[miner_hk] = False
+
+    consensus_costs: Dict[str, float] = {}
+    for miner_hk in miner_weighted_cost:
+        total_stake = miner_total_stake[miner_hk]
+        if total_stake > 0:
+            consensus_costs[miner_hk] = miner_weighted_cost[miner_hk] / total_stake
+        else:
+            consensus_costs[miner_hk] = 0.0
+
+    logger.info(
+        "Consensus computed: %d miners, %d validators",
+        len(consensus_costs), len(validated_submissions),
+    )
+
+    return consensus_costs, miner_qualified
