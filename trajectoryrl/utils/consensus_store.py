@@ -8,6 +8,7 @@ Pointer registry is on-chain via Bittensor ``set_commitment`` — not handled he
 """
 
 import asyncio
+import asyncio
 import hashlib
 import json
 import logging
@@ -207,14 +208,17 @@ class ConsensusStore:
             return_exceptions=True,
         )
 
-        ipfs_cid = ipfs_result if isinstance(ipfs_result, str) else None
-        api_url = api_result if isinstance(api_result, str) else None
+        if isinstance(ipfs_result, Exception):
+            logger.warning("IPFS upload raised: %s", ipfs_result)
+            ipfs_result = None
+        if isinstance(api_result, Exception):
+            logger.warning("API upload raised: %s", api_result)
+            api_result = None
 
-        # Prefer GCS URL (universally accessible without local IPFS node)
-        if api_url:
-            return api_url
-        if ipfs_cid:
-            return ipfs_cid
+        if ipfs_result:
+            return ipfs_result
+        if api_result:
+            return api_result
 
         logger.error("Both IPFS and API upload failed for window %d", payload.window_number)
         return None
