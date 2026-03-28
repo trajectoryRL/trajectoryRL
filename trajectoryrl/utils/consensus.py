@@ -23,21 +23,26 @@ class ConsensusPayload:
     protocol_version: int
     window_number: int
     validator_hotkey: str
-    software_version: str
+    clawbench_version: str
     costs: Dict[str, float]         # miner hotkey -> EMA cost (USD)
-    qualified: Dict[str, bool]      # miner hotkey -> qualification gate
+    qualified: Dict[str, bool]      # miner hotkey -> qualification gate (all known miners)
     timestamp: int                  # unix seconds when payload was built
+    disqualified: Dict[str, str] = field(default_factory=dict)
+    # miner hotkey -> reason (e.g. "pre_eval_rejected", "integrity_failed")
+    # miners in disqualified also appear in qualified with value=False
 
     def to_dict(self) -> dict:
-        return {
-            "protocol_version": self.protocol_version,
-            "window_number": self.window_number,
-            "validator_hotkey": self.validator_hotkey,
-            "software_version": self.software_version,
+        d = {
+            "clawbench_version": self.clawbench_version,
             "costs": self.costs,
+            "disqualified": self.disqualified,
+            "protocol_version": self.protocol_version,
             "qualified": self.qualified,
             "timestamp": self.timestamp,
+            "validator_hotkey": self.validator_hotkey,
+            "window_number": self.window_number,
         }
+        return d
 
     def serialize(self) -> bytes:
         """Canonical JSON serialization (sorted keys, no extra whitespace)."""
@@ -54,10 +59,11 @@ class ConsensusPayload:
             protocol_version=d["protocol_version"],
             window_number=d["window_number"],
             validator_hotkey=d["validator_hotkey"],
-            software_version=d["software_version"],
+            clawbench_version=d.get("clawbench_version", d.get("software_version", "")),
             costs=d["costs"],
             qualified=d["qualified"],
             timestamp=d["timestamp"],
+            disqualified=d.get("disqualified", {}),
         )
 
     @classmethod
@@ -66,10 +72,11 @@ class ConsensusPayload:
             protocol_version=d["protocol_version"],
             window_number=d["window_number"],
             validator_hotkey=d["validator_hotkey"],
-            software_version=d["software_version"],
+            clawbench_version=d.get("clawbench_version", d.get("software_version", "")),
             costs=d["costs"],
             qualified=d["qualified"],
             timestamp=d["timestamp"],
+            disqualified=d.get("disqualified", {}),
         )
 
 

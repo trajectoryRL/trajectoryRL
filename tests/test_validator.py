@@ -52,7 +52,7 @@ from trajectoryrl.utils.consensus_filter import (
     run_filter_pipeline, FilterStats, ValidatedSubmission,
     filter_protocol_version, filter_window_number,
     filter_trust_threshold, filter_data_integrity,
-    filter_software_version, filter_zero_signal,
+    filter_clawbench_version, filter_zero_signal,
 )
 from trajectoryrl.scoring import compute_consensus_costs
 from trajectoryrl.utils.incumbent import (
@@ -2511,7 +2511,7 @@ class TestConsensusPayload:
             "protocol_version": 1,
             "window_number": 42,
             "validator_hotkey": "5FFApaS75bvpgP9gQ5hTUdZHiTc6LB2VPP9gvHN6VQCNug6f",
-            "software_version": "4.1.0",
+            "clawbench_version": "0.1.0",
             "costs": {"miner_a": 3.42, "miner_b": 5.18},
             "qualified": {"miner_a": True, "miner_b": False},
             "timestamp": 1710000000,
@@ -2583,6 +2583,54 @@ class TestConsensusPayload:
         keys = list(parsed.keys())
         assert keys == sorted(keys)
 
+    def test_disqualified_field_default_empty(self):
+        p = self._make_payload()
+        assert p.disqualified == {}
+
+    def test_disqualified_field_roundtrip(self):
+        p = self._make_payload(disqualified={
+            "miner_c": "pre_eval_rejected:banned",
+            "miner_d": "integrity_failed",
+        })
+        assert p.qualified.get("miner_a") is True
+        data = p.serialize()
+        p2 = ConsensusPayload.deserialize(data)
+        assert p2.disqualified == {
+            "miner_c": "pre_eval_rejected:banned",
+            "miner_d": "integrity_failed",
+        }
+
+    def test_disqualified_included_in_serialization(self):
+        p = self._make_payload(disqualified={"miner_c": "integrity_failed"})
+        data = p.serialize()
+        parsed = json.loads(data)
+        assert "disqualified" in parsed
+        assert parsed["disqualified"]["miner_c"] == "integrity_failed"
+
+    def test_deserialize_without_disqualified_field(self):
+        """Payloads from older validators without disqualified field."""
+        p = self._make_payload()
+        d = p.to_dict()
+        del d["disqualified"]
+        data = json.dumps(d, sort_keys=True, separators=(",", ":")).encode()
+        p2 = ConsensusPayload.deserialize(data)
+        assert p2.disqualified == {}
+
+    def test_deserialize_legacy_software_version(self):
+        """Payloads from older validators with software_version instead of clawbench_version."""
+        raw = {
+            "protocol_version": 1,
+            "window_number": 42,
+            "validator_hotkey": "val_x",
+            "software_version": "4.1.0",
+            "costs": {"m1": 3.0},
+            "qualified": {"m1": True},
+            "timestamp": 1000,
+        }
+        data = json.dumps(raw, sort_keys=True, separators=(",", ":")).encode()
+        p = ConsensusPayload.deserialize(data)
+        assert p.clawbench_version == "4.1.0"
+
 
 # ---------------------------------------------------------------------------
 # Consensus filter pipeline tests
@@ -2592,7 +2640,7 @@ class TestConsensusFilter:
     """Tests for the 6-layer submission filter pipeline."""
 
     def _make_submission(
-        self, hotkey="val_a", window=42, protocol=1, version="4.1.0",
+        self, hotkey="val_a", window=42, protocol=1, version="0.1.0",
         costs=None, qualified=None,
     ):
         if costs is None:
@@ -2603,7 +2651,7 @@ class TestConsensusFilter:
             protocol_version=protocol,
             window_number=window,
             validator_hotkey=hotkey,
-            software_version=version,
+            clawbench_version=version,
             costs=costs,
             qualified=qualified,
             timestamp=1000,
@@ -2624,7 +2672,7 @@ class TestConsensusFilter:
         stakes = {"val_a": 100.0, "val_b": 200.0}
         validated, stats = run_filter_pipeline(
             subs, expected_window=42, validator_stakes=stakes,
-            min_stake=10.0, local_version="4.1.0",
+            min_stake=10.0, local_version="0.1.0",
         )
         assert stats.passed == 2
         assert stats.total_input == 2
@@ -2692,22 +2740,22 @@ class TestConsensusFilter:
         assert len(passed) == 1
         assert skipped == 0
 
-    def test_filter_software_version_major_mismatch(self):
+    def test_filter_clawbench_version_major_mismatch(self):
         subs = [
-            self._make_submission(hotkey="val_a", version="4.1.0"),
-            self._make_submission(hotkey="val_b", version="3.9.0"),
+            self._make_submission(hotkey="val_a", version="0.1.0"),
+            self._make_submission(hotkey="val_b", version="1.0.0"),
         ]
-        passed, skipped = filter_software_version(subs, local_version="4.2.0")
+        passed, skipped = filter_clawbench_version(subs, local_version="0.2.0")
         assert len(passed) == 1
         assert skipped == 1
         assert passed[0][0].validator_hotkey == "val_a"
 
-    def test_filter_software_version_same_major(self):
+    def test_filter_clawbench_version_same_major(self):
         subs = [
-            self._make_submission(hotkey="val_a", version="4.0.0"),
-            self._make_submission(hotkey="val_b", version="4.9.9"),
+            self._make_submission(hotkey="val_a", version="0.1.0"),
+            self._make_submission(hotkey="val_b", version="0.9.9"),
         ]
-        passed, skipped = filter_software_version(subs, local_version="4.1.0")
+        passed, skipped = filter_clawbench_version(subs, local_version="0.2.0")
         assert len(passed) == 2
         assert skipped == 0
 
@@ -2732,18 +2780,18 @@ class TestConsensusFilter:
 
     def test_full_pipeline_cascading_filters(self):
         subs = [
-            self._make_submission(hotkey="good", window=42, protocol=1, version="4.0.0", costs={"m": 3.0}),
-            self._make_submission(hotkey="bad_proto", window=42, protocol=2, version="4.0.0"),
-            self._make_submission(hotkey="bad_window", window=41, protocol=1, version="4.0.0"),
-            self._make_submission(hotkey="low_stake", window=42, protocol=1, version="4.0.0"),
-            self._make_submission(hotkey="bad_version", window=42, protocol=1, version="3.0.0"),
-            self._make_submission(hotkey="zero_cost", window=42, protocol=1, version="4.0.0", costs={"m": 0.0}),
+            self._make_submission(hotkey="good", window=42, protocol=1, version="0.1.0", costs={"m": 3.0}),
+            self._make_submission(hotkey="bad_proto", window=42, protocol=2, version="0.1.0"),
+            self._make_submission(hotkey="bad_window", window=41, protocol=1, version="0.1.0"),
+            self._make_submission(hotkey="low_stake", window=42, protocol=1, version="0.1.0"),
+            self._make_submission(hotkey="bad_version", window=42, protocol=1, version="1.0.0"),
+            self._make_submission(hotkey="zero_cost", window=42, protocol=1, version="0.1.0", costs={"m": 0.0}),
         ]
         stakes = {"good": 100.0, "bad_proto": 100.0, "bad_window": 100.0,
                   "low_stake": 1.0, "bad_version": 100.0, "zero_cost": 100.0}
         validated, stats = run_filter_pipeline(
             subs, expected_window=42, validator_stakes=stakes,
-            min_stake=10.0, local_version="4.1.0",
+            min_stake=10.0, local_version="0.1.0",
         )
         assert stats.passed == 1
         assert stats.skipped_protocol == 1
@@ -2774,7 +2822,7 @@ class TestConsensusAggregation:
             qualified = {k: True for k in costs}
         payload = ConsensusPayload(
             protocol_version=1, window_number=42,
-            validator_hotkey=hotkey, software_version="4.0.0",
+            validator_hotkey=hotkey, clawbench_version="0.1.0",
             costs=costs, qualified=qualified, timestamp=1000,
         )
         pointer = ConsensusPointer(

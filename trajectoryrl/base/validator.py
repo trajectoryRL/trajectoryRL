@@ -237,6 +237,10 @@ class TrajectoryValidator:
         self._consensus_costs: Dict[str, float] = {}
         self._consensus_qualified: Dict[str, bool] = {}
 
+        # Miners disqualified during current window's evaluation (pre-eval, integrity)
+        # Reset at each new eval cycle. Included in ConsensusPayload.
+        self._disqualified_miners: Dict[str, str] = {}
+
         # Incumbent advantage state
         self._incumbent_state_path = os.path.join(
             getattr(config, "log_dir", "/tmp"), "incumbent_state.json"
@@ -637,10 +641,11 @@ class TrajectoryValidator:
 
     async def _submit_consensus_payload(self, window: EvaluationWindow):
         """Build and upload consensus payload to CAS, then write pointer on-chain."""
-        from trajectoryrl import __version__
+        from clawbench import __version__ as clawbench_version
 
         costs_by_hotkey: Dict[str, float] = {}
         qualified_by_hotkey: Dict[str, bool] = {}
+        disqualified_by_hotkey: Dict[str, str] = {}
 
         for hotkey, scenario_costs in self.ema_costs.items():
             if scenario_costs:
@@ -651,7 +656,12 @@ class TrajectoryValidator:
                 bool(scenario_q) and all(scenario_q.values())
             )
 
-        if not costs_by_hotkey:
+        for hotkey, reason in getattr(self, "_disqualified_miners", {}).items():
+            if hotkey not in qualified_by_hotkey:
+                qualified_by_hotkey[hotkey] = False
+            disqualified_by_hotkey[hotkey] = reason
+
+        if not costs_by_hotkey and not disqualified_by_hotkey:
             logger.warning(
                 "Window %d: no evaluation data to submit", window.window_number
             )
@@ -661,10 +671,11 @@ class TrajectoryValidator:
             protocol_version=self.config.consensus_protocol_version,
             window_number=window.window_number,
             validator_hotkey=self.wallet.hotkey.ss58_address,
-            software_version=__version__,
+            clawbench_version=clawbench_version,
             costs=costs_by_hotkey,
             qualified=qualified_by_hotkey,
             timestamp=int(time.time()),
+            disqualified=disqualified_by_hotkey,
         )
 
         content_address = await self._consensus_store.upload_payload(payload)
@@ -739,14 +750,14 @@ class TrajectoryValidator:
                 continue
             validator_stakes[neuron.hotkey] = float(neuron.stake)
 
-        from trajectoryrl import __version__
+        from clawbench import __version__ as clawbench_version
         min_stake = getattr(self.config, "min_validator_stake", 0.0)
         validated, stats = run_filter_pipeline(
             submissions=submissions,
             expected_window=window.window_number,
             validator_stakes=validator_stakes,
             min_stake=min_stake,
-            local_version=__version__,
+            local_version=clawbench_version,
             expected_protocol=self.config.consensus_protocol_version,
         )
 
@@ -1089,6 +1100,8 @@ class TrajectoryValidator:
         await self._compute_and_set_weights(current_block)
         self.last_weight_block = current_block
 
+        self._disqualified_miners = {}
+
         # Epoch seed for context variation
         epoch = current_block // self.config.eval_interval_blocks
         epoch_seed = self.compute_epoch_seed(epoch, self.config.netuid)
@@ -1285,13 +1298,12 @@ class TrajectoryValidator:
                             rejection_detail=_detail,
                         )
                     )
-                    # Clear stale EMA state so rejected miners cannot
-                    # retain weight from a previous successful evaluation.
+                    self._disqualified_miners[hotkey] = f"pre_eval_rejected:{reason}"
                     self.ema_costs.pop(hotkey, None)
                     self.scenario_qualified.pop(hotkey, None)
                     self._ema_pack_hash.pop(hotkey, None)
                     continue
-            
+
             needs_eval = self._needs_evaluation(
                 hotkey, commitment.pack_hash, current_block
             )
@@ -1781,8 +1793,7 @@ class TrajectoryValidator:
                     rejection_detail=integrity.summary,
                 )
             )
-            # Clear EMA so weight phase doesn't score this miner using
-            # stale data accumulated before the hardcoding was detected.
+            self._disqualified_miners[commitment.hotkey] = "integrity_failed"
             self.ema_costs.pop(commitment.hotkey, None)
             self.scenario_qualified.pop(commitment.hotkey, None)
             self._ema_pack_hash.pop(commitment.hotkey, None)

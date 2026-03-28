@@ -9,7 +9,7 @@ Pipeline order:
   2. Window number     — discard submissions from wrong window
   3. Trust threshold   — discard validators below min stake
   4. Data integrity    — discard payloads that fail hash verification
-  5. Software version  — discard incompatible major versions
+  5. ClawBench version — discard incompatible major versions
   6. Zero-signal       — discard all-zero cost submissions (free-riders)
 """
 
@@ -145,14 +145,14 @@ def filter_data_integrity(
     return passed, skipped
 
 
-def filter_software_version(
+def filter_clawbench_version(
     submissions: List[Tuple[ConsensusPointer, ConsensusPayload]],
     local_version: str,
 ) -> Tuple[List[Tuple[ConsensusPointer, ConsensusPayload]], int]:
-    """Layer 5: discard submissions from incompatible major versions.
+    """Layer 5: discard submissions from incompatible ClawBench major versions.
 
-    Different major versions may use different evaluation logic producing
-    incomparable scores.
+    Different major versions use different scenarios/criteria/judge logic,
+    producing incomparable scores.
     """
     local_major = _parse_major_version(local_version)
     if local_major is None:
@@ -161,11 +161,11 @@ def filter_software_version(
     passed = []
     skipped = 0
     for ptr, payload in submissions:
-        remote_major = _parse_major_version(payload.software_version)
+        remote_major = _parse_major_version(payload.clawbench_version)
         if remote_major is None or remote_major != local_major:
             logger.debug(
-                "Filter[version]: skip %s (v%s, local major=%d)",
-                ptr.validator_hotkey[:8], payload.software_version, local_major,
+                "Filter[clawbench_version]: skip %s (v%s, local major=%d)",
+                ptr.validator_hotkey[:8], payload.clawbench_version, local_major,
             )
             skipped += 1
         else:
@@ -233,7 +233,7 @@ def run_filter_pipeline(
     current, n = filter_data_integrity(current)
     stats.skipped_integrity = n
 
-    current, n = filter_software_version(current, local_version)
+    current, n = filter_clawbench_version(current, local_version)
     stats.skipped_version = n
 
     current, n = filter_zero_signal(current)

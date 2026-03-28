@@ -973,7 +973,7 @@ A 7200-block window contains ~20 tempos. Validators set weights at every one of 
 
 ### Payload Externalization + On-Chain Pointer Registration
 
-Evaluation payloads (per-miner costs, judge results, software version, metadata) can be large. Direct on-chain storage is impractical.
+Evaluation payloads (per-miner costs, judge results, ClawBench version, disqualification reasons, metadata) can be large. Direct on-chain storage is impractical.
 
 **Solution**: Two-layer storage with on-chain pointer registration.
 
@@ -1009,8 +1009,8 @@ All submissions from on-chain commitments
   ├─ [4] Data integrity filter
   │   Discard submissions whose CAS content fails hash verification
   │
-  ├─ [5] Software version compatibility filter
-  │   Discard submissions from validators running incompatible major versions
+  ├─ [5] ClawBench version compatibility filter
+  │   Discard submissions from validators running incompatible ClawBench major versions
   │   (different evaluation logic produces incomparable scores)
   │
   └─ [6] Zero-signal exclusion
@@ -1224,7 +1224,7 @@ fully_qualified[hotkey]     = integrity[hotkey] AND qualified on ALL scenarios
 
 # ── Submission (T_publish) ──
 
-payload = { local_cost, qualified, software_version, metadata }
+payload = { local_cost, qualified, clawbench_version, disqualified, metadata }
 content_address = cas_upload(payload)        # IPFS primary, GCS proxy fallback
 subtensor.set_commitment("consensus:{version}|{window}|{content_address}")
 
