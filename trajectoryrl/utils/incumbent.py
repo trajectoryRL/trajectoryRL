@@ -39,9 +39,13 @@ def select_winner_with_incumbent(
     state: IncumbentState,
     window_number: int,
     season_length: int,
-    incumbent_margin: float = 0.05,
+    cost_delta: float = 0.10,
 ) -> Tuple[Optional[str], IncumbentState]:
     """Select winner using incumbent advantage and historical best.
+
+    Uses the same cost_delta threshold as first-mover protection:
+    a challenger must be at least cost_delta (10%) cheaper than
+    the incumbent's historical best to dethrone.
 
     Args:
         consensus_costs: miner_hotkey -> stake-weighted consensus cost
@@ -49,8 +53,8 @@ def select_winner_with_incumbent(
         state: persisted incumbent state from previous window
         window_number: current evaluation window number
         season_length: number of windows per season
-        incumbent_margin: fraction by which challenger must beat
-            incumbent's historical best (default 0.05 = 5%)
+        cost_delta: fraction by which challenger must beat
+            incumbent's historical best (default 0.10 = 10%)
 
     Returns:
         (winner_hotkey, updated_state)
@@ -128,7 +132,7 @@ def select_winner_with_incumbent(
     incumbent_best = updated.historical_best.get(
         incumbent_hk, qualified_miners[incumbent_hk]
     )
-    threshold = incumbent_best * (1 - incumbent_margin)
+    threshold = incumbent_best * (1 - cost_delta)
 
     if lowest_cost < threshold:
         logger.info(
@@ -136,7 +140,7 @@ def select_winner_with_incumbent(
             "$%.4f × %.0f%% = $%.4f",
             lowest_cost_hk[:8], lowest_cost,
             incumbent_hk[:8], incumbent_best,
-            (1 - incumbent_margin) * 100, threshold,
+            (1 - cost_delta) * 100, threshold,
         )
         updated.incumbent_hotkey = lowest_cost_hk
         return lowest_cost_hk, updated

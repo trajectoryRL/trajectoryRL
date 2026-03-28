@@ -2863,32 +2863,32 @@ class TestIncumbentAdvantage:
         state = IncumbentState()
         winner, new_state = select_winner_with_incumbent(
             costs, quals, state, window_number=0,
-            season_length=30, incumbent_margin=0.05,
+            season_length=30, cost_delta=0.10,
         )
         assert winner == "m1"
         assert new_state.incumbent_hotkey == "m1"
 
     def test_incumbent_retains_within_margin(self):
-        costs = {"m1": 3.0, "m2": 2.90}
+        costs = {"m1": 3.0, "m2": 2.75}
         quals = {"m1": True, "m2": True}
         state = IncumbentState(incumbent_hotkey="m1", historical_best={"m1": 3.0})
         winner, new_state = select_winner_with_incumbent(
             costs, quals, state, window_number=1,
-            season_length=30, incumbent_margin=0.05,
+            season_length=30, cost_delta=0.10,
         )
-        # m2 (2.90) needs < 3.0 * 0.95 = 2.85 to dethrone
+        # m2 (2.75) needs < 3.0 * 0.90 = 2.70 to dethrone
         assert winner == "m1"
         assert new_state.incumbent_hotkey == "m1"
 
     def test_challenger_overtakes_past_margin(self):
-        costs = {"m1": 3.0, "m2": 2.80}
+        costs = {"m1": 3.0, "m2": 2.60}
         quals = {"m1": True, "m2": True}
         state = IncumbentState(incumbent_hotkey="m1", historical_best={"m1": 3.0})
         winner, new_state = select_winner_with_incumbent(
             costs, quals, state, window_number=1,
-            season_length=30, incumbent_margin=0.05,
+            season_length=30, cost_delta=0.10,
         )
-        # m2 (2.80) < 3.0 * 0.95 = 2.85 → overtake
+        # m2 (2.60) < 3.0 * 0.90 = 2.70 → overtake
         assert winner == "m2"
         assert new_state.incumbent_hotkey == "m2"
 
@@ -2898,7 +2898,7 @@ class TestIncumbentAdvantage:
         state = IncumbentState(incumbent_hotkey="m1", historical_best={"m1": 3.0})
         winner, new_state = select_winner_with_incumbent(
             costs, quals, state, window_number=1,
-            season_length=30, incumbent_margin=0.05,
+            season_length=30, cost_delta=0.10,
         )
         assert winner == "m2"
         assert new_state.incumbent_hotkey == "m2"
@@ -2909,7 +2909,7 @@ class TestIncumbentAdvantage:
         state = IncumbentState(historical_best={"m1": 4.0})
         _, new_state = select_winner_with_incumbent(
             costs, quals, state, window_number=0,
-            season_length=30, incumbent_margin=0.05,
+            season_length=30, cost_delta=0.10,
         )
         assert new_state.historical_best["m1"] == 3.0
 
@@ -2919,7 +2919,7 @@ class TestIncumbentAdvantage:
         state = IncumbentState(historical_best={"m1": 3.0})
         _, new_state = select_winner_with_incumbent(
             costs, quals, state, window_number=0,
-            season_length=30, incumbent_margin=0.05,
+            season_length=30, cost_delta=0.10,
         )
         assert new_state.historical_best["m1"] == 3.0
 
@@ -2934,7 +2934,7 @@ class TestIncumbentAdvantage:
         # window 30 → season 1 (season_length=30)
         winner, new_state = select_winner_with_incumbent(
             costs, quals, state, window_number=30,
-            season_length=30, incumbent_margin=0.05,
+            season_length=30, cost_delta=0.10,
         )
         assert new_state.current_season == 1
         # Historical bests were reset, so m2 wins (lowest cost, no incumbent)
@@ -2947,7 +2947,7 @@ class TestIncumbentAdvantage:
         state = IncumbentState()
         winner, _ = select_winner_with_incumbent(
             costs, quals, state, window_number=0,
-            season_length=30, incumbent_margin=0.05,
+            season_length=30, cost_delta=0.10,
         )
         assert winner is None
 
@@ -2981,9 +2981,9 @@ class TestIncumbentAdvantage:
         quals = {"m1": True, "m2": True}
         winner, _ = select_winner_with_incumbent(
             costs, quals, state, window_number=1,
-            season_length=30, incumbent_margin=0.05,
+            season_length=30, cost_delta=0.10,
         )
-        # threshold = 2.0 * 0.95 = 1.90; m2 (2.5) > 1.90 → incumbent retains
+        # threshold = 2.0 * 0.90 = 1.80; m2 (2.5) > 1.80 → incumbent retains
         assert winner == "m1"
 
     def test_incumbent_is_cheapest(self):
@@ -2996,7 +2996,7 @@ class TestIncumbentAdvantage:
         quals = {"m1": True, "m2": True}
         winner, _ = select_winner_with_incumbent(
             costs, quals, state, window_number=1,
-            season_length=30, incumbent_margin=0.05,
+            season_length=30, cost_delta=0.10,
         )
         assert winner == "m1"
 

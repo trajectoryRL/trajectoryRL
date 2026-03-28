@@ -770,7 +770,7 @@ class TrajectoryValidator:
             state=self._incumbent_state,
             window_number=window.window_number,
             season_length=self.config.season_length,
-            incumbent_margin=self.config.incumbent_margin,
+            cost_delta=self.config.cost_delta,
         )
         self._incumbent_state = updated_state
         save_incumbent_state(updated_state, self._incumbent_state_path)
