@@ -44,6 +44,10 @@ from trajectoryrl.utils.eval_window import (
     compute_window, is_new_window, should_submit, should_aggregate,
     can_evaluate, window_progress_pct,
 )
+from trajectoryrl.utils.consensus import (
+    ConsensusPayload, ConsensusPointer,
+    verify_payload_integrity, CONSENSUS_PROTOCOL_VERSION,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -2477,3 +2481,88 @@ class TestEvaluationWindow:
 
         w2 = compute_window(8500, cfg)
         assert w2.phase == WindowPhase.AGGREGATION
+
+
+# ---------------------------------------------------------------------------
+# ConsensusPayload tests
+# ---------------------------------------------------------------------------
+
+class TestConsensusPayload:
+    """Tests for consensus data model serialization and integrity."""
+
+    def _make_payload(self, **overrides) -> ConsensusPayload:
+        defaults = {
+            "protocol_version": 1,
+            "window_number": 42,
+            "validator_hotkey": "5FFApaS75bvpgP9gQ5hTUdZHiTc6LB2VPP9gvHN6VQCNug6f",
+            "software_version": "4.1.0",
+            "costs": {"miner_a": 3.42, "miner_b": 5.18},
+            "qualified": {"miner_a": True, "miner_b": False},
+            "timestamp": 1710000000,
+        }
+        defaults.update(overrides)
+        return ConsensusPayload(**defaults)
+
+    def test_serialize_deserialize_roundtrip(self):
+        p = self._make_payload()
+        data = p.serialize()
+        p2 = ConsensusPayload.deserialize(data)
+        assert p.protocol_version == p2.protocol_version
+        assert p.window_number == p2.window_number
+        assert p.validator_hotkey == p2.validator_hotkey
+        assert p.costs == p2.costs
+        assert p.qualified == p2.qualified
+
+    def test_content_hash_deterministic(self):
+        p = self._make_payload()
+        h1 = p.content_hash()
+        h2 = p.content_hash()
+        assert h1 == h2
+        assert h1.startswith("sha256:")
+        assert len(h1) == len("sha256:") + 64
+
+    def test_content_hash_changes_with_data(self):
+        p1 = self._make_payload(window_number=1)
+        p2 = self._make_payload(window_number=2)
+        assert p1.content_hash() != p2.content_hash()
+
+    def test_verify_integrity_pass(self):
+        p = self._make_payload()
+        data = p.serialize()
+        assert verify_payload_integrity(data, p.content_hash()) is True
+
+    def test_verify_integrity_fail(self):
+        p = self._make_payload()
+        data = p.serialize()
+        assert verify_payload_integrity(data, "sha256:0000") is False
+
+    def test_verify_integrity_bare_hex(self):
+        p = self._make_payload()
+        data = p.serialize()
+        bare_hex = p.content_hash().removeprefix("sha256:")
+        assert verify_payload_integrity(data, bare_hex) is True
+
+    def test_to_dict_from_dict_roundtrip(self):
+        p = self._make_payload()
+        d = p.to_dict()
+        p2 = ConsensusPayload.from_dict(d)
+        assert p.content_hash() == p2.content_hash()
+
+    def test_pointer_roundtrip(self):
+        ptr = ConsensusPointer(
+            protocol_version=1,
+            window_number=42,
+            content_address="sha256:abc123",
+            validator_hotkey="5FFApaS75bvpgP9gQ5hTUdZHiTc6LB2VPP9gvHN6VQCNug6f",
+        )
+        d = ptr.to_dict()
+        ptr2 = ConsensusPointer.from_dict(d)
+        assert ptr.content_address == ptr2.content_address
+        assert ptr.window_number == ptr2.window_number
+
+    def test_canonical_json_sorted_keys(self):
+        p = self._make_payload()
+        data = p.serialize()
+        parsed = json.loads(data)
+        keys = list(parsed.keys())
+        assert keys == sorted(keys)

@@ -91,6 +91,11 @@ class ValidatorConfig:
 
     # Consensus config (mitigates LLM non-determinism across validators)
     consensus_epsilon: float = 0.02
+    consensus_protocol_version: int = 1
+
+    # Consensus CAS: IPFS primary, trajrl.com API fallback
+    ipfs_api_url: str = "http://localhost:5001"
+    consensus_api_url: str = "https://api.trajrl.com"
 
     # Bootstrap config (graduated rewards until enough miners join)
     bootstrap_threshold: int = 10
@@ -196,6 +201,9 @@ class ValidatorConfig:
             # --- Operational ---
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             eval_on_startup=os.getenv("EVAL_ON_STARTUP", "1") == "1",
+            # --- Consensus CAS ---
+            ipfs_api_url=os.getenv("IPFS_API_URL", "http://localhost:5001"),
+            consensus_api_url=os.getenv("CONSENSUS_API_URL", "https://api.trajrl.com"),
             # --- IM parameters are hardcoded (dataclass defaults) ---
             # Do NOT load from env: ema_alpha, cost_ema_alpha, cost_delta,
             # rho_reliability, consensus_epsilon, bootstrap_threshold,
