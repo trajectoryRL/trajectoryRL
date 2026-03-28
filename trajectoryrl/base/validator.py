@@ -225,10 +225,15 @@ class TrajectoryValidator:
         self._window_aggregated: bool = False
 
         # Consensus CAS store (IPFS + API)
+        def _sign_consensus_msg(msg: str) -> str:
+            sig = self.wallet.hotkey.sign(msg.encode())
+            return "0x" + (sig if isinstance(sig, bytes) else bytes(sig)).hex()
+
         self._consensus_store = ConsensusStore(
             ipfs=IPFSBackend(api_url=config.ipfs_api_url, api_token=config.ipfs_api_jwt_token),
             api=TrajRLAPIBackend(
                 base_url=config.consensus_api_url,
+                sign_fn=_sign_consensus_msg,
                 validator_hotkey=self.wallet.hotkey.ss58_address,
             ),
         )
@@ -651,10 +656,10 @@ class TrajectoryValidator:
             if scenario_costs:
                 total_cost = sum(scenario_costs.values()) / len(scenario_costs)
                 costs_by_hotkey[hotkey] = total_cost
-            scenario_q = self.scenario_qualified.get(hotkey, {})
-            qualified_by_hotkey[hotkey] = (
-                bool(scenario_q) and all(scenario_q.values())
-            )
+                scenario_q = self.scenario_qualified.get(hotkey, {})
+                qualified_by_hotkey[hotkey] = (
+                    bool(scenario_q) and all(scenario_q.values())
+                )
 
         for hotkey, reason in getattr(self, "_disqualified_miners", {}).items():
             if hotkey not in qualified_by_hotkey:
@@ -743,9 +748,8 @@ class TrajectoryValidator:
             )
             return
 
-        metagraph = self.subtensor.metagraph(netuid=self.config.netuid)
         validator_stakes: Dict[str, float] = {}
-        for neuron in metagraph.neurons:
+        for neuron in self.metagraph.neurons:
             if neuron.is_null:
                 continue
             validator_stakes[neuron.hotkey] = float(neuron.stake)
@@ -2396,9 +2400,10 @@ class TrajectoryValidator:
         )
 
         # Update champion_hotkey to this cycle's winner (only if there IS a winner)
-        winner_uid = max(weights_dict, key=weights_dict.get)
-        if weights_dict.get(winner_uid, 0) > 0 and winner_uid in uid_to_hotkey:
-            self.champion_hotkey = uid_to_hotkey[winner_uid]
+        if weights_dict:
+            winner_uid = max(weights_dict, key=weights_dict.get)
+            if weights_dict.get(winner_uid, 0) > 0 and winner_uid in uid_to_hotkey:
+                self.champion_hotkey = uid_to_hotkey[winner_uid]
 
         # Apply burn: scale miner weights by (1 - BURN_FRACTION),
         # give BURN_FRACTION to owner UID (burned by the chain).
