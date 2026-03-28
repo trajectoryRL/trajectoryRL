@@ -44,15 +44,21 @@ class IPFSBackend(CASBackend):
     Download: POST /api/v0/cat?arg={cid}
     """
 
-    def __init__(self, api_url: str = "http://localhost:5001"):
+    def __init__(self, api_url: str = "http://localhost:5001", api_token: str = ""):
         self.api_url = api_url.rstrip("/")
+        self._api_token = api_token
+
+    def _auth_headers(self) -> dict:
+        if self._api_token:
+            return {"Authorization": f"Bearer {self._api_token}"}
+        return {}
 
     async def upload(self, data: bytes) -> Optional[str]:
         try:
             url = f"{self.api_url}/api/v0/add"
             form = aiohttp.FormData()
             form.add_field("file", data, content_type="application/octet-stream")
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(headers=self._auth_headers()) as session:
                 async with session.post(url, data=form, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                     if resp.status != 200:
                         logger.warning("IPFS upload failed: HTTP %d", resp.status)
@@ -69,7 +75,7 @@ class IPFSBackend(CASBackend):
     async def download(self, address: str) -> Optional[bytes]:
         try:
             url = f"{self.api_url}/api/v0/cat"
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(headers=self._auth_headers()) as session:
                 async with session.post(
                     url,
                     params={"arg": address},

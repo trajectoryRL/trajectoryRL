@@ -95,6 +95,7 @@ class ValidatorConfig:
 
     # Consensus CAS: IPFS primary, trajrl.com API fallback
     ipfs_api_url: str = "http://localhost:5001"
+    ipfs_api_jwt_token: str = ""
     consensus_api_url: str = "https://api.trajrl.com"
     min_validator_stake: float = 0.0  # minimum stake for consensus participation
 
@@ -207,6 +208,7 @@ class ValidatorConfig:
             eval_on_startup=os.getenv("EVAL_ON_STARTUP", "1") == "1",
             # --- Consensus CAS ---
             ipfs_api_url=os.getenv("IPFS_API_URL", "http://localhost:5001"),
+            ipfs_api_jwt_token=os.getenv("IPFS_API_JWT_TOKEN", ""),
             consensus_api_url=os.getenv("CONSENSUS_API_URL", "https://api.trajrl.com"),
             # --- IM parameters are hardcoded (dataclass defaults) ---
             # Do NOT load from env: ema_alpha, cost_ema_alpha, cost_delta,

@@ -226,7 +226,7 @@ class TrajectoryValidator:
 
         # Consensus CAS store (IPFS + API)
         self._consensus_store = ConsensusStore(
-            ipfs=IPFSBackend(api_url=config.ipfs_api_url),
+            ipfs=IPFSBackend(api_url=config.ipfs_api_url, api_token=config.ipfs_api_jwt_token),
             api=TrajRLAPIBackend(
                 base_url=config.consensus_api_url,
                 validator_hotkey=self.wallet.hotkey.ss58_address,
