@@ -38,6 +38,11 @@ from ..utils.clawbench import ClawBenchHarness, EvaluationResult
 from ..scoring import TrajectoryScorer
 from ..utils.github import PackFetcher
 from ..utils.epoch_context import generate_epoch_context, render_context_preamble
+from ..utils.eval_window import (
+    WindowConfig, WindowPhase, EvaluationWindow,
+    compute_window, is_new_window, can_evaluate,
+    should_submit, should_aggregate,
+)
 from ..utils.commitments import MinerCommitment, fetch_all_commitments
 from ..utils.ncd import deduplicate_packs
 from ..utils.status_reporter import (
@@ -185,8 +190,21 @@ class TrajectoryValidator:
         # Timestamp of the most recent completed full evaluation cycle
         self._last_eval_at: Optional[int] = None
 
-        # UTC date of the most recent completed eval cycle (for daily scheduling)
+        # UTC date of the most recent completed eval cycle (legacy daily scheduling)
         self._last_eval_date: Optional[datetime.date] = None
+
+        # Block-based window tracking (replaces _last_eval_date for consensus protocol)
+        self._last_eval_window: int = -1
+        self._window_config = WindowConfig(
+            window_length=config.eval_interval_blocks,
+            global_anchor=config.global_anchor_block,
+            publish_pct=config.window_publish_pct,
+            aggregate_pct=config.window_aggregate_pct,
+        )
+        # Whether this window's evaluation results have been submitted to CAS
+        self._window_submitted: bool = False
+        # Whether this window's consensus aggregation has been performed
+        self._window_aggregated: bool = False
 
         # Set to True on startup when eval_on_startup=True; cleared after first eval
         self._startup_eval_pending: bool = config.eval_on_startup
@@ -256,6 +274,7 @@ class TrajectoryValidator:
                 for k, v in data.get("first_mover_data", {}).items()
             }
             self.champion_hotkey = data.get("champion_hotkey")
+            self._last_eval_window = data.get("last_eval_window", -1)
 
             # Load integrity judge cache if present
             integrity_cache = data.get("integrity_cache")
@@ -279,6 +298,7 @@ class TrajectoryValidator:
             "last_eval_block": self.last_eval_block,
             "first_mover_data": self.first_mover_data,
             "champion_hotkey": self.champion_hotkey,
+            "last_eval_window": self._last_eval_window,
             "integrity_cache": self.integrity_judge.dump_cache(),
         }
         try:
@@ -573,11 +593,31 @@ class TrajectoryValidator:
                 logger.warning("Heartbeat error: %s", e)
             await asyncio.sleep(600)
 
-    async def run(self):
-        """Main validator loop with dual cadence.
+    def _should_start_evaluation(self, current_block: int) -> bool:
+        """Return True if a new evaluation cycle should start.
 
-        - Daily eval: evaluate all miner packs once per day at UTC eval_utc_hour.
-        - tempo (~72 min / 360 blocks): compute weights from EMA, set_weights.
+        Block-based: fires when we enter a new evaluation window and are
+        in the evaluation phase.  Also fires on startup if eval_on_startup
+        is set and no eval has run yet.
+        """
+        if self._startup_eval_pending:
+            return True
+
+        window = compute_window(current_block, self._window_config)
+        if window.phase != WindowPhase.EVALUATION:
+            return False
+        return window.window_number > self._last_eval_window
+
+    async def run(self):
+        """Main validator loop with block-based window phases.
+
+        Window phases (per eval_interval_blocks window):
+          - evaluation (0% - 80%):   run ClawBench, compute local cost EMA
+          - propagation (80% - 90%): submit results to CAS, wait for others
+          - aggregation (90% - 100%): read submissions, consensus, select winner
+
+        Independent cadence:
+          - tempo (~72 min / 360 blocks): set_weights using latest consensus
         """
         self._start_time = time.time()
 
@@ -585,7 +625,11 @@ class TrajectoryValidator:
 
         logger.info("Starting validator main loop...")
         logger.info(
-            f"Eval schedule: daily at UTC {self.config.eval_utc_hour:02d}:00"
+            f"Eval window: {self._window_config.window_length} blocks "
+            f"(~{self._window_config.window_length * 12 // 3600:.0f}h), "
+            f"anchor={self._window_config.global_anchor}, "
+            f"publish={self._window_config.publish_pct:.0%}, "
+            f"aggregate={self._window_config.aggregate_pct:.0%}"
         )
         logger.info(
             f"Weight interval: {self.config.weight_interval_blocks} blocks "
@@ -595,6 +639,7 @@ class TrajectoryValidator:
         while True:
             try:
                 current_block = self.subtensor.get_current_block()
+                window = compute_window(current_block, self._window_config)
 
                 # --- Pre-launch phase: fallback weights only ---
                 if current_block < EVAL_START_BLOCK:
@@ -610,23 +655,25 @@ class TrajectoryValidator:
                     await asyncio.sleep(60)
                     continue
 
-                # --- Eval cadence: daily at fixed UTC hour ---
-                if self._should_run_eval_today():
-                    now_utc = datetime.datetime.utcnow()
+                # --- Window phase: evaluation ---
+                if self._should_start_evaluation(current_block):
                     logger.info("=" * 60)
                     logger.info(
-                        f"Daily evaluation cycle at block {current_block} "
-                        f"(UTC {now_utc.strftime('%Y-%m-%d %H:%M')})"
+                        f"Evaluation window {window.window_number} at block "
+                        f"{current_block} (phase={window.phase.value}, "
+                        f"offset={window.block_offset}/{self._window_config.window_length})"
                     )
                     logger.info("=" * 60)
 
-                    # Sync ClawBench to latest before evaluation
                     await self._sync_clawbench()
 
                     await self._run_evaluation_cycle(current_block)
                     self._last_eval_at = int(time.time())
+                    self._last_eval_window = window.window_number
                     self._last_eval_date = datetime.datetime.utcnow().date()
                     self._startup_eval_pending = False
+                    self._window_submitted = False
+                    self._window_aggregated = False
                     self.last_weight_block = self.subtensor.get_current_block()
 
                     self.pack_fetcher.cleanup_cache(
@@ -635,13 +682,44 @@ class TrajectoryValidator:
                     self._save_ema_state()
                     self._save_eval_cache()
 
-                # --- Tempo cadence: re-set weights ---
+                # --- Window phase: submission (T_publish) ---
+                if (window.phase == WindowPhase.PROPAGATION
+                        and not self._window_submitted
+                        and self._last_eval_window == window.window_number):
+                    logger.info(
+                        f"Window {window.window_number}: T_publish reached "
+                        f"at block {current_block}, submitting evaluation results"
+                    )
+                    # TODO(commit2): upload payload to CAS + register pointer
+                    self._window_submitted = True
+                    logger.info(
+                        f"Window {window.window_number}: submission complete "
+                        f"(placeholder — CAS not yet implemented)"
+                    )
+
+                # --- Window phase: aggregation (T_aggregate) ---
+                if (window.phase == WindowPhase.AGGREGATION
+                        and not self._window_aggregated
+                        and self._last_eval_window == window.window_number):
+                    logger.info(
+                        f"Window {window.window_number}: T_aggregate reached "
+                        f"at block {current_block}, running consensus aggregation"
+                    )
+                    # TODO(commit4): read pointers, filter, stake-weighted avg
+                    self._window_aggregated = True
+                    logger.info(
+                        f"Window {window.window_number}: aggregation complete "
+                        f"(placeholder — consensus not yet implemented)"
+                    )
+
+                # --- Tempo cadence: re-set weights (independent of window) ---
                 current_block = self.subtensor.get_current_block()
                 blocks_since_weights = current_block - self.last_weight_block
                 if blocks_since_weights >= self.config.weight_interval_blocks:
                     logger.info(
                         f"Tempo weight refresh at block {current_block} "
-                        f"({blocks_since_weights} blocks since last)"
+                        f"({blocks_since_weights} blocks since last, "
+                        f"window={window.window_number} phase={window.phase.value})"
                     )
                     if not await self._apply_weight_override():
                         if self._eval_fallback_active:

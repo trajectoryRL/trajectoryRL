@@ -39,6 +39,11 @@ from trajectoryrl.utils.epoch_context import (
     generate_epoch_context, render_context_preamble,
     EpochContext, NAMES, ROLES, COMPANIES, DEPARTMENTS, TIMEZONES,
 )
+from trajectoryrl.utils.eval_window import (
+    WindowConfig, WindowPhase, EvaluationWindow,
+    compute_window, is_new_window, should_submit, should_aggregate,
+    can_evaluate, window_progress_pct,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -2330,3 +2335,145 @@ class TestScoringIntegration:
 
         # Score should be high for this good result
         assert eval_result.score >= 0.7, f"Expected good score, got {eval_result.score}"
+
+
+# ---------------------------------------------------------------------------
+# EvaluationWindow tests
+# ---------------------------------------------------------------------------
+
+class TestEvaluationWindow:
+    """Tests for block-based evaluation window computation."""
+
+    def setup_method(self):
+        self.config = WindowConfig(
+            window_length=7200,
+            global_anchor=0,
+            publish_pct=0.80,
+            aggregate_pct=0.90,
+        )
+
+    def test_window_number_at_anchor(self):
+        w = compute_window(0, self.config)
+        assert w.window_number == 0
+        assert w.window_start == 0
+        assert w.block_offset == 0
+
+    def test_window_number_mid_window(self):
+        w = compute_window(3600, self.config)
+        assert w.window_number == 0
+        assert w.block_offset == 3600
+
+    def test_window_number_boundary(self):
+        w = compute_window(7200, self.config)
+        assert w.window_number == 1
+        assert w.window_start == 7200
+        assert w.block_offset == 0
+
+    def test_window_number_second_window(self):
+        w = compute_window(10000, self.config)
+        assert w.window_number == 1
+        assert w.window_start == 7200
+        assert w.block_offset == 2800
+
+    def test_phase_evaluation(self):
+        w = compute_window(100, self.config)
+        assert w.phase == WindowPhase.EVALUATION
+        assert w.blocks_remaining_in_phase == 5760 - 100
+
+    def test_phase_at_publish_boundary(self):
+        w = compute_window(5760, self.config)
+        assert w.phase == WindowPhase.PROPAGATION
+        assert w.blocks_into_phase == 0
+
+    def test_phase_propagation(self):
+        w = compute_window(6000, self.config)
+        assert w.phase == WindowPhase.PROPAGATION
+        assert w.blocks_into_phase == 240
+
+    def test_phase_at_aggregate_boundary(self):
+        w = compute_window(6480, self.config)
+        assert w.phase == WindowPhase.AGGREGATION
+        assert w.blocks_into_phase == 0
+
+    def test_phase_aggregation(self):
+        w = compute_window(7000, self.config)
+        assert w.phase == WindowPhase.AGGREGATION
+        assert w.blocks_remaining_in_phase == 200
+
+    def test_phase_end_of_window(self):
+        w = compute_window(7199, self.config)
+        assert w.phase == WindowPhase.AGGREGATION
+        assert w.window_number == 0
+        assert w.blocks_remaining_in_phase == 1
+
+    def test_global_anchor_offset(self):
+        cfg = WindowConfig(window_length=7200, global_anchor=1000)
+        w = compute_window(1000, cfg)
+        assert w.window_number == 0
+        assert w.window_start == 1000
+        assert w.block_offset == 0
+
+        w2 = compute_window(8200, cfg)
+        assert w2.window_number == 1
+        assert w2.window_start == 8200
+
+    def test_before_anchor_clamps(self):
+        cfg = WindowConfig(window_length=7200, global_anchor=5000)
+        w = compute_window(100, cfg)
+        assert w.window_number == 0
+        assert w.block_offset == 0
+
+    def test_is_new_window(self):
+        assert is_new_window(7200, 0, self.config) is True
+        assert is_new_window(7199, 0, self.config) is False
+        assert is_new_window(14400, 1, self.config) is True
+        assert is_new_window(14400, 2, self.config) is False
+
+    def test_can_evaluate(self):
+        assert can_evaluate(100, self.config) is True
+        assert can_evaluate(5759, self.config) is True
+        assert can_evaluate(5760, self.config) is False
+        assert can_evaluate(6480, self.config) is False
+
+    def test_should_submit(self):
+        assert should_submit(5759, self.config) is False
+        assert should_submit(5760, self.config) is True
+        assert should_submit(6000, self.config) is True
+        assert should_submit(6480, self.config) is False
+
+    def test_should_aggregate(self):
+        assert should_aggregate(6479, self.config) is False
+        assert should_aggregate(6480, self.config) is True
+        assert should_aggregate(7199, self.config) is True
+
+    def test_window_progress(self):
+        assert window_progress_pct(0, self.config) == pytest.approx(0.0)
+        assert window_progress_pct(3600, self.config) == pytest.approx(0.5)
+        assert window_progress_pct(7200, self.config) == pytest.approx(0.0)
+
+    def test_deterministic(self):
+        """Same inputs always produce same outputs (pure function)."""
+        for block in [0, 100, 5760, 6480, 7199, 7200, 99999]:
+            w1 = compute_window(block, self.config)
+            w2 = compute_window(block, self.config)
+            assert w1 == w2
+
+    def test_frozen_dataclass(self):
+        w = compute_window(100, self.config)
+        with pytest.raises(AttributeError):
+            w.window_number = 999
+
+    def test_custom_percentages(self):
+        cfg = WindowConfig(
+            window_length=10000,
+            publish_pct=0.70,
+            aggregate_pct=0.85,
+        )
+        assert cfg.publish_block == 7000
+        assert cfg.aggregate_block == 8500
+
+        w = compute_window(7000, cfg)
+        assert w.phase == WindowPhase.PROPAGATION
+
+        w2 = compute_window(8500, cfg)
+        assert w2.phase == WindowPhase.AGGREGATION

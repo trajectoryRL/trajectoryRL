@@ -69,10 +69,15 @@ class ValidatorConfig:
 
     # Evaluation config
     seeds_per_task: int = 1
-    eval_interval_blocks: int = 7200  # ~24 hours at 12s/block (used by _needs_evaluation)
+    eval_interval_blocks: int = 7200  # ~24 hours at 12s/block (window length)
     eval_utc_hour: int = 0           # UTC hour to trigger daily eval cycle (0 = midnight)
     eval_on_startup: bool = True     # Run eval immediately on validator startup
     timeout_per_scenario: int = 300  # 5 minutes max per scenario
+
+    # Evaluation window config (block-aligned consensus protocol)
+    global_anchor_block: int = 0     # anchor block for window alignment
+    window_publish_pct: float = 0.80  # T_publish: 80% of window for evaluation
+    window_aggregate_pct: float = 0.90  # T_aggregate: 90% (10% propagation interval)
 
     # Scoring config
     delta_threshold: float = 0.05
