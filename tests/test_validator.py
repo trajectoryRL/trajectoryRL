@@ -48,6 +48,12 @@ from trajectoryrl.utils.consensus import (
     ConsensusPayload, ConsensusPointer,
     verify_payload_integrity, CONSENSUS_PROTOCOL_VERSION,
 )
+from trajectoryrl.utils.consensus_filter import (
+    run_filter_pipeline, FilterStats, ValidatedSubmission,
+    filter_protocol_version, filter_window_number,
+    filter_trust_threshold, filter_data_integrity,
+    filter_software_version, filter_zero_signal,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -2566,3 +2572,181 @@ class TestConsensusPayload:
         parsed = json.loads(data)
         keys = list(parsed.keys())
         assert keys == sorted(keys)
+
+
+# ---------------------------------------------------------------------------
+# Consensus filter pipeline tests
+# ---------------------------------------------------------------------------
+
+class TestConsensusFilter:
+    """Tests for the 6-layer submission filter pipeline."""
+
+    def _make_submission(
+        self, hotkey="val_a", window=42, protocol=1, version="4.1.0",
+        costs=None, qualified=None,
+    ):
+        if costs is None:
+            costs = {"miner_x": 3.0}
+        if qualified is None:
+            qualified = {"miner_x": True}
+        payload = ConsensusPayload(
+            protocol_version=protocol,
+            window_number=window,
+            validator_hotkey=hotkey,
+            software_version=version,
+            costs=costs,
+            qualified=qualified,
+            timestamp=1000,
+        )
+        pointer = ConsensusPointer(
+            protocol_version=protocol,
+            window_number=window,
+            content_address=payload.content_hash(),
+            validator_hotkey=hotkey,
+        )
+        return pointer, payload
+
+    def test_full_pipeline_all_pass(self):
+        subs = [
+            self._make_submission(hotkey="val_a"),
+            self._make_submission(hotkey="val_b"),
+        ]
+        stakes = {"val_a": 100.0, "val_b": 200.0}
+        validated, stats = run_filter_pipeline(
+            subs, expected_window=42, validator_stakes=stakes,
+            min_stake=10.0, local_version="4.1.0",
+        )
+        assert stats.passed == 2
+        assert stats.total_input == 2
+        assert len(validated) == 2
+        assert validated[0].validator_stake == 100.0
+        assert validated[1].validator_stake == 200.0
+
+    def test_filter_protocol_version(self):
+        subs = [
+            self._make_submission(hotkey="val_a", protocol=1),
+            self._make_submission(hotkey="val_b", protocol=2),
+        ]
+        passed, skipped = filter_protocol_version(subs, expected_version=1)
+        assert len(passed) == 1
+        assert skipped == 1
+        assert passed[0][0].validator_hotkey == "val_a"
+
+    def test_filter_window_number(self):
+        subs = [
+            self._make_submission(hotkey="val_a", window=42),
+            self._make_submission(hotkey="val_b", window=41),
+        ]
+        passed, skipped = filter_window_number(subs, expected_window=42)
+        assert len(passed) == 1
+        assert skipped == 1
+
+    def test_filter_trust_threshold(self):
+        subs = [
+            self._make_submission(hotkey="val_a"),
+            self._make_submission(hotkey="val_b"),
+        ]
+        stakes = {"val_a": 100.0, "val_b": 5.0}
+        passed, skipped = filter_trust_threshold(subs, stakes, min_stake=10.0)
+        assert len(passed) == 1
+        assert skipped == 1
+        assert passed[0][0].validator_hotkey == "val_a"
+
+    def test_filter_trust_threshold_missing_stake(self):
+        subs = [self._make_submission(hotkey="val_unknown")]
+        passed, skipped = filter_trust_threshold(subs, {}, min_stake=1.0)
+        assert len(passed) == 0
+        assert skipped == 1
+
+    def test_filter_data_integrity(self):
+        ptr, payload = self._make_submission(hotkey="val_a")
+        bad_ptr = ConsensusPointer(
+            protocol_version=1, window_number=42,
+            content_address="sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            validator_hotkey="val_a",
+        )
+        subs = [(ptr, payload), (bad_ptr, payload)]
+        passed, skipped = filter_data_integrity(subs)
+        assert len(passed) == 1
+        assert skipped == 1
+
+    def test_filter_data_integrity_ipfs_cid_skips_check(self):
+        ptr, payload = self._make_submission(hotkey="val_a")
+        ipfs_ptr = ConsensusPointer(
+            protocol_version=1, window_number=42,
+            content_address="QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG",
+            validator_hotkey="val_a",
+        )
+        subs = [(ipfs_ptr, payload)]
+        passed, skipped = filter_data_integrity(subs)
+        assert len(passed) == 1
+        assert skipped == 0
+
+    def test_filter_software_version_major_mismatch(self):
+        subs = [
+            self._make_submission(hotkey="val_a", version="4.1.0"),
+            self._make_submission(hotkey="val_b", version="3.9.0"),
+        ]
+        passed, skipped = filter_software_version(subs, local_version="4.2.0")
+        assert len(passed) == 1
+        assert skipped == 1
+        assert passed[0][0].validator_hotkey == "val_a"
+
+    def test_filter_software_version_same_major(self):
+        subs = [
+            self._make_submission(hotkey="val_a", version="4.0.0"),
+            self._make_submission(hotkey="val_b", version="4.9.9"),
+        ]
+        passed, skipped = filter_software_version(subs, local_version="4.1.0")
+        assert len(passed) == 2
+        assert skipped == 0
+
+    def test_filter_zero_signal_with_nonzero(self):
+        subs = [
+            self._make_submission(hotkey="val_a", costs={"m": 3.0}),
+            self._make_submission(hotkey="val_b", costs={"m": 0.0}),
+        ]
+        passed, skipped = filter_zero_signal(subs)
+        assert len(passed) == 1
+        assert skipped == 1
+        assert passed[0][0].validator_hotkey == "val_a"
+
+    def test_filter_zero_signal_all_zero_passes(self):
+        subs = [
+            self._make_submission(hotkey="val_a", costs={"m": 0.0}),
+            self._make_submission(hotkey="val_b", costs={"m": 0.0}),
+        ]
+        passed, skipped = filter_zero_signal(subs)
+        assert len(passed) == 2
+        assert skipped == 0
+
+    def test_full_pipeline_cascading_filters(self):
+        subs = [
+            self._make_submission(hotkey="good", window=42, protocol=1, version="4.0.0", costs={"m": 3.0}),
+            self._make_submission(hotkey="bad_proto", window=42, protocol=2, version="4.0.0"),
+            self._make_submission(hotkey="bad_window", window=41, protocol=1, version="4.0.0"),
+            self._make_submission(hotkey="low_stake", window=42, protocol=1, version="4.0.0"),
+            self._make_submission(hotkey="bad_version", window=42, protocol=1, version="3.0.0"),
+            self._make_submission(hotkey="zero_cost", window=42, protocol=1, version="4.0.0", costs={"m": 0.0}),
+        ]
+        stakes = {"good": 100.0, "bad_proto": 100.0, "bad_window": 100.0,
+                  "low_stake": 1.0, "bad_version": 100.0, "zero_cost": 100.0}
+        validated, stats = run_filter_pipeline(
+            subs, expected_window=42, validator_stakes=stakes,
+            min_stake=10.0, local_version="4.1.0",
+        )
+        assert stats.passed == 1
+        assert stats.skipped_protocol == 1
+        assert stats.skipped_window == 1
+        assert stats.skipped_stake == 1
+        assert stats.skipped_version == 1
+        assert stats.skipped_zero_signal == 1
+        assert validated[0].pointer.validator_hotkey == "good"
+
+    def test_empty_submissions(self):
+        validated, stats = run_filter_pipeline(
+            [], expected_window=42, validator_stakes={},
+            min_stake=0, local_version="4.0.0",
+        )
+        assert stats.passed == 0
+        assert len(validated) == 0
