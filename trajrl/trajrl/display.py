@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any
 
 from rich.console import Console
 from rich.panel import Panel
@@ -13,6 +12,7 @@ console = Console()
 
 
 # -- helpers ---------------------------------------------------------------
+
 
 def trunc(hotkey: str | None, n: int = 6) -> str:
     """Truncate a hotkey: 5Cd6ht…sn11"""
@@ -77,6 +77,7 @@ def size_fmt(b: int | None) -> str:
 
 
 # -- command displays ------------------------------------------------------
+
 
 def display_status(validators_data: dict, submissions_data: dict) -> None:
     valis = validators_data.get("validators", [])
@@ -215,11 +216,13 @@ def display_miner(data: dict) -> None:
             reason = (fp.get("reason") or "")[:80]
             lines.append(f"    - {trunc(fp.get('pack_hash'), 10)}: {reason}…")
 
-    console.print(Panel(
-        "\n".join(lines),
-        title=f"Miner {trunc(hk)} (UID {uid or '—'})",
-        border_style="cyan",
-    ))
+    console.print(
+        Panel(
+            "\n".join(lines),
+            title=f"Miner {trunc(hk)} (UID {uid or '—'})",
+            border_style="cyan",
+        )
+    )
 
     # scenario summary
     scenarios = data.get("scenarioSummary", [])
