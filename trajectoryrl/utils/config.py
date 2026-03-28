@@ -96,6 +96,7 @@ class ValidatorConfig:
     # Consensus CAS: IPFS primary, trajrl.com API fallback
     ipfs_api_url: str = "http://localhost:5001"
     consensus_api_url: str = "https://api.trajrl.com"
+    min_validator_stake: float = 0.0  # minimum stake for consensus participation
 
     # Bootstrap config (graduated rewards until enough miners join)
     bootstrap_threshold: int = 10

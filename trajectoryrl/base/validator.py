@@ -43,6 +43,17 @@ from ..utils.eval_window import (
     compute_window, is_new_window, can_evaluate,
     should_submit, should_aggregate,
 )
+from ..utils.consensus import (
+    ConsensusPayload, ConsensusPointer,
+    CONSENSUS_PROTOCOL_VERSION,
+)
+from ..utils.consensus_store import (
+    ConsensusStore, IPFSBackend, TrajRLAPIBackend,
+)
+from ..utils.consensus_filter import (
+    run_filter_pipeline, ValidatedSubmission,
+)
+from ..scoring import compute_consensus_costs
 from ..utils.commitments import MinerCommitment, fetch_all_commitments
 from ..utils.ncd import deduplicate_packs
 from ..utils.status_reporter import (
@@ -205,6 +216,19 @@ class TrajectoryValidator:
         self._window_submitted: bool = False
         # Whether this window's consensus aggregation has been performed
         self._window_aggregated: bool = False
+
+        # Consensus CAS store (IPFS + API)
+        self._consensus_store = ConsensusStore(
+            ipfs=IPFSBackend(api_url=config.ipfs_api_url),
+            api=TrajRLAPIBackend(
+                base_url=config.consensus_api_url,
+                validator_hotkey=self.wallet.hotkey.ss58_address,
+            ),
+        )
+
+        # Latest consensus results from aggregation (used by weight setting)
+        self._consensus_costs: Dict[str, float] = {}
+        self._consensus_qualified: Dict[str, bool] = {}
 
         # Set to True on startup when eval_on_startup=True; cleared after first eval
         self._startup_eval_pending: bool = config.eval_on_startup
@@ -593,6 +617,123 @@ class TrajectoryValidator:
                 logger.warning("Heartbeat error: %s", e)
             await asyncio.sleep(600)
 
+    async def _submit_consensus_payload(self, window: EvaluationWindow):
+        """Build and upload consensus payload to CAS, then register pointer."""
+        from trajectoryrl import __version__
+
+        costs_by_hotkey: Dict[str, float] = {}
+        qualified_by_hotkey: Dict[str, bool] = {}
+
+        for hotkey, scenario_costs in self.ema_costs.items():
+            if scenario_costs:
+                total_cost = sum(scenario_costs.values()) / len(scenario_costs)
+                costs_by_hotkey[hotkey] = total_cost
+            scenario_q = self.scenario_qualified.get(hotkey, {})
+            qualified_by_hotkey[hotkey] = (
+                bool(scenario_q) and all(scenario_q.values())
+            )
+
+        if not costs_by_hotkey:
+            logger.warning(
+                "Window %d: no evaluation data to submit", window.window_number
+            )
+            return
+
+        payload = ConsensusPayload(
+            protocol_version=self.config.consensus_protocol_version,
+            window_number=window.window_number,
+            validator_hotkey=self.wallet.hotkey.ss58_address,
+            software_version=__version__,
+            costs=costs_by_hotkey,
+            qualified=qualified_by_hotkey,
+            timestamp=int(time.time()),
+        )
+
+        content_address = await self._consensus_store.upload_payload(payload)
+        if content_address is None:
+            logger.error(
+                "Window %d: failed to upload consensus payload",
+                window.window_number,
+            )
+            return
+
+        pointer = ConsensusPointer(
+            protocol_version=self.config.consensus_protocol_version,
+            window_number=window.window_number,
+            content_address=content_address,
+            validator_hotkey=self.wallet.hotkey.ss58_address,
+        )
+
+        await self._consensus_store.write_pointer(pointer)
+        logger.info(
+            "Window %d: consensus payload submitted (address=%s, %d miners)",
+            window.window_number, content_address[:24], len(costs_by_hotkey),
+        )
+
+    async def _run_consensus_aggregation(self, window: EvaluationWindow):
+        """Read submissions, filter, compute stake-weighted consensus costs."""
+        pointers = await self._consensus_store.read_all_pointers(
+            window.window_number
+        )
+        if not pointers:
+            logger.warning(
+                "Window %d: no pointers found, using local results",
+                window.window_number,
+            )
+            return
+
+        submissions = []
+        for ptr in pointers:
+            payload = await self._consensus_store.download_payload(
+                ptr.content_address
+            )
+            if payload is not None:
+                submissions.append((ptr, payload))
+
+        if not submissions:
+            logger.warning(
+                "Window %d: all payload downloads failed, using local results",
+                window.window_number,
+            )
+            return
+
+        metagraph = self.subtensor.metagraph(netuid=self.config.netuid)
+        validator_stakes: Dict[str, float] = {}
+        for neuron in metagraph.neurons:
+            if neuron.is_null:
+                continue
+            validator_stakes[neuron.hotkey] = float(neuron.stake)
+
+        from trajectoryrl import __version__
+        min_stake = getattr(self.config, "min_validator_stake", 0.0)
+        validated, stats = run_filter_pipeline(
+            submissions=submissions,
+            expected_window=window.window_number,
+            validator_stakes=validator_stakes,
+            min_stake=min_stake,
+            local_version=__version__,
+            expected_protocol=self.config.consensus_protocol_version,
+        )
+
+        if not validated:
+            logger.warning(
+                "Window %d: all submissions filtered out (%s), using local results",
+                window.window_number, stats.summary(),
+            )
+            return
+
+        consensus_costs, consensus_qualified = compute_consensus_costs(validated)
+
+        self._consensus_costs = consensus_costs
+        self._consensus_qualified = consensus_qualified
+
+        logger.info(
+            "Window %d: consensus aggregation complete — %d miners, "
+            "%d validators contributed (%s)",
+            window.window_number, len(consensus_costs),
+            stats.passed, stats.summary(),
+        )
+
     def _should_start_evaluation(self, current_block: int) -> bool:
         """Return True if a new evaluation cycle should start.
 
@@ -690,12 +831,8 @@ class TrajectoryValidator:
                         f"Window {window.window_number}: T_publish reached "
                         f"at block {current_block}, submitting evaluation results"
                     )
-                    # TODO(commit2): upload payload to CAS + register pointer
+                    await self._submit_consensus_payload(window)
                     self._window_submitted = True
-                    logger.info(
-                        f"Window {window.window_number}: submission complete "
-                        f"(placeholder — CAS not yet implemented)"
-                    )
 
                 # --- Window phase: aggregation (T_aggregate) ---
                 if (window.phase == WindowPhase.AGGREGATION
@@ -705,12 +842,8 @@ class TrajectoryValidator:
                         f"Window {window.window_number}: T_aggregate reached "
                         f"at block {current_block}, running consensus aggregation"
                     )
-                    # TODO(commit4): read pointers, filter, stake-weighted avg
+                    await self._run_consensus_aggregation(window)
                     self._window_aggregated = True
-                    logger.info(
-                        f"Window {window.window_number}: aggregation complete "
-                        f"(placeholder — consensus not yet implemented)"
-                    )
 
                 # --- Tempo cadence: re-set weights (independent of window) ---
                 current_block = self.subtensor.get_current_block()

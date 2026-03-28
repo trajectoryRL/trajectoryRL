@@ -54,6 +54,7 @@ from trajectoryrl.utils.consensus_filter import (
     filter_trust_threshold, filter_data_integrity,
     filter_software_version, filter_zero_signal,
 )
+from trajectoryrl.scoring import compute_consensus_costs
 
 
 # ---------------------------------------------------------------------------
@@ -2750,3 +2751,91 @@ class TestConsensusFilter:
         )
         assert stats.passed == 0
         assert len(validated) == 0
+
+
+# ---------------------------------------------------------------------------
+# Stake-weighted consensus aggregation tests
+# ---------------------------------------------------------------------------
+
+class TestConsensusAggregation:
+    """Tests for compute_consensus_costs."""
+
+    def _make_validated(self, hotkey, stake, costs, qualified=None):
+        if qualified is None:
+            qualified = {k: True for k in costs}
+        payload = ConsensusPayload(
+            protocol_version=1, window_number=42,
+            validator_hotkey=hotkey, software_version="4.0.0",
+            costs=costs, qualified=qualified, timestamp=1000,
+        )
+        pointer = ConsensusPointer(
+            protocol_version=1, window_number=42,
+            content_address=payload.content_hash(),
+            validator_hotkey=hotkey,
+        )
+        return ValidatedSubmission(
+            pointer=pointer, payload=payload, validator_stake=stake,
+        )
+
+    def test_single_validator(self):
+        subs = [self._make_validated("v1", 100.0, {"m1": 3.0, "m2": 5.0})]
+        costs, quals = compute_consensus_costs(subs)
+        assert costs["m1"] == pytest.approx(3.0)
+        assert costs["m2"] == pytest.approx(5.0)
+        assert quals["m1"] is True
+        assert quals["m2"] is True
+
+    def test_equal_stake_average(self):
+        subs = [
+            self._make_validated("v1", 100.0, {"m1": 2.0}),
+            self._make_validated("v2", 100.0, {"m1": 4.0}),
+        ]
+        costs, _ = compute_consensus_costs(subs)
+        assert costs["m1"] == pytest.approx(3.0)
+
+    def test_stake_weighted_average(self):
+        subs = [
+            self._make_validated("v1", 300.0, {"m1": 2.0}),
+            self._make_validated("v2", 100.0, {"m1": 6.0}),
+        ]
+        costs, _ = compute_consensus_costs(subs)
+        # (300*2 + 100*6) / (300+100) = (600+600)/400 = 3.0
+        assert costs["m1"] == pytest.approx(3.0)
+
+    def test_different_miners_per_validator(self):
+        subs = [
+            self._make_validated("v1", 100.0, {"m1": 2.0, "m2": 4.0}),
+            self._make_validated("v2", 100.0, {"m1": 6.0}),
+        ]
+        costs, _ = compute_consensus_costs(subs)
+        assert costs["m1"] == pytest.approx(4.0)
+        assert costs["m2"] == pytest.approx(4.0)
+
+    def test_qualification_consensus_and(self):
+        subs = [
+            self._make_validated("v1", 100.0, {"m1": 2.0}, {"m1": True}),
+            self._make_validated("v2", 100.0, {"m1": 3.0}, {"m1": False}),
+        ]
+        _, quals = compute_consensus_costs(subs)
+        assert quals["m1"] is False
+
+    def test_qualification_all_true(self):
+        subs = [
+            self._make_validated("v1", 100.0, {"m1": 2.0}, {"m1": True}),
+            self._make_validated("v2", 100.0, {"m1": 3.0}, {"m1": True}),
+        ]
+        _, quals = compute_consensus_costs(subs)
+        assert quals["m1"] is True
+
+    def test_empty_submissions(self):
+        costs, quals = compute_consensus_costs([])
+        assert costs == {}
+        assert quals == {}
+
+    def test_zero_stake_ignored(self):
+        subs = [
+            self._make_validated("v1", 0.0, {"m1": 100.0}),
+            self._make_validated("v2", 50.0, {"m1": 3.0}),
+        ]
+        costs, _ = compute_consensus_costs(subs)
+        assert costs["m1"] == pytest.approx(3.0)
