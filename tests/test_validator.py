@@ -59,6 +59,11 @@ from trajectoryrl.utils.incumbent import (
     IncumbentState, select_winner_with_incumbent,
     save_incumbent_state, load_incumbent_state,
 )
+from trajectoryrl.utils.commitments import (
+    parse_consensus_commitment, format_consensus_commitment,
+    is_consensus_commitment, parse_commitment,
+    ValidatorConsensusCommitment,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -2994,3 +2999,91 @@ class TestIncumbentAdvantage:
             season_length=30, incumbent_margin=0.05,
         )
         assert winner == "m1"
+
+
+# ---------------------------------------------------------------------------
+# On-chain consensus commitment tests
+# ---------------------------------------------------------------------------
+
+class TestConsensusCommitments:
+    """Tests for validator consensus commitment parsing and formatting."""
+
+    def test_format_consensus_commitment(self):
+        result = format_consensus_commitment(1, 42, "QmXxx123")
+        assert result == "consensus:1|42|QmXxx123"
+
+    def test_format_with_gcs_url(self):
+        url = "https://storage.googleapis.com/trajrl-consensus/sha256_abc.json"
+        result = format_consensus_commitment(1, 42, url)
+        assert result == f"consensus:1|42|{url}"
+
+    def test_parse_consensus_commitment_ipfs(self):
+        raw = "consensus:1|42|QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
+        parsed = parse_consensus_commitment(raw)
+        assert parsed is not None
+        pv, wn, addr = parsed
+        assert pv == 1
+        assert wn == 42
+        assert addr == "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
+
+    def test_parse_consensus_commitment_gcs(self):
+        raw = "consensus:1|42|https://storage.googleapis.com/trajrl/sha256_abc.json"
+        parsed = parse_consensus_commitment(raw)
+        assert parsed is not None
+        pv, wn, addr = parsed
+        assert pv == 1
+        assert wn == 42
+        assert addr == "https://storage.googleapis.com/trajrl/sha256_abc.json"
+
+    def test_parse_consensus_commitment_invalid_prefix(self):
+        assert parse_consensus_commitment("notconsensus:1|42|QmXxx") is None
+
+    def test_parse_consensus_commitment_missing_parts(self):
+        assert parse_consensus_commitment("consensus:1|42") is None
+        assert parse_consensus_commitment("consensus:1") is None
+        assert parse_consensus_commitment("consensus:") is None
+
+    def test_parse_consensus_commitment_bad_numbers(self):
+        assert parse_consensus_commitment("consensus:abc|42|QmXxx") is None
+        assert parse_consensus_commitment("consensus:1|xyz|QmXxx") is None
+
+    def test_parse_consensus_commitment_empty_address(self):
+        assert parse_consensus_commitment("consensus:1|42|") is None
+
+    def test_parse_consensus_commitment_none(self):
+        assert parse_consensus_commitment(None) is None
+        assert parse_consensus_commitment("") is None
+
+    def test_roundtrip(self):
+        original = format_consensus_commitment(1, 99, "QmTestCID123")
+        parsed = parse_consensus_commitment(original)
+        assert parsed == (1, 99, "QmTestCID123")
+
+    def test_is_consensus_commitment(self):
+        assert is_consensus_commitment("consensus:1|42|QmXxx") is True
+        assert is_consensus_commitment("  consensus:1|42|QmXxx  ") is True
+        assert is_consensus_commitment("abc123|https://example.com/pack.json") is False
+        assert is_consensus_commitment("") is False
+        assert is_consensus_commitment(None) is False
+
+    def test_miner_parse_rejects_consensus(self):
+        """parse_commitment (miner format) should reject consensus commitments."""
+        raw = "consensus:1|42|QmXxx"
+        assert parse_commitment(raw) is None
+
+    def test_miner_parse_still_works(self):
+        """parse_commitment still works for normal miner commitments."""
+        pack_hash = "a" * 64
+        raw = f"{pack_hash}|https://example.com/pack.json"
+        result = parse_commitment(raw)
+        assert result is not None
+        assert result[0] == pack_hash
+        assert result[1] == "https://example.com/pack.json"
+
+    def test_pipes_in_url_preserved(self):
+        """Content address with pipes should be handled (split maxsplit=2)."""
+        raw = "consensus:1|42|https://example.com/path?a=1|extra"
+        parsed = parse_consensus_commitment(raw)
+        assert parsed is not None
+        _, _, addr = parsed
+        assert addr == "https://example.com/path?a=1|extra"

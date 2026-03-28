@@ -58,7 +58,11 @@ from ..utils.incumbent import (
     IncumbentState, select_winner_with_incumbent,
     save_incumbent_state, load_incumbent_state,
 )
-from ..utils.commitments import MinerCommitment, fetch_all_commitments
+from ..utils.commitments import (
+    MinerCommitment, fetch_all_commitments,
+    ValidatorConsensusCommitment, fetch_validator_consensus_commitments,
+    format_consensus_commitment,
+)
 from ..utils.ncd import deduplicate_packs
 from ..utils.status_reporter import (
     heartbeat, pre_eval, submit_eval, upload_eval_logs, upload_cycle_logs,
@@ -628,7 +632,7 @@ class TrajectoryValidator:
             await asyncio.sleep(600)
 
     async def _submit_consensus_payload(self, window: EvaluationWindow):
-        """Build and upload consensus payload to CAS, then register pointer."""
+        """Build and upload consensus payload to CAS, then write pointer on-chain."""
         from trajectoryrl import __version__
 
         costs_by_hotkey: Dict[str, float] = {}
@@ -667,43 +671,60 @@ class TrajectoryValidator:
             )
             return
 
-        pointer = ConsensusPointer(
+        commitment_str = format_consensus_commitment(
             protocol_version=self.config.consensus_protocol_version,
             window_number=window.window_number,
             content_address=content_address,
-            validator_hotkey=self.wallet.hotkey.ss58_address,
         )
-
-        await self._consensus_store.write_pointer(pointer)
-        logger.info(
-            "Window %d: consensus payload submitted (address=%s, %d miners)",
-            window.window_number, content_address[:24], len(costs_by_hotkey),
-        )
+        try:
+            self.subtensor.set_commitment(
+                wallet=self.wallet,
+                netuid=self.config.netuid,
+                data=commitment_str,
+            )
+            logger.info(
+                "Window %d: consensus pointer written on-chain "
+                "(address=%s, %d miners, commitment=%s)",
+                window.window_number, content_address[:24],
+                len(costs_by_hotkey), commitment_str[:60],
+            )
+        except Exception as e:
+            logger.error(
+                "Window %d: failed to write consensus pointer on-chain: %s",
+                window.window_number, e,
+            )
 
     async def _run_consensus_aggregation(self, window: EvaluationWindow):
-        """Read submissions, filter, compute stake-weighted consensus costs."""
-        pointers = await self._consensus_store.read_all_pointers(
-            window.window_number
+        """Read on-chain consensus pointers, download payloads, filter, aggregate."""
+        chain_commitments = fetch_validator_consensus_commitments(
+            self.subtensor, self.config.netuid, self.metagraph,
         )
-        if not pointers:
+        if not chain_commitments:
             logger.warning(
-                "Window %d: no pointers found, using local results",
+                "Window %d: no consensus commitments on chain, using local results",
                 window.window_number,
             )
             return
 
         submissions = []
-        for ptr in pointers:
+        for vc in chain_commitments:
+            pointer = ConsensusPointer(
+                protocol_version=vc.protocol_version,
+                window_number=vc.window_number,
+                content_address=vc.content_address,
+                validator_hotkey=vc.validator_hotkey,
+            )
             payload = await self._consensus_store.download_payload(
-                ptr.content_address
+                vc.content_address
             )
             if payload is not None:
-                submissions.append((ptr, payload))
+                submissions.append((pointer, payload))
 
         if not submissions:
             logger.warning(
-                "Window %d: all payload downloads failed, using local results",
-                window.window_number,
+                "Window %d: all payload downloads failed (%d commitments), "
+                "using local results",
+                window.window_number, len(chain_commitments),
             )
             return
 

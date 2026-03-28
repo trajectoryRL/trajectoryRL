@@ -1,22 +1,22 @@
-"""Dual-backend CAS for consensus payloads: IPFS primary, trajrl.com fallback.
+"""Dual-backend CAS for consensus payloads: IPFS primary, trajrl.com/GCS fallback.
 
-Upload: try IPFS first, then trajrl.com API if IPFS fails.
-Download: try IPFS first, then trajrl.com API if IPFS fails.
+Upload: try IPFS first, then trajrl.com API (which stores to GCS) if IPFS fails.
+Download: try IPFS first, then direct URL (GCS or other) if IPFS fails.
 Both backends are written on upload (best-effort) for redundancy.
 
-Pointer registry: trajrl.com API serves as the pointer registry.
+Pointer registry is on-chain via Bittensor ``set_commitment`` — not handled here.
 """
 
 import hashlib
 import json
 import logging
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import Optional
 
 import aiohttp
 
 from .consensus import (
-    ConsensusPayload, ConsensusPointer,
+    ConsensusPayload,
     verify_payload_integrity,
 )
 
@@ -87,10 +87,10 @@ class IPFSBackend(CASBackend):
 
 
 class TrajRLAPIBackend(CASBackend):
-    """Centralized fallback via trajrl.com API.
+    """GCS proxy via trajrl.com API.
 
-    Upload:   POST /api/v1/consensus/payload
-    Download: GET  /api/v1/consensus/payload/{content_hash}
+    Upload:   POST /api/v1/consensus/payload → stores to GCS, returns public URL
+    Download: GET {url} — direct download from the public GCS URL
     """
 
     def __init__(
@@ -103,14 +103,8 @@ class TrajRLAPIBackend(CASBackend):
         self._sign_fn = sign_fn
         self._validator_hotkey = validator_hotkey
 
-    def _auth_headers(self, timestamp: int) -> dict:
-        """Build authentication headers for trajrl.com API."""
-        headers = {"Content-Type": "application/json"}
-        return headers
-
     async def upload(self, data: bytes) -> Optional[str]:
-        """Upload payload via API. Returns sha256: content hash."""
-        content_hash = "sha256:" + hashlib.sha256(data).hexdigest()
+        """Upload payload via API. Returns a public GCS URL."""
         try:
             import time
             ts = int(time.time())
@@ -133,6 +127,12 @@ class TrajRLAPIBackend(CASBackend):
                     timeout=aiohttp.ClientTimeout(total=30),
                 ) as resp:
                     if resp.status in (200, 409):
+                        result = await resp.json()
+                        public_url = result.get("url")
+                        if public_url:
+                            logger.info("API upload OK: url=%s", public_url)
+                            return public_url
+                        content_hash = result.get("content_hash", "")
                         logger.info("API upload OK: hash=%s", content_hash)
                         return content_hash
                     logger.warning("API upload failed: HTTP %d", resp.status)
@@ -142,33 +142,27 @@ class TrajRLAPIBackend(CASBackend):
             return None
 
     async def download(self, address: str) -> Optional[bytes]:
-        """Download payload by content hash from API."""
+        """Download payload by direct URL (GCS or other public URL)."""
         try:
-            normalized = address.removeprefix("sha256:")
-            url = f"{self.base_url}/api/v1/consensus/payload/sha256:{normalized}"
             async with aiohttp.ClientSession() as session:
                 async with session.get(
-                    url, timeout=aiohttp.ClientTimeout(total=30),
+                    address, timeout=aiohttp.ClientTimeout(total=30),
                 ) as resp:
                     if resp.status != 200:
-                        logger.warning("API download failed: HTTP %d (hash=%s)", resp.status, address)
+                        logger.warning("URL download failed: HTTP %d (url=%s)", resp.status, address)
                         return None
-                    result = await resp.json()
-                    payload_dict = result.get("payload")
-                    if payload_dict is None:
-                        return None
-                    data = json.dumps(payload_dict, sort_keys=True, separators=(",", ":")).encode("utf-8")
-                    logger.debug("API download OK: hash=%s, %d bytes", address, len(data))
+                    data = await resp.read()
+                    logger.debug("URL download OK: url=%s, %d bytes", address[:60], len(data))
                     return data
         except Exception as e:
-            logger.warning("API download error (hash=%s): %s", address, e)
+            logger.warning("URL download error (url=%s): %s", address[:60], e)
             return None
 
 
 class ConsensusStore:
-    """Dual-backend CAS with IPFS primary, trajrl.com API fallback.
+    """Dual-backend CAS with IPFS primary, trajrl.com/GCS fallback.
 
-    Pointer registry is always via the API backend.
+    Pointer registry is handled on-chain (not here).
     """
 
     def __init__(self, ipfs: IPFSBackend, api: TrajRLAPIBackend):
@@ -176,21 +170,20 @@ class ConsensusStore:
         self.api = api
 
     async def upload_payload(self, payload: ConsensusPayload) -> Optional[str]:
-        """Upload payload to CAS. Returns content address or None.
+        """Upload payload to CAS. Returns content address (IPFS CID or GCS URL).
 
-        Strategy: try IPFS first, then API. Best-effort mirror to both.
+        Strategy: try IPFS first, then API/GCS. Best-effort mirror to both.
         """
         data = payload.serialize()
-        sha_hash = payload.content_hash()
 
         ipfs_cid = await self.ipfs.upload(data)
 
-        api_hash = await self.api.upload(data)
+        api_url = await self.api.upload(data)
 
         if ipfs_cid:
             return ipfs_cid
-        if api_hash:
-            return api_hash
+        if api_url:
+            return api_url
 
         logger.error("Both IPFS and API upload failed for window %d", payload.window_number)
         return None
@@ -198,98 +191,37 @@ class ConsensusStore:
     async def download_payload(self, content_address: str) -> Optional[ConsensusPayload]:
         """Download and verify payload from CAS.
 
-        Try IPFS first (if address looks like a CID), then API.
-        Always verify integrity via sha256.
+        Determines backend by address format:
+        - IPFS CID (Qm... / bafy...): download via IPFS
+        - HTTP(S) URL: download directly (GCS or other public URL)
         """
         data = None
 
-        is_ipfs_cid = not content_address.startswith("sha256:")
+        is_url = content_address.startswith("http://") or content_address.startswith("https://")
+        is_ipfs_cid = not is_url
+
         if is_ipfs_cid:
             data = await self.ipfs.download(content_address)
 
-        if data is None:
-            sha_addr = content_address if content_address.startswith("sha256:") else None
-            if sha_addr:
-                data = await self.api.download(sha_addr)
+        if data is None and is_url:
+            data = await self.api.download(content_address)
 
         if data is None:
-            if is_ipfs_cid:
-                data = await self.api.download(content_address)
-            if data is None:
-                logger.warning("Failed to download payload: %s", content_address)
-                return None
+            logger.warning("Failed to download payload: %s", content_address[:60])
+            return None
 
         try:
             payload = ConsensusPayload.deserialize(data)
         except Exception as e:
-            logger.warning("Failed to deserialize payload %s: %s", content_address, e)
+            logger.warning("Failed to deserialize payload %s: %s", content_address[:60], e)
             return None
 
         expected_hash = payload.content_hash()
         if not verify_payload_integrity(data, expected_hash):
             logger.warning(
                 "Payload integrity check failed: address=%s, computed=%s",
-                content_address, expected_hash,
+                content_address[:60], expected_hash[:24],
             )
             return None
 
         return payload
-
-    async def write_pointer(self, pointer: ConsensusPointer, sign_fn=None) -> bool:
-        """Register a pointer via the API backend."""
-        try:
-            import time
-            ts = int(time.time())
-            body = {
-                "validator_hotkey": pointer.validator_hotkey,
-                "timestamp": ts,
-                "signature": "",
-                "pointer": pointer.to_dict(),
-            }
-            if sign_fn:
-                msg = f"trajectoryrl-consensus:{pointer.validator_hotkey}:{ts}"
-                body["signature"] = sign_fn(msg)
-
-            url = f"{self.api.base_url}/api/v1/consensus/pointer"
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    url, json=body,
-                    timeout=aiohttp.ClientTimeout(total=30),
-                ) as resp:
-                    if resp.status == 200:
-                        logger.info(
-                            "Pointer registered: window=%d, validator=%s",
-                            pointer.window_number, pointer.validator_hotkey[:8],
-                        )
-                        return True
-                    logger.warning("Pointer registration failed: HTTP %d", resp.status)
-                    return False
-        except Exception as e:
-            logger.warning("Pointer registration error: %s", e)
-            return False
-
-    async def read_all_pointers(self, window_number: int) -> List[ConsensusPointer]:
-        """Read all pointers for a window from the API backend."""
-        try:
-            url = f"{self.api.base_url}/api/v1/consensus/pointers/{window_number}"
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    url, timeout=aiohttp.ClientTimeout(total=30),
-                ) as resp:
-                    if resp.status != 200:
-                        logger.warning(
-                            "Read pointers failed: HTTP %d (window=%d)",
-                            resp.status, window_number,
-                        )
-                        return []
-                    result = await resp.json()
-                    raw_pointers = result.get("pointers", [])
-                    pointers = [ConsensusPointer.from_dict(p) for p in raw_pointers]
-                    logger.info(
-                        "Read %d pointers for window %d",
-                        len(pointers), window_number,
-                    )
-                    return pointers
-        except Exception as e:
-            logger.warning("Read pointers error (window=%d): %s", window_number, e)
-            return []
