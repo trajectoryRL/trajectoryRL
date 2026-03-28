@@ -98,6 +98,10 @@ class ValidatorConfig:
     consensus_api_url: str = "https://api.trajrl.com"
     min_validator_stake: float = 0.0  # minimum stake for consensus participation
 
+    # Incumbent advantage + season tracking
+    incumbent_margin: float = 0.05  # 5% — challenger must beat incumbent's historical best by this margin
+    season_length: int = 30         # number of evaluation windows per season
+
     # Bootstrap config (graduated rewards until enough miners join)
     bootstrap_threshold: int = 10
 

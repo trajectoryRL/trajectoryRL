@@ -54,6 +54,10 @@ from ..utils.consensus_filter import (
     run_filter_pipeline, ValidatedSubmission,
 )
 from ..scoring import compute_consensus_costs
+from ..utils.incumbent import (
+    IncumbentState, select_winner_with_incumbent,
+    save_incumbent_state, load_incumbent_state,
+)
 from ..utils.commitments import MinerCommitment, fetch_all_commitments
 from ..utils.ncd import deduplicate_packs
 from ..utils.status_reporter import (
@@ -229,6 +233,12 @@ class TrajectoryValidator:
         # Latest consensus results from aggregation (used by weight setting)
         self._consensus_costs: Dict[str, float] = {}
         self._consensus_qualified: Dict[str, bool] = {}
+
+        # Incumbent advantage state
+        self._incumbent_state_path = os.path.join(
+            getattr(config, "log_dir", "/tmp"), "incumbent_state.json"
+        )
+        self._incumbent_state = load_incumbent_state(self._incumbent_state_path)
 
         # Set to True on startup when eval_on_startup=True; cleared after first eval
         self._startup_eval_pending: bool = config.eval_on_startup
@@ -726,6 +736,26 @@ class TrajectoryValidator:
 
         self._consensus_costs = consensus_costs
         self._consensus_qualified = consensus_qualified
+
+        # Apply incumbent advantage + update historical best
+        winner_hk, updated_state = select_winner_with_incumbent(
+            consensus_costs=consensus_costs,
+            consensus_qualified=consensus_qualified,
+            state=self._incumbent_state,
+            window_number=window.window_number,
+            season_length=self.config.season_length,
+            incumbent_margin=self.config.incumbent_margin,
+        )
+        self._incumbent_state = updated_state
+        save_incumbent_state(updated_state, self._incumbent_state_path)
+
+        if winner_hk:
+            self.champion_hotkey = winner_hk
+            logger.info(
+                "Window %d: consensus winner = %s (incumbent=%s)",
+                window.window_number, winner_hk[:8],
+                "yes" if winner_hk == updated_state.incumbent_hotkey else "new",
+            )
 
         logger.info(
             "Window %d: consensus aggregation complete — %d miners, "

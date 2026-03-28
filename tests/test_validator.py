@@ -55,6 +55,10 @@ from trajectoryrl.utils.consensus_filter import (
     filter_software_version, filter_zero_signal,
 )
 from trajectoryrl.scoring import compute_consensus_costs
+from trajectoryrl.utils.incumbent import (
+    IncumbentState, select_winner_with_incumbent,
+    save_incumbent_state, load_incumbent_state,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -2839,3 +2843,154 @@ class TestConsensusAggregation:
         ]
         costs, _ = compute_consensus_costs(subs)
         assert costs["m1"] == pytest.approx(3.0)
+
+
+# ---------------------------------------------------------------------------
+# Incumbent advantage tests
+# ---------------------------------------------------------------------------
+
+class TestIncumbentAdvantage:
+    """Tests for incumbent advantage and historical best tracking."""
+
+    def test_no_incumbent_lowest_wins(self):
+        costs = {"m1": 3.0, "m2": 5.0}
+        quals = {"m1": True, "m2": True}
+        state = IncumbentState()
+        winner, new_state = select_winner_with_incumbent(
+            costs, quals, state, window_number=0,
+            season_length=30, incumbent_margin=0.05,
+        )
+        assert winner == "m1"
+        assert new_state.incumbent_hotkey == "m1"
+
+    def test_incumbent_retains_within_margin(self):
+        costs = {"m1": 3.0, "m2": 2.90}
+        quals = {"m1": True, "m2": True}
+        state = IncumbentState(incumbent_hotkey="m1", historical_best={"m1": 3.0})
+        winner, new_state = select_winner_with_incumbent(
+            costs, quals, state, window_number=1,
+            season_length=30, incumbent_margin=0.05,
+        )
+        # m2 (2.90) needs < 3.0 * 0.95 = 2.85 to dethrone
+        assert winner == "m1"
+        assert new_state.incumbent_hotkey == "m1"
+
+    def test_challenger_overtakes_past_margin(self):
+        costs = {"m1": 3.0, "m2": 2.80}
+        quals = {"m1": True, "m2": True}
+        state = IncumbentState(incumbent_hotkey="m1", historical_best={"m1": 3.0})
+        winner, new_state = select_winner_with_incumbent(
+            costs, quals, state, window_number=1,
+            season_length=30, incumbent_margin=0.05,
+        )
+        # m2 (2.80) < 3.0 * 0.95 = 2.85 → overtake
+        assert winner == "m2"
+        assert new_state.incumbent_hotkey == "m2"
+
+    def test_incumbent_disqualified(self):
+        costs = {"m1": 3.0, "m2": 5.0}
+        quals = {"m1": False, "m2": True}
+        state = IncumbentState(incumbent_hotkey="m1", historical_best={"m1": 3.0})
+        winner, new_state = select_winner_with_incumbent(
+            costs, quals, state, window_number=1,
+            season_length=30, incumbent_margin=0.05,
+        )
+        assert winner == "m2"
+        assert new_state.incumbent_hotkey == "m2"
+
+    def test_historical_best_updates(self):
+        costs = {"m1": 3.0}
+        quals = {"m1": True}
+        state = IncumbentState(historical_best={"m1": 4.0})
+        _, new_state = select_winner_with_incumbent(
+            costs, quals, state, window_number=0,
+            season_length=30, incumbent_margin=0.05,
+        )
+        assert new_state.historical_best["m1"] == 3.0
+
+    def test_historical_best_does_not_increase(self):
+        costs = {"m1": 5.0}
+        quals = {"m1": True}
+        state = IncumbentState(historical_best={"m1": 3.0})
+        _, new_state = select_winner_with_incumbent(
+            costs, quals, state, window_number=0,
+            season_length=30, incumbent_margin=0.05,
+        )
+        assert new_state.historical_best["m1"] == 3.0
+
+    def test_season_reset(self):
+        state = IncumbentState(
+            historical_best={"m1": 2.0, "m2": 3.0},
+            incumbent_hotkey="m1",
+            current_season=0,
+        )
+        costs = {"m1": 5.0, "m2": 4.0}
+        quals = {"m1": True, "m2": True}
+        # window 30 → season 1 (season_length=30)
+        winner, new_state = select_winner_with_incumbent(
+            costs, quals, state, window_number=30,
+            season_length=30, incumbent_margin=0.05,
+        )
+        assert new_state.current_season == 1
+        # Historical bests were reset, so m2 wins (lowest cost, no incumbent)
+        assert winner == "m2"
+        assert new_state.historical_best == {"m1": 5.0, "m2": 4.0}
+
+    def test_no_qualified_miners(self):
+        costs = {"m1": 3.0}
+        quals = {"m1": False}
+        state = IncumbentState()
+        winner, _ = select_winner_with_incumbent(
+            costs, quals, state, window_number=0,
+            season_length=30, incumbent_margin=0.05,
+        )
+        assert winner is None
+
+    def test_save_load_roundtrip(self, tmp_path):
+        state = IncumbentState(
+            historical_best={"m1": 3.0, "m2": 5.0},
+            incumbent_hotkey="m1",
+            current_season=2,
+            last_window=42,
+        )
+        path = str(tmp_path / "incumbent.json")
+        save_incumbent_state(state, path)
+        loaded = load_incumbent_state(path)
+        assert loaded.historical_best == state.historical_best
+        assert loaded.incumbent_hotkey == state.incumbent_hotkey
+        assert loaded.current_season == state.current_season
+        assert loaded.last_window == state.last_window
+
+    def test_load_missing_file(self, tmp_path):
+        loaded = load_incumbent_state(str(tmp_path / "nonexistent.json"))
+        assert loaded.incumbent_hotkey is None
+        assert loaded.historical_best == {}
+
+    def test_incumbent_uses_historical_best_not_current(self):
+        """Challenger threshold is against historical best, not current cost."""
+        state = IncumbentState(
+            incumbent_hotkey="m1",
+            historical_best={"m1": 2.0},
+        )
+        costs = {"m1": 4.0, "m2": 2.5}
+        quals = {"m1": True, "m2": True}
+        winner, _ = select_winner_with_incumbent(
+            costs, quals, state, window_number=1,
+            season_length=30, incumbent_margin=0.05,
+        )
+        # threshold = 2.0 * 0.95 = 1.90; m2 (2.5) > 1.90 → incumbent retains
+        assert winner == "m1"
+
+    def test_incumbent_is_cheapest(self):
+        """When incumbent is already cheapest, they retain without margin check."""
+        state = IncumbentState(
+            incumbent_hotkey="m1",
+            historical_best={"m1": 3.0},
+        )
+        costs = {"m1": 2.0, "m2": 5.0}
+        quals = {"m1": True, "m2": True}
+        winner, _ = select_winner_with_incumbent(
+            costs, quals, state, window_number=1,
+            season_length=30, incumbent_margin=0.05,
+        )
+        assert winner == "m1"
