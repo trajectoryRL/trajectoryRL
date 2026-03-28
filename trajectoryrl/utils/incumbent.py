@@ -3,7 +3,7 @@
 Stabilizes winner selection against LLM variance by:
   1. Tracking each miner's best consensus cost within a season.
   2. Requiring challengers to beat the incumbent's historical best
-     by a margin (default 5%) to dethrone them.
+     by a margin (default 10%) to dethrone them.
   3. Resetting historical bests at season boundaries.
 """
 
@@ -77,8 +77,11 @@ def select_winner_with_incumbent(
         updated.incumbent_hotkey = None
         updated.current_season = current_season
 
-    # Update historical bests
+    # Update historical bests (only for qualified miners — disqualified miners
+    # may have artificially low costs from gaming, which should not be recorded)
     for miner_hk, cost in consensus_costs.items():
+        if not consensus_qualified.get(miner_hk, False):
+            continue
         if miner_hk not in updated.historical_best:
             updated.historical_best[miner_hk] = cost
         else:

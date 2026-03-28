@@ -2483,6 +2483,19 @@ class TestEvaluationWindow:
         with pytest.raises(AttributeError):
             w.window_number = 999
 
+    def test_publish_deadline_block(self):
+        w = compute_window(100, self.config)
+        assert w.publish_deadline_block == 0 + 5760  # window_start=0, 80% of 7200
+
+    def test_aggregate_start_block(self):
+        w = compute_window(100, self.config)
+        assert w.aggregate_start_block == 0 + 6480  # window_start=0, 90% of 7200
+
+    def test_publish_aggregate_second_window(self):
+        w = compute_window(10000, self.config)
+        assert w.publish_deadline_block == 7200 + 5760
+        assert w.aggregate_start_block == 7200 + 6480
+
     def test_custom_percentages(self):
         cfg = WindowConfig(
             window_length=10000,
@@ -2999,6 +3012,20 @@ class TestIncumbentAdvantage:
             season_length=30, cost_delta=0.10,
         )
         assert winner == "m1"
+
+    def test_disqualified_miner_historical_best_not_updated(self):
+        """Disqualified miners should not get their historical best updated."""
+        state = IncumbentState(historical_best={})
+        costs = {"m1": 1.0, "m2": 2.0}
+        quals = {"m1": False, "m2": True}
+        _, new_state = select_winner_with_incumbent(
+            costs, quals, state, window_number=0,
+            season_length=30, cost_delta=0.10,
+        )
+        # m1 is disqualified — its cost should NOT appear in historical_best
+        assert "m1" not in new_state.historical_best
+        # m2 is qualified — its cost should appear
+        assert new_state.historical_best["m2"] == 2.0
 
 
 # ---------------------------------------------------------------------------

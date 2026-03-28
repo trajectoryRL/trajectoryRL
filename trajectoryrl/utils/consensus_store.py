@@ -7,6 +7,7 @@ Both backends are written on upload (best-effort) for redundancy.
 Pointer registry is on-chain via Bittensor ``set_commitment`` — not handled here.
 """
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -21,6 +22,10 @@ from .consensus import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Maximum payload size (10 MB).  Consensus payloads are small JSON documents;
+# anything larger is either corrupt or a denial-of-service attempt.
+MAX_PAYLOAD_BYTES = 10 * 1024 * 1024
 
 
 class CASBackend(ABC):
@@ -84,7 +89,13 @@ class IPFSBackend(CASBackend):
                     if resp.status != 200:
                         logger.warning("IPFS download failed: HTTP %d (CID=%s)", resp.status, address)
                         return None
-                    data = await resp.read()
+                    if resp.content_length and resp.content_length > MAX_PAYLOAD_BYTES:
+                        logger.warning("IPFS download too large: %d bytes (CID=%s)", resp.content_length, address)
+                        return None
+                    data = await resp.content.read(MAX_PAYLOAD_BYTES + 1)
+                    if len(data) > MAX_PAYLOAD_BYTES:
+                        logger.warning("IPFS download exceeded max size: %d bytes (CID=%s)", len(data), address)
+                        return None
                     logger.debug("IPFS download OK: CID=%s, %d bytes", address, len(data))
                     return data
         except Exception as e:
@@ -157,7 +168,13 @@ class TrajRLAPIBackend(CASBackend):
                     if resp.status != 200:
                         logger.warning("URL download failed: HTTP %d (url=%s)", resp.status, address)
                         return None
-                    data = await resp.read()
+                    if resp.content_length and resp.content_length > MAX_PAYLOAD_BYTES:
+                        logger.warning("URL download too large: %d bytes (url=%s)", resp.content_length, address[:60])
+                        return None
+                    data = await resp.content.read(MAX_PAYLOAD_BYTES + 1)
+                    if len(data) > MAX_PAYLOAD_BYTES:
+                        logger.warning("URL download exceeded max size: %d bytes (url=%s)", len(data), address[:60])
+                        return None
                     logger.debug("URL download OK: url=%s, %d bytes", address[:60], len(data))
                     return data
         except Exception as e:
@@ -176,20 +193,28 @@ class ConsensusStore:
         self.api = api
 
     async def upload_payload(self, payload: ConsensusPayload) -> Optional[str]:
-        """Upload payload to CAS. Returns content address (IPFS CID or GCS URL).
+        """Upload payload to CAS. Returns content address (GCS URL or IPFS CID).
 
-        Strategy: try IPFS first, then API/GCS. Best-effort mirror to both.
+        Strategy: upload to both backends concurrently for redundancy.
+        Prefer GCS URL as the returned address (universally accessible
+        without a local IPFS node). Fall back to IPFS CID if API fails.
         """
         data = payload.serialize()
 
-        ipfs_cid = await self.ipfs.upload(data)
+        ipfs_result, api_result = await asyncio.gather(
+            self.ipfs.upload(data),
+            self.api.upload(data),
+            return_exceptions=True,
+        )
 
-        api_url = await self.api.upload(data)
+        ipfs_cid = ipfs_result if isinstance(ipfs_result, str) else None
+        api_url = api_result if isinstance(api_result, str) else None
 
-        if ipfs_cid:
-            return ipfs_cid
+        # Prefer GCS URL (universally accessible without local IPFS node)
         if api_url:
             return api_url
+        if ipfs_cid:
+            return ipfs_cid
 
         logger.error("Both IPFS and API upload failed for window %d", payload.window_number)
         return None
@@ -216,18 +241,22 @@ class ConsensusStore:
             logger.warning("Failed to download payload: %s", content_address[:60])
             return None
 
+        # Verify integrity against the pointer's content address (not self-reported hash).
+        # For sha256-addressed payloads, check the raw bytes match the pointer.
+        # IPFS CIDs are verified by IPFS itself; skip hash check for those.
+        if content_address.startswith("sha256:"):
+            if not verify_payload_integrity(data, content_address):
+                logger.warning(
+                    "Payload integrity check failed: pointer=%s, computed=%s",
+                    content_address[:60],
+                    "sha256:" + hashlib.sha256(data).hexdigest()[:16],
+                )
+                return None
+
         try:
             payload = ConsensusPayload.deserialize(data)
         except Exception as e:
             logger.warning("Failed to deserialize payload %s: %s", content_address[:60], e)
-            return None
-
-        expected_hash = payload.content_hash()
-        if not verify_payload_integrity(data, expected_hash):
-            logger.warning(
-                "Payload integrity check failed: address=%s, computed=%s",
-                content_address[:60], expected_hash[:24],
-            )
             return None
 
         return payload

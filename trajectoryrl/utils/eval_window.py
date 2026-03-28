@@ -51,19 +51,18 @@ class EvaluationWindow:
     phase: WindowPhase
     blocks_into_phase: int
     blocks_remaining_in_phase: int
+    publish_offset: int = 0      # block offset of T_publish within window
+    aggregate_offset: int = 0    # block offset of T_aggregate within window
 
     @property
     def publish_deadline_block(self) -> int:
         """Absolute block number of T_publish for this window."""
-        return self.window_start + self._publish_block
+        return self.window_start + self.publish_offset
 
     @property
     def aggregate_start_block(self) -> int:
         """Absolute block number of T_aggregate for this window."""
-        return self.window_start + self._aggregate_block
-
-    def __init_subclass__(cls, **kwargs):
-        super().__init_subclass__(**kwargs)
+        return self.window_start + self.aggregate_offset
 
 
 def compute_window(current_block: int, config: WindowConfig) -> EvaluationWindow:
@@ -105,6 +104,8 @@ def compute_window(current_block: int, config: WindowConfig) -> EvaluationWindow
         phase=phase,
         blocks_into_phase=blocks_into,
         blocks_remaining_in_phase=blocks_remaining,
+        publish_offset=publish_block,
+        aggregate_offset=aggregate_block,
     )
 
 
