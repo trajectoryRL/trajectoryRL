@@ -73,9 +73,9 @@ trajrl status
 ```
 ╭──────────────────── Network Status ────────────────────╮
 │   Validators: 7 total, 7 active (seen <1h)             │
-│   LLM Models: zhipu/glm-5 (3), chutes/GLM-5-TEE (3)   │
-│   Latest Eval: 7h ago                                   │
-│   Submissions: 65 passed, 35 failed (last batch)        │
+│   LLM Models: zhipu/glm-5 (3), chutes/GLM-5-TEE (3)    │
+│   Latest Eval: 7h ago                                  │
+│   Submissions: 65 passed, 35 failed (last batch)       │
 ╰────────────────────────────────────────────────────────╯
 ```
 
