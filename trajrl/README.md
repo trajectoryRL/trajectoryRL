@@ -2,7 +2,7 @@
 
 CLI for the [TrajectoryRL subnet](https://trajrl.com) (Bittensor SN11). Query live validator, miner, and evaluation data from the terminal.
 
-Designed for AI agents (Claude Code, Cursor) and humans alike — outputs JSON when piped, Rich tables when interactive.
+Designed for AI agents (Claude Code, Cursor, Codex, OpenClaw, Manus) and humans alike — outputs JSON when piped, Rich tables when interactive.
 
 ## Install
 
@@ -98,18 +98,30 @@ By hotkey:
 trajrl miner 5HMgR6LnNqUAtaKRwa6bLF4Vy4KBf7TaxCLehyff9mWPhSHt
 ```
 
-Or by UID (v0.2.0+):
+Or by UID:
 ```bash
 trajrl miner --uid 65
 ```
 
 Shows rank, qualification status, cost, scenario breakdown, per-validator reports, recent submissions, and ban records.
 
+### Check a validator's scores
+
+See how a specific validator scored all miners:
+
+```bash
+trajrl scores --uid 221
+```
+
+Returns per-miner entries with `qualified`, `costUsd`, `score`, `weight`, `scenarioScores`, and rejection info. Useful for comparing validator behavior or debugging why a miner was rejected.
+
 ### View failed submissions
 
 ```bash
 trajrl submissions --failed
 ```
+
+Shows recent packs that failed pre-eval integrity checks, with rejection stage and reason.
 
 ### Investigate a validator's eval cycle
 
@@ -139,9 +151,25 @@ Or just grab the latest one:
 trajrl cycle-log 5Cd6h...
 ```
 
+Use `--format summary` to parse the raw log into structured tables — eval metrics, winner info, and top qualified miners:
+
+```bash
+trajrl cycle-log 5Cd6h... --format summary
+```
+
 The cycle log contains the complete eval cycle output: metagraph sync, miner enumeration, per-miner eval timing, WEIGHT RESULTS, and set_weights status.
 
 > **Note:** Eval IDs are defined by each validator independently (typically a timestamp like `20260325_060012`). They are **not** globally unique — the same eval ID from different validators refers to different evaluation cycles. Always pair an eval ID with a specific validator hotkey.
+
+### Inspect a specific pack
+
+Check how a miner's pack was evaluated across all validators:
+
+```bash
+trajrl pack 5HMgR6... abc123def456...
+```
+
+Returns the pack's aggregated qualification status, best/average cost, and per-validator scenario breakdowns.
 
 ### Filter eval logs
 
@@ -149,6 +177,7 @@ The cycle log contains the complete eval cycle output: metagraph sync, miner enu
 trajrl logs --type cycle --limit 5
 trajrl logs --validator 5Cd6h... --type miner
 trajrl logs --eval-id 20260324_000340
+trajrl logs --miner 5HMgR6... --pack-hash abc123...
 ```
 
 ### JSON output for agents
@@ -157,7 +186,14 @@ Pipe to any tool — JSON is automatic:
 
 ```bash
 trajrl validators | jq '.validators[].hotkey'
-trajrl scores 5Cd6h... --json | python3 -c "
+trajrl scores --uid 221 | jq '.entries[] | select(.qualified) | {uid, costUsd, weight}'
+trajrl miner --uid 65 | jq '.scenarioSummary'
+```
+
+Parse with Python:
+
+```bash
+trajrl scores 5Cd6h... | python3 -c "
   import sys, json
   d = json.load(sys.stdin)
   for e in d['entries'][:5]:
@@ -173,7 +209,7 @@ trajrl miner 5HMgR6... --json
 
 ## API Reference
 
-All data comes from the [TrajectoryRL Public API](https://trajrl.com) — read-only, no authentication required.
+All data comes from the [TrajectoryRL Public API](https://trajrl.com) — read-only, no authentication required. See [PUBLIC_API.md](PUBLIC_API.md) for full endpoint documentation.
 
 | Endpoint | CLI Command |
 |----------|-------------|
@@ -186,10 +222,3 @@ All data comes from the [TrajectoryRL Public API](https://trajrl.com) — read-o
 | `GET /api/eval-logs?log_type=cycle` | `trajrl eval-history <hotkey>` |
 | `GET /api/eval-logs` + GCS download | `trajrl cycle-log <hotkey>` |
 
-## Development
-
-```bash
-git clone <repo> && cd trajrl
-pip install -e .
-trajrl --help
-```
