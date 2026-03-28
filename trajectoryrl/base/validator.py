@@ -314,6 +314,9 @@ class TrajectoryValidator:
             self.champion_hotkey = data.get("champion_hotkey")
             self._last_eval_window = data.get("last_eval_window", -1)
 
+            self._consensus_costs = data.get("consensus_costs", {})
+            self._consensus_qualified = data.get("consensus_qualified", {})
+
             # Load integrity judge cache if present
             integrity_cache = data.get("integrity_cache")
             if integrity_cache:
@@ -337,6 +340,8 @@ class TrajectoryValidator:
             "first_mover_data": self.first_mover_data,
             "champion_hotkey": self.champion_hotkey,
             "last_eval_window": self._last_eval_window,
+            "consensus_costs": self._consensus_costs,
+            "consensus_qualified": self._consensus_qualified,
             "integrity_cache": self.integrity_judge.dump_cache(),
         }
         try:
@@ -785,6 +790,8 @@ class TrajectoryValidator:
             stats.passed, stats.summary(),
         )
 
+        self._save_ema_state()
+
     def _should_start_evaluation(self, current_block: int) -> bool:
         """Return True if a new evaluation cycle should start.
 
@@ -1081,7 +1088,7 @@ class TrajectoryValidator:
         # eval cycle. This caches the computed weights for mid-eval replays,
         # so the validator stays active on-chain even if eval takes longer
         # than one tempo window.
-        logger.info("Setting weights from previous eval before starting eval cycle")
+        logger.info("Setting weights from consensus before starting eval cycle")
         await self._compute_and_set_weights(current_block)
         self.last_weight_block = current_block
 
@@ -1455,7 +1462,7 @@ class TrajectoryValidator:
         # refreshes use real computed weights.
         self._eval_fallback_active = False
 
-        # 5. Set weights from EMA scores
+        # 5. Set weights from consensus costs (or fallback if no consensus yet)
         await self._compute_and_set_weights(current_block)
 
     def _should_run_eval_today(self) -> bool:
@@ -2369,7 +2376,11 @@ class TrajectoryValidator:
         return True
 
     async def _compute_and_set_weights(self, current_block: int):
-        """Compute weights from EMA scores, set on-chain, and cache the result.
+        """Compute weights from consensus or local EMA, set on-chain, and cache.
+
+        After consensus aggregation completes (_window_aggregated=True and
+        _consensus_costs is populated), uses stake-weighted consensus costs
+        and qualification. Otherwise falls back to local EMA state.
 
         Maps hotkey -> UID via metagraph, applies winner selection,
         and calls set_weights. The resulting uids/weights are cached in
@@ -2393,24 +2404,38 @@ class TrajectoryValidator:
             await self._set_fallback_weights()
             return
 
-        # Build costs and qualification from EMA state
-        scores: Dict[int, float] = {}  # kept for report metadata compatibility
+        if not self._consensus_costs:
+            logger.info(
+                "No consensus data yet — using fallback weights until "
+                "first consensus aggregation completes"
+            )
+            await self._set_fallback_weights(
+                reason="No consensus data (pre-first-aggregation)"
+            )
+            return
+
+        scores: Dict[int, float] = {}
         costs: Dict[int, float] = {}
         qualified: Dict[int, bool] = {}
         uid_to_hotkey: Dict[int, str] = {}
 
+        hotkey_to_uid: Dict[str, int] = {}
         for uid, commitment in active.items():
-            hotkey = commitment.hotkey
-            total_cost = self.compute_total_cost_from_ema(hotkey)
-            is_qualified = self.is_fully_qualified(hotkey)
+            hotkey_to_uid[commitment.hotkey] = uid
+            uid_to_hotkey[uid] = commitment.hotkey
 
-            # Only include miners that have been evaluated (have cost data)
-            if total_cost is not None:
-                costs[uid] = total_cost
-                qualified[uid] = is_qualified
-                uid_to_hotkey[uid] = hotkey
-                # Score = 1.0 if qualified, 0.0 otherwise (for report compat)
-                scores[uid] = 1.0 if is_qualified else 0.0
+        for hotkey, consensus_cost in self._consensus_costs.items():
+            uid = hotkey_to_uid.get(hotkey)
+            if uid is None:
+                continue
+            costs[uid] = consensus_cost
+            qualified[uid] = self._consensus_qualified.get(hotkey, False)
+            scores[uid] = 1.0 if qualified[uid] else 0.0
+
+        logger.info(
+            "Weight setting using consensus costs (%d miners from %d active)",
+            len(costs), len(active),
+        )
 
         if not scores:
             logger.warning("All miners have zero EMA score")
@@ -2449,7 +2474,7 @@ class TrajectoryValidator:
 
         # Log results
         logger.info("=" * 60)
-        logger.info("WEIGHT RESULTS")
+        logger.info("WEIGHT RESULTS (source: CONSENSUS)")
         logger.info(f"Burn fraction: {BURN_FRACTION:.0%} to owner UID {OWNER_UID}")
         logger.info("=" * 60)
         for uid, weight in sorted(

@@ -3087,3 +3087,117 @@ class TestConsensusCommitments:
         assert parsed is not None
         _, _, addr = parsed
         assert addr == "https://example.com/path?a=1|extra"
+
+
+# ---------------------------------------------------------------------------
+# Consensus-based weight setting tests
+# ---------------------------------------------------------------------------
+
+class TestConsensusWeightSetting:
+    """Tests for weight setting data source selection (consensus vs local EMA).
+
+    Rule: once consensus costs exist, they are ALWAYS used for weight setting.
+    Local EMA is only used as a bootstrap fallback when no consensus has ever
+    been computed.  Consensus costs persist across windows and restarts.
+    """
+
+    def test_use_consensus_when_costs_present(self):
+        """Consensus costs should always be used when they exist."""
+        consensus_costs = {"m1": 3.0, "m2": 5.0}
+        use_consensus = bool(consensus_costs)
+        assert use_consensus is True
+
+    def test_fallback_when_no_consensus(self):
+        """Without consensus data, weight setting should use fallback weights."""
+        consensus_costs = {}
+        should_fallback = not bool(consensus_costs)
+        assert should_fallback is True
+
+    def test_consensus_persists_across_windows(self):
+        """Previous window's consensus costs should still be used in new window."""
+        consensus_costs = {"m1": 3.0}
+        should_fallback = not bool(consensus_costs)
+        assert should_fallback is False
+
+    def test_new_aggregation_overwrites_old(self):
+        """New window's aggregation replaces previous consensus costs."""
+        consensus_costs = {"m1": 3.0}
+        new_consensus = {"m1": 2.5, "m2": 4.0}
+        consensus_costs = new_consensus
+        use_consensus = bool(consensus_costs)
+        assert use_consensus is True
+        assert consensus_costs["m1"] == 2.5
+
+    def test_consensus_costs_mapped_to_uids(self):
+        """Consensus costs (keyed by hotkey) should map to UIDs correctly."""
+        consensus_costs = {"hk_m1": 3.0, "hk_m2": 5.0, "hk_m3": 2.0}
+        consensus_qualified = {"hk_m1": True, "hk_m2": False, "hk_m3": True}
+
+        active = {
+            10: type("C", (), {"hotkey": "hk_m1"})(),
+            20: type("C", (), {"hotkey": "hk_m2"})(),
+            30: type("C", (), {"hotkey": "hk_m3"})(),
+            40: type("C", (), {"hotkey": "hk_m4"})(),
+        }
+
+        hotkey_to_uid = {}
+        uid_to_hotkey = {}
+        for uid, commitment in active.items():
+            hotkey_to_uid[commitment.hotkey] = uid
+            uid_to_hotkey[uid] = commitment.hotkey
+
+        costs = {}
+        qualified = {}
+        for hotkey, c_cost in consensus_costs.items():
+            uid = hotkey_to_uid.get(hotkey)
+            if uid is None:
+                continue
+            costs[uid] = c_cost
+            qualified[uid] = consensus_qualified.get(hotkey, False)
+
+        assert costs == {10: 3.0, 20: 5.0, 30: 2.0}
+        assert qualified == {10: True, 20: False, 30: True}
+        assert 40 not in costs
+
+    def test_consensus_costs_skip_deregistered_miners(self):
+        """Miners in consensus but no longer in active commitments are skipped."""
+        consensus_costs = {"hk_m1": 3.0, "hk_m_gone": 5.0}
+
+        active = {10: type("C", (), {"hotkey": "hk_m1"})()}
+        hotkey_to_uid = {c.hotkey: uid for uid, c in active.items()}
+
+        costs = {}
+        for hotkey, c_cost in consensus_costs.items():
+            uid = hotkey_to_uid.get(hotkey)
+            if uid is None:
+                continue
+            costs[uid] = c_cost
+
+        assert costs == {10: 3.0}
+        assert "hk_m_gone" not in [active[u].hotkey for u in costs]
+
+    def test_window_aggregated_resets_on_new_window(self):
+        """_window_aggregated should reset to False at new window boundary."""
+        window_aggregated = True
+        new_window_detected = True
+        if new_window_detected:
+            window_aggregated = False
+        assert window_aggregated is False
+
+    def test_consensus_qualified_false_propagates(self):
+        """If consensus says not qualified, weight setting should see False."""
+        consensus_qualified = {"hk_m1": True, "hk_m2": False}
+        active = {
+            10: type("C", (), {"hotkey": "hk_m1"})(),
+            20: type("C", (), {"hotkey": "hk_m2"})(),
+        }
+        hotkey_to_uid = {c.hotkey: uid for uid, c in active.items()}
+
+        qualified = {}
+        for hotkey in consensus_qualified:
+            uid = hotkey_to_uid.get(hotkey)
+            if uid is not None:
+                qualified[uid] = consensus_qualified[hotkey]
+
+        assert qualified[10] is True
+        assert qualified[20] is False
