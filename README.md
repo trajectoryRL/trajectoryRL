@@ -216,16 +216,18 @@ See [MINER_OPERATIONS.md](MINER_OPERATIONS.md) for full details: automated mode,
 
 ## trajrl CLI
 
-A standalone CLI for querying live subnet data — validators, miners, scores, submissions, and eval logs. Designed for both humans and AI agents (Claude Code, Cursor).
+A standalone CLI for querying live subnet data — validators, miners, scores, submissions, and eval logs. Designed for both humans and AI agents (Claude Code, Cursor, Codex, OpenClaw, Manus).
 
 ```bash
 pip install trajrl
 
 trajrl status                       # Network health overview
 trajrl validators                   # List all validators
-trajrl scores <validator_hotkey>    # Per-miner scores from a validator
-trajrl miner <hotkey>               # Miner detail + diagnostics
+trajrl scores --uid <uid>           # Per-miner scores from a validator
+trajrl miner --uid <uid>            # Miner detail + diagnostics
 trajrl submissions --failed         # Recent failed submissions
+trajrl cycle-log <validator>        # Download and display a cycle log
+trajrl logs --type cycle|miner      # Eval log archives
 ```
 
 Outputs JSON automatically when piped, Rich tables when interactive. See [trajrl/README.md](trajrl/README.md) for full documentation.
