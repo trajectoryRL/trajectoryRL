@@ -51,7 +51,7 @@ def relative_time(ts: str | None) -> str:
 def qual(v: bool | None) -> str:
     if v is None:
         return "—"
-    return "[green]\\u2713[/]" if v else "[red]\\u2717[/]"
+    return "[green]\u2713[/]" if v else "[red]\u2717[/]"
 
 
 def cost(v: float | None) -> str:
