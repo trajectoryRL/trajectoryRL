@@ -17,7 +17,6 @@ DEFAULT_SUBMIT_URL = f"{_BASE_URL}/api/scores/submit"
 DEFAULT_PRE_EVAL_URL = f"{_BASE_URL}/api/miners/pre-eval"
 DEFAULT_LOGS_UPLOAD_URL = f"{_BASE_URL}/api/validators/logs/upload"
 DEFAULT_CYCLE_LOGS_URL = f"{_BASE_URL}/api/validators/logs/cycle"
-DEFAULT_WEIGHT_OVERRIDE_URL = f"{_BASE_URL}/api/validators/weight-override"
 
 
 async def heartbeat(
@@ -331,64 +330,6 @@ async def upload_cycle_logs(
     except Exception as e:
         logger.warning("Cycle log upload error: %s", e)
         return False
-
-
-async def fetch_weight_override(
-    wallet,
-    *,
-    override_url: str = DEFAULT_WEIGHT_OVERRIDE_URL,
-) -> Optional[Dict[str, Any]]:
-    """Fetch any active forced weight override for this validator.
-
-    Only activated in exceptional circumstances (e.g. consensus divergence)
-    to save validator vtrust by forcing a known-good winner UID from the
-    server side.
-
-    Returns the override dict with ``winnerUid`` and ``expiresAt`` if one
-    exists and is still within its validity period, otherwise ``None``.
-    """
-    try:
-        hotkey_kp = wallet.hotkey
-    except Exception:
-        logger.debug("Skipping weight-override check: wallet hotkey not available")
-        return None
-
-    hotkey_addr = hotkey_kp.ss58_address
-    timestamp = int(time.time())
-
-    message = f"trajectoryrl-weight-override:{hotkey_addr}:{timestamp}"
-    sig = hotkey_kp.sign(message.encode())
-    signature = "0x" + (sig if isinstance(sig, bytes) else bytes(sig)).hex()
-
-    payload: Dict[str, Any] = {
-        "hotkey": hotkey_addr,
-        "timestamp": timestamp,
-        "signature": signature,
-    }
-
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(override_url, json=payload, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("success") and data.get("override") is not None:
-                logger.info(
-                    "Weight override active: winnerUid=%s expiresAt=%s",
-                    data["override"].get("winnerUid"),
-                    data["override"].get("expiresAt"),
-                )
-                return data["override"]
-            logger.debug("No active weight override")
-            return None
-        logger.warning(
-            "Weight override check failed: %d %s",
-            resp.status_code,
-            resp.text[:200],
-        )
-        return None
-    except Exception as e:
-        logger.warning("Weight override check error: %s", e)
-        return None
 
 
 async def submit_eval(
