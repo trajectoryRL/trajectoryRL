@@ -289,6 +289,9 @@ class TestPRTestPlan:
         stale_pack = _pack("# Stale miner policy that should be cleared")
         v._hotkey_packs = {"hk_deregistered": stale_pack}
         v._pack_by_hash = {"stale_hash_abc": stale_pack}
+        v._cycle_eval_id = None
+        v._cycle_log_offset = 0
+        v._cycle_log_block = 0
 
         assert len(v._hotkey_packs) == 1
         assert len(v._pack_by_hash) == 1
@@ -298,6 +301,8 @@ class TestPRTestPlan:
         # (no active commitments → falls through to fallback weights).
         with patch.object(
             TrajectoryValidator, "_check_llm_keys", return_value=True
+        ), patch.object(
+            TrajectoryValidator, "_get_validator_log_offset", return_value=0,
         ), patch(
             "trajectoryrl.base.validator.fetch_all_commitments",
             return_value={},
@@ -308,7 +313,7 @@ class TestPRTestPlan:
         ):
             loop = asyncio.new_event_loop()
             try:
-                loop.run_until_complete(v._run_evaluation_cycle(100000))
+                loop.run_until_complete(v._run_evaluation_cycle(100000, window_number=0))
             finally:
                 loop.close()
 

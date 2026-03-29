@@ -224,6 +224,11 @@ class TrajectoryValidator:
         # Whether this window's consensus aggregation has been performed
         self._window_aggregated: bool = False
 
+        # Cycle log state — deferred until after aggregation completes
+        self._cycle_eval_id: Optional[str] = None
+        self._cycle_log_offset: int = 0
+        self._cycle_log_block: int = 0
+
         # Consensus CAS store (IPFS + API)
         def _sign_consensus_msg(msg: str) -> str:
             sig = self.wallet.hotkey.sign(msg.encode())
@@ -881,7 +886,7 @@ class TrajectoryValidator:
 
                     await self._sync_clawbench()
 
-                    await self._run_evaluation_cycle(current_block)
+                    await self._run_evaluation_cycle(current_block, window.window_number)
                     self._last_eval_at = int(time.time())
                     self._last_eval_window = window.window_number
                     self._last_eval_date = datetime.datetime.utcnow().date()
@@ -918,6 +923,18 @@ class TrajectoryValidator:
                     await self._run_consensus_aggregation(window)
                     self._window_aggregated = True
 
+                    # Upload cycle logs after aggregation so submission &
+                    # consensus log lines are included.
+                    if self._cycle_eval_id is not None:
+                        asyncio.ensure_future(
+                            self._fire_upload_cycle_logs(
+                                self._cycle_eval_id,
+                                self._cycle_log_offset,
+                                self._cycle_log_block,
+                            )
+                        )
+                        self._cycle_eval_id = None
+
                 # --- Tempo cadence: re-set weights (independent of window) ---
                 current_block = self.subtensor.get_current_block()
                 blocks_since_weights = current_block - self.last_weight_block
@@ -941,9 +958,16 @@ class TrajectoryValidator:
                 logger.info("Received interrupt, shutting down...")
                 self._save_ema_state()
                 self._save_eval_cache()
+                if self._cycle_eval_id is not None:
+                    await self._fire_upload_cycle_logs(
+                        self._cycle_eval_id,
+                        self._cycle_log_offset,
+                        self._cycle_log_block,
+                    )
+                    self._cycle_eval_id = None
                 break
             except Exception as e:
-                logger.error(f"Error in main loop: {e}", exc_info=True)
+                logger.error(f"Error in main loop: %s", e, exc_info=True)
                 await asyncio.sleep(60)
 
     # ------------------------------------------------------------------
@@ -1055,26 +1079,25 @@ class TrajectoryValidator:
     # Evaluation cycle
     # ------------------------------------------------------------------
 
-    async def _run_evaluation_cycle(self, current_block: int):
-        """Run one evaluation cycle with guaranteed cycle log upload.
+    async def _run_evaluation_cycle(
+        self, current_block: int, window_number: int,
+    ):
+        """Run one evaluation cycle.
 
-        Wraps _execute_evaluation_cycle in try/finally to ensure the
-        cycle-level validator log is always uploaded to the dashboard,
-        regardless of early returns (no LLM key, no miners) or exceptions.
+        Cycle log upload is deferred — the log offset is saved to instance
+        state so the main loop can upload after aggregation completes,
+        capturing submission and consensus logs as well.
         """
         cycle_start = time.time()
-        cycle_log_offset = self._get_validator_log_offset()
-        cycle_eval_id = time.strftime("%Y%m%d_%H%M%S")
-        try:
-            await self._execute_evaluation_cycle(
-                current_block, cycle_eval_id, cycle_start,
-            )
-        finally:
-            asyncio.ensure_future(
-                self._fire_upload_cycle_logs(
-                    cycle_eval_id, cycle_log_offset, current_block,
-                )
-            )
+        cycle_eval_id = f"w{window_number}"
+
+        self._cycle_eval_id = cycle_eval_id
+        self._cycle_log_offset = self._get_validator_log_offset()
+        self._cycle_log_block = current_block
+
+        await self._execute_evaluation_cycle(
+            current_block, cycle_eval_id, cycle_start,
+        )
 
     async def _execute_evaluation_cycle(
         self,
@@ -2130,7 +2153,7 @@ class TrajectoryValidator:
         per-miner log so only new content is captured.
 
         Args:
-            eval_id: Cycle-level eval identifier (YYYYMMDD_HHMMSS).
+            eval_id: Cycle-level eval identifier (e.g. "w42").
             hotkey: Miner hotkey.
 
         Returns:
