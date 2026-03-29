@@ -54,9 +54,9 @@ from ..utils.consensus_filter import (
     run_filter_pipeline, ValidatedSubmission,
 )
 from ..scoring import compute_consensus_costs
-from ..utils.incumbent import (
-    IncumbentState, select_winner_with_incumbent,
-    save_incumbent_state, load_incumbent_state,
+from ..utils.winner_state import (
+    WinnerState, select_winner_with_protection,
+    save_winner_state, load_winner_state,
 )
 from ..utils.commitments import (
     MinerCommitment, fetch_all_commitments,
@@ -175,8 +175,8 @@ class TrajectoryValidator:
             cache_dir=config.pack_cache_dir,
         )
 
-        # Per-scenario cost EMA: {hotkey: {scenario: ema_cost_usd}}
-        self.ema_costs: Dict[str, Dict[str, float]] = {}
+        # Per-scenario raw costs from latest eval: {hotkey: {scenario: cost_usd}}
+        self.raw_costs: Dict[str, Dict[str, float]] = {}
 
         # Per-scenario qualification (latest judge verdict): {hotkey: {scenario: bool}}
         self.scenario_qualified: Dict[str, Dict[str, bool]] = {}
@@ -187,9 +187,8 @@ class TrajectoryValidator:
         # Latest model usage per hotkey/scenario: {hotkey: {scenario: [model_entry, ...]}}
         self.latest_model_usage: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
 
-        # Track the pack_hash that each hotkey's EMA is based on.
-        # EMA resets when pack_hash changes.
-        self._ema_pack_hash: Dict[str, str] = {}
+        # Track the pack_hash that each hotkey was last evaluated with.
+        self._eval_pack_hash: Dict[str, str] = {}
 
         # Last eval block for each hotkey (for rate-limiting and inactivity)
         self.last_eval_block: Dict[str, int] = {}
@@ -199,12 +198,6 @@ class TrajectoryValidator:
 
         # Packs by hotkey (populated during evaluation for NCD dedup)
         self._hotkey_packs: Dict[str, dict] = {}
-
-        # First-mover tracking: {hotkey: (best_cost, block_number)}
-        self.first_mover_data: Dict[str, Tuple[float, float]] = {}
-
-        # Previous cycle's winner hotkey (for δ champion protection)
-        self.champion_hotkey: Optional[str] = None
 
         # Tracks which UID each hotkey was last evaluated at for re-registration detection.
         self._hotkey_uid_map: Dict[str, int] = {}
@@ -264,11 +257,11 @@ class TrajectoryValidator:
         # Reset at each new eval cycle. Included in ConsensusPayload.
         self._disqualified_miners: Dict[str, str] = {}
 
-        # Incumbent advantage state
-        self._incumbent_state_path = os.path.join(
-            getattr(config, "log_dir", "/tmp"), "incumbent_state.json"
+        # Winner Protection state
+        self._winner_state_path = os.path.join(
+            getattr(config, "log_dir", "/tmp"), "winner_state.json"
         )
-        self._incumbent_state = load_incumbent_state(self._incumbent_state_path)
+        self._winner_state = load_winner_state(self._winner_state_path)
 
         # Set to True on startup when eval_on_startup=True; cleared after first eval
         self._startup_eval_pending: bool = config.eval_on_startup
@@ -394,57 +387,48 @@ class TrajectoryValidator:
         return hashlib.sha256(config_str.encode()).hexdigest()[:16]
 
     def _load_ema_state(self):
-        """Load persisted EMA state from disk."""
+        """Load persisted evaluation state from disk."""
         path = self.config.ema_state_path
         if not path.exists():
-            logger.debug("No persisted EMA state found, starting fresh")
+            logger.debug("No persisted eval state found, starting fresh")
             return
         try:
             data = json.loads(path.read_text())
             if data.get("scenario_config_hash") != self._scenario_config_hash:
                 logger.debug(
-                    "Scenario pool changed, invalidating all EMA state"
+                    "Scenario pool changed, invalidating all eval state"
                 )
                 return
 
-            self.ema_costs = data.get("ema_costs", {})
+            self.raw_costs = data.get("raw_costs", data.get("ema_costs", {}))
             self.scenario_qualified = data.get("scenario_qualified", {})
-            self._ema_pack_hash = data.get("ema_pack_hash", {})
+            self._eval_pack_hash = data.get("eval_pack_hash", data.get("ema_pack_hash", {}))
             self.last_eval_block = {
                 k: int(v) for k, v in data.get("last_eval_block", {}).items()
             }
-            self.first_mover_data = {
-                k: (v[0], v[1])
-                for k, v in data.get("first_mover_data", {}).items()
-            }
-            self.champion_hotkey = data.get("champion_hotkey")
             self._last_eval_window = data.get("last_eval_window", -1)
 
             self._consensus_costs = data.get("consensus_costs", {})
             self._consensus_qualified = data.get("consensus_qualified", {})
 
-            # Load integrity judge cache if present
             integrity_cache = data.get("integrity_cache")
             if integrity_cache:
                 self.integrity_judge.load_cache(integrity_cache)
 
             logger.debug(
-                f"Loaded EMA state: {len(self.ema_costs)} hotkeys, "
-                f"{len(self.first_mover_data)} first-mover entries"
+                f"Loaded eval state: {len(self.raw_costs)} hotkeys"
             )
         except Exception as e:
-            logger.warning(f"Failed to load EMA state: {e}, starting fresh")
+            logger.warning(f"Failed to load eval state: {e}, starting fresh")
 
     def _save_ema_state(self):
-        """Persist EMA state to disk for restart recovery."""
+        """Persist evaluation state to disk for restart recovery."""
         data = {
             "scenario_config_hash": self._scenario_config_hash,
-            "ema_costs": self.ema_costs,
+            "raw_costs": self.raw_costs,
             "scenario_qualified": self.scenario_qualified,
-            "ema_pack_hash": self._ema_pack_hash,
+            "eval_pack_hash": self._eval_pack_hash,
             "last_eval_block": self.last_eval_block,
-            "first_mover_data": self.first_mover_data,
-            "champion_hotkey": self.champion_hotkey,
             "last_eval_window": self._last_eval_window,
             "consensus_costs": self._consensus_costs,
             "consensus_qualified": self._consensus_qualified,
@@ -580,59 +564,48 @@ class TrajectoryValidator:
     # EMA update
     # ------------------------------------------------------------------
 
-    def _update_ema(
+    def _update_eval_results(
         self,
         hotkey: str,
         pack_hash: str,
         scenario_costs: Optional[Dict[str, float]] = None,
         scenario_qualified: Optional[Dict[str, bool]] = None,
     ):
-        """Update per-scenario cost EMA and qualification for a miner.
+        """Record raw per-scenario costs and qualification for a miner.
 
-        Resets EMA when pack_hash changes (new pack = new observations).
-        Score EMA removed in v4.0 — qualification is a binary judge verdict.
+        Resets data when pack_hash changes (new pack = new observations).
         """
-        if self._ema_pack_hash.get(hotkey) != pack_hash:
+        if self._eval_pack_hash.get(hotkey) != pack_hash:
             self._get_miner_logger(hotkey).info(
                 f"Pack changed "
-                f"({self._ema_pack_hash.get(hotkey, 'none')[:8]} -> {pack_hash[:8]}), "
-                f"resetting EMA"
+                f"({self._eval_pack_hash.get(hotkey, 'none')[:8]} -> {pack_hash[:8]}), "
+                f"resetting eval data"
             )
-            self.ema_costs[hotkey] = {}
+            self.raw_costs[hotkey] = {}
             self.scenario_qualified[hotkey] = {}
             self.latest_token_usage.pop(hotkey, None)
             self.latest_model_usage.pop(hotkey, None)
-            self._ema_pack_hash[hotkey] = pack_hash
+            self._eval_pack_hash[hotkey] = pack_hash
 
-        # Cost EMA
         if scenario_costs:
-            cost_alpha = self.config.cost_ema_alpha
-            if hotkey not in self.ema_costs:
-                self.ema_costs[hotkey] = {}
+            if hotkey not in self.raw_costs:
+                self.raw_costs[hotkey] = {}
             for scenario, cost in scenario_costs.items():
-                if cost is None:
-                    continue
-                prev = self.ema_costs[hotkey].get(scenario)
-                if prev is None:
-                    self.ema_costs[hotkey][scenario] = cost
-                else:
-                    self.ema_costs[hotkey][scenario] = (
-                        cost_alpha * cost + (1 - cost_alpha) * prev
-                    )
+                if cost is not None:
+                    self.raw_costs[hotkey][scenario] = cost
 
-        # Qualification: latest judge verdict (binary, not smoothed)
         if scenario_qualified:
             if hotkey not in self.scenario_qualified:
                 self.scenario_qualified[hotkey] = {}
             self.scenario_qualified[hotkey].update(scenario_qualified)
 
-    def compute_total_cost_from_ema(self, hotkey: str) -> Optional[float]:
-        """Compute weighted average cost from per-scenario cost EMA.
+    def compute_total_cost(self, hotkey: str) -> Optional[float]:
+        """Compute weighted average cost from per-scenario raw costs.
 
         Returns None if no cost data available.
         """
-        ema = self.ema_costs.get(hotkey, {})
-        if not ema:
+        costs = self.raw_costs.get(hotkey, {})
+        if not costs:
             return None
 
         scenario_weights = {
@@ -642,7 +615,7 @@ class TrajectoryValidator:
 
         total_weight = 0.0
         weighted_sum = 0.0
-        for scenario, cost in ema.items():
+        for scenario, cost in costs.items():
             w = scenario_weights.get(scenario, 1.0)
             weighted_sum += w * cost
             total_weight += w
@@ -750,7 +723,7 @@ class TrajectoryValidator:
         qualified_by_hotkey: Dict[str, bool] = {}
         disqualified_by_hotkey: Dict[str, str] = {}
 
-        for hotkey, scenario_costs in self.ema_costs.items():
+        for hotkey, scenario_costs in self.raw_costs.items():
             if scenario_costs:
                 total_cost = sum(scenario_costs.values()) / len(scenario_costs)
                 costs_by_hotkey[hotkey] = total_cost
@@ -855,10 +828,11 @@ class TrajectoryValidator:
             return
 
         validator_stakes: Dict[str, float] = {}
-        for neuron in self.metagraph.neurons:
-            if neuron.is_null:
-                continue
-            validator_stakes[neuron.hotkey] = float(neuron.stake)
+        for uid in range(len(self.metagraph.hotkeys)):
+            hotkey = self.metagraph.hotkeys[uid]
+            stake = float(self.metagraph.stake[uid])
+            if stake > 0:
+                validator_stakes[hotkey] = stake
 
         from clawbench import __version__ as clawbench_version
         min_stake = getattr(self.config, "min_validator_stake", 0.0)
@@ -878,30 +852,29 @@ class TrajectoryValidator:
             )
             return
 
-        consensus_costs, consensus_qualified = compute_consensus_costs(validated)
+        consensus_costs, consensus_qualified = compute_consensus_costs(
+            validated,
+            qualification_stake_threshold=self.config.qualification_stake_threshold,
+        )
 
         self._consensus_costs = consensus_costs
         self._consensus_qualified = consensus_qualified
 
-        # Apply incumbent advantage + update historical best
-        winner_hk, updated_state = select_winner_with_incumbent(
+        # Apply Winner Protection
+        winner_hk, updated_state = select_winner_with_protection(
             consensus_costs=consensus_costs,
             consensus_qualified=consensus_qualified,
-            state=self._incumbent_state,
-            window_number=window.window_number,
-            season_length=self.config.season_length,
+            state=self._winner_state,
             cost_delta=self.config.cost_delta,
         )
-        self._incumbent_state = updated_state
-        save_incumbent_state(updated_state, self._incumbent_state_path)
+        self._winner_state = updated_state
+        save_winner_state(updated_state, self._winner_state_path)
 
         if winner_hk:
-            self.champion_hotkey = winner_hk
             logger.info(
-                "Window %d: incumbent elected = %s (%s) — "
+                "Window %d: winner = %s — "
                 "local state only, weights will be applied at next tempo",
                 window.window_number, winner_hk[:8],
-                "retained" if winner_hk == updated_state.incumbent_hotkey else "new challenger",
             )
 
         logger.info(
@@ -1385,9 +1358,9 @@ class TrajectoryValidator:
                         rejection_detail=detail,
                     )
                 )
-                self.ema_costs.pop(hotkey, None)
+                self.raw_costs.pop(hotkey, None)
                 self.scenario_qualified.pop(hotkey, None)
-                self._ema_pack_hash.pop(hotkey, None)
+                self._eval_pack_hash.pop(hotkey, None)
                 continue
 
             # Pre-eval gate: ask the server whether this miner's submission
@@ -1439,9 +1412,9 @@ class TrajectoryValidator:
                         )
                     )
                     self._disqualified_miners[hotkey] = f"pre_eval_rejected:{reason}"
-                    self.ema_costs.pop(hotkey, None)
+                    self.raw_costs.pop(hotkey, None)
                     self.scenario_qualified.pop(hotkey, None)
-                    self._ema_pack_hash.pop(hotkey, None)
+                    self._eval_pack_hash.pop(hotkey, None)
                     continue
 
             needs_eval = self._needs_evaluation(
@@ -1496,13 +1469,13 @@ class TrajectoryValidator:
                 )
 
             if eval_result is not None:
-                ema_reset = self._ema_pack_hash.get(hotkey) != commitment.pack_hash
+                ema_reset = self._eval_pack_hash.get(hotkey) != commitment.pack_hash
                 if ema_reset:
                     self._eval_counts[hotkey] = 0
                 self._eval_counts[hotkey] = self._eval_counts.get(hotkey, 0) + 1
                 eval_count = self._eval_counts[hotkey]
 
-                self._update_ema(
+                self._update_eval_results(
                     hotkey, commitment.pack_hash,
                     scenario_costs=eval_result.get("costs"),
                     scenario_qualified=eval_result.get("qualified"),
@@ -1532,13 +1505,7 @@ class TrajectoryValidator:
                     )
                 )
 
-                # First-mover tracks cost (lower = better)
-                total_cost = self.compute_total_cost_from_ema(hotkey)
-                if total_cost is not None:
-                    self._update_first_mover(
-                        uid, hotkey, total_cost, float(commitment.block_number),
-                        pack_hash=commitment.pack_hash,
-                    )
+                self._track_uid_change(uid, hotkey)
 
             else:
                 elapsed_str = f" ({eval_elapsed:.1f}s)" if eval_elapsed else ""
@@ -1583,14 +1550,14 @@ class TrajectoryValidator:
         if evaluated_count > 0:
             for uid, commitment in active_commitments.items():
                 hk = commitment.hotkey
-                ema_cost = self.compute_total_cost_from_ema(hk)
-                if ema_cost is not None:
-                    per_scenario = self.ema_costs.get(hk, {})
+                total_cost = self.compute_total_cost(hk)
+                if total_cost is not None:
+                    per_scenario = self.raw_costs.get(hk, {})
                     scenario_str = ", ".join(
                         f"{s}=${c:.4f}" for s, c in sorted(per_scenario.items())
                     )
                     self._get_miner_logger(hk).info(
-                        f"EMA cost: total=${ema_cost:.4f} ({scenario_str})"
+                        f"Total cost: ${total_cost:.4f} ({scenario_str})"
                     )
 
         # All attempted evaluations failed — likely an LLM API issue
@@ -1640,7 +1607,7 @@ class TrajectoryValidator:
         - Time since last eval >= eval_interval
         - Never evaluated before
         """
-        if self._ema_pack_hash.get(hotkey) != pack_hash:
+        if self._eval_pack_hash.get(hotkey) != pack_hash:
             self._get_miner_logger(hotkey).info(
                 f"pack_hash changed, marking for eval"
             )
@@ -1702,9 +1669,8 @@ class TrajectoryValidator:
                     self._get_miner_logger(hotkey).info(
                         f"Inactive for {blocks_since} blocks > "
                         f"{self.config.inactivity_blocks}, "
-                        f"removing first-mover protection"
+                        f"removing from active set"
                     )
-                    self.first_mover_data.pop(hotkey, None)
                     self._hotkey_uid_map.pop(hotkey, None)
                     continue
 
@@ -1713,63 +1679,22 @@ class TrajectoryValidator:
         return active
 
     # ------------------------------------------------------------------
-    # First-mover tracking
+    # UID re-registration tracking
     # ------------------------------------------------------------------
 
-    def _update_first_mover(
+    def _track_uid_change(
         self,
         miner_uid: int,
         hotkey: str,
-        cost: float,
-        block_number: float,
-        pack_hash: Optional[str] = None,
     ) -> None:
-        """Detect re-registration and update first-mover data for a miner.
-
-        Tracks best (lowest) cost. Lower cost = better.
-
-        When a miner submits a new pack (pack_hash changed), the block
-        number is reset to the new commitment's block.  This ensures
-        first-mover protection reflects the current pack's submission
-        time, not a historical one.
-        """
+        """Detect re-registration for a miner hotkey."""
         prev_uid = self._hotkey_uid_map.get(hotkey)
         if prev_uid is not None and prev_uid != miner_uid:
             self._get_miner_logger(hotkey).info(
                 f"Previously at UID {prev_uid}; "
-                f"re-registration detected, resetting first-mover data"
+                f"re-registration detected"
             )
-            self.first_mover_data.pop(hotkey, None)
         self._hotkey_uid_map[hotkey] = miner_uid
-
-        # Detect pack change: if pack_hash differs from EMA tracking,
-        # the miner submitted a new pack → reset block to new commitment.
-        current_ema_hash = self._ema_pack_hash.get(hotkey)
-        pack_changed = (
-            pack_hash is not None
-            and current_ema_hash is not None
-            and pack_hash != current_ema_hash
-        )
-
-        if hotkey not in self.first_mover_data:
-            self.first_mover_data[hotkey] = (cost, block_number)
-            self._get_miner_logger(hotkey).info(
-                f"First submission (cost=${cost:.4f}, block={block_number:.0f})"
-            )
-        elif pack_changed:
-            # New pack → reset block number to new commitment block
-            self.first_mover_data[hotkey] = (cost, block_number)
-            self._get_miner_logger(hotkey).info(
-                f"Pack changed, reset first-mover block to {block_number:.0f} "
-                f"(cost=${cost:.4f})"
-            )
-        elif cost < self.first_mover_data[hotkey][0]:
-            # Same pack, cost improved (EMA drift) → keep original block
-            original_block = self.first_mover_data[hotkey][1]
-            self.first_mover_data[hotkey] = (cost, original_block)
-            self._get_miner_logger(hotkey).info(
-                f"Cost improved to ${cost:.4f}"
-            )
 
     # ------------------------------------------------------------------
     # Episode detail logging (file-only, no console output)
@@ -1934,9 +1859,9 @@ class TrajectoryValidator:
                 )
             )
             self._disqualified_miners[commitment.hotkey] = "integrity_failed"
-            self.ema_costs.pop(commitment.hotkey, None)
+            self.raw_costs.pop(commitment.hotkey, None)
             self.scenario_qualified.pop(commitment.hotkey, None)
-            self._ema_pack_hash.pop(commitment.hotkey, None)
+            self._eval_pack_hash.pop(commitment.hotkey, None)
             return None
 
         if integrity.flags:
@@ -2162,7 +2087,7 @@ class TrajectoryValidator:
             }
             if sname in raw_costs:
                 entry["cost"] = round(raw_costs[sname], 4)
-                entry["ema_cost"] = round(self.ema_costs.get(hotkey, {}).get(sname, 0.0), 4)
+                entry["raw_cost"] = round(self.raw_costs.get(hotkey, {}).get(sname, 0.0), 4)
             tu = (eval_result.get("token_usage") or {}).get(sname)
             if tu:
                 entry["token_usage"] = tu
@@ -2177,14 +2102,14 @@ class TrajectoryValidator:
         # Log the full eval summary to the per-miner file for debugging.
         mlog = self._get_miner_logger(hotkey)
         fully_qualified = self.is_fully_qualified(hotkey)
-        total_ema_cost = self.compute_total_cost_from_ema(hotkey) or 0.0
+        total_raw_cost = self.compute_total_cost(hotkey) or 0.0
         mlog.info(
             f"=== eval summary (uid={uid}, eval#{eval_count}) ==="
         )
         mlog.info(
             f"  score={raw_score:.4f} cost=${raw_cost:.4f} "
-            f"ema_cost=${total_ema_cost:.4f} qualified={fully_qualified} "
-            f"ema_reset={ema_reset}"
+            f"total_cost=${total_raw_cost:.4f} qualified={fully_qualified} "
+            f"pack_changed={ema_reset}"
         )
         mlog.info(
             f"  pack_url={commitment.pack_url} "
@@ -2195,7 +2120,7 @@ class TrajectoryValidator:
             mlog.info(
                 f"  {sname}: qualified={sr.get('qualified')} "
                 f"cost=${sr.get('cost', 0):.4f} "
-                f"ema_cost=${sr.get('ema_cost', 0):.4f} "
+                f"raw_cost=${sr.get('raw_cost', 0):.4f} "
                 f"judge_score={jd.get('overall_score', '?')} "
                 f"verdict={jd.get('verdict', '?')} "
                 f"grounded={jd.get('grounded', '?')} "
@@ -2228,7 +2153,7 @@ class TrajectoryValidator:
             score=round(raw_score, 4),
             ema_score=round(raw_score, 4),
             cost=round(raw_cost, 4),
-            ema_cost=round(total_ema_cost, 4),
+            ema_cost=round(total_raw_cost, 4),
             weight=0.0,
             qualified=fully_qualified,
             pack_url=commitment.pack_url,
@@ -2536,18 +2461,12 @@ class TrajectoryValidator:
         weights_dict = self.scorer.select_winner_by_cost(
             costs=costs,
             qualified=qualified,
-            first_mover_data=self.first_mover_data,
+            first_mover_data={},
             cost_delta=self.config.cost_delta,
             num_active_miners=num_active,
             uid_to_hotkey=uid_to_hotkey,
-            champion_hotkey=self.champion_hotkey,
+            champion_hotkey=self._winner_state.winner_hotkey,
         )
-
-        # Update champion_hotkey to this cycle's winner (only if there IS a winner)
-        if weights_dict:
-            winner_uid = max(weights_dict, key=weights_dict.get)
-            if weights_dict.get(winner_uid, 0) > 0 and winner_uid in uid_to_hotkey:
-                self.champion_hotkey = uid_to_hotkey[winner_uid]
 
         # Apply burn: scale miner weights by (1 - BURN_FRACTION),
         # give BURN_FRACTION to owner UID (burned by the chain).

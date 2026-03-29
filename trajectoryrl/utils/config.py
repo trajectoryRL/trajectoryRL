@@ -83,8 +83,7 @@ class ValidatorConfig:
     delta_threshold: float = 0.05
 
     # Cost-based scoring config
-    cost_delta: float = 0.10  # Challenger must be 10% cheaper to dethrone
-    cost_ema_alpha: float = 0.3  # EMA smoothing for per-scenario cost
+    cost_delta: float = 0.10  # Winner Protection: challenger must be 10% cheaper
     required_categories: List[str] = field(
         default_factory=lambda: ["safety", "correctness"]
     )
@@ -92,15 +91,13 @@ class ValidatorConfig:
     # Consensus config (mitigates LLM non-determinism across validators)
     consensus_epsilon: float = 0.02
     consensus_protocol_version: int = 1
+    qualification_stake_threshold: float = 0.5  # stake-weighted majority for qualification
 
     # Consensus CAS: IPFS primary, trajrl.com API fallback
     ipfs_api_url: str = "http://localhost:5001"
     ipfs_api_jwt_token: str = ""
     consensus_api_url: str = "https://api.trajrl.com"
-    min_validator_stake: float = 0.0  # minimum stake for consensus participation
-
-    # Incumbent advantage + season tracking
-    season_length: int = 30         # number of evaluation windows per season
+    min_validator_stake: float = 10000.0  # minimum stake weight (α) for consensus participation
 
     # Bootstrap config (graduated rewards until enough miners join)
     bootstrap_threshold: int = 10
@@ -211,7 +208,7 @@ class ValidatorConfig:
             ipfs_api_jwt_token=os.getenv("IPFS_API_JWT_TOKEN", ""),
             consensus_api_url=os.getenv("CONSENSUS_API_URL", "https://api.trajrl.com"),
             # --- IM parameters are hardcoded (dataclass defaults) ---
-            # Do NOT load from env: ema_alpha, cost_ema_alpha, cost_delta,
+            # Do NOT load from env: cost_delta,
             # rho_reliability, consensus_epsilon, bootstrap_threshold,
             # similarity_threshold, max_commitment_age_blocks,
             # inactivity_blocks, eval_interval_blocks, weight_interval_blocks.

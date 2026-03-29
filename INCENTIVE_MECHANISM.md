@@ -2,7 +2,7 @@
 
 **Subnet**: SN11 (TrajectoryRL)
 
-**Version**: v4.1
+**Version**: v4.2
 
 **Date**: 2026-03-29
 
@@ -22,7 +22,9 @@ Validators evaluate packs independently using **ClawBench scenarios** with **LLM
 
 > **v4.0 change**: Replaced regex-based scoring with LLM-as-judge. The previous regex system was vulnerable to keyword-stuffing attacks where miners hardcoded canned responses containing the exact keywords the regex patterns matched, achieving near-zero cost with zero tool calls. LLM-as-judge evaluates the full trajectory and requires claims to be grounded in tool call data, making this class of attack impossible.
 
-> **v4.1 change**: Added two-phase off-chain consensus protocol to address LLM variance across validators. Validators now share evaluation results via CAS + pointer registration and compute stake-weighted consensus costs before setting weights. Introduced incumbent advantage (same δ=10% threshold as first-mover protection) and cross-window historical best tracking within seasons to stabilize winner selection against LLM noise.
+> **v4.1 change**: Added two-phase off-chain consensus protocol to address LLM variance across validators. Validators now share evaluation results via CAS + pointer registration and compute stake-weighted consensus costs before setting weights.
+
+> **v4.2 change**: Simplified winner selection: removed EMA smoothing (use raw costs directly — cross-validator stake-weighted aggregation provides sufficient variance suppression), replaced first-mover/incumbent/historical-best with unified **Winner Protection** (winner defends with their winning cost, challengers must beat by δ=10%), changed consensus qualification from AND (single-validator veto) to **stake-weighted majority** (>50% stake must agree to disqualify). Validators now only persist winner state (hotkey, pack_hash, cost) locally.
 
 ---
 
@@ -67,7 +69,7 @@ Revenue flows back to the subnet through licensing fees, API access, and marketp
 
 ## Scoring: LLM-as-Judge + Cost Ranking
 
-Scoring uses a two-phase LLM-as-judge pipeline that replaces all regex-based checks. Each phase uses a single LLM call (no majority voting, no EMA smoothing on judge output) — gaming attacks are obvious and polarized, making false positives rare.
+Scoring uses a two-phase LLM-as-judge pipeline that replaces all regex-based checks. Each phase uses a single LLM call (no majority voting) — gaming attacks are obvious and polarized, making false positives rare.
 
 ### Phase 1: Pack Integrity Analysis (Static, Pre-Evaluation)
 
@@ -173,44 +175,25 @@ Cost is captured from the LLM provider's usage data after each episode. It inclu
 
 **Note**: The judge's own LLM cost is borne by the validator and is **not** counted toward the miner's episode cost.
 
-### Step 4: Per-Scenario Cost EMA
+### Step 4: Aggregated Cost
 
-Validators smooth per-scenario costs using an Exponential Moving Average (EMA):
-
-```
-ema_cost[hotkey][scenario] = α × new_cost + (1 - α) × ema_cost[hotkey][scenario]
-```
-
-Where:
-- **hotkey**: the miner's ss58 address (stable across UID recycling)
-- **α** = 0.3 (cost EMA smoothing factor, configurable)
-- **new_cost**: measured cost from the latest evaluation run
-
-When a miner submits a new pack (different `pack_hash`), the cost EMA resets for that hotkey — old cost observations from a different pack are irrelevant.
-
-### Step 5: Aggregated Cost
-
-From the smoothed per-scenario cost EMA values:
+For each miner, the total cost is averaged across all scenarios:
 
 ```
-total_cost[hotkey] = Σ(w_i × ema_cost[hotkey][scenario_i]) / Σ(w_i)
+total_cost[hotkey] = Σ(w_i × cost[hotkey][scenario_i]) / Σ(w_i)
 ```
 
-Where **w_i** is the weight from each scenario YAML (`weight` field, default 1.0).
+Where **w_i** is the weight from each scenario YAML (`weight` field, default 1.0), and **cost** is the raw measured cost from the latest evaluation (no EMA smoothing).
 
-### Step 6: Winner Selection
+### Step 5: Winner Selection
 
-Among **qualified** miners (Phase 1 passed, Phase 2 gate passed on all scenarios), the one with the lowest `total_cost` wins. See [Winner-Take-All with First-Mover Advantage](#winner-take-all-with-first-mover-advantage) for full rules.
+Among **qualified** miners (Phase 1 passed, Phase 2 gate passed on all scenarios), the one with the lowest `total_cost` wins. See [Winner-Take-All with Winner Protection](#winner-take-all-with-winner-protection) for full rules.
 
-### Why No Score EMA or Majority Voting on Judge Output
+### Why No EMA or Majority Voting
 
-The judge produces a **binary** qualification gate (PASS/FAIL) per scenario. Unlike cost (which varies due to LLM non-determinism in token usage), the qualification verdict is **polarized**:
+**Cost**: Cross-validator stake-weighted aggregation (consensus protocol) already suppresses LLM run-to-run variance. Using raw costs makes results transparent and directly reviewable — reviewers can see exactly what each validator measured.
 
-- A hardcoded canned-response pack with zero tool calls → FAIL with near-certainty
-- A legitimate agent that retrieves data and reasons about it → PASS with near-certainty
-- The gray zone is vanishingly small for these scenarios
-
-Therefore: no score EMA, no majority voting, no repeated judge runs. A single judge call per scenario per evaluation suffices. Cost EMA remains because cost genuinely varies across runs.
+**Qualification**: The judge produces a **binary** qualification gate (PASS/FAIL) per scenario. The verdict is **polarized** (gaming is obvious). Consensus qualification uses **stake-weighted majority** (>50% of reporting stake must agree), preventing any single validator from unilaterally disqualifying a miner.
 
 ---
 
@@ -220,7 +203,7 @@ The current evaluation dataset (**v0**) has 5 scenarios covering knowledge-worke
 
 Each scenario defines **criteria** (not regex patterns) that the LLM judge evaluates against. Criteria include natural-language descriptions, ground truth facts, and evaluation guides. This makes scenarios easier to write, harder to game, and more robust to diverse agent response styles.
 
-This is an early dataset, not the final benchmark. The scenario pool will grow as the subnet matures (new scenarios, harder criteria, new task domains). When scenarios are added or changed, all cost EMA state is invalidated and packs are re-evaluated fresh.
+This is an early dataset, not the final benchmark. The scenario pool will grow as the subnet matures (new scenarios, harder criteria, new task domains). When scenarios are added or changed, packs are re-evaluated fresh on the new set.
 
 See [DATASET_v0.md](DATASET_v0.md) for scenario details, criteria definitions, and evolution plans.
 
@@ -324,7 +307,7 @@ Validators continuously read miner commitments from the chain via `subtensor.get
 
 ---
 
-## Winner-Take-All with First-Mover Advantage
+## Winner-Take-All with Winner Protection
 
 ### Core Rule: Winner Takes All (Steady State)
 
@@ -376,7 +359,7 @@ If no miner has a valid on-chain commitment (or no miner has cost data), the val
 
 ### Miner Inactivity
 
-**Problem**: What if a miner registers, wins once, then never updates their commitment? Without explicit handling, the miner's stale pack could hold the throne indefinitely (protected by first-mover), and the miner could count toward the bootstrap threshold despite being inactive.
+**Problem**: What if a miner registers, wins once, then never updates their commitment? Without explicit handling, the miner's stale pack could hold the throne indefinitely, and the miner could count toward the bootstrap threshold despite being inactive.
 
 **Rules**:
 
@@ -391,41 +374,57 @@ If no miner has a valid on-chain commitment (or no miner has cost data), the val
 | Cost | N/A (no pack to evaluate) |
 | Weight | 0.0 |
 | Bootstrap threshold | Does NOT count. Only active miners count toward the 10-miner threshold |
-| First-mover protection | **Lost**: an inactive incumbent is removed from cost competition, so any active challenger can claim the crown |
+| Winner protection | **Lost**: an inactive winner is removed from cost competition, so any active challenger can claim the crown |
 | Bittensor deregistration | Handled natively. Miners receiving weight 0.0 for extended periods eventually get deregistered by the chain when their immunity period expires |
 
-4. **Re-activation**: If a previously inactive miner submits a valid pack, they re-enter the competition normally. Their `last_eval_block` updates, and they are subject to standard first-mover/NCD rules like any new submission.
+4. **Re-activation**: If a previously inactive miner submits a valid pack, they re-enter the competition normally. Their `last_eval_block` updates, and they are subject to standard Winner Protection/NCD rules like any new submission.
 
-**Why 14400 blocks (~48h)?** This gives miners 48 hours of downtime (maintenance, key rotation, etc.) before losing first-mover protection. Short enough to prevent indefinite stale-pack squatting; long enough to tolerate operational hiccups.
+**Why 14400 blocks (~48h)?** This gives miners 48 hours of downtime (maintenance, key rotation, etc.) before losing winner protection. Short enough to prevent indefinite stale-pack squatting; long enough to tolerate operational hiccups.
 
 | Parameter | Value | Tunable? |
 |-----------|-------|----------|
 | `inactivity_blocks` | 14400 (~48h) | Yes |
 
-### First-Mover Protection (Cost-Based)
+### Winner Protection (Cost-Based)
 
-To prevent copy-paste attacks and cheap-by-epsilon undercutting, validators enforce **chronological precedence with a multiplicative cost threshold**:
+To prevent copy-paste attacks and cheap-by-epsilon undercutting, and to stabilize winner selection against LLM variance, validators enforce **Winner Protection with a multiplicative cost threshold**:
 
-**Rule**: A later submission can only dethrone the current champion if:
+**Rule**: The current winner defends with their **winning cost** (the consensus cost at the time they became winner). A challenger can only dethrone the winner if:
 ```
-new_cost < current_best_cost × (1 - δ)
+challenger_cost < winner_cost × (1 - δ)
 ```
 
 Where:
 - **δ** = 0.10 (10% cost improvement threshold)
-- **current_best_cost** = current EMA-smoothed cost of the first-mover
-- Chronological order determined by **on-chain commitment block number** (unforgeable)
+- **winner_cost** = the consensus cost recorded when the winner was elected (frozen, not the winner's latest cost)
+
+**Winner self-update**: The winner can update their own record (lower the winning cost) by the same rule — if the winner's new consensus cost < `winner_cost × (1 - δ)`, their `winner_cost` and `winner_pack_hash` are updated. This makes their defense even stronger going forward.
+
+**Winner disqualified**: If the current winner is disqualified (consensus_qualified = False via stake-weighted majority), the winner is removed and the lowest-cost qualified miner takes over.
+
+**Validator local state**: Each validator persists a `WinnerState` containing:
+- `winner_hotkey` — current winner's hotkey
+- `winner_pack_hash` — the pack hash when they won
+- `winner_cost` — the consensus cost when they won
 
 **Example Timeline**:
 ```
-Miner A submits at block 1000 (cost: $5.00/episode)
-  → Becomes winner (first qualified submission)
+Window 1: Miner A (consensus cost: $5.00, qualified)
+  → Becomes winner (first qualified miner), winner_cost = $5.00
 
-Miner B submits at block 1200 (cost: $4.80/episode)
+Window 2: Miner B (consensus cost: $4.80, qualified)
   → Rejected! Must beat $5.00 × 0.90 = $4.50
 
-Miner C submits at block 5000 (cost: $3.80/episode)
-  → Becomes new winner! ($3.80 < $4.50)
+Window 3: Miner C (consensus cost: $3.80, qualified)
+  → Becomes new winner! ($3.80 < $4.50), winner_cost = $3.80
+
+Window 4: Winner C submits worse pack (consensus cost: $4.20)
+  → C retains winner title, still defends with winner_cost = $3.80
+  → Challengers must beat $3.80 × 0.90 = $3.42
+
+Window 5: Winner C submits better pack (consensus cost: $3.30)
+  → $3.30 < $3.80 × 0.90 = $3.42 → C self-updates
+  → winner_cost updated to $3.30, defense even stronger
 ```
 
 **Why multiplicative (not additive)?** Cost is measured in dollars, not a [0,1] score. A fixed additive threshold (e.g., $0.50) would be meaningless for a $50 episode but prohibitive for a $1 episode. A 10% multiplicative threshold scales naturally with the cost range.
@@ -434,9 +433,9 @@ Miner C submits at block 5000 (cost: $3.80/episode)
 - Direct copying (same cost) never wins
 - Minor optimizations (< 10% cheaper) fail the threshold
 - Must genuinely reduce cost to dethrone the leader
-- First-mover advantage rewards original research
+- Winner advantage rewards original research
 
-**Anti-Stagnation**: The δ threshold alone could let an incumbent sit forever. Growing the scenario pool and `inactivity_blocks` prevent this.
+**Anti-Stagnation**: The δ threshold alone could let a winner sit forever. Growing the scenario pool and `inactivity_blocks` prevent this. Manual season reset is available for operational control.
 
 ### Reward Distribution
 
@@ -556,7 +555,7 @@ while running:
          c. Phase 2: Trajectory evaluation (LLM judge, 1 call per scenario)
             → qualification gate + overall score per scenario
          (rate limit: at most 1 eval per hotkey per window)
-       Update per-scenario cost EMA and qualification status
+       Record raw costs + qualification status (no EMA)
 
      If block_offset = T_publish (80%):
        # Submission phase — publish evaluation results
@@ -566,7 +565,7 @@ while running:
      If block_offset ≥ T_aggregate (90%):
        # Aggregation phase — compute consensus
        Read all submissions, filter, stake-weighted aggregation
-       Apply incumbent advantage, update historical best
+       Apply Winner Protection, update winner state
 
   5. Every tempo: set_weights via commit-reveal
      - If consensus costs exist → use consensus costs
@@ -580,7 +579,7 @@ Evaluation is rate-limited to **at most one evaluation per miner per evaluation 
 - If a miner submits a new `pack_hash` within the current window, the validator **notes** the new hash but waits for the next window
 - At the next window, the validator evaluates the **latest** `pack_hash` for that miner
 - A miner who submits 100 times per hour gets evaluated exactly the same number of times as one who submits once
-- The cost EMA resets when a new `pack_hash` is first *evaluated* (not when committed on-chain)
+- Each evaluation produces a fresh raw cost (no EMA smoothing)
 
 ### Timing
 
@@ -592,7 +591,7 @@ Evaluation is rate-limited to **at most one evaluation per miner per evaluation 
 │  block_offset  = (current_block - global_anchor) % 7200                      │
 │                                                                              │
 │  ├─ Evaluation phase (block 0 → 5760, 80%):                                 │
-│  │   [Sync] → [Commitments] → [Phase 1] → [Episodes] → [Phase 2] → [EMA]   │
+│  │   [Sync] → [Commitments] → [Phase 1] → [Episodes] → [Phase 2] → [Record]│
 │  │   ~1s      ~1-2 min        ~5s/pack    ~5-30 min    ~10s/scen   ~instant  │
 │  │                             (cached)                 (1 call ea)          │
 │  │                                                                           │
@@ -601,7 +600,7 @@ Evaluation is rate-limited to **at most one evaluation per miner per evaluation 
 │  ├─ Propagation (block 5760 → 6480, 10%): wait for submissions              │
 │  │                                                                           │
 │  ├─ Aggregation (block 6480): compute consensus, update latest_consensus     │
-│  │   [Filter] → [Stake-weighted avg] → [Incumbent check] → [Winner]         │
+│  │   [Filter] → [Stake-weighted avg + majority qual] → [Winner Protection]  │
 │  │                                                                           │
 │  └─ Consensus effective (block 6480 → 7200, 10%):                            │
 │      set_weights picks up new consensus data at next tempo                   │
@@ -622,9 +621,9 @@ Evaluation is rate-limited to **at most one evaluation per miner per evaluation 
 
 Every evaluation runs the **full scenario set**. No subset selection or rotation. The benchmark is fixed and consistent: same scenarios, same criteria, same judge prompts. This ensures costs and qualification are directly comparable across validators and across time.
 
-**Anti-stagnation** comes from the team **growing the scenario pool** over time (new scenarios, harder criteria, new task domains). When the pool changes, it's coordinated via a validator software update. All cost EMA state is invalidated and packs are re-evaluated fresh on the new set.
+**Anti-stagnation** comes from the team **growing the scenario pool** over time (new scenarios, harder criteria, new task domains). When the pool changes, it's coordinated via a validator software update. Packs are re-evaluated fresh on the new set.
 
-**EMA persistence**: Per-scenario cost EMA state persists across validator restarts (serialized to disk). When a pack hasn't changed (`pack_hash` matches), the validator continues accumulating cost EMA samples. When the **scenario pool itself changes** (detected by hash of scenario configuration), all EMA state is invalidated. Pack integrity results (Phase 1) are cached by `pack_hash` and persist across restarts.
+**State persistence**: Winner state (hotkey, pack_hash, cost) persists across validator restarts (serialized to disk as JSON). Pack integrity results (Phase 1) are cached by `pack_hash` and persist across restarts.
 
 ---
 
@@ -647,19 +646,21 @@ Every evaluation runs the **full scenario set**. No subset selection or rotation
 - Deleting or modifying the hosted file is self-punishing: hash mismatch → weight 0
 - Public URLs allow community audit and verification
 
-### 2. First-Mover Advantage (Multiplicative δ)
+### 2. Winner Protection (Multiplicative δ)
 
-**Enforcement**: New submission must cost `< current_best × (1 - δ)` to win (δ = 0.10, i.e. 10% cheaper)
+**Enforcement**: Challenger must cost `< winner_cost × (1 - δ)` to dethrone the current winner (δ = 0.10, i.e. 10% cheaper)
 
 **Prevents**:
 - Direct copy-paste attacks (same cost fails)
 - Cheap-by-epsilon undercutting (< 10% cheaper fails)
 - Lazy free-riding on others' research
+- Winner oscillation from LLM variance (winner defends with frozen winning cost)
 
 **How it works**:
-- Track the FIRST qualified submission and its cost
-- Later submissions must meaningfully reduce cost (10%+)
-- Creates incentive to publish cost optimizations quickly
+- Winner defends with their **winning cost** (consensus cost at time of winning), not their latest cost
+- Challengers must meaningfully reduce cost (10%+) below winner's winning cost
+- Winner can self-update only if their new cost also beats the 10% threshold
+- Winner is removed only if disqualified by stake-weighted majority
 - Anti-stagnation comes from growing the scenario pool over time
 
 ### 3. Pack Integrity Analysis (LLM-as-Judge Phase 1)
@@ -857,21 +858,21 @@ SIMILARITY_THRESHOLD = 0.80   # reject if ≥ 80% similar
 
 The threshold is tunable via `similarity_threshold` in validator config.
 
-### 10. Repeated Evaluation (Cost EMA)
+### 10. Cross-Validator Consensus (Stake-Weighted Aggregation)
 
-**Enforcement**: Validators evaluate each pack **multiple times** (every `eval_interval`) and smooth costs via per-scenario EMA. A single evaluation does not determine the winner.
+**Enforcement**: Each miner's cost is computed as a stake-weighted average across all validators. Qualification requires >50% of reporting stake to agree (stake-weighted majority, not AND).
 
 **Prevents**:
-- Gaming via LLM variance luck (a single cheap run doesn't determine the cost)
-- Transient low costs from non-deterministic agent behavior
-- Inconsistent packs that occasionally complete cheaply but usually don't
+- Gaming via LLM variance luck (consensus across many validators suppresses noise)
+- Single-validator manipulation (one validator cannot unilaterally disqualify a miner)
+- Transient low costs from non-deterministic agent behavior (aggregation over multiple validators provides natural smoothing)
 
 **How it works**:
-- Each validator accumulates multiple independent cost observations per pack
-- Per-scenario cost EMA smooths noise: after 3-4 observations (~12-16 hours), costs converge to within ~2-3% of the pack's true cost
-- A pack must be *consistently* cheap to earn a low smoothed cost
-- Combined with YC3 cross-validator aggregation, effective variance drops below 1%
-- **Note**: EMA applies to cost only. The qualification gate is a single binary verdict from the LLM judge per evaluation — no score EMA or smoothing needed
+- Each validator independently evaluates and reports raw costs + qualified status
+- Consensus cost = stake-weighted average across all validators reporting on that miner
+- Consensus qualification = stake-weighted majority (>50% of reporting stake must report qualified=True)
+- A low-stake malicious validator's influence is bounded by their stake proportion
+- Controlling >50% of stake to manipulate results is equivalent to controlling the network (consistent with Bittensor security assumptions)
 
 ---
 
@@ -883,24 +884,24 @@ LLM outputs vary between API calls even with the same input and temperature=0. T
 
 ### Solution: Two-Phase Evaluation Consensus + YC3
 
-Variance is managed at three layers:
+Variance is managed at two layers:
 
 ```
-Layer 1 (within-validator):   Per-scenario cost EMA
-                              → smooths run-to-run variance from LLM non-determinism
-
-Layer 2 (cross-validator):    Two-phase off-chain consensus protocol
-                              → validators share evaluation results and compute
+Layer 1 (cross-validator):    Two-phase off-chain consensus protocol
+                              → validators share raw evaluation results and compute
                                 stake-weighted consensus costs before setting weights
+                              → qualification uses stake-weighted majority (>50% stake)
 
-Layer 3 (on-chain):           YC3 with Liquid Alpha
+Layer 2 (on-chain):           YC3 with Liquid Alpha
                               → aggregates weight vectors on-chain
                               → handles residual disagreement after off-chain consensus
 ```
 
-**Qualification** remains a single LLM judge call per scenario — verdicts are polarized (obvious PASS/FAIL), so no cross-validator smoothing is needed.
+**No per-validator EMA**: Raw costs from each evaluation are submitted directly. Cross-validator stake-weighted aggregation provides sufficient variance suppression, and raw costs make results transparent and reviewable.
 
-**Cost** benefits from cross-validator consensus: each validator's local cost EMA is one noisy estimate of a pack's true cost. Aggregating estimates from multiple validators using stake-weighted averaging produces a more accurate consensus cost.
+**Qualification** uses stake-weighted majority: a miner is qualified only if >50% of reporting stake reports qualified=True. This prevents any single validator from unilaterally disqualifying a miner (requires majority stake to agree on disqualification).
+
+**Cost** benefits from cross-validator consensus: each validator's raw cost measurement is one noisy estimate of a pack's true cost. Aggregating estimates from multiple validators using stake-weighted averaging produces a more accurate consensus cost.
 
 ### Evaluation Windows
 
@@ -922,13 +923,13 @@ Every validator reads `current_block` from the chain and arrives at the same `wi
 ```
 Window N (7200 blocks, ~20 tempos)
 ├── [block 0 ── 5760]          Independent evaluation phase (80%)
-│   Each validator runs ClawBench episodes, computes local cost EMA
+│   Each validator runs ClawBench episodes, records raw costs + qualified
 │   Submit partial results at T_publish even if not all miners evaluated
 │   set_weights every tempo using latest consensus (Window N-1 or earlier)
 │   If no consensus exists yet: set fallback weights
 │
 ├── [block 5760]               T_publish — submission deadline (hard)
-│   1. Construct evaluation payload (costs, judge results, metadata)
+│   1. Construct evaluation payload (raw costs, qualified, metadata)
 │   2. Upload payload to CAS (IPFS primary, GCS fallback), obtain content address
 │   3. Write on-chain commitment: consensus:{protocol_version}|{window_number}|{content_address}
 │   Unpublished results are excluded from this window's consensus
@@ -942,8 +943,8 @@ Window N (7200 blocks, ~20 tempos)
 │   2. Run filter pipeline (protocol → window → stake → integrity → version → zero-signal)
 │   3. Download valid payloads from CAS
 │   4. Compute stake-weighted consensus cost per miner
-│   5. Update season historical best
-│   6. Apply incumbent advantage → select winner
+│   5. Compute stake-weighted majority qualification per miner
+│   6. Apply Winner Protection → select winner
 │   7. Store Window N consensus as latest_consensus
 │
 └── [block 6480 ── 7200]       Consensus effective (10%)
@@ -965,7 +966,7 @@ latest_consensus persists across windows and restarts:
   If no consensus ever computed:         set_fallback_weights()
 ```
 
-A 7200-block window contains ~20 tempos. Validators set weights at every one of them. After T_aggregate, the next `set_weights` call picks up the new consensus data automatically. Between windows, the previous consensus data is retained — local EMA is never used for weight setting.
+A 7200-block window contains ~20 tempos. Validators set weights at every one of them. After T_aggregate, the next `set_weights` call picks up the new consensus data automatically. Between windows, the previous consensus data is retained.
 
 **Timing rationale**: 80/10/10 split gives validators ~19.2 hours for evaluation (sufficient for multi-hour runs across many miners), ~2.4 hours for propagation (ample for IPFS propagation and on-chain commitment finality), and ~2.4 hours for aggregation before the next window starts. The propagation interval must exceed max expected network latency + max storage write latency.
 
@@ -1028,69 +1029,55 @@ Each filter layer logs skip counts and reasons for diagnosing low consensus part
 For each miner, the consensus cost is a stake-weighted average across all validators whose submissions passed the filter pipeline:
 
 ```
-consensus_cost[miner] = Σ(validator_stake_i × local_cost_i) / Σ(validator_stake_i)
+consensus_cost[miner] = Σ(validator_stake_i × raw_cost_i) / Σ(validator_stake_i)
 ```
 
 Where:
 - `validator_stake_i` = validator's TAO stake (from metagraph)
-- `local_cost_i` = validator i's EMA-smoothed cost for this miner
+- `raw_cost_i` = validator i's raw measured cost for this miner (no EMA smoothing)
 - Sum is over all validators whose submissions passed the filter pipeline
+
+**Consensus qualification** uses stake-weighted majority (not AND):
+
+```
+qualified_stake[miner] = Σ(stake_i for validators reporting qualified=True)
+total_stake[miner]     = Σ(stake_i for all validators reporting on this miner)
+consensus_qualified[miner] = qualified_stake / total_stake > 0.50
+```
+
+This prevents any single validator from unilaterally disqualifying a miner. A malicious validator with 5% stake can only shift the qualification ratio by 5% — controlling >50% of stake is required to disqualify a miner, consistent with Bittensor's security assumptions.
 
 **Fallback**: When all submissions are filtered out (e.g., storage outage across all validators), the consensus costs from the previous window are retained. If no consensus has ever been computed, fallback weights are set (owner UID burn).
 
-### Incumbent Advantage
+### Winner Protection
 
-Direct winner selection from consensus costs is sensitive to LLM variance — the winner can oscillate between windows due to noise. The **incumbent advantage** mechanism stabilizes winner selection:
-
-- The current winner (**incumbent**) retains their position unless a challenger's consensus cost is lower than `incumbent_historical_best_cost × (1 - δ)`, using the same δ threshold as first-mover protection (10%).
-- If no challenger meets the threshold → incumbent retains winner status.
-- If a challenger meets the threshold → challenger becomes the new incumbent.
-- First window with no incumbent → lowest consensus cost wins directly.
-
-This is complementary to the δ first-mover threshold (which gates new submissions based on cost improvement). The incumbent advantage operates on **consensus costs** and prevents oscillation even among already-qualified miners.
-
-The incumbent advantage uses the same `δ` threshold (10%) as first-mover protection — a unified cost protection parameter. A challenger must demonstrate a consensus cost at least 10% lower than the incumbent's historical best.
-
-### Cross-Window Historical Best (Season)
-
-Within a **season** (configurable number of evaluation windows), each miner's best consensus cost is persisted. The incumbent advantage compares challengers against the incumbent's **historical best cost within the current season**, not just the latest window's cost.
+After computing consensus costs and qualification, each validator applies **Winner Protection** locally:
 
 ```
-After each window:
-  historical_best_cost[miner] = min(historical_best_cost[miner], consensus_cost[miner])
+If no current winner OR winner is disqualified:
+  → lowest consensus-cost qualified miner becomes winner
+  → record (winner_hotkey, winner_pack_hash, winner_cost)
 
-Season boundary:
-  Reset all historical_best_cost → forces re-competition
+If winner exists and is qualified:
+  → find lowest consensus-cost qualified miner (including winner)
+  → if lowest_cost < winner_cost × (1 - δ):
+      → that miner becomes the new winner (or winner self-updates)
+      → record (winner_hotkey, winner_pack_hash, winner_cost) = new values
+  → else:
+      → winner retains, no change
 ```
 
-**Why historical best?**
-- A single window's LLM variance may inflate a strong miner's cost
-- Historical best ensures proven low-cost performance is not lost to random noise
-- Season reset prevents indefinite lock-in, giving all miners a fair chance to compete
+**Key properties**:
+- Winner always defends with their **winning cost** (frozen at time of winning), not their latest cost
+- Winner's pack can degrade without losing the title — only disqualification removes them
+- Self-update follows the same 10% rule — winner must beat their own winning cost by 10% to update their record
+- No automatic season reset — winner persists until beaten or disqualified. Manual reset available for operational control.
 
-### Per-Validator: Local Cost EMA
-
-Each validator maintains local per-scenario cost EMA (input to the cross-validator consensus):
-
-```
-ema_cost[hotkey][scenario] = α × new_cost + (1 - α) × ema_cost[hotkey][scenario]
-
-Where:
-  hotkey   = miner's ss58 address (stable identifier; UIDs recycle)
-  α        = 0.3 (cost EMA smoothing factor, configurable)
-  scenario = individual ClawBench scenario name
-```
-
-**EMA reset**: When a miner submits a new pack (`pack_hash` changes), the cost EMA resets for that hotkey at the next scheduled evaluation. Old observations from a different pack are discarded.
-
-**Convergence**: With α = 0.3 and `eval_interval` = 7200 blocks (~24h):
-- After 1 observation: raw noisy cost (variance ~5-10%)
-- After 3 observations (~3 days): EMA within ~3% of true cost
-- After 5 observations (~5 days): EMA within ~1-2% of true cost
+**Validator local state** (`WinnerState`): Each validator persists `winner_hotkey`, `winner_pack_hash`, and `winner_cost` to a local JSON file. Since all validators process the same consensus data with the same deterministic algorithm, they converge on the same winner as long as they participate in each window.
 
 **Rate-limiting**: At most one evaluation per miner per `eval_interval`, regardless of how often the miner updates their commitment. This prevents DDoS via rapid commitment churn (see [Evaluation Cadence](#evaluation-cadence)).
 
-The local cost EMA is used exclusively for building the `ConsensusPayload` that gets submitted at T_publish. It is **never** used directly for `set_weights` — weight setting always uses consensus costs (stake-weighted averages from all validators). Before the first consensus aggregation completes, the validator sets fallback weights.
+Raw costs are submitted directly in the `ConsensusPayload` at T_publish. Weight setting always uses consensus costs (stake-weighted averages from all validators). Before the first consensus aggregation completes, the validator sets fallback weights.
 
 ### Degradation Strategies
 
@@ -1126,7 +1113,7 @@ on_chain_weight[miner] = YC3(
 Commit-reveal is enabled on SN11 (`commit_reveal_period: 1` tempo). Off-chain consensus sharing does not compromise commit-reveal because:
 
 - Shared data is **evaluation results** (costs, judge verdicts), not **weight vectors**
-- The mapping from consensus costs to weights still involves validator-specific logic (qualification status, filter outcomes, incumbent state)
+- The mapping from consensus costs to weights still involves validator-specific logic (qualification status, filter outcomes, winner state)
 - Free-riding validators (no evaluation submissions) are filtered by zero-signal exclusion
 
 ### YC3 Chain Configuration
@@ -1217,9 +1204,9 @@ trajectory[hotkey][scenario] = run_clawbench(pack, scenario)      # tool calls +
 judge_result[hotkey][scenario] = llm_judge_trajectory(trajectory, criteria)
 qualified[hotkey][scenario]    = judge_result.safety_passed AND judge_result.correctness_passed
 
-# Local cost EMA
-ema_cost[hotkey][scenario]  = α × new_cost + (1 - α) × ema_cost[hotkey][scenario]
-local_cost[hotkey]          = weighted_mean(ema_cost_scenarios)
+# Raw cost (no EMA)
+raw_cost[hotkey][scenario]  = measured cost from episode
+local_cost[hotkey]          = weighted_mean(raw_cost_scenarios)
 fully_qualified[hotkey]     = integrity[hotkey] AND qualified on ALL scenarios
 
 # ── Submission (T_publish) ──
@@ -1233,16 +1220,16 @@ subtensor.set_commitment("consensus:{version}|{window}|{content_address}")
 submissions = subtensor.get_all_commitments()  # filter for "consensus:" prefix
 valid = filter_pipeline(submissions)        # protocol → window → stake → integrity → version → zero-signal
 consensus_cost[hotkey] = Σ(stake_i × cost_i) / Σ(stake_i)   # stake-weighted average
+consensus_qualified[hotkey] = qualified_stake / total_stake > 0.50  # stake-weighted majority
 
-# ── Winner selection with incumbent advantage ──
+# ── Winner Protection ──
 
-historical_best[hotkey] = min(historical_best[hotkey], consensus_cost[hotkey])
-winner = select_winner(consensus_cost, historical_best, cost_delta)
+winner = select_winner(consensus_cost, consensus_qualified, winner_state, cost_delta)
 
 # ── Weight setting (hotkey → UID via metagraph, every tempo) ──
 
-weight[uid] = f(consensus_cost, fully_qualified, winner)
-# consensus_cost persists across windows; local EMA is never used for weights
+weight[uid] = f(consensus_cost, consensus_qualified, winner)
+# consensus data persists across windows
 # Before first consensus: set_fallback_weights()
 
 # ── Cross-validator (YC3 on-chain) ──
@@ -1266,10 +1253,9 @@ where Winner = lowest consensus-cost qualified miner that satisfies:
   - pack integrity passed (LLM judge Phase 1: no hardcoded responses, no gaming)
   - all safety + correctness criteria pass on every scenario (LLM judge Phase 2)
   - all claims grounded in tool call data (LLM judge grounding check)
-  - consensus_cost < incumbent_historical_best × (1 - δ) to dethrone incumbent
-  - cost < previous_best × (1 - δ) for new submissions (first-mover protection)
-  - both use the same δ = 10% threshold
-  - ties broken by earliest on-chain commitment block number
+  - consensus_cost < winner_cost × (1 - δ) to dethrone current winner (Winner Protection)
+  - δ = 10% threshold
+  - consensus qualification: >50% reporting stake agrees qualified (stake-weighted majority)
   - pack accessible at committed HTTP URL, hash matches
   - pack passes OPP v1 schema validation (AGENTS.md required, ≤32KB)
   - pairwise NCD: no other earlier-submitted pack with similarity ≥ σ
@@ -1288,13 +1274,12 @@ Bootstrap:     top-3 qualified get 70/20/10 of miner alpha emissions
 
 | Parameter | Value | Tunable? |
 |-----------|-------|----------|
-| δ (cost_delta) | 0.10 (10%) — first-mover + incumbent protection | Yes |
-| α (cost EMA smoothing factor) | 0.3 | Yes |
+| δ (cost_delta) | 0.10 (10%) — Winner Protection threshold | Yes |
+| qualification_stake_threshold | 0.50 (>50% stake majority) | Yes |
 | Required categories | safety, correctness | Yes |
 | eval_interval | 7200 blocks (~24h at 12s/block) | Yes |
 | T_publish (submission deadline) | 80% of window (block 5760) | Yes |
 | T_aggregate (aggregation start) | 90% of window (block 6480) | Yes |
-| season_length | configurable (number of eval windows) | Yes |
 | min_validator_stake | minimum stake for consensus participation | Yes |
 | window_skip_threshold | 0.30 (30% of window elapsed) | Yes |
 | Scenario pool | 5 (all run every eval; pool grows over time) | Yes |
@@ -1323,6 +1308,6 @@ Bootstrap:     top-3 qualified get 70/20/10 of miner alpha emissions
 
 ---
 
-**Version**: v4.1
+**Version**: v4.2
 
 **Date**: 2026-03-29

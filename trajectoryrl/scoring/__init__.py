@@ -526,6 +526,7 @@ class TrajectoryScorer:
 
 def compute_consensus_costs(
     validated_submissions: List[ValidatedSubmission],
+    qualification_stake_threshold: float = 0.5,
 ) -> Tuple[Dict[str, float], Dict[str, bool]]:
     """Compute stake-weighted consensus costs and qualification across validators.
 
@@ -534,12 +535,18 @@ def compute_consensus_costs(
 
     where the sum is over all validated submissions that include that miner.
 
-    Qualification is consensus-AND: a miner is qualified only if ALL
-    validators that evaluated it report qualified=True.
+    Qualification uses stake-weighted majority: a miner is qualified when
+    the fraction of stake reporting qualified=True exceeds
+    ``qualification_stake_threshold``.  This prevents any single validator
+    from unilaterally disqualifying a miner (requires > threshold of total
+    reporting stake to agree on disqualification).
 
     Args:
         validated_submissions: Submissions that passed the filter pipeline,
             each with an attached validator_stake.
+        qualification_stake_threshold: Fraction of reporting stake that must
+            vote qualified=True for a miner to be considered qualified.
+            Default 0.5 (simple majority by stake weight).
 
     Returns:
         Tuple of (consensus_costs, consensus_qualified):
@@ -551,7 +558,7 @@ def compute_consensus_costs(
 
     miner_weighted_cost: Dict[str, float] = {}
     miner_total_stake: Dict[str, float] = {}
-    miner_qualified: Dict[str, bool] = {}
+    miner_qualified_stake: Dict[str, float] = {}
 
     for sub in validated_submissions:
         stake = sub.validator_stake
@@ -562,26 +569,30 @@ def compute_consensus_costs(
             if miner_hk not in miner_weighted_cost:
                 miner_weighted_cost[miner_hk] = 0.0
                 miner_total_stake[miner_hk] = 0.0
-                miner_qualified[miner_hk] = True
+                miner_qualified_stake[miner_hk] = 0.0
 
             miner_weighted_cost[miner_hk] += stake * cost
             miner_total_stake[miner_hk] += stake
 
-            q = sub.payload.qualified.get(miner_hk, False)
-            if not q:
-                miner_qualified[miner_hk] = False
+            if sub.payload.qualified.get(miner_hk, False):
+                miner_qualified_stake[miner_hk] += stake
 
     consensus_costs: Dict[str, float] = {}
+    miner_qualified: Dict[str, bool] = {}
     for miner_hk in miner_weighted_cost:
         total_stake = miner_total_stake[miner_hk]
         if total_stake > 0:
             consensus_costs[miner_hk] = miner_weighted_cost[miner_hk] / total_stake
+            qual_ratio = miner_qualified_stake[miner_hk] / total_stake
+            miner_qualified[miner_hk] = qual_ratio > qualification_stake_threshold
         else:
             consensus_costs[miner_hk] = 0.0
+            miner_qualified[miner_hk] = False
 
     logger.info(
-        "Consensus computed: %d miners, %d validators",
+        "Consensus computed: %d miners, %d validators, qual_threshold=%.2f",
         len(consensus_costs), len(validated_submissions),
+        qualification_stake_threshold,
     )
 
     return consensus_costs, miner_qualified

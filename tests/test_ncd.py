@@ -269,6 +269,7 @@ class TestPRTestPlan:
         mock_metagraph.hotkeys = ["hk_0", "hk_1"]
         mock_metagraph.validator_permit = [False, False]
         mock_metagraph.S = [100.0, 100.0]
+        mock_metagraph.stake = [100.0, 100.0]
         mock_subtensor.metagraph.return_value = mock_metagraph
 
         v = TrajectoryValidator.__new__(TrajectoryValidator)
@@ -276,11 +277,10 @@ class TestPRTestPlan:
         v.metagraph = mock_metagraph
         v.subtensor = mock_subtensor
         v.ema_scores = {}
-        v.ema_costs = {}
+        v.raw_costs = {}
         v.scenario_qualified = {}
-        v._ema_pack_hash = {}
+        v._eval_pack_hash = {}
         v.last_eval_block = {}
-        v.first_mover_data = {}
         v._hotkey_uid_map = {}
         v.scenarios = {"client_escalation": {"weight": 1.0}}
         v.wallet = MagicMock()

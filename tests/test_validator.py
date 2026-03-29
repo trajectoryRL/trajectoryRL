@@ -55,14 +55,14 @@ from trajectoryrl.utils.consensus_filter import (
     filter_clawbench_version, filter_zero_signal,
 )
 from trajectoryrl.scoring import compute_consensus_costs
-from trajectoryrl.utils.incumbent import (
-    IncumbentState, select_winner_with_incumbent,
-    save_incumbent_state, load_incumbent_state,
+from trajectoryrl.utils.winner_state import (
+    WinnerState, select_winner_with_protection,
+    save_winner_state, load_winner_state,
 )
 from trajectoryrl.utils.commitments import (
     parse_consensus_commitment, format_consensus_commitment,
     is_consensus_commitment, parse_commitment,
-    ValidatorConsensusCommitment,
+    ValidatorConsensusCommitment, fetch_validator_consensus_commitments,
 )
 
 
@@ -308,89 +308,6 @@ class TestTrajectoryScorer:
         final = scorer.compute_final_score(agg)
         assert final == 0.0  # Clamped to 0
 
-    def test_select_winner_basic(self, scorer):
-        scores = {0: 0.85, 1: 0.72, 2: 0.91}
-        weights = scorer.select_winner(
-            scores, first_mover_data={}, delta=0.05, num_active_miners=20
-        )
-
-        assert weights[2] == 1.0  # uid 2 has highest score
-        assert weights[0] == 0.0
-        assert weights[1] == 0.0
-
-    def test_select_winner_empty(self, scorer):
-        assert scorer.select_winner({}, {}, delta=0.05) == {}
-
-    def test_select_winner_single_miner(self, scorer):
-        scores = {42: 0.8}
-        weights = scorer.select_winner(
-            scores, first_mover_data={}, delta=0.05, num_active_miners=20
-        )
-        assert weights[42] == 1.0
-
-    def test_select_winner_first_mover_protection(self, scorer):
-        """Early miner A (score=0.85) should be protected against B (score=0.88)
-        because B doesn't beat A + delta (0.85 + 0.05 = 0.90)."""
-        scores = {0: 0.85, 1: 0.88}
-        uid_to_hotkey = {0: "hk_A", 1: "hk_B"}
-        first_mover_data = {
-            "hk_A": (0.85, 100.0),  # A submitted first
-            "hk_B": (0.88, 200.0),  # B submitted later
-        }
-        weights = scorer.select_winner(
-            scores, first_mover_data, delta=0.05, num_active_miners=20,
-            uid_to_hotkey=uid_to_hotkey,
-        )
-
-        # A should win due to first-mover protection
-        assert weights[0] == 1.0
-        assert weights[1] == 0.0
-
-    def test_select_winner_first_mover_beaten(self, scorer):
-        """New miner B (score=0.91) beats A + delta (0.85 + 0.05 = 0.90)."""
-        scores = {0: 0.85, 1: 0.91}
-        uid_to_hotkey = {0: "hk_A", 1: "hk_B"}
-        first_mover_data = {
-            "hk_A": (0.85, 100.0),
-            "hk_B": (0.91, 200.0),
-        }
-        weights = scorer.select_winner(
-            scores, first_mover_data, delta=0.05, num_active_miners=20,
-            uid_to_hotkey=uid_to_hotkey,
-        )
-
-        # B wins because 0.91 > 0.90
-        assert weights[1] == 1.0
-        assert weights[0] == 0.0
-
-    def test_select_winner_transitive_first_mover(self, scorer):
-        """First-mover protection must be transitive.
-
-        A(block 100, score=0.76), B(block 200, score=0.80), C(block 300, score=0.84).
-        - B can't beat A: 0.80 <= 0.76 + 0.05 = 0.81
-        - C can beat A: 0.84 > 0.81
-        - So C should win, NOT B.
-
-        Previously, the code found B blocks C (0.84 <= 0.85) and stopped,
-        awarding B the win even though B never legitimately beat A.
-        """
-        scores = {0: 0.76, 1: 0.80, 2: 0.84}
-        uid_to_hotkey = {0: "hk_A", 1: "hk_B", 2: "hk_C"}
-        first_mover_data = {
-            "hk_A": (0.76, 100.0),
-            "hk_B": (0.80, 200.0),
-            "hk_C": (0.84, 300.0),
-        }
-        weights = scorer.select_winner(
-            scores, first_mover_data, delta=0.05, num_active_miners=20,
-            uid_to_hotkey=uid_to_hotkey,
-        )
-
-        # C beats A's protection (0.84 > 0.81), and B never became champion
-        assert weights[2] == 1.0, "C should win (beats A's protection)"
-        assert weights[0] == 0.0
-        assert weights[1] == 0.0
-
     def test_full_scoring_pipeline(self, scorer, sample_results):
         """End-to-end: results -> aggregate -> final score."""
         agg = scorer.aggregate_scores(sample_results)
@@ -416,112 +333,6 @@ class TestTrajectoryScorer:
         # 0.87 - 0 = 0.87, returned as-is
         assert s.compute_final_score(agg) == 0.87
 
-    def test_select_winner_consensus_epsilon_tie(self):
-        """Scores within ε → tie broken by earliest timestamp."""
-        s = TrajectoryScorer(
-            consensus_epsilon=0.02
-        )
-        # Two miners with nearly identical scores (within ε).
-        # Without first_mover_data, miners have no block ordering, so the
-        # iterative approach picks the first in iteration order.
-        # With first_mover_data: miner 0 submitted first (earliest),
-        # miner 1's score (0.91) is within ε of champion (0.90), so it
-        # doesn't overtake — earliest miner keeps the crown.
-        scores = {0: 0.90, 1: 0.91}
-        uid_to_hotkey = {0: "hk_0", 1: "hk_1"}
-        first_mover = {"hk_0": (0.90, 100.0), "hk_1": (0.91, 200.0)}
-        # Use delta=0 to isolate epsilon behavior from first-mover protection
-        weights = s.select_winner(
-            scores, first_mover, delta=0.0, num_active_miners=20,
-            uid_to_hotkey=uid_to_hotkey,
-        )
-        # |0.91 - 0.90| = 0.01 ≤ ε=0.02 → tied → earliest (miner 0) wins
-        assert weights[0] == 1.0
-        assert weights[1] == 0.0
-
-    def test_select_winner_clear_margin_no_tie(self):
-        """Scores separated by more than ε → no tie-break."""
-        s = TrajectoryScorer(
-            consensus_epsilon=0.02
-        )
-        scores = {0: 0.85, 1: 0.91}
-        uid_to_hotkey = {0: "hk_0", 1: "hk_1"}
-        first_mover = {"hk_0": (0.85, 100.0), "hk_1": (0.91, 200.0)}
-        weights = s.select_winner(
-            scores, first_mover, delta=0.05, num_active_miners=20,
-            uid_to_hotkey=uid_to_hotkey,
-        )
-
-        # |0.91 - 0.85| = 0.06 > ε=0.02 → not tied, miner 1 wins on score
-        # Also 0.91 > 0.85 + 0.05 = 0.90 → beats delta threshold
-        assert weights[1] == 1.0
-        assert weights[0] == 0.0
-
-    def test_select_winner_bootstrap_graduated(self):
-        """With few miners, use graduated 70/20/10 curve instead of WTA."""
-        s = TrajectoryScorer(bootstrap_threshold=10)
-        scores = {0: 0.80, 1: 0.91, 2: 0.85}
-        uid_to_hotkey = {0: "hk_0", 1: "hk_1", 2: "hk_2"}
-        first_mover = {"hk_0": (0.80, 100.0), "hk_1": (0.91, 200.0), "hk_2": (0.85, 300.0)}
-        # 3 miners < threshold 10 → bootstrap mode
-        weights = s.select_winner(
-            scores, first_mover, delta=0.05, num_active_miners=3,
-            uid_to_hotkey=uid_to_hotkey,
-        )
-        assert weights[1] == 0.70  # 1st (highest score)
-        assert weights[2] == 0.20  # 2nd
-        assert weights[0] == 0.10  # 3rd
-
-    def test_select_winner_bootstrap_tie_break(self):
-        """Bootstrap ties broken by earliest push timestamp."""
-        s = TrajectoryScorer(bootstrap_threshold=10)
-        scores = {0: 0.90, 1: 0.90}  # same score
-        uid_to_hotkey = {0: "hk_0", 1: "hk_1"}
-        first_mover = {"hk_0": (0.90, 200.0), "hk_1": (0.90, 100.0)}  # miner 1 pushed first
-        weights = s.select_winner(
-            scores, first_mover, delta=0.05, num_active_miners=2,
-            uid_to_hotkey=uid_to_hotkey,
-        )
-        # 2 miners: raw 0.70/0.20 normalized to sum to 1.0
-        assert weights[1] == pytest.approx(0.70 / 0.90)  # ~0.778
-        assert weights[0] == pytest.approx(0.20 / 0.90)  # ~0.222
-
-    def test_select_winner_bootstrap_single_miner(self):
-        """Single miner in bootstrap gets weight 1.0 (normalized)."""
-        s = TrajectoryScorer(bootstrap_threshold=10)
-        scores = {0: 0.75}
-        uid_to_hotkey = {0: "hk_0"}
-        first_mover = {"hk_0": (0.75, 100.0)}
-        weights = s.select_winner(
-            scores, first_mover, delta=0.05, num_active_miners=1,
-            uid_to_hotkey=uid_to_hotkey,
-        )
-        assert weights[0] == 1.0
-
-    def test_select_winner_bootstrap_two_miners_sum_to_one(self):
-        """Two miners in bootstrap: weights must sum to 1.0."""
-        s = TrajectoryScorer(bootstrap_threshold=10)
-        scores = {0: 0.80, 1: 0.91}
-        uid_to_hotkey = {0: "hk_0", 1: "hk_1"}
-        first_mover = {"hk_0": (0.80, 100.0), "hk_1": (0.91, 200.0)}
-        weights = s.select_winner(
-            scores, first_mover, delta=0.05, num_active_miners=2,
-            uid_to_hotkey=uid_to_hotkey,
-        )
-        assert weights[1] > weights[0]  # higher score wins more
-        assert sum(weights.values()) == pytest.approx(1.0)
-
-    def test_select_winner_above_threshold_is_wta(self):
-        """Once miner count >= threshold, pure winner-take-all resumes."""
-        s = TrajectoryScorer(bootstrap_threshold=3)
-        scores = {0: 0.80, 1: 0.91, 2: 0.85}
-        weights = s.select_winner(
-            scores, first_mover_data={}, delta=0.05, num_active_miners=3
-        )
-        # 3 >= threshold 3 → WTA
-        assert weights[1] == 1.0
-        assert weights[0] == 0.0
-        assert weights[2] == 0.0
 
 
 # ===================================================================
@@ -1367,7 +1178,6 @@ class TestValidatorConfig:
         assert defaults["delta_threshold"].default == 0.05
         assert defaults["seeds_per_task"].default == 1
         assert defaults["eval_interval_blocks"].default == 7200
-        assert defaults["cost_ema_alpha"].default == 0.3
         assert defaults["similarity_threshold"].default == 0.80
         assert defaults["inactivity_blocks"].default == 14400
         assert defaults["weight_interval_blocks"].default == 360
@@ -1644,8 +1454,6 @@ class TestPerScenarioEMA:
             config.eval_interval_blocks = 7200
             config.similarity_threshold = 0.80
             config.weight_interval_blocks = 360
-            config.ema_alpha = 0.3
-            config.cost_ema_alpha = 0.3
             config.cost_delta = 0.10
             config.required_categories = ["safety", "correctness"]
             config.ema_state_path = Path("/tmp/test_ema_state.json")
@@ -1661,30 +1469,32 @@ class TestPerScenarioEMA:
             mock_metagraph.hotkeys = ["hk_0", "hk_1", "hk_2"]
             mock_metagraph.validator_permit = [False, False, False]
             mock_metagraph.S = [100.0, 100.0, 100.0]
+            mock_metagraph.stake = [100.0, 100.0, 100.0]
             mock_subtensor.metagraph.return_value = mock_metagraph
 
             validator = TrajectoryValidator.__new__(TrajectoryValidator)
             validator.config = config
             validator.metagraph = mock_metagraph
             validator.subtensor = mock_subtensor
-            validator.ema_costs = {}
+            validator.raw_costs = {}
             validator.scenario_qualified = {}
-            validator._ema_pack_hash = {}
+            validator._eval_pack_hash = {}
             validator.last_eval_block = {}
-            validator.first_mover_data = {}
             validator._hotkey_uid_map = {}
             validator._hotkey_packs = {}
             validator._pack_by_hash = {}
             validator._eval_counts = {}
             validator._scenario_config_hash = ""
+            validator._last_eval_window = -1
             validator.latest_token_usage = {}
             validator.latest_model_usage = {}
             validator.current_winner_pack = None
             validator.current_winner_hotkey = None
-            validator.champion_hotkey = None
             validator._miner_loggers = {}
             validator._miner_log_dir = Path("/tmp/test_logs/miners")
             validator._miner_log_dir.mkdir(parents=True, exist_ok=True)
+            validator._consensus_costs = {}
+            validator._consensus_qualified = {}
             validator.scenarios = {
                 "client_escalation": {"weight": 1.5},
                 "morning_brief": {"weight": 1.0},
@@ -1709,33 +1519,32 @@ class TestPerScenarioEMA:
     def test_needs_evaluation_pack_changed(self):
         """Pack hash change triggers re-evaluation."""
         v = self._make_validator()
-        v._ema_pack_hash["hk_0"] = "hash_a"
+        v._eval_pack_hash["hk_0"] = "hash_a"
         v.last_eval_block["hk_0"] = 99999
         assert v._needs_evaluation("hk_0", "hash_b", 100000) is True
 
     def test_needs_evaluation_within_interval(self):
         """Within eval interval and same pack → no re-evaluation."""
         v = self._make_validator()
-        v._ema_pack_hash["hk_0"] = "hash_a"
+        v._eval_pack_hash["hk_0"] = "hash_a"
         v.last_eval_block["hk_0"] = 99500  # 500 blocks ago < 1200
         assert v._needs_evaluation("hk_0", "hash_a", 100000) is False
 
     def test_needs_evaluation_interval_exceeded(self):
         """Past eval interval → needs re-evaluation."""
         v = self._make_validator()
-        v._ema_pack_hash["hk_0"] = "hash_a"
+        v._eval_pack_hash["hk_0"] = "hash_a"
         v.last_eval_block["hk_0"] = 92000  # 8000 blocks ago > 7200
         assert v._needs_evaluation("hk_0", "hash_a", 100000) is True
 
-    def test_ema_persistence_roundtrip(self):
-        """EMA state can be saved and loaded (v4.0: no score EMA)."""
+    def test_eval_state_persistence_roundtrip(self):
+        """Eval state can be saved and loaded."""
         v = self._make_validator()
         v._scenario_config_hash = "test_hash"
-        v.ema_costs = {"hk_0": {"client_escalation": 0.042}}
+        v.raw_costs = {"hk_0": {"client_escalation": 0.042}}
         v.scenario_qualified = {"hk_0": {"client_escalation": True}}
-        v._ema_pack_hash = {"hk_0": "hash_a"}
+        v._eval_pack_hash = {"hk_0": "hash_a"}
         v.last_eval_block = {"hk_0": 99000}
-        v.first_mover_data = {"hk_0": (0.042, 1000.0)}
 
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
             v.config.ema_state_path = Path(f.name)
@@ -1743,69 +1552,65 @@ class TestPerScenarioEMA:
         try:
             v._save_ema_state()
 
-            # Create a fresh validator and load
             v2 = self._make_validator()
             v2.config.ema_state_path = v.config.ema_state_path
             v2._scenario_config_hash = "test_hash"
             v2._load_ema_state()
 
-            assert v2.ema_costs == {"hk_0": {"client_escalation": 0.042}}
+            assert v2.raw_costs == {"hk_0": {"client_escalation": 0.042}}
             assert v2.scenario_qualified == {"hk_0": {"client_escalation": True}}
-            assert v2._ema_pack_hash == {"hk_0": "hash_a"}
+            assert v2._eval_pack_hash == {"hk_0": "hash_a"}
             assert v2.last_eval_block == {"hk_0": 99000}
-            assert v2.first_mover_data == {"hk_0": (0.042, 1000.0)}
         finally:
             v.config.ema_state_path.unlink(missing_ok=True)
 
-    def test_ema_cost_tracking(self):
-        """Cost EMA tracks per-scenario costs."""
+    def test_raw_cost_tracking(self):
+        """Raw costs are recorded per-scenario."""
         v = self._make_validator()
-        v._update_ema("hk_0", "hash_a",
+        v._update_eval_results("hk_0", "hash_a",
             scenario_costs={"client_escalation": 0.050},
             scenario_qualified={"client_escalation": True},
         )
-        assert v.ema_costs["hk_0"]["client_escalation"] == 0.050
+        assert v.raw_costs["hk_0"]["client_escalation"] == 0.050
         assert v.scenario_qualified["hk_0"]["client_escalation"] is True
 
-    def test_ema_cost_smoothing(self):
-        """Cost EMA applies smoothing on second observation."""
+    def test_raw_cost_overwrites_on_new_eval(self):
+        """New evaluation overwrites previous raw cost (no smoothing)."""
         v = self._make_validator()
-        v._update_ema("hk_0", "hash_a",
+        v._update_eval_results("hk_0", "hash_a",
             scenario_costs={"client_escalation": 0.050},
         )
-        v._update_ema("hk_0", "hash_a",
+        v._update_eval_results("hk_0", "hash_a",
             scenario_costs={"client_escalation": 0.030},
         )
-        # α=0.3: 0.3*0.030 + 0.7*0.050 = 0.009 + 0.035 = 0.044
-        assert abs(v.ema_costs["hk_0"]["client_escalation"] - 0.044) < 1e-6
+        assert v.raw_costs["hk_0"]["client_escalation"] == 0.030
 
-    def test_ema_cost_resets_on_pack_change(self):
-        """Cost EMA resets when pack changes."""
+    def test_raw_cost_resets_on_pack_change(self):
+        """Raw costs reset when pack changes."""
         v = self._make_validator()
-        v._update_ema("hk_0", "hash_a",
+        v._update_eval_results("hk_0", "hash_a",
             scenario_costs={"client_escalation": 0.050},
         )
-        v._update_ema("hk_0", "hash_b",
+        v._update_eval_results("hk_0", "hash_b",
             scenario_costs={"client_escalation": 0.030},
         )
-        # Fresh start after pack change
-        assert v.ema_costs["hk_0"]["client_escalation"] == 0.030
+        assert v.raw_costs["hk_0"]["client_escalation"] == 0.030
 
-    def test_compute_total_cost_from_ema(self):
-        """Total cost from EMA is weighted average across scenarios."""
+    def test_compute_total_cost(self):
+        """Total cost is weighted average across scenarios."""
         v = self._make_validator()
-        v.ema_costs["hk_0"] = {
+        v.raw_costs["hk_0"] = {
             "client_escalation": 0.050,  # weight 1.5
             "morning_brief": 0.030,      # weight 1.0
         }
         # weighted_avg = (1.5*0.050 + 1.0*0.030) / 2.5 = (0.075 + 0.030) / 2.5 = 0.042
-        cost = v.compute_total_cost_from_ema("hk_0")
+        cost = v.compute_total_cost("hk_0")
         assert abs(cost - 0.042) < 1e-6
 
     def test_compute_total_cost_no_data(self):
         """No cost data returns None."""
         v = self._make_validator()
-        assert v.compute_total_cost_from_ema("hk_unknown") is None
+        assert v.compute_total_cost("hk_unknown") is None
 
     def test_is_fully_qualified(self):
         """Fully qualified requires all scenarios to pass."""
@@ -1834,38 +1639,21 @@ class TestPerScenarioEMA:
         }
         assert v.is_fully_qualified("hk_0") is False
 
-    def test_first_mover_tracks_cost(self):
-        """First-mover data tracks best (lowest) cost, block preserved for same pack."""
+    def test_uid_change_tracking(self):
+        """UID change detection works for re-registration."""
         v = self._make_validator()
-        v._ema_pack_hash["hk_0"] = "hash_a"
-        v._update_first_mover(0, "hk_0", cost=0.050, block_number=1000.0, pack_hash="hash_a")
-        assert v.first_mover_data["hk_0"] == (0.050, 1000.0)
+        v._track_uid_change(0, "hk_0")
+        assert v._hotkey_uid_map["hk_0"] == 0
 
-        # Cost improves (lower), same pack → block preserved
-        v._update_first_mover(0, "hk_0", cost=0.030, block_number=2000.0, pack_hash="hash_a")
-        assert v.first_mover_data["hk_0"] == (0.030, 1000.0)  # block preserved
+        v._track_uid_change(5, "hk_0")
+        assert v._hotkey_uid_map["hk_0"] == 5
 
-        # Cost regresses (higher), same pack → no update
-        v._update_first_mover(0, "hk_0", cost=0.040, block_number=3000.0, pack_hash="hash_a")
-        assert v.first_mover_data["hk_0"] == (0.030, 1000.0)
-
-    def test_first_mover_block_resets_on_pack_change(self):
-        """When pack_hash changes, first-mover block resets to new commitment."""
-        v = self._make_validator()
-        v._ema_pack_hash["hk_0"] = "hash_a"
-        v._update_first_mover(0, "hk_0", cost=0.050, block_number=1000.0, pack_hash="hash_a")
-        assert v.first_mover_data["hk_0"] == (0.050, 1000.0)
-
-        # New pack submitted → block resets
-        v._update_first_mover(0, "hk_0", cost=0.040, block_number=5000.0, pack_hash="hash_b")
-        assert v.first_mover_data["hk_0"] == (0.040, 5000.0)  # block updated
-
-    def test_ema_invalidated_on_scenario_pool_change(self):
-        """Loading EMA state with different scenario config invalidates all state."""
+    def test_eval_state_invalidated_on_scenario_pool_change(self):
+        """Loading eval state with different scenario config invalidates all state."""
         v = self._make_validator()
         v._scenario_config_hash = "old_hash"
-        v.ema_costs = {"hk_0": {"client_escalation": 0.042}}
-        v._ema_pack_hash = {"hk_0": "hash_a"}
+        v.raw_costs = {"hk_0": {"client_escalation": 0.042}}
+        v._eval_pack_hash = {"hk_0": "hash_a"}
 
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
             v.config.ema_state_path = Path(f.name)
@@ -1873,14 +1661,13 @@ class TestPerScenarioEMA:
         try:
             v._save_ema_state()
 
-            # Load with different scenario config hash
             v2 = self._make_validator()
             v2.config.ema_state_path = v.config.ema_state_path
             v2._scenario_config_hash = "new_hash"
             v2._load_ema_state()
 
-            assert v2.ema_costs == {}
-            assert v2._ema_pack_hash == {}
+            assert v2.raw_costs == {}
+            assert v2._eval_pack_hash == {}
         finally:
             v.config.ema_state_path.unlink(missing_ok=True)
 
@@ -1919,7 +1706,6 @@ class TestInactivityBlocks:
             config.eval_interval_blocks = 7200
             config.similarity_threshold = 0.80
             config.weight_interval_blocks = 360
-            config.cost_ema_alpha = 0.3
             config.cost_delta = 0.10
             config.required_categories = ["safety", "correctness"]
             config.ema_state_path = Path("/tmp/test_ema_state.json")
@@ -1932,17 +1718,17 @@ class TestInactivityBlocks:
             mock_metagraph.hotkeys = ["hk_0", "hk_1", "hk_2"]
             mock_metagraph.validator_permit = [False, False, False]
             mock_metagraph.S = [100.0, 100.0, 100.0]
+            mock_metagraph.stake = [100.0, 100.0, 100.0]
             mock_subtensor.metagraph.return_value = mock_metagraph
 
             validator = TrajectoryValidator.__new__(TrajectoryValidator)
             validator.config = config
             validator.metagraph = mock_metagraph
             validator.subtensor = mock_subtensor
-            validator.ema_costs = {}
+            validator.raw_costs = {}
             validator.scenario_qualified = {}
-            validator._ema_pack_hash = {}
+            validator._eval_pack_hash = {}
             validator.last_eval_block = {}
-            validator.first_mover_data = {}
             validator._hotkey_uid_map = {}
             validator._hotkey_packs = {}
             validator._pack_by_hash = {}
@@ -1951,7 +1737,6 @@ class TestInactivityBlocks:
             validator.latest_model_usage = {}
             validator.current_winner_pack = None
             validator.current_winner_hotkey = None
-            validator.champion_hotkey = None
             validator._miner_loggers = {}
             validator._miner_log_dir = Path("/tmp/test_logs/miners")
             validator._miner_log_dir.mkdir(parents=True, exist_ok=True)
@@ -1977,11 +1762,10 @@ class TestInactivityBlocks:
         active = v._get_active_miners_from_commitments(commitments, 100000)
         assert 0 in active
 
-    def test_inactive_miner_loses_first_mover(self):
-        """Miner inactive > inactivity_blocks loses first-mover protection."""
+    def test_inactive_miner_removed_from_active(self):
+        """Miner inactive > inactivity_blocks is removed from active set."""
         v = self._make_validator()
         v.last_eval_block["hk_1"] = 80000  # 20000 blocks ago > 14400
-        v.first_mover_data["hk_1"] = (0.85, 5000.0)
 
         from trajectoryrl.utils.commitments import MinerCommitment
         commitments = {
@@ -1993,7 +1777,6 @@ class TestInactivityBlocks:
         }
         active = v._get_active_miners_from_commitments(commitments, 100000)
         assert 1 not in active
-        assert "hk_1" not in v.first_mover_data
 
     def test_never_evaluated_miner_is_active(self):
         """Miner never evaluated (no last_eval_block) is treated as active
@@ -2100,148 +1883,78 @@ class TestScoringIntegration:
         assert result.tool_calls == 11
         assert result.cost_usd == 0.042
 
-    def test_full_pipeline_json_to_weights(self, harness, scorer):
-        """Full: 4 scenario JSON outputs → aggregate → final score → winner."""
-        scenario_outputs = [
-            ("client_escalation", 23, 25),
-            ("morning_brief", 21, 25),
-            ("inbox_to_action", 20, 25),
-            ("team_standup", 22, 25),
-        ]
-
-        results = []
-        for scenario, passed, total in scenario_outputs:
-            score = passed / total
-            json_output = json.dumps({
-                "success": passed == total,
-                "checks_passed": passed,
-                "checks_total": total,
-                "tool_calls": 10,
-                "response": f"{scenario} done",
-                "rubric": {"passed": passed, "total": total, "checks": [], "failed_ids": []},
-            })
-            parsed = harness._parse_episode_output(json_output)
-            results.append(EvaluationResult(
-                scenario_name=scenario,
-                score=score,
-                success=parsed["success"],
-                tool_calls=parsed["tool_calls"],
-                response=parsed["response"],
-                rubric=parsed["rubric"],
-            ))
-
-        # Aggregate and score
-        agg = scorer.aggregate_scores(results)
-        final = scorer.compute_final_score(agg)
-
-        # Two miners compete (num_active_miners above threshold for WTA)
-        miner_scores = {0: final, 1: final * 0.8}
-        weights = scorer.select_winner(
-            miner_scores, first_mover_data={}, delta=0.05, num_active_miners=20
-        )
-
-        assert weights[0] == 1.0  # Higher score wins
-        assert weights[1] == 0.0
-        assert 0.0 < final <= 1.0
-
     def test_cost_based_winner_selection(self, scorer):
-        """Cost-based winner: lowest-cost qualified miner wins."""
+        """Lowest-cost qualified miner beats champion beyond delta threshold."""
         costs = {0: 0.050, 1: 0.030, 2: 0.045}
-        qualified = {0: True, 1: True, 2: False}  # miner 2 disqualified
-        first_mover = {
-            "hk_0": (0.050, 100.0),
-            "hk_1": (0.030, 200.0),
-        }
+        qualified = {0: True, 1: True, 2: False}
         uid_to_hotkey = {0: "hk_0", 1: "hk_1", 2: "hk_2"}
 
         weights = scorer.select_winner_by_cost(
             costs=costs,
             qualified=qualified,
-            first_mover_data=first_mover,
-            cost_delta=0.10,
-            num_active_miners=20,
-            uid_to_hotkey=uid_to_hotkey,
-            champion_hotkey="hk_0",  # miner 0 was previous champion
-        )
-
-        # Miner 1 has lowest cost and is qualified ($0.030 < $0.050 * 0.90 = $0.045)
-        assert weights[1] == 1.0
-        assert weights[0] == 0.0
-        assert weights[2] == 0.0  # disqualified
-
-    def test_cost_first_mover_protection(self, scorer):
-        """First-mover protection: challenger must be 10% cheaper than champion."""
-        costs = {0: 0.050, 1: 0.048}  # 1 is cheaper but not by 10%
-        qualified = {0: True, 1: True}
-        first_mover = {
-            "hk_0": (0.050, 100.0),  # champion (submitted first)
-            "hk_1": (0.048, 200.0),
-        }
-        uid_to_hotkey = {0: "hk_0", 1: "hk_1"}
-
-        weights = scorer.select_winner_by_cost(
-            costs=costs,
-            qualified=qualified,
-            first_mover_data=first_mover,
+            first_mover_data={},
             cost_delta=0.10,
             num_active_miners=20,
             uid_to_hotkey=uid_to_hotkey,
             champion_hotkey="hk_0",
         )
 
-        # Miner 0 wins: $0.048 is NOT < $0.050 * 0.90 = $0.045
+        # Miner 1 ($0.030) < $0.050 * 0.90 = $0.045 → beats champion
+        assert weights[1] == 1.0
+        assert weights[0] == 0.0
+        assert weights[2] == 0.0
+
+    def test_cost_winner_protection(self, scorer):
+        """Champion retains when challenger is cheaper but within delta."""
+        costs = {0: 0.050, 1: 0.048}
+        qualified = {0: True, 1: True}
+        uid_to_hotkey = {0: "hk_0", 1: "hk_1"}
+
+        weights = scorer.select_winner_by_cost(
+            costs=costs,
+            qualified=qualified,
+            first_mover_data={},
+            cost_delta=0.10,
+            num_active_miners=20,
+            uid_to_hotkey=uid_to_hotkey,
+            champion_hotkey="hk_0",
+        )
+
+        # $0.048 is NOT < $0.050 * 0.90 = $0.045 → champion retains
         assert weights[0] == 1.0
         assert weights[1] == 0.0
 
     def test_cost_delta_only_protects_champion(self, scorer):
-        """δ only protects the actual champion, not intermediate miners.
-
-        Reproduces the 91-vs-224 bug: champion is miner 233 ($0.0196).
-        Miner 91 ($0.0172) and miner 224 ($0.0156) are both new challengers.
-        Under the old iterative algorithm, 91 would overtake 233 and then
-        block 224 via transitive δ protection. Under the new algorithm,
-        224 should win because it beats the champion (233) by >10%.
-        """
+        """Delta only protects the actual champion, not intermediate miners."""
         costs = {233: 0.0196, 91: 0.0172, 224: 0.0156}
         qualified = {233: True, 91: True, 224: True}
-        first_mover = {
-            "hk_233": (0.0196, 100.0),  # earliest block
-            "hk_91": (0.0172, 200.0),
-            "hk_224": (0.0156, 300.0),  # latest block
-        }
         uid_to_hotkey = {233: "hk_233", 91: "hk_91", 224: "hk_224"}
 
         weights = scorer.select_winner_by_cost(
             costs=costs,
             qualified=qualified,
-            first_mover_data=first_mover,
+            first_mover_data={},
             cost_delta=0.10,
             num_active_miners=20,
             uid_to_hotkey=uid_to_hotkey,
-            champion_hotkey="hk_233",  # 233 was previous winner
+            champion_hotkey="hk_233",
         )
 
         # 224 ($0.0156) < $0.0196 * 0.90 = $0.01764 → beats champion
-        # 224 is cheaper than 91, so 224 should be the winner
         assert weights[224] == 1.0, "224 should win (cheapest, beats champion δ)"
         assert weights[91] == 0.0
         assert weights[233] == 0.0
 
     def test_cost_champion_retains_when_no_challenger_clears_delta(self, scorer):
-        """Champion retains when all challengers are cheaper but within δ."""
+        """Champion retains when all challengers are cheaper but within delta."""
         costs = {0: 0.050, 1: 0.046, 2: 0.047}
         qualified = {0: True, 1: True, 2: True}
-        first_mover = {
-            "hk_0": (0.050, 100.0),
-            "hk_1": (0.046, 200.0),
-            "hk_2": (0.047, 300.0),
-        }
         uid_to_hotkey = {0: "hk_0", 1: "hk_1", 2: "hk_2"}
 
         weights = scorer.select_winner_by_cost(
             costs=costs,
             qualified=qualified,
-            first_mover_data=first_mover,
+            first_mover_data={},
             cost_delta=0.10,
             num_active_miners=20,
             uid_to_hotkey=uid_to_hotkey,
@@ -2252,30 +1965,6 @@ class TestScoringIntegration:
         assert weights[0] == 1.0
         assert weights[1] == 0.0
         assert weights[2] == 0.0
-
-    def test_cost_no_champion_falls_back_to_earliest_block(self, scorer):
-        """Without champion_hotkey, earliest qualified miner by block is champion."""
-        costs = {0: 0.050, 1: 0.030}
-        qualified = {0: True, 1: True}
-        first_mover = {
-            "hk_0": (0.050, 100.0),  # earliest block → becomes champion
-            "hk_1": (0.030, 200.0),
-        }
-        uid_to_hotkey = {0: "hk_0", 1: "hk_1"}
-
-        weights = scorer.select_winner_by_cost(
-            costs=costs,
-            qualified=qualified,
-            first_mover_data=first_mover,
-            cost_delta=0.10,
-            num_active_miners=20,
-            uid_to_hotkey=uid_to_hotkey,
-            # No champion_hotkey — fallback to earliest block
-        )
-
-        # Miner 1 ($0.030) < $0.050 * 0.90 = $0.045 → beats earliest-block champion
-        assert weights[1] == 1.0
-        assert weights[0] == 0.0
 
     def test_cost_all_disqualified(self, scorer):
         """All miners disqualified → zero weights."""
@@ -2881,7 +2570,8 @@ class TestConsensusAggregation:
         assert costs["m1"] == pytest.approx(4.0)
         assert costs["m2"] == pytest.approx(4.0)
 
-    def test_qualification_consensus_and(self):
+    def test_qualification_equal_stake_split_fails(self):
+        """50/50 stake split: qualified_ratio = 0.5, NOT > 0.5, so disqualified."""
         subs = [
             self._make_validated("v1", 100.0, {"m1": 2.0}, {"m1": True}),
             self._make_validated("v2", 100.0, {"m1": 3.0}, {"m1": False}),
@@ -2896,6 +2586,48 @@ class TestConsensusAggregation:
         ]
         _, quals = compute_consensus_costs(subs)
         assert quals["m1"] is True
+
+    def test_qualification_stake_weighted_majority(self):
+        """High-stake validator says qualified, low-stake says not: miner survives."""
+        subs = [
+            self._make_validated("v1", 300.0, {"m1": 2.0}, {"m1": True}),
+            self._make_validated("v2", 100.0, {"m1": 3.0}, {"m1": False}),
+        ]
+        _, quals = compute_consensus_costs(subs)
+        assert quals["m1"] is True  # 300/(300+100) = 0.75 > 0.5
+
+    def test_qualification_minority_stake_cannot_disqualify(self):
+        """A low-stake malicious validator cannot disqualify a miner alone."""
+        subs = [
+            self._make_validated("v1", 500.0, {"m1": 2.0}, {"m1": True}),
+            self._make_validated("v2", 200.0, {"m1": 3.0}, {"m1": True}),
+            self._make_validated("v_malicious", 50.0, {"m1": 4.0}, {"m1": False}),
+        ]
+        _, quals = compute_consensus_costs(subs)
+        assert quals["m1"] is True  # 700/750 ≈ 0.93 > 0.5
+
+    def test_qualification_majority_stake_disqualifies(self):
+        """When >50% of stake says disqualified, miner is disqualified."""
+        subs = [
+            self._make_validated("v1", 100.0, {"m1": 2.0}, {"m1": True}),
+            self._make_validated("v2", 300.0, {"m1": 3.0}, {"m1": False}),
+            self._make_validated("v3", 200.0, {"m1": 4.0}, {"m1": False}),
+        ]
+        _, quals = compute_consensus_costs(subs)
+        assert quals["m1"] is False  # 100/600 ≈ 0.17 < 0.5
+
+    def test_qualification_custom_threshold(self):
+        """Custom threshold (e.g. 2/3 supermajority)."""
+        subs = [
+            self._make_validated("v1", 200.0, {"m1": 2.0}, {"m1": True}),
+            self._make_validated("v2", 100.0, {"m1": 3.0}, {"m1": False}),
+        ]
+        # 200/300 ≈ 0.667 > 0.5 → qualified with default threshold
+        _, quals_default = compute_consensus_costs(subs)
+        assert quals_default["m1"] is True
+        # 200/300 ≈ 0.667, NOT > 0.67 → disqualified with 2/3 threshold
+        _, quals_super = compute_consensus_costs(subs, qualification_stake_threshold=0.67)
+        assert quals_super["m1"] is False
 
     def test_empty_submissions(self):
         costs, quals = compute_consensus_costs([])
@@ -2912,168 +2644,151 @@ class TestConsensusAggregation:
 
 
 # ---------------------------------------------------------------------------
-# Incumbent advantage tests
+# Winner Protection tests
 # ---------------------------------------------------------------------------
 
-class TestIncumbentAdvantage:
-    """Tests for incumbent advantage and historical best tracking."""
+class TestWinnerProtection:
+    """Tests for Winner Protection mechanism."""
 
-    def test_no_incumbent_lowest_wins(self):
+    def test_no_winner_lowest_wins(self):
         costs = {"m1": 3.0, "m2": 5.0}
         quals = {"m1": True, "m2": True}
-        state = IncumbentState()
-        winner, new_state = select_winner_with_incumbent(
-            costs, quals, state, window_number=0,
-            season_length=30, cost_delta=0.10,
+        state = WinnerState()
+        winner, new_state = select_winner_with_protection(
+            costs, quals, state, cost_delta=0.10,
         )
         assert winner == "m1"
-        assert new_state.incumbent_hotkey == "m1"
+        assert new_state.winner_hotkey == "m1"
+        assert new_state.winner_cost == 3.0
 
-    def test_incumbent_retains_within_margin(self):
+    def test_winner_retains_within_margin(self):
         costs = {"m1": 3.0, "m2": 2.75}
         quals = {"m1": True, "m2": True}
-        state = IncumbentState(incumbent_hotkey="m1", historical_best={"m1": 3.0})
-        winner, new_state = select_winner_with_incumbent(
-            costs, quals, state, window_number=1,
-            season_length=30, cost_delta=0.10,
+        state = WinnerState(winner_hotkey="m1", winner_cost=3.0)
+        winner, new_state = select_winner_with_protection(
+            costs, quals, state, cost_delta=0.10,
         )
         # m2 (2.75) needs < 3.0 * 0.90 = 2.70 to dethrone
         assert winner == "m1"
-        assert new_state.incumbent_hotkey == "m1"
+        assert new_state.winner_cost == 3.0
 
     def test_challenger_overtakes_past_margin(self):
         costs = {"m1": 3.0, "m2": 2.60}
         quals = {"m1": True, "m2": True}
-        state = IncumbentState(incumbent_hotkey="m1", historical_best={"m1": 3.0})
-        winner, new_state = select_winner_with_incumbent(
-            costs, quals, state, window_number=1,
-            season_length=30, cost_delta=0.10,
+        state = WinnerState(winner_hotkey="m1", winner_cost=3.0)
+        winner, new_state = select_winner_with_protection(
+            costs, quals, state, cost_delta=0.10,
         )
         # m2 (2.60) < 3.0 * 0.90 = 2.70 → overtake
         assert winner == "m2"
-        assert new_state.incumbent_hotkey == "m2"
+        assert new_state.winner_hotkey == "m2"
+        assert new_state.winner_cost == 2.60
 
-    def test_incumbent_disqualified(self):
+    def test_winner_disqualified(self):
         costs = {"m1": 3.0, "m2": 5.0}
         quals = {"m1": False, "m2": True}
-        state = IncumbentState(incumbent_hotkey="m1", historical_best={"m1": 3.0})
-        winner, new_state = select_winner_with_incumbent(
-            costs, quals, state, window_number=1,
-            season_length=30, cost_delta=0.10,
+        state = WinnerState(winner_hotkey="m1", winner_cost=3.0)
+        winner, new_state = select_winner_with_protection(
+            costs, quals, state, cost_delta=0.10,
         )
         assert winner == "m2"
-        assert new_state.incumbent_hotkey == "m2"
+        assert new_state.winner_hotkey == "m2"
+        assert new_state.winner_cost == 5.0
 
-    def test_historical_best_updates(self):
-        costs = {"m1": 3.0}
-        quals = {"m1": True}
-        state = IncumbentState(historical_best={"m1": 4.0})
-        _, new_state = select_winner_with_incumbent(
-            costs, quals, state, window_number=0,
-            season_length=30, cost_delta=0.10,
-        )
-        assert new_state.historical_best["m1"] == 3.0
-
-    def test_historical_best_does_not_increase(self):
-        costs = {"m1": 5.0}
-        quals = {"m1": True}
-        state = IncumbentState(historical_best={"m1": 3.0})
-        _, new_state = select_winner_with_incumbent(
-            costs, quals, state, window_number=0,
-            season_length=30, cost_delta=0.10,
-        )
-        assert new_state.historical_best["m1"] == 3.0
-
-    def test_season_reset(self):
-        state = IncumbentState(
-            historical_best={"m1": 2.0, "m2": 3.0},
-            incumbent_hotkey="m1",
-            current_season=0,
-        )
-        costs = {"m1": 5.0, "m2": 4.0}
+    def test_winner_defends_with_winning_cost_not_current(self):
+        """Winner defends with frozen winner_cost, not their latest consensus cost."""
+        state = WinnerState(winner_hotkey="m1", winner_cost=2.0)
+        # m1's current cost is 4.0 (worse), but defense uses winner_cost=2.0
+        costs = {"m1": 4.0, "m2": 2.5}
         quals = {"m1": True, "m2": True}
-        # window 30 → season 1 (season_length=30)
-        winner, new_state = select_winner_with_incumbent(
-            costs, quals, state, window_number=30,
-            season_length=30, cost_delta=0.10,
+        winner, _ = select_winner_with_protection(
+            costs, quals, state, cost_delta=0.10,
         )
-        assert new_state.current_season == 1
-        # Historical bests were reset, so m2 wins (lowest cost, no incumbent)
-        assert winner == "m2"
-        assert new_state.historical_best == {"m1": 5.0, "m2": 4.0}
+        # threshold = 2.0 * 0.90 = 1.80; m2 (2.5) > 1.80 → winner retains
+        assert winner == "m1"
+
+    def test_winner_self_update(self):
+        """Winner can update their own record if they beat the margin."""
+        state = WinnerState(
+            winner_hotkey="m1", winner_cost=3.0, winner_pack_hash="old_hash",
+        )
+        costs = {"m1": 2.60, "m2": 5.0}
+        quals = {"m1": True, "m2": True}
+        winner, new_state = select_winner_with_protection(
+            costs, quals, state, cost_delta=0.10,
+            pack_hashes={"m1": "new_hash", "m2": "m2_hash"},
+        )
+        # m1 (2.60) < 3.0 * 0.90 = 2.70 → self-update
+        assert winner == "m1"
+        assert new_state.winner_cost == 2.60
+        assert new_state.winner_pack_hash == "new_hash"
+
+    def test_winner_no_self_update_within_margin(self):
+        """Winner does NOT update if their new cost doesn't clear margin."""
+        state = WinnerState(
+            winner_hotkey="m1", winner_cost=3.0, winner_pack_hash="old_hash",
+        )
+        costs = {"m1": 2.80, "m2": 5.0}
+        quals = {"m1": True, "m2": True}
+        winner, new_state = select_winner_with_protection(
+            costs, quals, state, cost_delta=0.10,
+        )
+        # m1 (2.80) >= 3.0 * 0.90 = 2.70 → no update
+        assert winner == "m1"
+        assert new_state.winner_cost == 3.0
+        assert new_state.winner_pack_hash == "old_hash"
 
     def test_no_qualified_miners(self):
         costs = {"m1": 3.0}
         quals = {"m1": False}
-        state = IncumbentState()
-        winner, _ = select_winner_with_incumbent(
-            costs, quals, state, window_number=0,
-            season_length=30, cost_delta=0.10,
+        state = WinnerState()
+        winner, _ = select_winner_with_protection(
+            costs, quals, state, cost_delta=0.10,
         )
         assert winner is None
 
     def test_save_load_roundtrip(self, tmp_path):
-        state = IncumbentState(
-            historical_best={"m1": 3.0, "m2": 5.0},
-            incumbent_hotkey="m1",
-            current_season=2,
-            last_window=42,
+        state = WinnerState(
+            winner_hotkey="m1",
+            winner_pack_hash="abc123",
+            winner_cost=3.5,
         )
-        path = str(tmp_path / "incumbent.json")
-        save_incumbent_state(state, path)
-        loaded = load_incumbent_state(path)
-        assert loaded.historical_best == state.historical_best
-        assert loaded.incumbent_hotkey == state.incumbent_hotkey
-        assert loaded.current_season == state.current_season
-        assert loaded.last_window == state.last_window
+        path = str(tmp_path / "winner.json")
+        save_winner_state(state, path)
+        loaded = load_winner_state(path)
+        assert loaded.winner_hotkey == state.winner_hotkey
+        assert loaded.winner_pack_hash == state.winner_pack_hash
+        assert loaded.winner_cost == state.winner_cost
 
     def test_load_missing_file(self, tmp_path):
-        loaded = load_incumbent_state(str(tmp_path / "nonexistent.json"))
-        assert loaded.incumbent_hotkey is None
-        assert loaded.historical_best == {}
+        loaded = load_winner_state(str(tmp_path / "nonexistent.json"))
+        assert loaded.winner_hotkey is None
+        assert loaded.winner_cost is None
 
-    def test_incumbent_uses_historical_best_not_current(self):
-        """Challenger threshold is against historical best, not current cost."""
-        state = IncumbentState(
-            incumbent_hotkey="m1",
-            historical_best={"m1": 2.0},
-        )
-        costs = {"m1": 4.0, "m2": 2.5}
+    def test_challenger_beats_winner_self_update(self):
+        """When both challenger and winner beat margin, lowest cost wins."""
+        state = WinnerState(winner_hotkey="m1", winner_cost=3.0)
+        costs = {"m1": 2.60, "m2": 2.50}
         quals = {"m1": True, "m2": True}
-        winner, _ = select_winner_with_incumbent(
-            costs, quals, state, window_number=1,
-            season_length=30, cost_delta=0.10,
+        winner, new_state = select_winner_with_protection(
+            costs, quals, state, cost_delta=0.10,
         )
-        # threshold = 2.0 * 0.90 = 1.80; m2 (2.5) > 1.80 → incumbent retains
-        assert winner == "m1"
+        # Both < 3.0 * 0.90 = 2.70, but m2 (2.50) is lowest → m2 wins
+        assert winner == "m2"
+        assert new_state.winner_hotkey == "m2"
+        assert new_state.winner_cost == 2.50
 
-    def test_incumbent_is_cheapest(self):
-        """When incumbent is already cheapest, they retain without margin check."""
-        state = IncumbentState(
-            incumbent_hotkey="m1",
-            historical_best={"m1": 3.0},
-        )
-        costs = {"m1": 2.0, "m2": 5.0}
+    def test_winner_degraded_pack_retains(self):
+        """Winner with worse pack still defends with winning cost."""
+        state = WinnerState(winner_hotkey="m1", winner_cost=2.0)
+        costs = {"m1": 5.0, "m2": 3.0}
         quals = {"m1": True, "m2": True}
-        winner, _ = select_winner_with_incumbent(
-            costs, quals, state, window_number=1,
-            season_length=30, cost_delta=0.10,
+        winner, new_state = select_winner_with_protection(
+            costs, quals, state, cost_delta=0.10,
         )
+        # threshold = 2.0 * 0.90 = 1.80; m2 (3.0) > 1.80 → winner retains
         assert winner == "m1"
-
-    def test_disqualified_miner_historical_best_not_updated(self):
-        """Disqualified miners should not get their historical best updated."""
-        state = IncumbentState(historical_best={})
-        costs = {"m1": 1.0, "m2": 2.0}
-        quals = {"m1": False, "m2": True}
-        _, new_state = select_winner_with_incumbent(
-            costs, quals, state, window_number=0,
-            season_length=30, cost_delta=0.10,
-        )
-        # m1 is disqualified — its cost should NOT appear in historical_best
-        assert "m1" not in new_state.historical_best
-        # m2 is qualified — its cost should appear
-        assert new_state.historical_best["m2"] == 2.0
+        assert new_state.winner_cost == 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -3165,15 +2880,145 @@ class TestConsensusCommitments:
 
 
 # ---------------------------------------------------------------------------
+# Validator identity filtering tests
+# ---------------------------------------------------------------------------
+
+class TestValidatorIdentityFiltering:
+    """Tests for validator_permit-based filtering in fetch_validator_consensus_commitments."""
+
+    def _make_metagraph(self, hotkeys, validator_permits):
+        mg = MagicMock()
+        mg.hotkeys = hotkeys
+        mg.validator_permit = validator_permits
+        return mg
+
+    def test_only_permitted_validators_returned(self):
+        """Consensus commitments from non-validator hotkeys should be filtered out."""
+        validator_hk = "5Fval_aaaa"
+        miner_hk = "5Fminer_bb"
+        raw_commitments = {
+            validator_hk: "consensus:1|42|QmTestCID_val",
+            miner_hk: "consensus:1|42|QmTestCID_miner",
+        }
+
+        mock_sub = MagicMock()
+        mock_sub.get_all_commitments.return_value = raw_commitments
+        mock_sub.get_commitment_metadata.return_value = {"block": 50000}
+
+        mg = self._make_metagraph(
+            hotkeys=[validator_hk, miner_hk],
+            validator_permits=[True, False],
+        )
+
+        results = fetch_validator_consensus_commitments(mock_sub, netuid=11, metagraph=mg)
+        assert len(results) == 1
+        assert results[0].validator_hotkey == validator_hk
+
+    def test_miner_fake_consensus_commitment_rejected(self):
+        """A miner submitting a consensus:-prefixed commitment must be rejected."""
+        miner_hk = "5Fminer_aa"
+        raw_commitments = {miner_hk: "consensus:1|42|QmFakeCID"}
+
+        mock_sub = MagicMock()
+        mock_sub.get_all_commitments.return_value = raw_commitments
+        mock_sub.get_commitment_metadata.return_value = {"block": 50000}
+
+        mg = self._make_metagraph(
+            hotkeys=[miner_hk],
+            validator_permits=[False],
+        )
+
+        results = fetch_validator_consensus_commitments(mock_sub, netuid=11, metagraph=mg)
+        assert len(results) == 0
+
+    def test_all_validators_pass(self):
+        """All hotkeys with validator_permit=True should be included."""
+        hk_a = "5Fval_a"
+        hk_b = "5Fval_b"
+        raw_commitments = {
+            hk_a: "consensus:1|42|QmCID_A",
+            hk_b: "consensus:1|42|QmCID_B",
+        }
+
+        mock_sub = MagicMock()
+        mock_sub.get_all_commitments.return_value = raw_commitments
+        mock_sub.get_commitment_metadata.return_value = {"block": 50000}
+
+        mg = self._make_metagraph(
+            hotkeys=[hk_a, hk_b],
+            validator_permits=[True, True],
+        )
+
+        results = fetch_validator_consensus_commitments(mock_sub, netuid=11, metagraph=mg)
+        assert len(results) == 2
+
+    def test_miner_commitment_format_not_affected(self):
+        """Normal miner commitments (non-consensus prefix) are ignored regardless."""
+        miner_hk = "5Fminer_aa"
+        raw_commitments = {
+            miner_hk: "a" * 64 + "|https://example.com/pack.json",
+        }
+
+        mock_sub = MagicMock()
+        mock_sub.get_all_commitments.return_value = raw_commitments
+
+        mg = self._make_metagraph(
+            hotkeys=[miner_hk],
+            validator_permits=[False],
+        )
+
+        results = fetch_validator_consensus_commitments(mock_sub, netuid=11, metagraph=mg)
+        assert len(results) == 0
+
+    def test_metagraph_fallback_on_error(self):
+        """If metagraph.validator_permit fails, fall back to prefix-only filtering."""
+        hk = "5Fval_aa"
+        raw_commitments = {hk: "consensus:1|42|QmCID_X"}
+
+        mock_sub = MagicMock()
+        mock_sub.get_all_commitments.return_value = raw_commitments
+        mock_sub.get_commitment_metadata.return_value = {"block": 50000}
+
+        mg = MagicMock()
+        mg.hotkeys = property(lambda self: (_ for _ in ()).throw(RuntimeError("broken")))
+        type(mg).hotkeys = property(lambda self: (_ for _ in ()).throw(RuntimeError("broken")))
+
+        results = fetch_validator_consensus_commitments(mock_sub, netuid=11, metagraph=mg)
+        assert len(results) == 1
+
+    def test_unknown_hotkey_not_in_metagraph(self):
+        """Hotkey not in metagraph.hotkeys should be filtered out."""
+        known_hk = "5Fval_known"
+        unknown_hk = "5Funknown"
+        raw_commitments = {
+            known_hk: "consensus:1|42|QmCID_known",
+            unknown_hk: "consensus:1|42|QmCID_unknown",
+        }
+
+        mock_sub = MagicMock()
+        mock_sub.get_all_commitments.return_value = raw_commitments
+        mock_sub.get_commitment_metadata.return_value = {"block": 50000}
+
+        mg = self._make_metagraph(
+            hotkeys=[known_hk],
+            validator_permits=[True],
+        )
+
+        results = fetch_validator_consensus_commitments(mock_sub, netuid=11, metagraph=mg)
+        assert len(results) == 1
+        assert results[0].validator_hotkey == known_hk
+
+
+# ---------------------------------------------------------------------------
 # Consensus-based weight setting tests
 # ---------------------------------------------------------------------------
 
 class TestConsensusWeightSetting:
-    """Tests for weight setting data source selection (consensus vs local EMA).
+    """Tests for weight setting data source selection (consensus vs fallback).
 
     Rule: once consensus costs exist, they are ALWAYS used for weight setting.
-    Local EMA is only used as a bootstrap fallback when no consensus has ever
-    been computed.  Consensus costs persist across windows and restarts.
+    Fallback weights are only used when no consensus has ever been computed.
+    Consensus costs persist across windows and restarts.
     """
 
     def test_use_consensus_when_costs_present(self):

@@ -232,11 +232,13 @@ def fetch_validator_consensus_commitments(
     """Read all validator consensus commitments from the chain.
 
     Calls ``get_all_commitments`` and filters for entries with the
-    ``consensus:`` prefix.  Only entries from registered validators
-    (not miners) are returned.
+    ``consensus:`` prefix.  Only entries from hotkeys that hold a
+    ``validator_permit`` in the metagraph are returned; this prevents
+    miners from injecting fake consensus data by submitting a
+    ``consensus:``-prefixed commitment.
 
     Returns:
-        List of ValidatorConsensusCommitment from all validators.
+        List of ValidatorConsensusCommitment from permitted validators.
     """
     results: List[ValidatorConsensusCommitment] = []
 
@@ -249,8 +251,33 @@ def fetch_validator_consensus_commitments(
     if not raw_commitments:
         return results
 
+    permitted_validators: set = set()
+    permit_check_available = False
+    try:
+        hotkeys = metagraph.hotkeys
+        permits = metagraph.validator_permit
+        for uid in range(len(hotkeys)):
+            if uid < len(permits) and permits[uid]:
+                permitted_validators.add(hotkeys[uid])
+        permit_check_available = True
+    except Exception as e:
+        logger.warning(
+            "Failed to read validator_permit from metagraph: %s. "
+            "Falling back to prefix-only filtering.", e,
+        )
+
+    skipped_non_validator = 0
     for hotkey, raw in raw_commitments.items():
         if not is_consensus_commitment(raw):
+            continue
+
+        if permit_check_available and hotkey not in permitted_validators:
+            skipped_non_validator += 1
+            logger.debug(
+                "Hotkey %s: consensus commitment ignored — "
+                "no validator_permit in metagraph",
+                hotkey[:8],
+            )
             continue
 
         parsed = parse_consensus_commitment(raw)
@@ -277,6 +304,11 @@ def fetch_validator_consensus_commitments(
             hotkey[:8], protocol_version, window_number, content_address[:24],
         )
 
+    if skipped_non_validator:
+        logger.info(
+            "Skipped %d consensus commitments from non-validator hotkeys",
+            skipped_non_validator,
+        )
     logger.info(
         "Fetched %d validator consensus commitments", len(results),
     )
