@@ -2642,6 +2642,43 @@ class TestConsensusAggregation:
         costs, _ = compute_consensus_costs(subs)
         assert costs["m1"] == pytest.approx(3.0)
 
+    def test_cost_excludes_not_qualified_votes(self):
+        """Costs from validators that voted not-qualified are excluded.
+
+        Prevents fail-fast partial evaluations (low cost from incomplete
+        scenario runs) from pulling down the consensus cost.
+        """
+        subs = [
+            self._make_validated("v1", 200.0, {"m1": 0.02}, {"m1": False}),
+            self._make_validated("v2", 300.0, {"m1": 0.05}, {"m1": True}),
+        ]
+        costs, quals = compute_consensus_costs(subs)
+        assert quals["m1"] is True  # 300/500 = 0.6 > 0.5
+        assert costs["m1"] == pytest.approx(0.05)  # only v2's cost
+
+    def test_cost_uses_only_qualified_stake_weighted(self):
+        """When multiple validators vote qualified, cost is stake-weighted
+        among qualified votes only."""
+        subs = [
+            self._make_validated("v1", 300.0, {"m1": 0.04}, {"m1": True}),
+            self._make_validated("v2", 100.0, {"m1": 0.08}, {"m1": True}),
+            self._make_validated("v3", 50.0,  {"m1": 0.01}, {"m1": False}),
+        ]
+        costs, quals = compute_consensus_costs(subs)
+        assert quals["m1"] is True  # 400/450 > 0.5
+        # cost = (300*0.04 + 100*0.08) / (300+100) = (12+8)/400 = 0.05
+        assert costs["m1"] == pytest.approx(0.05)
+
+    def test_cost_zero_when_no_qualified_votes(self):
+        """If no validator voted qualified, cost defaults to 0."""
+        subs = [
+            self._make_validated("v1", 100.0, {"m1": 5.0}, {"m1": False}),
+            self._make_validated("v2", 100.0, {"m1": 3.0}, {"m1": False}),
+        ]
+        costs, quals = compute_consensus_costs(subs)
+        assert quals["m1"] is False
+        assert costs["m1"] == pytest.approx(0.0)
+
 
 # ---------------------------------------------------------------------------
 # Winner Protection tests

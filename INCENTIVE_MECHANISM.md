@@ -860,17 +860,18 @@ The threshold is tunable via `similarity_threshold` in validator config.
 
 ### 10. Cross-Validator Consensus (Stake-Weighted Aggregation)
 
-**Enforcement**: Each miner's cost is computed as a stake-weighted average across all validators. Qualification requires >50% of reporting stake to agree (stake-weighted majority, not AND).
+**Enforcement**: Each miner's cost is computed as a stake-weighted average across validators that voted qualified=True. Qualification requires >50% of reporting stake to agree (stake-weighted majority, not AND).
 
 **Prevents**:
 - Gaming via LLM variance luck (consensus across many validators suppresses noise)
 - Single-validator manipulation (one validator cannot unilaterally disqualify a miner)
 - Transient low costs from non-deterministic agent behavior (aggregation over multiple validators provides natural smoothing)
+- Artificially low costs from incomplete evaluations (fail-fast partial costs excluded from consensus)
 
 **How it works**:
 - Each validator independently evaluates and reports raw costs + qualified status
-- Consensus cost = stake-weighted average across all validators reporting on that miner
 - Consensus qualification = stake-weighted majority (>50% of reporting stake must report qualified=True)
+- Consensus cost = stake-weighted average across only validators that voted qualified=True (costs from not-qualified votes are excluded to prevent fail-fast partial evaluations from skewing the cost down)
 - A low-stake malicious validator's influence is bounded by their stake proportion
 - Controlling >50% of stake to manipulate results is equivalent to controlling the network (consistent with Bittensor security assumptions)
 
@@ -901,7 +902,7 @@ Layer 2 (on-chain):           YC3 with Liquid Alpha
 
 **Qualification** uses stake-weighted majority: a miner is qualified only if >50% of reporting stake reports qualified=True. This prevents any single validator from unilaterally disqualifying a miner (requires majority stake to agree on disqualification).
 
-**Cost** benefits from cross-validator consensus: each validator's raw cost measurement is one noisy estimate of a pack's true cost. Aggregating estimates from multiple validators using stake-weighted averaging produces a more accurate consensus cost.
+**Cost** benefits from cross-validator consensus: each validator's raw cost measurement is one noisy estimate of a pack's true cost. Aggregating estimates from multiple validators using stake-weighted averaging produces a more accurate consensus cost. Only costs from validators that voted qualified=True are included — this prevents artificially low costs from fail-fast partial evaluations from skewing the consensus.
 
 ### Evaluation Windows
 
@@ -942,8 +943,8 @@ Window N (7200 blocks, ~20 tempos)
 │   1. Read all commitments from chain (filter for "consensus:" prefix)
 │   2. Run filter pipeline (protocol → window → stake → integrity → version → zero-signal)
 │   3. Download valid payloads from CAS
-│   4. Compute stake-weighted consensus cost per miner
-│   5. Compute stake-weighted majority qualification per miner
+│   4. Compute stake-weighted majority qualification per miner
+│   5. Compute stake-weighted consensus cost (qualified votes only)
 │   6. Apply Winner Protection → select winner
 │   7. Store Window N consensus as latest_consensus
 │
@@ -1026,18 +1027,7 @@ Each filter layer logs skip counts and reasons for diagnosing low consensus part
 
 ### Stake-Weighted Aggregation
 
-For each miner, the consensus cost is a stake-weighted average across all validators whose submissions passed the filter pipeline:
-
-```
-consensus_cost[miner] = Σ(validator_stake_i × raw_cost_i) / Σ(validator_stake_i)
-```
-
-Where:
-- `validator_stake_i` = validator's TAO stake (from metagraph)
-- `raw_cost_i` = validator i's raw measured cost for this miner (no EMA smoothing)
-- Sum is over all validators whose submissions passed the filter pipeline
-
-**Consensus qualification** uses stake-weighted majority (not AND):
+**Consensus qualification** uses stake-weighted majority across ALL reporting validators (not AND):
 
 ```
 qualified_stake[miner] = Σ(stake_i for validators reporting qualified=True)
@@ -1046,6 +1036,15 @@ consensus_qualified[miner] = qualified_stake / total_stake > 0.50
 ```
 
 This prevents any single validator from unilaterally disqualifying a miner. A malicious validator with 5% stake can only shift the qualification ratio by 5% — controlling >50% of stake is required to disqualify a miner, consistent with Bittensor's security assumptions.
+
+**Consensus cost** uses stake-weighted average across ONLY validators that voted qualified=True:
+
+```
+consensus_cost[miner] = Σ(stake_i × cost_i) / Σ(stake_i)
+                         where i ∈ {validators reporting qualified=True}
+```
+
+Costs from not-qualified votes are excluded because fail-fast evaluation may produce artificially low costs from incomplete scenario runs. If a validator marked a miner as not-qualified (e.g., failed on the first scenario), the partial cost from that incomplete evaluation is not trustworthy and must not influence the consensus cost.
 
 **Fallback**: When all submissions are filtered out (e.g., storage outage across all validators), the consensus costs from the previous window are retained. If no consensus has ever been computed, fallback weights are set (owner UID burn).
 
@@ -1219,8 +1218,8 @@ subtensor.set_commitment("consensus:{version}|{window}|{content_address}")
 
 submissions = subtensor.get_all_commitments()  # filter for "consensus:" prefix
 valid = filter_pipeline(submissions)        # protocol → window → stake → integrity → version → zero-signal
-consensus_cost[hotkey] = Σ(stake_i × cost_i) / Σ(stake_i)   # stake-weighted average
-consensus_qualified[hotkey] = qualified_stake / total_stake > 0.50  # stake-weighted majority
+consensus_qualified[hotkey] = qualified_stake / total_stake > 0.50  # stake-weighted majority (all reporters)
+consensus_cost[hotkey] = Σ(stake_i × cost_i) / Σ(stake_i)         # qualified votes only
 
 # ── Winner Protection ──
 
