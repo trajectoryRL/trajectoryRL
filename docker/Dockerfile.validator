@@ -81,7 +81,7 @@ RUN chmod +x /entrypoint.sh
 
 # ── Environment defaults ────────────────────────────────────────
 ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONPATH="/app/clawbench"
+ENV PYTHONPATH="/app/clawbench:/app/clawbench/clawbench"
 ENV WALLET_NAME=validator
 ENV WALLET_HOTKEY=default
 ENV NETUID=11
