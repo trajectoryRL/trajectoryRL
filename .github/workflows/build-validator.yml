@@ -21,7 +21,9 @@ on:
     paths:
       - "neurons/**"
       - "trajectoryrl/**"
+      - "clawbench"
       - "clawbench/**"
+      - "openclaw"
       - "openclaw/**"
       - "docker/**"
       - "pyproject.toml"
