@@ -137,6 +137,14 @@ class TrajectoryValidator:
                 config.network,
             )
 
+        # Log ClawBench version and submodule status for operational visibility
+        clawbench_sha = self._get_clawbench_sha(config.clawbench_path)
+        if clawbench_sha:
+            logger.info(f"ClawBench SHA: {clawbench_sha[:12]}")
+        else:
+            logger.warning("ClawBench SHA: unknown (not a git repo or git unavailable)")
+        self._check_submodule_status()
+
         logger.debug("Initializing ClawBench harness...")
         self.harness = ClawBenchHarness(
             clawbench_path=config.clawbench_path,
@@ -1072,6 +1080,62 @@ class TrajectoryValidator:
                 await asyncio.sleep(60)
 
     # ------------------------------------------------------------------
+    # ClawBench version check
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _get_clawbench_sha(clawbench_path: Path) -> Optional[str]:
+        """Return the git HEAD SHA of the clawbench directory, or None."""
+        import subprocess
+        try:
+            return subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(clawbench_path),
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        except Exception:
+            return None
+
+    def _check_submodule_status(self) -> None:
+        """Warn if any git submodules are out of sync with the parent repo.
+
+        A '+' prefix in ``git submodule status`` means the checked-out commit
+        differs from what the parent repo recorded — usually a sign that
+        submodules need updating after a pull.
+        """
+        import subprocess
+        try:
+            output = subprocess.check_output(
+                ["git", "submodule", "status"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        except Exception:
+            return
+
+        for line in output.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("+"):
+                parts = line[1:].split()
+                path = parts[1] if len(parts) >= 2 else "?"
+                logger.warning(
+                    "Submodule '%s' is out of sync with the parent repo. "
+                    "Run: git submodule update --init --recursive",
+                    path,
+                )
+            elif line.startswith("-"):
+                parts = line[1:].split()
+                path = parts[1] if len(parts) >= 2 else "?"
+                logger.warning(
+                    "Submodule '%s' is not initialized. "
+                    "Run: git submodule update --init --recursive",
+                    path,
+                )
+
+    # ------------------------------------------------------------------
     # ClawBench auto-sync
     # ------------------------------------------------------------------
 
@@ -1115,6 +1179,7 @@ class TrajectoryValidator:
             logger.warning("ClawBench sync timed out (30s) — using current version")
         except Exception as e:
             logger.warning("ClawBench sync error: %s", e)
+
 
     # ------------------------------------------------------------------
     # LLM key check
