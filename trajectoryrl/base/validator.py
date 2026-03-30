@@ -1052,6 +1052,16 @@ class TrajectoryValidator:
                     e, exc_info=True,
                 )
 
+        # --- One-time replay for specific windows, then pending uploads ---
+        try:
+            await self._onetime_replay_logs()
+        except Exception as e:
+            logger.warning("One-time log replay failed: %s", e, exc_info=True)
+        try:
+            await self._replay_pending_uploads()
+        except Exception as e:
+            logger.warning("Startup pending upload replay failed: %s", e, exc_info=True)
+
         while True:
             try:
                 current_block = self.subtensor.get_current_block()
@@ -2357,7 +2367,24 @@ class TrajectoryValidator:
             validator_log_offset, miner_log_offset, session_keys,
         )
         if log_archive:
-            await upload_eval_logs(
+            meta = {
+                "eval_id": eval_id,
+                "window_number": int(eval_id.rsplit("_w", 1)[-1]) if "_w" in eval_id else None,
+                "miner_hotkey": commitment.hotkey,
+                "miner_uid": uid,
+                "block_height": block_height,
+                "pack_hash": commitment.pack_hash,
+                "type": "eval",
+            }
+            try:
+                (eval_dir / "upload_meta.json").write_text(
+                    json.dumps(meta), encoding="utf-8",
+                )
+                (eval_dir / "logs.tar.gz").write_bytes(log_archive)
+            except OSError as e:
+                logger.warning("Failed to persist eval upload metadata: %s", e)
+
+            ok = await upload_eval_logs(
                 self.wallet,
                 eval_id=eval_id,
                 miner_hotkey=commitment.hotkey,
@@ -2366,6 +2393,11 @@ class TrajectoryValidator:
                 pack_hash=commitment.pack_hash,
                 log_archive=log_archive,
             )
+            if ok:
+                try:
+                    (eval_dir / ".uploaded").touch()
+                except OSError:
+                    pass
 
     async def _fire_upload_cycle_logs(
         self,
@@ -2404,14 +2436,299 @@ class TrajectoryValidator:
                 )
                 return
 
-            await upload_cycle_logs(
+            meta = {
+                "eval_id": eval_id,
+                "window_number": int(eval_id.rsplit("_w", 1)[-1]) if "_w" in eval_id else None,
+                "block_height": block_height,
+                "type": "cycle",
+            }
+            try:
+                (cycle_dir / "cycle_upload_meta.json").write_text(
+                    json.dumps(meta), encoding="utf-8",
+                )
+                (cycle_dir / "cycle.tar.gz").write_bytes(archive)
+            except OSError as e:
+                logger.warning("Failed to persist cycle upload metadata: %s", e)
+
+            ok = await upload_cycle_logs(
                 self.wallet,
                 eval_id=eval_id,
                 block_height=block_height,
                 log_archive=archive,
             )
+            if ok:
+                try:
+                    (cycle_dir / ".cycle_uploaded").touch()
+                except OSError:
+                    pass
         except Exception as e:
             logger.warning("Cycle log upload error: %s", e)
+
+    # ------------------------------------------------------------------
+    # Log replay (one-time + startup)
+    # ------------------------------------------------------------------
+
+    _ONETIME_REPLAY_WINDOWS = [1090, 1091]
+
+    def _resolve_hotkey_prefix(self, prefix: str) -> Optional[Tuple[str, int]]:
+        """Resolve a hotkey[:16] prefix to (full_hotkey, uid) via metagraph."""
+        try:
+            hotkeys = self.metagraph.hotkeys
+            for uid in range(len(hotkeys)):
+                if hotkeys[uid][:16] == prefix:
+                    return hotkeys[uid], uid
+        except Exception:
+            pass
+        return None
+
+    async def _onetime_replay_logs(self):
+        """One-time replay of eval/cycle logs for specific windows.
+
+        Scans local eval directories for the target windows, rebuilds
+        upload metadata from metagraph, and re-uploads any logs that
+        lack an .uploaded marker.  Writes a done-marker so this only
+        runs once per validator instance.
+        """
+        target_windows = self._ONETIME_REPLAY_WINDOWS
+        if not target_windows:
+            return
+
+        tag = "_".join(f"w{w}" for w in target_windows)
+        done_marker = self.config.log_dir / f".replay_{tag}_done"
+        if done_marker.exists():
+            return
+
+        evals_root = self.config.log_dir / "evals"
+        if not evals_root.exists():
+            done_marker.touch()
+            return
+
+        self._sync_metagraph(caller="onetime_replay_logs")
+
+        logger.info(
+            "One-time log replay: scanning for windows %s", target_windows,
+        )
+        eval_uploaded = 0
+        cycle_uploaded = 0
+
+        for window_num in target_windows:
+            suffix = f"_w{window_num}"
+            for eval_id_dir in sorted(evals_root.iterdir()):
+                if not eval_id_dir.is_dir():
+                    continue
+                if not eval_id_dir.name.endswith(suffix):
+                    continue
+
+                eval_id = eval_id_dir.name
+
+                # --- Per-miner eval logs ---
+                for miner_dir in sorted(eval_id_dir.iterdir()):
+                    if not miner_dir.is_dir():
+                        continue
+                    if (miner_dir / ".uploaded").exists():
+                        continue
+
+                    prefix = miner_dir.name
+                    resolved = self._resolve_hotkey_prefix(prefix)
+                    if resolved is None:
+                        logger.debug(
+                            "Replay: cannot resolve hotkey prefix %s, skipping",
+                            prefix,
+                        )
+                        continue
+                    full_hotkey, uid = resolved
+
+                    archive = self._repack_directory(miner_dir)
+                    if archive is None:
+                        continue
+
+                    ok = await upload_eval_logs(
+                        self.wallet,
+                        eval_id=eval_id,
+                        miner_hotkey=full_hotkey,
+                        miner_uid=uid,
+                        block_height=0,
+                        pack_hash="unknown",
+                        log_archive=archive,
+                    )
+                    if ok:
+                        eval_uploaded += 1
+                        try:
+                            (miner_dir / ".uploaded").touch()
+                        except OSError:
+                            pass
+                    logger.info(
+                        "Replay eval log: %s/%s -> %s",
+                        eval_id, prefix, "OK" if ok else "FAILED",
+                    )
+
+                # --- Cycle logs ---
+                if (eval_id_dir / ".cycle_uploaded").exists():
+                    continue
+                cycle_log = eval_id_dir / "validator.log"
+                if not cycle_log.exists():
+                    continue
+
+                cycle_archive = self._repack_directory(
+                    eval_id_dir, filenames=["validator.log"],
+                )
+                if cycle_archive is None:
+                    continue
+
+                ok = await upload_cycle_logs(
+                    self.wallet,
+                    eval_id=eval_id,
+                    block_height=0,
+                    log_archive=cycle_archive,
+                )
+                if ok:
+                    cycle_uploaded += 1
+                    try:
+                        (eval_id_dir / ".cycle_uploaded").touch()
+                    except OSError:
+                        pass
+                logger.info(
+                    "Replay cycle log: %s -> %s",
+                    eval_id, "OK" if ok else "FAILED",
+                )
+
+        logger.info(
+            "One-time log replay complete: %d eval + %d cycle logs uploaded",
+            eval_uploaded, cycle_uploaded,
+        )
+        try:
+            done_marker.touch()
+        except OSError:
+            pass
+
+    async def _replay_pending_uploads(self):
+        """Re-upload logs from recent windows that have metadata but no .uploaded marker."""
+        evals_root = self.config.log_dir / "evals"
+        if not evals_root.exists():
+            return
+
+        current_block = self.subtensor.get_current_block()
+        window = compute_window(current_block, self._window_config)
+        recent_windows = {window.window_number, window.window_number - 1}
+        recent_suffixes = {f"_w{w}" for w in recent_windows}
+
+        eval_uploaded = 0
+        cycle_uploaded = 0
+
+        for eval_id_dir in sorted(evals_root.iterdir()):
+            if not eval_id_dir.is_dir():
+                continue
+            if not any(eval_id_dir.name.endswith(s) for s in recent_suffixes):
+                continue
+
+            eval_id = eval_id_dir.name
+
+            # --- Per-miner eval logs with persisted metadata ---
+            for miner_dir in sorted(eval_id_dir.iterdir()):
+                if not miner_dir.is_dir():
+                    continue
+                if (miner_dir / ".uploaded").exists():
+                    continue
+                meta_path = miner_dir / "upload_meta.json"
+                archive_path = miner_dir / "logs.tar.gz"
+                if not meta_path.exists() or not archive_path.exists():
+                    continue
+
+                try:
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+
+                ok = await upload_eval_logs(
+                    self.wallet,
+                    eval_id=meta.get("eval_id", eval_id),
+                    miner_hotkey=meta["miner_hotkey"],
+                    miner_uid=meta["miner_uid"],
+                    block_height=meta.get("block_height", 0),
+                    pack_hash=meta.get("pack_hash", "unknown"),
+                    log_archive=archive_path.read_bytes(),
+                )
+                if ok:
+                    eval_uploaded += 1
+                    try:
+                        (miner_dir / ".uploaded").touch()
+                    except OSError:
+                        pass
+
+            # --- Cycle logs with persisted metadata ---
+            if (eval_id_dir / ".cycle_uploaded").exists():
+                continue
+            cycle_meta_path = eval_id_dir / "cycle_upload_meta.json"
+            cycle_archive_path = eval_id_dir / "cycle.tar.gz"
+            if not cycle_meta_path.exists() or not cycle_archive_path.exists():
+                continue
+
+            try:
+                meta = json.loads(cycle_meta_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+
+            ok = await upload_cycle_logs(
+                self.wallet,
+                eval_id=meta.get("eval_id", eval_id),
+                block_height=meta.get("block_height", 0),
+                log_archive=cycle_archive_path.read_bytes(),
+            )
+            if ok:
+                cycle_uploaded += 1
+                try:
+                    (eval_id_dir / ".cycle_uploaded").touch()
+                except OSError:
+                    pass
+
+        if eval_uploaded or cycle_uploaded:
+            logger.info(
+                "Startup log replay: re-uploaded %d eval + %d cycle logs",
+                eval_uploaded, cycle_uploaded,
+            )
+
+    @staticmethod
+    def _repack_directory(
+        directory: Path,
+        *,
+        filenames: Optional[List[str]] = None,
+    ) -> Optional[bytes]:
+        """Re-archive files in a directory as tar.gz.
+
+        If *filenames* is given, only those files are included;
+        otherwise all files (excluding marker/meta files) are packed.
+        """
+        import io
+        import tarfile
+
+        _EXCLUDE = {".uploaded", ".cycle_uploaded", "upload_meta.json",
+                     "cycle_upload_meta.json", "logs.tar.gz", "cycle.tar.gz"}
+        try:
+            buf = io.BytesIO()
+            added = 0
+            with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+                candidates = (
+                    [directory / fn for fn in filenames]
+                    if filenames
+                    else sorted(directory.iterdir())
+                )
+                for child in candidates:
+                    if not isinstance(child, Path):
+                        child = Path(child)
+                    if not child.exists() or not child.is_file():
+                        continue
+                    if child.name in _EXCLUDE:
+                        continue
+                    tar.add(str(child), arcname=child.name)
+                    added += 1
+            if added == 0:
+                return None
+            archive = buf.getvalue()
+            if len(archive) > 10 * 1024 * 1024:
+                return None
+            return archive
+        except Exception:
+            return None
 
     # ------------------------------------------------------------------
     # Weight setting
