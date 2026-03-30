@@ -12,6 +12,11 @@ Miner commitment (pipe-delimited, ≤256 bytes):
 Validator consensus commitment (pipe-delimited, ≤256 bytes):
     consensus:{protocol_version}|{window_number}|{content_address}
 
+``content_address`` may be a single CAS address (IPFS CID or GCS URL) or
+a dual-address string ``{ipfs_cid};{gcs_url}`` when both backends
+succeeded.  Use ``decode_dual_address`` / ``encode_dual_address`` to
+convert between the wire format and separate (ipfs, gcs) components.
+
 The ``consensus:`` prefix distinguishes validator consensus pointers from
 miner pack commitments.
 
@@ -32,6 +37,7 @@ _HTTP_URL = re.compile(r"^https?://\S+$")
 
 
 _CONSENSUS_PREFIX = "consensus:"
+DUAL_ADDRESS_SEPARATOR = ";"
 
 
 @dataclass
@@ -61,6 +67,46 @@ class ValidatorConsensusCommitment:
     validator_hotkey: str
     block_number: int
     raw: str
+
+
+def encode_dual_address(
+    ipfs_cid: Optional[str] = None,
+    gcs_url: Optional[str] = None,
+) -> Optional[str]:
+    """Encode IPFS CID and/or GCS URL into a single content-address string.
+
+    When both are present, joins them with ``;`` so both can be recovered
+    during download.  When only one is available the raw address is returned
+    unchanged, which keeps the format identical to the legacy single-address
+    encoding.
+
+    Returns None if neither address is provided.
+    """
+    if ipfs_cid and gcs_url:
+        return f"{ipfs_cid}{DUAL_ADDRESS_SEPARATOR}{gcs_url}"
+    return ipfs_cid or gcs_url or None
+
+
+def decode_dual_address(
+    content_address: str,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Decode a content-address string into (ipfs_cid, gcs_url).
+
+    Handles three formats:
+    * Dual:   ``{ipfs_cid};{gcs_url}``  → both fields populated
+    * Legacy URL:  ``https://…``          → (None, url)
+    * Legacy CID:  ``Qm…`` / ``bafy…``   → (cid, None)
+    """
+    if DUAL_ADDRESS_SEPARATOR in content_address:
+        parts = content_address.split(DUAL_ADDRESS_SEPARATOR, maxsplit=1)
+        ipfs_cid = parts[0].strip() or None
+        gcs_url = parts[1].strip() or None
+        return ipfs_cid, gcs_url
+
+    addr = content_address.strip()
+    if addr.startswith("http://") or addr.startswith("https://"):
+        return None, addr
+    return addr, None
 
 
 def is_consensus_commitment(raw: str) -> bool:

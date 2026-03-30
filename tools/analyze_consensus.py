@@ -28,7 +28,9 @@ import bittensor as bt
 
 from trajectoryrl.utils.consensus import ConsensusPointer, ConsensusPayload
 from trajectoryrl.utils.consensus_filter import run_filter_pipeline
-from trajectoryrl.utils.commitments import fetch_validator_consensus_commitments
+from trajectoryrl.utils.commitments import (
+    fetch_validator_consensus_commitments, decode_dual_address,
+)
 from trajectoryrl.scoring import compute_consensus_costs
 from trajectoryrl.utils.winner_state import (
     WinnerState, select_winner_with_protection,
@@ -92,6 +94,38 @@ async def download_ipfs_payload(cid: str) -> Optional[ConsensusPayload]:
     return None
 
 
+async def download_gcs_payload(gcs_url: str) -> Optional[ConsensusPayload]:
+    """Download a payload directly from a GCS URL."""
+    async with aiohttp.ClientSession() as session:
+        data = await _fetch_raw(session, gcs_url)
+        if data is None:
+            return None
+        try:
+            return ConsensusPayload.deserialize(data)
+        except Exception:
+            print(f"      GCS: got {len(data)} bytes but JSON invalid")
+            return None
+
+
+async def download_payload_dual(content_address: str) -> Optional[ConsensusPayload]:
+    """Download payload from a dual-address string (IPFS first, GCS fallback)."""
+    ipfs_cid, gcs_url = decode_dual_address(content_address)
+
+    if ipfs_cid:
+        payload = await download_ipfs_payload(ipfs_cid)
+        if payload is not None:
+            return payload
+        if gcs_url:
+            print("      IPFS failed, falling back to GCS...")
+
+    if gcs_url:
+        payload = await download_gcs_payload(gcs_url)
+        if payload is not None:
+            return payload
+
+    return None
+
+
 async def run(args):
     # ---- 1. Connect to chain ------------------------------------------------
     print(f"Connecting to subtensor (network={args.network})...")
@@ -130,7 +164,9 @@ async def run(args):
         if vc.window_number != target_window:
             continue
         uid = hk_to_uid.get(vc.validator_hotkey, -1)
-        print(f"  UID {uid} ({vc.validator_hotkey[:12]}...) CID={vc.content_address[:24]}...")
+        ipfs_cid, gcs_url = decode_dual_address(vc.content_address)
+        addr_summary = f"ipfs={ipfs_cid or '(none)'}, gcs={(gcs_url or '(none)')[:40]}"
+        print(f"  UID {uid} ({vc.validator_hotkey[:12]}...) {addr_summary}")
 
         pointer = ConsensusPointer(
             protocol_version=vc.protocol_version,
@@ -140,7 +176,7 @@ async def run(args):
         )
         payload = None
         for attempt in range(1, max_retries + 1):
-            payload = await download_ipfs_payload(vc.content_address)
+            payload = await download_payload_dual(vc.content_address)
             if payload is not None:
                 break
             if attempt < max_retries:

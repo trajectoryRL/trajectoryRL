@@ -16,6 +16,7 @@ from typing import List, Optional
 
 import aiohttp
 
+from .commitments import decode_dual_address, encode_dual_address
 from .consensus import (
     ConsensusPayload,
     verify_payload_integrity,
@@ -210,11 +211,18 @@ class ConsensusStore:
         self.api = api
 
     async def upload_payload(self, payload: ConsensusPayload) -> Optional[str]:
-        """Upload payload to CAS. Returns content address (GCS URL or IPFS CID).
+        """Upload payload to CAS. Returns a content-address string.
 
-        Strategy: upload to both backends concurrently for redundancy.
-        Prefer GCS URL as the returned address (universally accessible
-        without a local IPFS node). Fall back to IPFS CID if API fails.
+        Strategy: upload to both IPFS and GCS concurrently for redundancy.
+        The returned string encodes whichever backends succeeded:
+
+        * Both OK:      ``{ipfs_cid};{gcs_url}``  (dual-address)
+        * IPFS only:    ``{ipfs_cid}``
+        * GCS only:     ``{gcs_url}``
+        * Both failed:  ``None``
+
+        Callers (and ``download_payload``) use ``decode_dual_address`` to
+        recover the individual components.
         """
         data = payload.serialize()
 
@@ -231,38 +239,65 @@ class ConsensusStore:
             logger.warning("API upload raised: %s", api_result)
             api_result = None
 
-        if ipfs_result:
-            return ipfs_result
-        if api_result:
-            return api_result
-
-        logger.error("Both IPFS and API upload failed for window %d", payload.window_number)
-        return None
+        address = encode_dual_address(
+            ipfs_cid=ipfs_result if ipfs_result else None,
+            gcs_url=api_result if api_result else None,
+        )
+        if address is None:
+            logger.error("Both IPFS and API upload failed for window %d", payload.window_number)
+        else:
+            logger.info(
+                "Window %d upload: ipfs=%s, gcs=%s",
+                payload.window_number,
+                ipfs_result or "(none)",
+                (api_result or "(none)")[:60],
+            )
+        return address
 
     async def download_payload(self, content_address: str) -> Optional[ConsensusPayload]:
         """Download, verify, and deserialize a consensus payload.
 
-        For IPFS CIDs: tries kubo API, then each public gateway, validating
-        JSON per source (truncated streaming data is discarded automatically).
-        For HTTP URLs: downloads directly from GCS / public URL.
+        Supports three content-address formats:
+
+        * Dual-address ``{ipfs_cid};{gcs_url}``: try IPFS first, GCS fallback.
+        * Single IPFS CID (``Qm…`` / ``bafy…``): download via IPFS only.
+        * Single HTTP(S) URL: download directly from GCS.
+
+        Legacy single-address strings (no ``;``) are auto-detected by
+        ``decode_dual_address`` and handled transparently.
+
+        Default priority: **IPFS first**, GCS fallback.
         """
-        is_url = content_address.startswith("http://") or content_address.startswith("https://")
+        ipfs_cid, gcs_url = decode_dual_address(content_address)
 
         data = None
-        if not is_url:
-            data = await self.ipfs.download(content_address)
-        if data is None and is_url:
-            data = await self.api.download(content_address)
+
+        if ipfs_cid:
+            data = await self.ipfs.download(ipfs_cid)
+            if data is not None:
+                logger.debug("Downloaded payload via IPFS: CID=%s", ipfs_cid)
+
+        if data is None and gcs_url:
+            data = await self.api.download(gcs_url)
+            if data is not None:
+                logger.info(
+                    "IPFS download failed/unavailable, fell back to GCS: url=%s",
+                    gcs_url[:60],
+                )
 
         if data is None:
-            logger.warning("All sources failed for payload: %s", content_address[:60])
+            logger.warning(
+                "Failed to download payload from all backends: ipfs=%s, gcs=%s",
+                ipfs_cid or "(none)",
+                (gcs_url or "(none)")[:60],
+            )
             return None
 
-        if content_address.startswith("sha256:"):
-            if not verify_payload_integrity(data, content_address):
+        if ipfs_cid and ipfs_cid.startswith("sha256:"):
+            if not verify_payload_integrity(data, ipfs_cid):
                 logger.warning(
                     "Payload integrity check failed: pointer=%s, computed=%s",
-                    content_address[:60],
+                    ipfs_cid[:60],
                     "sha256:" + hashlib.sha256(data).hexdigest()[:16],
                 )
                 return None
@@ -270,5 +305,10 @@ class ConsensusStore:
         try:
             return ConsensusPayload.deserialize(data)
         except Exception as e:
-            logger.warning("Failed to deserialize payload %s: %s", content_address[:60], e)
+            logger.warning(
+                "Failed to deserialize payload (ipfs=%s, gcs=%s): %s",
+                ipfs_cid or "(none)",
+                (gcs_url or "(none)")[:60],
+                e,
+            )
             return None

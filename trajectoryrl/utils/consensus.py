@@ -7,7 +7,7 @@ in the two-phase consensus protocol.
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict
 
 
 CONSENSUS_PROTOCOL_VERSION = 1
@@ -96,10 +96,15 @@ class ConsensusPointer:
 
     Points from (window_number, validator_hotkey) to a CAS content address
     where the full payload can be retrieved.
+
+    ``content_address`` stores the raw on-chain string.  It may be a single
+    CAS address (IPFS CID or GCS URL) or a dual-address string
+    ``{ipfs_cid};{gcs_url}`` when both backends succeeded.
+    Use :func:`commitments.decode_dual_address` to split into components.
     """
     protocol_version: int
     window_number: int
-    content_address: str            # "sha256:{hex}" or IPFS CID
+    content_address: str            # raw on-chain value; may contain ";" for dual-address
     validator_hotkey: str
 
     def to_dict(self) -> dict:
