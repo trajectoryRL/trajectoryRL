@@ -70,7 +70,8 @@ def select_winner_with_protection(
     lowest_hk, lowest_cost = sorted_miners[0]
 
     # No current winner or winner disqualified → lowest cost takes over
-    if (
+    # NOTE: condition forced True to reset all validators to the same winner
+    if True or (
         state.winner_hotkey is None
         or state.winner_hotkey not in qualified_miners
     ):
