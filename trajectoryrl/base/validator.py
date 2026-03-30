@@ -84,6 +84,9 @@ _METAGRAPH_SYNC_RETRIES = 3
 _METAGRAPH_SYNC_DELAY = 10  # seconds between retries
 _METAGRAPH_MIN_NEURONS = 1  # minimum expected neurons for a healthy metagraph
 
+_SET_WEIGHTS_MAX_RETRIES = 3
+_SET_WEIGHTS_RETRY_DELAY = 12  # seconds; roughly 1 block interval
+
 
 class TrajectoryValidator:
     """TrajectoryRL validator that evaluates policy packs using ClawBench.
@@ -882,20 +885,22 @@ class TrajectoryValidator:
 
         self._consensus_window = window.window_number
 
-        # Apply Winner Protection
+        # Build hotkey → UID mapping (used by winner selection and logging)
+        hk_to_uid: Dict[str, int] = {}
+        for uid in range(len(self.metagraph.hotkeys)):
+            hk_to_uid[self.metagraph.hotkeys[uid]] = uid
+
+        # Apply Winner Protection (stores winner_uid so set_weights
+        # can skip the metagraph lookup later)
         winner_hk, updated_state = select_winner_with_protection(
             consensus_costs=consensus_costs,
             consensus_qualified=consensus_qualified,
             state=self._winner_state,
             cost_delta=self.config.cost_delta,
+            hk_to_uid=hk_to_uid,
         )
         self._winner_state = updated_state
         save_winner_state(updated_state, self._winner_state_path)
-
-        # Build hotkey → UID mapping for logging
-        hk_to_uid: Dict[str, int] = {}
-        for uid in range(len(self.metagraph.hotkeys)):
-            hk_to_uid[self.metagraph.hotkeys[uid]] = uid
 
         n_qualified = sum(1 for q in consensus_qualified.values() if q)
         logger.info("=" * 60)
@@ -2331,37 +2336,79 @@ class TrajectoryValidator:
     # Weight setting
     # ------------------------------------------------------------------
 
+    async def _do_set_weights(
+        self,
+        uids: list,
+        weights: list,
+        *,
+        label: str = "",
+    ) -> bool:
+        """Call subtensor.set_weights with retry on failure.
+
+        Returns True if weights were set successfully.
+        """
+        for attempt in range(1, _SET_WEIGHTS_MAX_RETRIES + 1):
+            try:
+                result = self.subtensor.set_weights(
+                    netuid=self.config.netuid,
+                    wallet=self.wallet,
+                    uids=uids,
+                    weights=weights,
+                    wait_for_inclusion=True,
+                    wait_for_finalization=False,
+                )
+                success = getattr(result, "success", None)
+                message = getattr(result, "message", str(result))
+                if success is False:
+                    logger.warning(
+                        "%sset_weights attempt %d/%d FAILED — "
+                        "success=%s, message=%s, uids=%s",
+                        label, attempt, _SET_WEIGHTS_MAX_RETRIES,
+                        success, message, uids,
+                    )
+                else:
+                    logger.info(
+                        "%sset_weights OK — uids=%s, success=%s, message=%s",
+                        label, uids, success, message,
+                    )
+                    self._last_set_weights_at = int(time.time())
+                    return True
+            except Exception as e:
+                logger.warning(
+                    "%sset_weights attempt %d/%d exception: %s",
+                    label, attempt, _SET_WEIGHTS_MAX_RETRIES, e,
+                )
+
+            if attempt < _SET_WEIGHTS_MAX_RETRIES:
+                delay = _SET_WEIGHTS_RETRY_DELAY * attempt
+                logger.info(
+                    "%sRetrying set_weights in %ds...", label, delay,
+                )
+                await asyncio.sleep(delay)
+
+        logger.error(
+            "%sset_weights FAILED after %d attempts (uids=%s)",
+            label, _SET_WEIGHTS_MAX_RETRIES, uids,
+        )
+        return False
+
     async def _set_winner_weights(self):
         """Set on-chain weights from persisted WinnerState.
 
-        Uses the winner determined during consensus aggregation (persisted
-        in winner_state.json).  Maps winner hotkey → UID via metagraph,
-        applies burn fraction, and calls set_weights.
+        Reads winner_uid directly from the persisted state — no metagraph
+        lookup required.  The UID is captured at consensus aggregation time
+        when the metagraph is known to be healthy.
         """
-
         winner_hk = self._winner_state.winner_hotkey
-        if not winner_hk:
-            await self._set_fallback_weights(reason="No winner in WinnerState")
-            return
+        winner_uid = self._winner_state.winner_uid
 
-        winner_uid = None
-        try:
-            hotkeys = self.metagraph.hotkeys
-            for uid in range(len(hotkeys)):
-                if hotkeys[uid] == winner_hk:
-                    winner_uid = uid
-                    break
-        except Exception:
-            pass
-
-        if winner_uid is None:
-            logger.warning(
-                "Winner %s not found in metagraph — setting fallback weights",
-                winner_hk[:8],
+        if not winner_hk or winner_uid is None:
+            reason = (
+                "No winner in WinnerState"
+                if not winner_hk
+                else f"Winner {winner_hk[:8]} has no UID in state"
             )
-            await self._set_fallback_weights(
-                reason=f"Winner {winner_hk[:8]} not in metagraph"
-            )
+            await self._set_fallback_weights(reason=reason)
             return
 
         if winner_uid == OWNER_UID:
@@ -2371,31 +2418,10 @@ class TrajectoryValidator:
             uids = [winner_uid, OWNER_UID]
             weights = [1.0 - BURN_FRACTION, BURN_FRACTION]
 
-        try:
-            result = self.subtensor.set_weights(
-                netuid=self.config.netuid,
-                wallet=self.wallet,
-                uids=uids,
-                weights=weights,
-                wait_for_inclusion=True,
-                wait_for_finalization=False,
-            )
-            success = getattr(result, "success", None)
-            message = getattr(result, "message", str(result))
-            if success is False:
-                logger.error(
-                    "Mid-eval set_weights FAILED — success=%s, message=%s",
-                    success, message,
-                )
-            else:
-                logger.info(
-                    "Mid-eval weights set (winner=%s UID %d) — "
-                    "success=%s, message=%s",
-                    winner_hk[:8], winner_uid, success, message,
-                )
-                self._last_set_weights_at = int(time.time())
-        except Exception as e:
-            logger.error("Error setting mid-eval weights: %s", e, exc_info=True)
+        await self._do_set_weights(
+            uids, weights,
+            label=f"[winner={winner_hk[:8]} UID {winner_uid}] ",
+        )
 
     def _fallback_owner_weights(self) -> Optional[Tuple[list, list]]:
         """Read on-chain weights set by OWNER_UID and return (uids, weights).
@@ -2476,49 +2502,25 @@ class TrajectoryValidator:
             )
             self._sync_metagraph(caller="fallback_weights")
 
-        try:
-            copied = self._fallback_owner_weights()
-            if copied is not None:
-                uids, weights = copied
-                logger.info(
-                    "%s — copying weights from owner UID %d "
-                    "(%d entries, uids=%s)",
-                    reason, OWNER_UID, len(uids), uids,
-                )
-            else:
-                uids, weights = self._fallback_to_owner()
-                logger.info(
-                    "%s — setting fallback weight to "
-                    "owner UID %d (uids=%s, weights=%s)",
-                    reason, OWNER_UID, uids, weights,
-                )
-
-            result = self.subtensor.set_weights(
-                netuid=self.config.netuid,
-                wallet=self.wallet,
-                uids=uids,
-                weights=weights,
-                wait_for_inclusion=True,
-                wait_for_finalization=False,
+        copied = self._fallback_owner_weights()
+        if copied is not None:
+            uids, weights = copied
+            logger.info(
+                "%s — copying weights from owner UID %d "
+                "(%d entries, uids=%s)",
+                reason, OWNER_UID, len(uids), uids,
             )
-            success = getattr(result, "success", None)
-            message = getattr(result, "message", str(result))
-            if success is False:
-                logger.error(
-                    "FALLBACK set_weights FAILED on-chain — "
-                    "success=%s, message=%s, uids=%s. "
-                    "On-chain weights remain STALE.",
-                    success, message, uids,
-                )
-            else:
-                logger.info(
-                    "Fallback weights set (owner UID %d, uids=%s) — "
-                    "success=%s, message=%s",
-                    OWNER_UID, uids, success, message,
-                )
-                self._last_set_weights_at = int(time.time())
-        except Exception as e:
-            logger.error("Error setting fallback weights: %s", e, exc_info=True)
+        else:
+            uids, weights = self._fallback_to_owner()
+            logger.info(
+                "%s — setting fallback weight to "
+                "owner UID %d (uids=%s, weights=%s)",
+                reason, OWNER_UID, uids, weights,
+            )
+
+        await self._do_set_weights(
+            uids, weights, label=f"[fallback: {reason}] ",
+        )
 
 
 async def main():

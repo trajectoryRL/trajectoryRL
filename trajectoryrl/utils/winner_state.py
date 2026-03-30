@@ -22,6 +22,7 @@ class WinnerState:
     winner_hotkey: Optional[str] = None
     winner_pack_hash: Optional[str] = None
     winner_cost: Optional[float] = None
+    winner_uid: Optional[int] = None
 
 
 def select_winner_with_protection(
@@ -30,6 +31,7 @@ def select_winner_with_protection(
     state: WinnerState,
     cost_delta: float = 0.10,
     pack_hashes: Optional[Dict[str, str]] = None,
+    hk_to_uid: Optional[Dict[str, int]] = None,
 ) -> Tuple[Optional[str], WinnerState]:
     """Select winner using Winner Protection.
 
@@ -45,12 +47,15 @@ def select_winner_with_protection(
             winning cost to take over (default 0.10 = 10%)
         pack_hashes: optional miner_hotkey -> pack_hash mapping for
             recording the winner's pack hash
+        hk_to_uid: optional miner_hotkey -> on-chain UID mapping,
+            stored in WinnerState so set_weights can skip metagraph lookup
 
     Returns:
         (winner_hotkey, updated_state)
         winner_hotkey is None if no qualified miners exist.
     """
     pack_hashes = pack_hashes or {}
+    hk_to_uid = hk_to_uid or {}
 
     qualified_miners = {
         hk: cost for hk, cost in consensus_costs.items()
@@ -76,10 +81,11 @@ def select_winner_with_protection(
             winner_hotkey=lowest_hk,
             winner_pack_hash=pack_hashes.get(lowest_hk),
             winner_cost=lowest_cost,
+            winner_uid=hk_to_uid.get(lowest_hk),
         )
         logger.info(
-            "Winner elected (%s): %s (consensus cost $%.4f)",
-            reason, lowest_hk[:8], lowest_cost,
+            "Winner elected (%s): %s UID %s (consensus cost $%.4f)",
+            reason, lowest_hk[:8], hk_to_uid.get(lowest_hk, "?"), lowest_cost,
         )
         return lowest_hk, new_state
 
@@ -93,6 +99,7 @@ def select_winner_with_protection(
                 winner_hotkey=lowest_hk,
                 winner_pack_hash=pack_hashes.get(lowest_hk, state.winner_pack_hash),
                 winner_cost=lowest_cost,
+                winner_uid=hk_to_uid.get(lowest_hk, state.winner_uid),
             )
             logger.info(
                 "Winner %s self-updated: $%.4f → $%.4f (cleared δ threshold $%.4f)",
@@ -104,16 +111,20 @@ def select_winner_with_protection(
                 winner_hotkey=lowest_hk,
                 winner_pack_hash=pack_hashes.get(lowest_hk),
                 winner_cost=lowest_cost,
+                winner_uid=hk_to_uid.get(lowest_hk),
             )
             logger.info(
-                "Winner overtake: %s ($%.4f) dethrones %s "
+                "Winner overtake: %s UID %s ($%.4f) dethrones %s "
                 "(winner_cost $%.4f, δ threshold $%.4f)",
-                lowest_hk[:8], lowest_cost,
+                lowest_hk[:8], hk_to_uid.get(lowest_hk, "?"), lowest_cost,
                 state.winner_hotkey[:8], state.winner_cost, threshold,
             )
         return lowest_hk, new_state
 
-    # No one beats the threshold → winner retains
+    # No one beats the threshold → winner retains;
+    # refresh UID in case it changed due to re-registration
+    if state.winner_hotkey in hk_to_uid:
+        state.winner_uid = hk_to_uid[state.winner_hotkey]
     logger.info(
         "Winner %s retains (winner_cost $%.4f): best challenger %s ($%.4f) "
         "does not clear δ threshold ($%.4f)",
@@ -129,6 +140,7 @@ def save_winner_state(state: WinnerState, path: str):
         "winner_hotkey": state.winner_hotkey,
         "winner_pack_hash": state.winner_pack_hash,
         "winner_cost": state.winner_cost,
+        "winner_uid": state.winner_uid,
     }
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w") as f:
@@ -145,6 +157,7 @@ def load_winner_state(path: str) -> WinnerState:
             winner_hotkey=data.get("winner_hotkey"),
             winner_pack_hash=data.get("winner_pack_hash"),
             winner_cost=data.get("winner_cost"),
+            winner_uid=data.get("winner_uid"),
         )
     except (FileNotFoundError, json.JSONDecodeError):
         return WinnerState()
