@@ -116,7 +116,7 @@ class ValidatorConfig:
     weight_interval_blocks: int = 360  # 1 tempo ≈ 72 min at 12s/block
 
     # Startup aggregation: run consensus aggregation before entering main loop
-    aggregate_when_start: bool = False
+    aggregate_when_start: bool = True
 
     # ClawBench LLM configuration (passed to init container & OpenClaw gateway)
     clawbench_default_model: str = DEFAULT_CLAWBENCH_MODEL
