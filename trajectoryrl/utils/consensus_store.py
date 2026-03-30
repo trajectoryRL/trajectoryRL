@@ -42,12 +42,30 @@ class CASBackend(ABC):
         ...
 
 
+DOWNLOAD_TIMEOUT = 60
+
+
+async def _fetch_raw(session: aiohttp.ClientSession, url: str,
+                     method: str = "GET", **kwargs) -> Optional[bytes]:
+    """Fetch raw bytes from a URL, return None on any failure."""
+    try:
+        req = session.get if method == "GET" else session.post
+        async with req(url, timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT),
+                       **kwargs) as resp:
+            if resp.status != 200:
+                return None
+            return await resp.read()
+    except Exception:
+        return None
+
+
 class IPFSBackend(CASBackend):
     """IPFS via kubo-compatible HTTP API with public gateway fallback.
 
     Upload:   POST {api_url}/add
-    Download: POST {api_url}/cat?arg={cid} (primary),
-              then GET {gateway}/ipfs/{cid} for each fallback gateway.
+    Download: tries kubo API (POST /cat) then each public gateway (GET),
+              validating JSON completeness per source so truncated
+              streaming responses are discarded and the next source tried.
 
     api_url should include the /api/v0 prefix,
     e.g. ``http://ipfs.metahash73.com:5001/api/v0``.
@@ -83,79 +101,38 @@ class IPFSBackend(CASBackend):
             return None
 
     async def download(self, address: str) -> Optional[bytes]:
-        """Download CID: try kubo API first, then public gateways sequentially."""
-        data = await self._download_via_api(address)
-        if data is not None:
-            return data
+        """Download CID: try kubo API first, then public gateways sequentially.
+
+        Unlike a plain HTTP download, IPFS kubo streams the response before
+        fully resolving the content graph.  This can produce truncated bytes
+        under the wall-clock timeout.  Each source is therefore validated
+        (JSON parse) and discarded if corrupt, falling through to the next.
+        """
+        sources = [
+            ("kubo API", f"{self.api_url}/cat",
+             {"method": "POST", "params": {"arg": address}}),
+        ]
         for gw in self._gateway_urls:
-            data = await self._download_via_gateway(gw, address)
-            if data is not None:
+            sources.append((gw, f"{gw}/ipfs/{address}", {"method": "GET"}))
+
+        async with aiohttp.ClientSession() as session:
+            for name, url, opts in sources:
+                method = opts.pop("method", "GET")
+                data = await _fetch_raw(session, url, method=method, **opts)
+                if data is None:
+                    continue
+                try:
+                    json.loads(data)
+                except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                    logger.warning(
+                        "%s: truncated/corrupt payload (%d bytes, CID=%s): %s, trying next",
+                        name, len(data), address[:24], e,
+                    )
+                    continue
+                logger.debug("%s download OK: CID=%s, %d bytes", name, address[:24], len(data))
                 return data
+
         return None
-
-    async def _download_via_api(self, cid: str) -> Optional[bytes]:
-        """Download via kubo HTTP API (POST /cat)."""
-        try:
-            url = f"{self.api_url}/cat"
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    url,
-                    params={"arg": cid},
-                    timeout=aiohttp.ClientTimeout(total=30),
-                ) as resp:
-                    if resp.status != 200:
-                        logger.warning("IPFS API download failed: HTTP %d (CID=%s)", resp.status, cid)
-                        return None
-                    return await self._read_body(resp, cid, "IPFS API")
-        except Exception as e:
-            logger.warning("IPFS API download error (CID=%s): %s", cid, e)
-            return None
-
-    async def _download_via_gateway(self, gateway_url: str, cid: str) -> Optional[bytes]:
-        """Download via public IPFS gateway (HTTP GET)."""
-        url = f"{gateway_url}/ipfs/{cid}"
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    url, timeout=aiohttp.ClientTimeout(total=30),
-                ) as resp:
-                    if resp.status != 200:
-                        logger.warning(
-                            "IPFS gateway %s download failed: HTTP %d (CID=%s)",
-                            gateway_url, resp.status, cid,
-                        )
-                        return None
-                    return await self._read_body(resp, cid, gateway_url)
-        except Exception as e:
-            logger.warning("IPFS gateway %s download error (CID=%s): %s", gateway_url, cid, e)
-            return None
-
-    @staticmethod
-    async def _read_body(resp: aiohttp.ClientResponse, cid: str, source: str) -> Optional[bytes]:
-        if resp.content_length and resp.content_length > MAX_PAYLOAD_BYTES:
-            logger.warning("%s download too large: %d bytes (CID=%s)", source, resp.content_length, cid)
-            return None
-        data = await resp.content.read(MAX_PAYLOAD_BYTES + 1)
-        if len(data) > MAX_PAYLOAD_BYTES:
-            logger.warning("%s download exceeded max size: %d bytes (CID=%s)", source, len(data), cid)
-            return None
-        if not data:
-            logger.warning("%s download returned empty body (CID=%s)", source, cid)
-            return None
-        # Streaming responses may be truncated (connection closed mid-transfer)
-        # while still returning HTTP 200.  Validate JSON completeness so that
-        # truncated data is discarded and the caller can fall through to the
-        # next source instead of treating corrupt bytes as a successful download.
-        try:
-            json.loads(data)
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            logger.warning(
-                "%s download returned truncated/corrupt JSON (%d bytes, CID=%s): %s",
-                source, len(data), cid, e,
-            )
-            return None
-        logger.debug("%s download OK: CID=%s, %d bytes", source, cid, len(data))
-        return data
 
 
 class TrajRLAPIBackend(CASBackend):
@@ -215,37 +192,11 @@ class TrajRLAPIBackend(CASBackend):
 
     async def download(self, address: str) -> Optional[bytes]:
         """Download payload by direct URL (GCS or other public URL)."""
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    address, timeout=aiohttp.ClientTimeout(total=30),
-                ) as resp:
-                    if resp.status != 200:
-                        logger.warning("URL download failed: HTTP %d (url=%s)", resp.status, address)
-                        return None
-                    if resp.content_length and resp.content_length > MAX_PAYLOAD_BYTES:
-                        logger.warning("URL download too large: %d bytes (url=%s)", resp.content_length, address[:60])
-                        return None
-                    data = await resp.content.read(MAX_PAYLOAD_BYTES + 1)
-                    if len(data) > MAX_PAYLOAD_BYTES:
-                        logger.warning("URL download exceeded max size: %d bytes (url=%s)", len(data), address[:60])
-                        return None
-                    if not data:
-                        logger.warning("URL download returned empty body (url=%s)", address[:60])
-                        return None
-                    try:
-                        json.loads(data)
-                    except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                        logger.warning(
-                            "URL download returned truncated/corrupt JSON (%d bytes, url=%s): %s",
-                            len(data), address[:60], e,
-                        )
-                        return None
-                    logger.debug("URL download OK: url=%s, %d bytes", address[:60], len(data))
-                    return data
-        except Exception as e:
-            logger.warning("URL download error (url=%s): %s", address[:60], e)
-            return None
+        async with aiohttp.ClientSession() as session:
+            data = await _fetch_raw(session, address)
+        if data is None:
+            logger.warning("URL download failed: %s", address[:60])
+        return data
 
 
 class ConsensusStore:
@@ -289,30 +240,24 @@ class ConsensusStore:
         return None
 
     async def download_payload(self, content_address: str) -> Optional[ConsensusPayload]:
-        """Download and verify payload from CAS.
+        """Download, verify, and deserialize a consensus payload.
 
-        Determines backend by address format:
-        - IPFS CID (Qm... / bafy...): download via IPFS
-        - HTTP(S) URL: download directly (GCS or other public URL)
+        For IPFS CIDs: tries kubo API, then each public gateway, validating
+        JSON per source (truncated streaming data is discarded automatically).
+        For HTTP URLs: downloads directly from GCS / public URL.
         """
-        data = None
-
         is_url = content_address.startswith("http://") or content_address.startswith("https://")
-        is_ipfs_cid = not is_url
 
-        if is_ipfs_cid:
+        data = None
+        if not is_url:
             data = await self.ipfs.download(content_address)
-
         if data is None and is_url:
             data = await self.api.download(content_address)
 
         if data is None:
-            logger.warning("Failed to download payload: %s", content_address[:60])
+            logger.warning("All sources failed for payload: %s", content_address[:60])
             return None
 
-        # Verify integrity against the pointer's content address (not self-reported hash).
-        # For sha256-addressed payloads, check the raw bytes match the pointer.
-        # IPFS CIDs are verified by IPFS itself; skip hash check for those.
         if content_address.startswith("sha256:"):
             if not verify_payload_integrity(data, content_address):
                 logger.warning(
@@ -323,9 +268,7 @@ class ConsensusStore:
                 return None
 
         try:
-            payload = ConsensusPayload.deserialize(data)
+            return ConsensusPayload.deserialize(data)
         except Exception as e:
             logger.warning("Failed to deserialize payload %s: %s", content_address[:60], e)
             return None
-
-        return payload
