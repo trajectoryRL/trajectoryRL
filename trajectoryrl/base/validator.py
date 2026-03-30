@@ -2468,7 +2468,7 @@ class TrajectoryValidator:
     # Log replay (one-time + startup)
     # ------------------------------------------------------------------
 
-    _ONETIME_REPLAY_WINDOWS = [1090, 1091]
+    _ONETIME_REPLAY_DATE_PREFIXES = ["20260330"]
 
     def _resolve_hotkey_prefix(self, prefix: str) -> Optional[Tuple[str, int]]:
         """Resolve a hotkey[:16] prefix to (full_hotkey, uid) via metagraph."""
@@ -2482,18 +2482,18 @@ class TrajectoryValidator:
         return None
 
     async def _onetime_replay_logs(self):
-        """One-time replay of eval/cycle logs for specific windows.
+        """One-time replay of eval/cycle logs for a specific date range.
 
-        Scans local eval directories for the target windows, rebuilds
-        upload metadata from metagraph, and re-uploads any logs that
-        lack an .uploaded marker.  Writes a done-marker so this only
-        runs once per validator instance.
+        Scans local eval directories matching the target date prefixes,
+        rebuilds upload metadata from metagraph, and re-uploads any logs
+        that lack an .uploaded marker.  Writes a done-marker so this
+        only runs once per validator instance.
         """
-        target_windows = self._ONETIME_REPLAY_WINDOWS
-        if not target_windows:
+        date_prefixes = self._ONETIME_REPLAY_DATE_PREFIXES
+        if not date_prefixes:
             return
 
-        tag = "_".join(f"w{w}" for w in target_windows)
+        tag = "_".join(date_prefixes)
         done_marker = self.config.log_dir / f".replay_{tag}_done"
         if done_marker.exists():
             return
@@ -2506,91 +2506,90 @@ class TrajectoryValidator:
         self._sync_metagraph(caller="onetime_replay_logs")
 
         logger.info(
-            "One-time log replay: scanning for windows %s", target_windows,
+            "One-time log replay: scanning for date prefixes %s",
+            date_prefixes,
         )
         eval_uploaded = 0
         cycle_uploaded = 0
 
-        for window_num in target_windows:
-            suffix = f"_w{window_num}"
-            for eval_id_dir in sorted(evals_root.iterdir()):
-                if not eval_id_dir.is_dir():
+        for eval_id_dir in sorted(evals_root.iterdir()):
+            if not eval_id_dir.is_dir():
+                continue
+            if not any(eval_id_dir.name.startswith(p) for p in date_prefixes):
+                continue
+
+            eval_id = eval_id_dir.name
+
+            # --- Per-miner eval logs ---
+            for miner_dir in sorted(eval_id_dir.iterdir()):
+                if not miner_dir.is_dir():
                     continue
-                if not eval_id_dir.name.endswith(suffix):
+                if (miner_dir / ".uploaded").exists():
                     continue
 
-                eval_id = eval_id_dir.name
-
-                # --- Per-miner eval logs ---
-                for miner_dir in sorted(eval_id_dir.iterdir()):
-                    if not miner_dir.is_dir():
-                        continue
-                    if (miner_dir / ".uploaded").exists():
-                        continue
-
-                    prefix = miner_dir.name
-                    resolved = self._resolve_hotkey_prefix(prefix)
-                    if resolved is None:
-                        logger.debug(
-                            "Replay: cannot resolve hotkey prefix %s, skipping",
-                            prefix,
-                        )
-                        continue
-                    full_hotkey, uid = resolved
-
-                    archive = self._repack_directory(miner_dir)
-                    if archive is None:
-                        continue
-
-                    ok = await upload_eval_logs(
-                        self.wallet,
-                        eval_id=eval_id,
-                        miner_hotkey=full_hotkey,
-                        miner_uid=uid,
-                        block_height=0,
-                        pack_hash="unknown",
-                        log_archive=archive,
+                prefix = miner_dir.name
+                resolved = self._resolve_hotkey_prefix(prefix)
+                if resolved is None:
+                    logger.debug(
+                        "Replay: cannot resolve hotkey prefix %s, skipping",
+                        prefix,
                     )
-                    if ok:
-                        eval_uploaded += 1
-                        try:
-                            (miner_dir / ".uploaded").touch()
-                        except OSError:
-                            pass
-                    logger.info(
-                        "Replay eval log: %s/%s -> %s",
-                        eval_id, prefix, "OK" if ok else "FAILED",
-                    )
-
-                # --- Cycle logs ---
-                if (eval_id_dir / ".cycle_uploaded").exists():
                     continue
-                cycle_log = eval_id_dir / "validator.log"
-                if not cycle_log.exists():
+                full_hotkey, uid = resolved
+
+                archive = self._repack_directory(miner_dir)
+                if archive is None:
                     continue
 
-                cycle_archive = self._repack_directory(
-                    eval_id_dir, filenames=["validator.log"],
-                )
-                if cycle_archive is None:
-                    continue
-
-                ok = await upload_cycle_logs(
+                ok = await upload_eval_logs(
                     self.wallet,
                     eval_id=eval_id,
+                    miner_hotkey=full_hotkey,
+                    miner_uid=uid,
                     block_height=0,
-                    log_archive=cycle_archive,
+                    pack_hash="unknown",
+                    log_archive=archive,
                 )
                 if ok:
-                    cycle_uploaded += 1
+                    eval_uploaded += 1
                     try:
-                        (eval_id_dir / ".cycle_uploaded").touch()
+                        (miner_dir / ".uploaded").touch()
                     except OSError:
                         pass
                 logger.info(
-                    "Replay cycle log: %s -> %s",
-                    eval_id, "OK" if ok else "FAILED",
+                    "Replay eval log: %s/%s -> %s",
+                    eval_id, prefix, "OK" if ok else "FAILED",
                 )
+
+            # --- Cycle logs ---
+            if (eval_id_dir / ".cycle_uploaded").exists():
+                continue
+            cycle_log = eval_id_dir / "validator.log"
+            if not cycle_log.exists():
+                continue
+
+            cycle_archive = self._repack_directory(
+                eval_id_dir, filenames=["validator.log"],
+            )
+            if cycle_archive is None:
+                continue
+
+            ok = await upload_cycle_logs(
+                self.wallet,
+                eval_id=eval_id,
+                block_height=0,
+                log_archive=cycle_archive,
+            )
+            if ok:
+                cycle_uploaded += 1
+                try:
+                    (eval_id_dir / ".cycle_uploaded").touch()
+                except OSError:
+                    pass
+            logger.info(
+                "Replay cycle log: %s -> %s",
+                eval_id, "OK" if ok else "FAILED",
+            )
 
         logger.info(
             "One-time log replay complete: %d eval + %d cycle logs uploaded",
@@ -2602,15 +2601,16 @@ class TrajectoryValidator:
             pass
 
     async def _replay_pending_uploads(self):
-        """Re-upload logs from recent windows that have metadata but no .uploaded marker."""
+        """Re-upload logs from the last 2 days that have metadata but no .uploaded marker."""
         evals_root = self.config.log_dir / "evals"
         if not evals_root.exists():
             return
 
-        current_block = self.subtensor.get_current_block()
-        window = compute_window(current_block, self._window_config)
-        recent_windows = {window.window_number, window.window_number - 1}
-        recent_suffixes = {f"_w{w}" for w in recent_windows}
+        today = datetime.datetime.utcnow().date()
+        recent_prefixes = {
+            (today - datetime.timedelta(days=d)).strftime("%Y%m%d")
+            for d in range(2)
+        }
 
         eval_uploaded = 0
         cycle_uploaded = 0
@@ -2618,7 +2618,7 @@ class TrajectoryValidator:
         for eval_id_dir in sorted(evals_root.iterdir()):
             if not eval_id_dir.is_dir():
                 continue
-            if not any(eval_id_dir.name.endswith(s) for s in recent_suffixes):
+            if not any(eval_id_dir.name.startswith(p) for p in recent_prefixes):
                 continue
 
             eval_id = eval_id_dir.name
