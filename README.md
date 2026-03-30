@@ -223,11 +223,12 @@ pip install trajrl
 
 trajrl status                       # Network health overview
 trajrl validators                   # List all validators
-trajrl scores --uid <uid>           # Per-miner scores from a validator
+trajrl scores                       # Per-miner scores (auto-picks validator)
 trajrl miner --uid <uid>            # Miner detail + diagnostics
+trajrl download -u <uid>            # Download miner's pack + eval results
 trajrl submissions --failed         # Recent failed submissions
-trajrl cycle-log <validator>        # Download and display a cycle log
-trajrl logs --type cycle|miner      # Eval log archives
+trajrl logs --show                  # Download and display latest cycle log
+trajrl logs --type cycle            # List cycle log archives
 ```
 
 Outputs JSON automatically when piped, Rich tables when interactive. See [trajrl/README.md](trajrl/README.md) for full documentation.

@@ -15,17 +15,16 @@ pip install trajrl
 ```
 trajrl status                          # Network health overview
 trajrl validators                      # List all validators
-trajrl scores <validator_hotkey>       # Per-miner scores from a validator
-trajrl scores --uid <uid>              # Query by validator UID instead
-trajrl miner <hotkey>                  # Miner detail + diagnostics
-trajrl miner --uid <uid>               # Query by miner UID instead
-trajrl pack <hotkey> <pack_hash>       # Pack evaluation detail
+trajrl scores                          # Per-miner scores (picks first active validator)
+trajrl scores --uid <uid>              # Per-miner scores from a specific validator
+trajrl miner --uid <uid>               # Miner detail + diagnostics
+trajrl miner <hotkey>                  # Query by hotkey
+trajrl download -u <uid>               # Download miner's current pack + eval results
+trajrl download <hotkey> <pack_hash>   # Download a specific pack version
 trajrl submissions [--failed]          # Recent pack submissions
-trajrl eval-history <validator>        # List eval cycle IDs for a validator
-trajrl eval-history <v> --from <date>  # Filter by date range
-trajrl cycle-log <validator>           # Download and display a cycle log
-trajrl cycle-log <v> --format summary  # Show parsed summary tables
-trajrl logs [--type cycle|miner]       # Eval log archives
+trajrl logs                            # List eval log archives
+trajrl logs --type cycle               # List cycle logs only
+trajrl logs --show                     # Download and display the latest cycle log
 trajrl --version                       # Show CLI version
 ```
 
@@ -41,27 +40,27 @@ Every command accepts:
 
 ### New in v0.2.0
 
-- **UID support**: Query validators and miners by UID instead of hotkey
+- **UID support everywhere**: Query miners by UID instead of hotkey
   ```bash
-  trajrl miner --uid 65      # Instead of full hotkey
-  trajrl scores --uid 221    # Query validator by UID
+  trajrl miner --uid 65
+  trajrl download -u 104
+  trajrl scores --uid 221
   ```
 
-- **Date filtering**: Filter eval history by date range
+- **`download` command**: Replaces `pack`. Downloads a miner's pack and evaluation results. Resolves hotkey and pack hash automatically from UID.
   ```bash
-  trajrl eval-history 5Cd6h... --from 2026-03-25 --to 2026-03-26
+  trajrl download -u 104   # Just the UID — resolves everything else
   ```
 
-- **Cycle log summary**: Parse cycle logs into structured tables
+- **Unified `logs` command**: Replaces `eval-history`, `cycle-log`, and old `logs`. One command for all log operations.
   ```bash
-  trajrl cycle-log 5Cd6h... --format summary
+  trajrl logs                            # List archives
+  trajrl logs --type cycle               # Filter by type
+  trajrl logs --show                     # Download and display latest log
+  trajrl logs --show --validator 5Cd6h...  # Specific validator
   ```
-  Shows: eval metrics, winner info, top qualified miners in tables instead of raw text
 
-- **Version command**: Check your CLI version
-  ```bash
-  trajrl --version
-  ```
+- **`scores` works with no arguments**: Automatically picks the first active validator instead of crashing.
 
 ## Usage Examples
 
@@ -79,41 +78,30 @@ trajrl status
 ╰────────────────────────────────────────────────────────╯
 ```
 
-### List validators
-
-```bash
-trajrl validators
-```
-```
- Hotkey         UID  Version  LLM Model              Last Eval   Last Seen
- 5Cd6h…sn11     29  0.2.7    chutes/zai-org/GLM-5…   7h ago      2m ago
- 5EcgNd…797f   221  0.2.7    zhipu/glm-5             10h ago     6m ago
- ...
-```
-
 ### Inspect a miner
 
-By hotkey:
-```bash
-trajrl miner 5HMgR6LnNqUAtaKRwa6bLF4Vy4KBf7TaxCLehyff9mWPhSHt
-```
-
-Or by UID:
 ```bash
 trajrl miner --uid 65
 ```
 
 Shows rank, qualification status, cost, scenario breakdown, per-validator reports, recent submissions, and ban records.
 
-### Check a validator's scores
-
-See how a specific validator scored all miners:
+### Download a miner's pack
 
 ```bash
-trajrl scores --uid 221
+trajrl download -u 104
 ```
 
-Returns per-miner entries with `qualified`, `costUsd`, `score`, `weight`, `scenarioScores`, and rejection info. Useful for comparing validator behavior or debugging why a miner was rejected.
+Returns the pack's cached content, eval status, per-validator scenario breakdowns, and the `gcsPackUrl` for downloading the verified pack JSON.
+
+### Check scores
+
+```bash
+trajrl scores                  # Any validator
+trajrl scores --uid 221        # Specific validator
+```
+
+Returns per-miner entries with `qualified`, `costUsd`, `score`, `weight`, `scenarioScores`, and rejection info.
 
 ### View failed submissions
 
@@ -121,63 +109,15 @@ Returns per-miner entries with `qualified`, `costUsd`, `score`, `weight`, `scena
 trajrl submissions --failed
 ```
 
-Shows recent packs that failed pre-eval integrity checks, with rejection stage and reason.
+Shows recent packs that failed pre-eval integrity checks, with rejection reason.
 
-### Investigate a validator's eval cycle
-
-First, list recent eval cycles for a validator:
+### View eval logs
 
 ```bash
-trajrl eval-history 5Cd6h...
-```
-```
-            Eval IDs (5) — 5Cd6h…sn11
- Eval ID            Validator    Block  Logs  Created
- 20260325_060012    5Cd6h…sn11  421890    12  3h ago
- 20260324_060008    5Cd6h…sn11  421530    11  1d ago
- 20260323_060015    5Cd6h…sn11  421170    13  2d ago
- ...
-```
-
-Then fetch the full cycle log for a specific eval:
-
-```bash
-trajrl cycle-log 5Cd6h... --eval-id 20260325_060012
-```
-
-Or just grab the latest one:
-
-```bash
-trajrl cycle-log 5Cd6h...
-```
-
-Use `--format summary` to parse the raw log into structured tables — eval metrics, winner info, and top qualified miners:
-
-```bash
-trajrl cycle-log 5Cd6h... --format summary
-```
-
-The cycle log contains the complete eval cycle output: metagraph sync, miner enumeration, per-miner eval timing, WEIGHT RESULTS, and set_weights status.
-
-> **Note:** Eval IDs are defined by each validator independently (typically a timestamp like `20260325_060012`). They are **not** globally unique — the same eval ID from different validators refers to different evaluation cycles. Always pair an eval ID with a specific validator hotkey.
-
-### Inspect a specific pack
-
-Check how a miner's pack was evaluated across all validators:
-
-```bash
-trajrl pack 5HMgR6... abc123def456...
-```
-
-Returns the pack's aggregated qualification status, best/average cost, and per-validator scenario breakdowns.
-
-### Filter eval logs
-
-```bash
-trajrl logs --type cycle --limit 5
-trajrl logs --validator 5Cd6h... --type miner
-trajrl logs --eval-id 20260324_000340
-trajrl logs --miner 5HMgR6... --pack-hash abc123...
+trajrl logs                              # List all log archives
+trajrl logs --type cycle --limit 5       # Recent cycle logs
+trajrl logs --show                       # Download and display latest cycle log
+trajrl logs --miner 5HMgR6...           # Logs for a specific miner
 ```
 
 ### JSON output for agents
@@ -186,25 +126,15 @@ Pipe to any tool — JSON is automatic:
 
 ```bash
 trajrl validators | jq '.validators[].hotkey'
-trajrl scores --uid 221 | jq '.entries[] | select(.qualified) | {uid, costUsd, weight}'
+trajrl scores | jq '.entries[] | select(.qualified) | {uid, costUsd, weight}'
 trajrl miner --uid 65 | jq '.scenarioSummary'
-```
-
-Parse with Python:
-
-```bash
-trajrl scores 5Cd6h... | python3 -c "
-  import sys, json
-  d = json.load(sys.stdin)
-  for e in d['entries'][:5]:
-      print(f\"{e['minerHotkey'][:12]}  qual={e['qualified']}  cost={e['costUsd']}\")
-"
+trajrl download -u 104 | jq '.gcsPackUrl'
 ```
 
 Force JSON in an interactive terminal:
 
 ```bash
-trajrl miner 5HMgR6... --json
+trajrl miner --uid 65 --json
 ```
 
 ## API Reference
@@ -214,11 +144,9 @@ All data comes from the [TrajectoryRL Public API](https://trajrl.com) — read-o
 | Endpoint | CLI Command |
 |----------|-------------|
 | `GET /api/validators` | `trajrl validators` |
-| `GET /api/scores/by-validator?validator=` | `trajrl scores <hotkey>` |
-| `GET /api/miners/:hotkey` | `trajrl miner <hotkey>` |
-| `GET /api/miners/:hotkey/packs/:hash` | `trajrl pack <hotkey> <hash>` |
+| `GET /api/scores/by-validator?validator=` | `trajrl scores [--uid <uid>]` |
+| `GET /api/miners/:hotkey` | `trajrl miner [--uid <uid>]` |
+| `GET /api/miners/:hotkey/packs/:hash` | `trajrl download [-u <uid>]` |
 | `GET /api/submissions` | `trajrl submissions` |
 | `GET /api/eval-logs` | `trajrl logs` |
-| `GET /api/eval-logs?log_type=cycle` | `trajrl eval-history <hotkey>` |
-| `GET /api/eval-logs` + GCS download | `trajrl cycle-log <hotkey>` |
-
+| `GET /api/eval-logs` + GCS download | `trajrl logs --show` |
