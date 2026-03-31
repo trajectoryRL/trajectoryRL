@@ -205,7 +205,7 @@ Each scenario defines **criteria** (not regex patterns) that the LLM judge evalu
 
 This is an early dataset, not the final benchmark. The scenario pool will grow as the subnet matures (new scenarios, harder criteria, new task domains). When scenarios are added or changed, packs are re-evaluated fresh on the new set.
 
-See [DATASET_v0.md](DATASET_v0.md) for scenario details, criteria definitions, and evolution plans.
+See [DATASET_v0.1.md](DATASET_v0.1.md) for scenario details, criteria definitions, and evolution plans.
 
 ---
 
@@ -1300,7 +1300,7 @@ Bootstrap:     top-3 qualified get 70/20/10 of miner alpha emissions
 - **Yuma Consensus 3**: https://docs.learnbittensor.org/learn/yc3-blog
 - **YC3 Migration Guide**: https://docs.learnbittensor.org/learn/yuma3-migration-guide
 - **ClawBench**: https://github.com/trajectoryRL/clawbench
-- **Evaluation Dataset**: [DATASET_v0.md](DATASET_v0.md) - current scenarios, criteria definitions, evolution plans
+- **Evaluation Dataset**: [DATASET_v0.1.md](DATASET_v0.1.md) - current scenarios, criteria definitions, evolution plans
 - **Miner Guide**: [MINER_OPERATIONS.md](MINER_OPERATIONS.md) - reference miner, local testing, submission workflow
 - **Validator Guide**: [VALIDATOR_OPERATIONS.md](VALIDATOR_OPERATIONS.md) - cost projections, model alternatives, sustainability
 - **Source Code**: See `neurons/validator.py` and `trajectoryrl/` package

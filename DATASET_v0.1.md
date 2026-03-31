@@ -1,7 +1,7 @@
-# ClawBench Evaluation Dataset v0
+# ClawBench Evaluation Dataset v0.1
 
-**Version**: v0.1 (hardened rubrics)
-**Date**: 2026-03-06
+**Version**: v0.1 (7 scenarios, hardened rubrics)
+**Date**: 2026-03-30
 
 > This is the initial evaluation dataset for TrajectoryRL. It is temporary and will evolve rapidly as the subnet matures. For the incentive mechanism spec, see [INCENTIVE_MECHANISM.md](INCENTIVE_MECHANISM.md).
 
