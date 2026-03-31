@@ -26,7 +26,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import aiohttp
 import bittensor as bt
 
-from trajectoryrl.utils.consensus import ConsensusPointer, ConsensusPayload
+from trajectoryrl.utils.consensus import (
+    ConsensusPointer, ConsensusPayload, SCORING_VERSION,
+)
 from trajectoryrl.utils.consensus_filter import run_filter_pipeline
 from trajectoryrl.utils.commitments import (
     fetch_validator_consensus_commitments, decode_dual_address,
@@ -160,8 +162,12 @@ async def run(args):
     # ---- 3. Download payloads (with per-source JSON validation) -------------
     max_retries = 3
     submissions = []
+    skipped_sv = 0
     for vc in chain_commitments:
         if vc.window_number != target_window:
+            continue
+        if vc.scoring_version != scoring_ver:
+            skipped_sv += 1
             continue
         uid = hk_to_uid.get(vc.validator_hotkey, -1)
         ipfs_cid, gcs_url = decode_dual_address(vc.content_address)
@@ -191,7 +197,9 @@ async def run(args):
             print(f"    FAILED after {max_retries} attempts")
 
     total_target = sum(1 for vc in chain_commitments if vc.window_number == target_window)
-    print(f"\n  Downloaded {len(submissions)}/{total_target} payloads")
+    if skipped_sv:
+        print(f"\n  Skipped {skipped_sv} commitments with mismatched scoring_version (expected {scoring_ver})")
+    print(f"\n  Downloaded {len(submissions)}/{total_target - skipped_sv} payloads")
 
     if not submissions:
         print("\nFailed to download any payloads!")
@@ -206,6 +214,7 @@ async def run(args):
             validator_stakes[hotkey] = stake
 
     # ---- 5. Run filter pipeline ---------------------------------------------
+    scoring_ver = args.scoring_version if args.scoring_version is not None else SCORING_VERSION
     validated, stats = run_filter_pipeline(
         submissions=submissions,
         expected_window=target_window,
@@ -213,6 +222,7 @@ async def run(args):
         min_stake=0.0,
         local_version=CLAWBENCH_VERSION,
         expected_protocol=CONSENSUS_PROTOCOL_VERSION,
+        expected_scoring_version=scoring_ver,
     )
     print(f"\n  Filter pipeline: {stats.summary()}")
 
@@ -292,6 +302,10 @@ def main():
     parser.add_argument("--prev-winner-cost", type=float, default=None)
     parser.add_argument("--qual-threshold", type=float, default=0.5)
     parser.add_argument("--cost-delta", type=float, default=0.10)
+    parser.add_argument(
+        "--scoring-version", type=int, default=None,
+        help=f"Override scoring version filter (default: {SCORING_VERSION})",
+    )
     args = parser.parse_args()
 
     asyncio.run(run(args))

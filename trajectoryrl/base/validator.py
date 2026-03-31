@@ -45,7 +45,7 @@ from ..utils.eval_window import (
 )
 from ..utils.consensus import (
     ConsensusPayload, ConsensusPointer,
-    CONSENSUS_PROTOCOL_VERSION,
+    CONSENSUS_PROTOCOL_VERSION, SCORING_VERSION,
 )
 from ..utils.consensus_store import (
     ConsensusStore, IPFSBackend, TrajRLAPIBackend,
@@ -374,13 +374,27 @@ class TrajectoryValidator:
         return hashlib.sha256(config_str.encode()).hexdigest()[:16]
 
     def _load_ema_state(self):
-        """Load persisted evaluation state from disk."""
+        """Load persisted evaluation state from disk.
+
+        Invalidates all state when either ``scoring_version`` or
+        ``scenario_config_hash`` no longer matches the running code.
+        """
         path = self.config.ema_state_path
         if not path.exists():
             logger.debug("No persisted eval state found, starting fresh")
             return
         try:
             data = json.loads(path.read_text())
+
+            file_sv = data.get("scoring_version", 1)
+            if file_sv != SCORING_VERSION:
+                logger.info(
+                    "EMA state scoring_version mismatch (%d != %d), "
+                    "invalidating all eval state",
+                    file_sv, SCORING_VERSION,
+                )
+                return
+
             if data.get("scenario_config_hash") != self._scenario_config_hash:
                 logger.debug(
                     "Scenario pool changed, invalidating all eval state"
@@ -410,6 +424,7 @@ class TrajectoryValidator:
     def _save_ema_state(self):
         """Persist evaluation state to disk for restart recovery."""
         data = {
+            "scoring_version": SCORING_VERSION,
             "scenario_config_hash": self._scenario_config_hash,
             "raw_costs": self.raw_costs,
             "scenario_qualified": self.scenario_qualified,
@@ -440,7 +455,13 @@ class TrajectoryValidator:
         return self.config.ema_state_path.parent / "eval_cache.json"
 
     def _load_eval_cache(self):
-        """Load eval result cache from disk, pruning entries older than TTL."""
+        """Load eval result cache from disk, pruning entries older than TTL.
+
+        The cache file carries a ``scoring_version`` header.  When the
+        version does not match the running ``SCORING_VERSION``, the entire
+        cache is discarded because evaluation criteria have changed and
+        all prior results are invalid.
+        """
         if not _EVAL_CACHE_ENABLED:
             return
         path = self._eval_cache_path
@@ -448,13 +469,29 @@ class TrajectoryValidator:
             logger.debug("No eval cache found, starting fresh")
             return
         try:
-            data = json.loads(path.read_text())
+            raw = json.loads(path.read_text())
+
+            if isinstance(raw, dict) and "entries" in raw:
+                file_sv = raw.get("scoring_version", 1)
+                entries = raw["entries"]
+            else:
+                file_sv = 1
+                entries = raw
+
+            if file_sv != SCORING_VERSION:
+                logger.info(
+                    "Eval cache scoring_version mismatch (%d != %d), "
+                    "discarding %d cached entries",
+                    file_sv, SCORING_VERSION, len(entries),
+                )
+                return
+
             cutoff = time.time() - _EVAL_CACHE_TTL_DAYS * 86400
             self._eval_cache = {
-                k: v for k, v in data.items()
+                k: v for k, v in entries.items()
                 if v.get("last_eval_at", 0) > cutoff
             }
-            pruned = len(data) - len(self._eval_cache)
+            pruned = len(entries) - len(self._eval_cache)
             logger.debug(
                 f"Loaded eval cache: {len(self._eval_cache)} entries"
                 + (f" (pruned {pruned} expired)" if pruned else "")
@@ -468,8 +505,12 @@ class TrajectoryValidator:
             return
         try:
             self._eval_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            wrapper = {
+                "scoring_version": SCORING_VERSION,
+                "entries": self._eval_cache,
+            }
             self._eval_cache_path.write_text(
-                json.dumps(self._eval_cache, indent=2, sort_keys=True)
+                json.dumps(wrapper, indent=2, sort_keys=True)
             )
         except Exception as e:
             logger.warning(f"Failed to save eval cache: {e}")
@@ -693,7 +734,7 @@ class TrajectoryValidator:
         if parsed is None:
             return False
 
-        _, on_chain_window, _ = parsed
+        _, on_chain_window, _, _ = parsed
         return on_chain_window == window_number
 
     async def _submit_consensus_payload(self, window: EvaluationWindow) -> bool:
@@ -721,6 +762,7 @@ class TrajectoryValidator:
             protocol_version=self.config.consensus_protocol_version,
             window_number=window.window_number,
             content_address=content_address,
+            scoring_version=SCORING_VERSION,
         )
         try:
             self.subtensor.set_commitment(
@@ -781,6 +823,7 @@ class TrajectoryValidator:
             costs=costs_by_hotkey,
             qualified=qualified_by_hotkey,
             timestamp=int(time.time()),
+            scoring_version=SCORING_VERSION,
             disqualified=disqualified_by_hotkey,
         )
 
@@ -805,7 +848,11 @@ class TrajectoryValidator:
             return
 
         submissions = []
+        skipped_sv = 0
         for vc in chain_commitments:
+            if vc.scoring_version != SCORING_VERSION:
+                skipped_sv += 1
+                continue
             pointer = ConsensusPointer(
                 protocol_version=vc.protocol_version,
                 window_number=vc.window_number,
@@ -817,6 +864,12 @@ class TrajectoryValidator:
             )
             if payload is not None:
                 submissions.append((pointer, payload))
+        if skipped_sv:
+            logger.info(
+                "Window %d: skipped %d commitments with mismatched "
+                "scoring_version (expected %d)",
+                window.window_number, skipped_sv, SCORING_VERSION,
+            )
 
         # Check if own submission is present; inject local data if missing
         my_hotkey = self.wallet.hotkey.ss58_address
@@ -869,6 +922,7 @@ class TrajectoryValidator:
             min_stake=min_stake,
             local_version=clawbench_version,
             expected_protocol=self.config.consensus_protocol_version,
+            expected_scoring_version=SCORING_VERSION,
         )
 
         if not validated:
@@ -1434,6 +1488,7 @@ class TrajectoryValidator:
                         rejected=True,
                         rejection_stage="integrity_check",
                         rejection_detail=detail,
+                        scoring_version=SCORING_VERSION,
                     )
                 )
                 self.raw_costs.pop(hotkey, None)
@@ -1487,6 +1542,7 @@ class TrajectoryValidator:
                             rejected=True,
                             rejection_stage=_stage,
                             rejection_detail=_detail,
+                            scoring_version=SCORING_VERSION,
                         )
                     )
                     self._disqualified_miners[hotkey] = f"pre_eval_rejected:{reason}"
@@ -1908,6 +1964,7 @@ class TrajectoryValidator:
                     rejected=True,
                     rejection_stage="integrity_check",
                     rejection_detail=integrity.summary,
+                    scoring_version=SCORING_VERSION,
                 )
             )
             self._disqualified_miners[commitment.hotkey] = "integrity_failed"
@@ -2215,6 +2272,7 @@ class TrajectoryValidator:
             scenario_results=scenario_results,
             llm_base_url=self._judge_base_url,
             llm_model=self._judge_model,
+            scoring_version=SCORING_VERSION,
         )
 
     # ------------------------------------------------------------------

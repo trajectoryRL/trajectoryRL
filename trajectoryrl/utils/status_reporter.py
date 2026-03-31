@@ -354,6 +354,7 @@ async def submit_eval(
     rejected: Optional[bool] = None,
     rejection_stage: Optional[str] = None,
     rejection_detail: Optional[str] = None,
+    scoring_version: Optional[int] = None,
     submit_url: str = DEFAULT_SUBMIT_URL,
 ) -> bool:
     """Submit a single miner eval result to the dashboard API.
@@ -411,6 +412,8 @@ async def submit_eval(
         payload["rejection_stage"] = rejection_stage
     if rejection_detail is not None:
         payload["rejection_detail"] = rejection_detail
+    if scoring_version is not None:
+        payload["scoring_version"] = scoring_version
 
     try:
         async with httpx.AsyncClient() as client:
