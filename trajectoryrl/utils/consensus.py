@@ -12,6 +12,12 @@ from typing import Dict
 
 CONSENSUS_PROTOCOL_VERSION = 1
 
+# Scoring version tracks evaluation criteria (scenario set, rubric, judge logic).
+# Bump this whenever scenarios are added/removed or scoring semantics change
+# so that results from different versions are never mixed during aggregation,
+# cached-result lookup, or winner selection.
+SCORING_VERSION = 1
+
 
 @dataclass
 class ConsensusPayload:
@@ -27,6 +33,7 @@ class ConsensusPayload:
     costs: Dict[str, float]         # miner hotkey -> EMA cost (USD)
     qualified: Dict[str, bool]      # miner hotkey -> qualification gate (all known miners)
     timestamp: int                  # unix seconds when payload was built
+    scoring_version: int = 1        # evaluation criteria version (scenario set + rubric)
     disqualified: Dict[str, str] = field(default_factory=dict)
     # miner hotkey -> reason (e.g. "pre_eval_rejected", "integrity_failed")
     # miners in disqualified also appear in qualified with value=False
@@ -38,6 +45,7 @@ class ConsensusPayload:
             "disqualified": self.disqualified,
             "protocol_version": self.protocol_version,
             "qualified": self.qualified,
+            "scoring_version": self.scoring_version,
             "timestamp": self.timestamp,
             "validator_hotkey": self.validator_hotkey,
             "window_number": self.window_number,
@@ -63,6 +71,7 @@ class ConsensusPayload:
             costs=d["costs"],
             qualified=d["qualified"],
             timestamp=d["timestamp"],
+            scoring_version=d.get("scoring_version", 1),
             disqualified=d.get("disqualified", {}),
         )
 
@@ -76,6 +85,7 @@ class ConsensusPayload:
             costs=d["costs"],
             qualified=d["qualified"],
             timestamp=d["timestamp"],
+            scoring_version=d.get("scoring_version", 1),
             disqualified=d.get("disqualified", {}),
         )
 

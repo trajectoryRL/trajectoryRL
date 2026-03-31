@@ -12,6 +12,8 @@ import os
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
+from .consensus import SCORING_VERSION
+
 logger = logging.getLogger(__name__)
 
 
@@ -23,6 +25,7 @@ class WinnerState:
     winner_pack_hash: Optional[str] = None
     winner_cost: Optional[float] = None
     winner_uid: Optional[int] = None
+    scoring_version: int = SCORING_VERSION
 
 
 def select_winner_with_protection(
@@ -139,6 +142,7 @@ def select_winner_with_protection(
 def save_winner_state(state: WinnerState, path: str):
     """Persist winner state to JSON file."""
     data = {
+        "scoring_version": state.scoring_version,
         "winner_hotkey": state.winner_hotkey,
         "winner_pack_hash": state.winner_pack_hash,
         "winner_cost": state.winner_cost,
@@ -151,15 +155,32 @@ def save_winner_state(state: WinnerState, path: str):
 
 
 def load_winner_state(path: str) -> WinnerState:
-    """Load winner state from JSON file, or return fresh state."""
+    """Load winner state from JSON file, or return fresh state.
+
+    Returns an empty ``WinnerState`` when the persisted
+    ``scoring_version`` does not match the running ``SCORING_VERSION``,
+    so that an obsolete winner cannot block elections under the new
+    evaluation criteria.
+    """
     try:
         with open(path) as f:
             data = json.load(f)
+
+        file_sv = data.get("scoring_version", 1)
+        if file_sv != SCORING_VERSION:
+            logger.warning(
+                "Winner state scoring_version mismatch (%d != %d), "
+                "resetting winner protection",
+                file_sv, SCORING_VERSION,
+            )
+            return WinnerState()
+
         return WinnerState(
             winner_hotkey=data.get("winner_hotkey"),
             winner_pack_hash=data.get("winner_pack_hash"),
             winner_cost=data.get("winner_cost"),
             winner_uid=data.get("winner_uid"),
+            scoring_version=file_sv,
         )
     except (FileNotFoundError, json.JSONDecodeError):
         return WinnerState()

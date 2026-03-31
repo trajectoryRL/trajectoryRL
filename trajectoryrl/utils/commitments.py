@@ -67,6 +67,7 @@ class ValidatorConsensusCommitment:
     validator_hotkey: str
     block_number: int
     raw: str
+    scoring_version: int = 1
 
 
 def encode_dual_address(
@@ -114,14 +115,19 @@ def is_consensus_commitment(raw: str) -> bool:
     return isinstance(raw, str) and raw.strip().startswith(_CONSENSUS_PREFIX)
 
 
-def parse_consensus_commitment(raw: str) -> Optional[Tuple[int, int, str]]:
+def parse_consensus_commitment(raw: str) -> Optional[Tuple[int, int, str, int]]:
     """Parse a validator consensus commitment string.
 
-    Format: ``consensus:{protocol_version}|{window_number}|{content_address}``
+    Supports two formats:
+        Old (3-field): ``consensus:{pv}|{window}|{content_address}``
+        New (4-field): ``consensus:{pv}|{window}|{scoring_version}|{content_address}``
+
+    Old-format commitments (missing scoring_version) default to
+    ``scoring_version=1``.
 
     Returns:
-        Tuple of (protocol_version, window_number, content_address)
-        or None if unparseable.
+        Tuple of (protocol_version, window_number, content_address,
+        scoring_version) or None if unparseable.
     """
     if not raw or not isinstance(raw, str):
         return None
@@ -131,34 +137,50 @@ def parse_consensus_commitment(raw: str) -> Optional[Tuple[int, int, str]]:
         return None
 
     body = raw[len(_CONSENSUS_PREFIX):]
-    parts = body.split("|", maxsplit=2)
-    if len(parts) != 3:
-        return None
+    parts = body.split("|", maxsplit=3)
 
-    try:
-        protocol_version = int(parts[0].strip())
-        window_number = int(parts[1].strip())
-    except (ValueError, TypeError):
-        return None
+    if len(parts) == 3:
+        try:
+            protocol_version = int(parts[0].strip())
+            window_number = int(parts[1].strip())
+        except (ValueError, TypeError):
+            return None
+        content_address = parts[2].strip()
+        if not content_address:
+            return None
+        return protocol_version, window_number, content_address, 1
 
-    content_address = parts[2].strip()
-    if not content_address:
-        return None
+    if len(parts) == 4:
+        try:
+            protocol_version = int(parts[0].strip())
+            window_number = int(parts[1].strip())
+            scoring_version = int(parts[2].strip())
+        except (ValueError, TypeError):
+            return None
+        content_address = parts[3].strip()
+        if not content_address:
+            return None
+        return protocol_version, window_number, content_address, scoring_version
 
-    return protocol_version, window_number, content_address
+    return None
 
 
 def format_consensus_commitment(
     protocol_version: int,
     window_number: int,
     content_address: str,
+    scoring_version: int = 1,
 ) -> str:
     """Build a consensus commitment string for ``set_commitment``.
 
     Returns:
-        Formatted string: ``consensus:{protocol_version}|{window_number}|{content_address}``
+        Formatted string:
+        ``consensus:{protocol_version}|{window_number}|{scoring_version}|{content_address}``
     """
-    return f"{_CONSENSUS_PREFIX}{protocol_version}|{window_number}|{content_address}"
+    return (
+        f"{_CONSENSUS_PREFIX}{protocol_version}|{window_number}"
+        f"|{scoring_version}|{content_address}"
+    )
 
 
 def parse_commitment(raw: str) -> Optional[Tuple[str, str]]:
@@ -334,7 +356,7 @@ def fetch_validator_consensus_commitments(
             )
             continue
 
-        protocol_version, window_number, content_address = parsed
+        protocol_version, window_number, content_address, scoring_version = parsed
         block_number = _get_commitment_block(subtensor, netuid, hotkey)
 
         results.append(ValidatorConsensusCommitment(
@@ -344,10 +366,12 @@ def fetch_validator_consensus_commitments(
             validator_hotkey=hotkey,
             block_number=block_number,
             raw=raw,
+            scoring_version=scoring_version,
         ))
         logger.debug(
-            "Validator %s: consensus commitment — v%d window=%d addr=%s",
-            hotkey[:8], protocol_version, window_number, content_address[:24],
+            "Validator %s: consensus commitment — v%d window=%d sv=%d addr=%s",
+            hotkey[:8], protocol_version, window_number,
+            scoring_version, content_address[:24],
         )
 
     if skipped_non_validator:

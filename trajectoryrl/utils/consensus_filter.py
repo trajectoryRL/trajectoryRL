@@ -1,6 +1,6 @@
 """Submission filter pipeline for consensus aggregation.
 
-6-layer pipeline that filters incoming consensus submissions before
+7-layer pipeline that filters incoming consensus submissions before
 stake-weighted aggregation.  Each layer logs skip counts for diagnosing
 low participation.
 
@@ -10,7 +10,8 @@ Pipeline order:
   3. Trust threshold   — discard validators below min stake
   4. Data integrity    — discard payloads that fail hash verification
   5. ClawBench version — discard incompatible major versions
-  6. Zero-signal       — discard all-zero cost submissions (free-riders)
+  6. Scoring version   — discard mismatched evaluation criteria versions
+  7. Zero-signal       — discard all-zero cost submissions (free-riders)
 """
 
 import logging
@@ -19,7 +20,7 @@ from typing import Dict, List, Optional, Tuple
 
 from .consensus import (
     ConsensusPayload, ConsensusPointer,
-    CONSENSUS_PROTOCOL_VERSION,
+    CONSENSUS_PROTOCOL_VERSION, SCORING_VERSION,
 )
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,7 @@ class FilterStats:
     skipped_stake: int = 0
     skipped_integrity: int = 0
     skipped_version: int = 0
+    skipped_scoring_version: int = 0
     skipped_zero_signal: int = 0
     passed: int = 0
 
@@ -42,7 +44,8 @@ class FilterStats:
             f"Filter: {self.total_input} in → {self.passed} passed | "
             f"protocol={self.skipped_protocol} window={self.skipped_window} "
             f"stake={self.skipped_stake} integrity={self.skipped_integrity} "
-            f"version={self.skipped_version} zero={self.skipped_zero_signal}"
+            f"version={self.skipped_version} scoring={self.skipped_scoring_version} "
+            f"zero={self.skipped_zero_signal}"
         )
 
 
@@ -173,10 +176,33 @@ def filter_clawbench_version(
     return passed, skipped
 
 
+def filter_scoring_version(
+    submissions: List[Tuple[ConsensusPointer, ConsensusPayload]],
+    expected_version: int = SCORING_VERSION,
+) -> Tuple[List[Tuple[ConsensusPointer, ConsensusPayload]], int]:
+    """Layer 6: discard submissions with mismatched scoring version.
+
+    Different scoring versions use different scenario sets or rubrics,
+    producing incomparable costs and qualification verdicts.
+    """
+    passed = []
+    skipped = 0
+    for ptr, payload in submissions:
+        if payload.scoring_version != expected_version:
+            logger.debug(
+                "Filter[scoring_version]: skip %s (sv%d != sv%d)",
+                ptr.validator_hotkey[:8], payload.scoring_version, expected_version,
+            )
+            skipped += 1
+        else:
+            passed.append((ptr, payload))
+    return passed, skipped
+
+
 def filter_zero_signal(
     submissions: List[Tuple[ConsensusPointer, ConsensusPayload]],
 ) -> Tuple[List[Tuple[ConsensusPointer, ConsensusPayload]], int]:
-    """Layer 6: discard all-zero cost submissions when non-zero signals exist.
+    """Layer 7: discard all-zero cost submissions when non-zero signals exist.
 
     Prevents free-riding validators from diluting legitimate signals.
     If ALL submissions are zero, they all pass (bootstrap scenario).
@@ -210,8 +236,9 @@ def run_filter_pipeline(
     min_stake: float,
     local_version: str,
     expected_protocol: int = CONSENSUS_PROTOCOL_VERSION,
+    expected_scoring_version: int = SCORING_VERSION,
 ) -> Tuple[List[ValidatedSubmission], FilterStats]:
-    """Run the full 6-layer filter pipeline.
+    """Run the full 7-layer filter pipeline.
 
     Returns:
         - List of ValidatedSubmission that passed all layers
@@ -235,6 +262,9 @@ def run_filter_pipeline(
 
     current, n = filter_clawbench_version(current, local_version)
     stats.skipped_version = n
+
+    current, n = filter_scoring_version(current, expected_scoring_version)
+    stats.skipped_scoring_version = n
 
     current, n = filter_zero_signal(current)
     stats.skipped_zero_signal = n
