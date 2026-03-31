@@ -559,8 +559,8 @@ while running:
 
      If block_offset = T_publish (80%):
        # Submission phase — publish evaluation results
-       Upload payload to CAS (IPFS → GCS fallback)
-       Write pointer on-chain via set_commitment("consensus:v|w|addr")
+       Upload payload to CAS (IPFS + GCS concurrently)
+       Write pointer on-chain via set_commitment("consensus:v|w|ipfs_cid;gcs_url")
 
      If block_offset ≥ T_aggregate (90%):
        # Aggregation phase — compute consensus
@@ -572,9 +572,9 @@ while running:
      - If no consensus yet (bootstrap) → set fallback weights
 ```
 
-### Rate-Limiting (Anti-DDoS)
+### Evaluation Rate-Limiting
 
-Evaluation is rate-limited to **at most one evaluation per miner per evaluation window**, regardless of how often the miner updates their on-chain commitment. This prevents a miner from draining validator API budgets via rapid commitment churn.
+Evaluation is rate-limited to **at most one evaluation per miner per evaluation window**, regardless of how often the miner updates their on-chain commitment. This is a natural property of the windowed evaluation design — validators evaluate each miner once per window and use the result until the next window.
 
 - If a miner submits a new `pack_hash` within the current window, the validator **notes** the new hash but waits for the next window
 - At the next window, the validator evaluates the **latest** `pack_hash` for that miner
@@ -930,9 +930,9 @@ Window N (7200 blocks, ~20 tempos)
 │   If no consensus exists yet: set fallback weights
 │
 ├── [block 5760]               T_publish — submission deadline (hard)
-│   1. Construct evaluation payload (raw costs, qualified, metadata)
-│   2. Upload payload to CAS (IPFS primary, GCS fallback), obtain content address
-│   3. Write on-chain commitment: consensus:{protocol_version}|{window_number}|{content_address}
+│   1. Construct ConsensusPayload (costs, qualified, disqualified, metadata)
+│   2. Upload to CAS concurrently (IPFS + GCS), obtain dual content address
+│   3. Write on-chain commitment: consensus:{version}|{window}|{ipfs_cid};{gcs_url}
 │   Unpublished results are excluded from this window's consensus
 │
 ├── [block 5760 ── 6480]       Propagation interval (10%)
@@ -975,21 +975,59 @@ A 7200-block window contains ~20 tempos. Validators set weights at every one of 
 
 ### Payload Externalization + On-Chain Pointer Registration
 
-Evaluation payloads (per-miner costs, judge results, ClawBench version, disqualification reasons, metadata) can be large. Direct on-chain storage is impractical.
+Evaluation payloads are too large for direct on-chain storage.
 
 **Solution**: Two-layer storage with on-chain pointer registration.
 
-1. **Content-Addressed Storage (CAS)**: Upload the full evaluation payload. IPFS is the primary backend; `trajrl.com` acts as a GCS proxy fallback (stores payload to GCS, returns a public URL). The content address (IPFS CID or sha256 hash) serves as an integrity proof.
-2. **On-chain pointer**: Write a lightweight commitment via `subtensor.set_commitment()` with format: `consensus:{protocol_version}|{window_number}|{content_address}`.
+1. **Content-Addressed Storage (CAS)**: Upload the full `ConsensusPayload` as canonical JSON to both IPFS (primary) and `trajrl.com`/GCS (fallback) concurrently. The content address serves as an integrity proof.
+2. **On-chain pointer**: Write a lightweight commitment via `subtensor.set_commitment()` with format: `consensus:{protocol_version}|{window_number}|{content_address}`. The `content_address` component uses a **dual-address** encoding when both backends succeed: `{ipfs_cid};{gcs_url}`. When only one backend succeeds, the raw CID or URL is used directly. Readers use `decode_dual_address` to split the string and try IPFS first, GCS as fallback.
 
-Validator consensus commitments share the same commitment channel as miner pack commitments (`pack_hash|pack_url`). They are distinguished by the `consensus:` prefix. During aggregation, each validator reads `get_all_commitments(netuid)` and filters for entries starting with `consensus:`.
+**`ConsensusPayload` wire format** (canonical JSON, sorted keys):
 
-**Verification**: Any validator can independently verify a submission: read on-chain pointer → extract content address → download payload from CAS → verify content hash matches.
+```json
+{
+    "clawbench_version": "0.1.0",
+    "costs": {
+        "5Miner_A_hotkey...": 0.0342,
+        "5Miner_B_hotkey...": 0.0518
+    },
+    "disqualified": {
+        "5Miner_C_hotkey...": "integrity_failed"
+    },
+    "protocol_version": 1,
+    "qualified": {
+        "5Miner_A_hotkey...": true,
+        "5Miner_B_hotkey...": false,
+        "5Miner_C_hotkey...": false
+    },
+    "timestamp": 1710000000,
+    "validator_hotkey": "5Validator_hotkey...",
+    "window_number": 42
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `protocol_version` | int | Must match expected version (currently `1`) |
+| `window_number` | int | Evaluation window this payload covers |
+| `validator_hotkey` | string | SS58 address of the submitting validator |
+| `clawbench_version` | string | ClawBench semver used for evaluation |
+| `costs` | dict | Miner hotkey → raw cost in USD (weighted mean across scenarios) |
+| `qualified` | dict | Miner hotkey → bool (all safety + correctness criteria passed on all scenarios) |
+| `timestamp` | int | Unix seconds when the payload was built |
+| `disqualified` | dict | Miner hotkey → reason string (e.g. `"pre_eval_rejected"`, `"integrity_failed"`). Miners here also appear in `qualified` with `false` |
+
+Content hash: `sha256:` + hex digest of the canonical JSON serialization (`json.dumps(payload, sort_keys=True, separators=(",", ":"))`).
+
+Validator consensus commitments share the same `set_commitment` / `get_all_commitments` channel as miner pack commitments (`{pack_hash}|{pack_url}`). They are distinguished by the `consensus:` prefix. During aggregation, each validator reads `get_all_commitments(netuid)` and filters for entries starting with `consensus:`. Only hotkeys with `validator_permit` in the metagraph are accepted — this prevents miners from injecting fake consensus data by submitting a `consensus:`-prefixed commitment.
+
+**Verification**: Any validator can independently verify a submission: read on-chain pointer → decode dual-address → download payload from CAS (try IPFS, fall back to GCS) → verify content hash matches.
 
 **Examples**:
 ```
-consensus:1|42|QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG   (IPFS)
-consensus:1|42|https://storage.googleapis.com/trajrl-consensus/sha256_abc.json  (GCS fallback)
+consensus:1|42|QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG                         (IPFS only)
+consensus:1|42|https://storage.googleapis.com/trajrl-consensus/sha256_abc.json           (GCS only)
+consensus:1|42|QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG;https://storage.goog...   (dual-address)
 ```
 
 ### Submission Filter Pipeline
@@ -1074,7 +1112,7 @@ If winner exists and is qualified:
 
 **Validator local state** (`WinnerState`): Each validator persists `winner_hotkey`, `winner_pack_hash`, and `winner_cost` to a local JSON file. Since all validators process the same consensus data with the same deterministic algorithm, they converge on the same winner as long as they participate in each window.
 
-**Rate-limiting**: At most one evaluation per miner per `eval_interval`, regardless of how often the miner updates their commitment. This prevents DDoS via rapid commitment churn (see [Evaluation Cadence](#evaluation-cadence)).
+**Rate-limiting**: At most one evaluation per miner per `eval_interval`, regardless of how often the miner updates their commitment. Rapid commitment churn has no effect — validators note the latest `pack_hash` but only evaluate once per window (see [Evaluation Cadence](#evaluation-cadence)).
 
 Raw costs are submitted directly in the `ConsensusPayload` at T_publish. Weight setting always uses consensus costs (stake-weighted averages from all validators). Before the first consensus aggregation completes, the validator sets fallback weights.
 
@@ -1210,8 +1248,9 @@ fully_qualified[hotkey]     = integrity[hotkey] AND qualified on ALL scenarios
 
 # ── Submission (T_publish) ──
 
-payload = { local_cost, qualified, clawbench_version, disqualified, metadata }
-content_address = cas_upload(payload)        # IPFS primary, GCS proxy fallback
+payload = ConsensusPayload(protocol_version, window_number, validator_hotkey,
+                           clawbench_version, costs, qualified, timestamp, disqualified)
+content_address = cas_upload(payload)        # IPFS + GCS concurrently → dual-address "{cid};{gcs_url}"
 subtensor.set_commitment("consensus:{version}|{window}|{content_address}")
 
 # ── Consensus aggregation (T_aggregate) ──
