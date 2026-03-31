@@ -199,7 +199,7 @@ Among **qualified** miners (Phase 1 passed, Phase 2 gate passed on all scenarios
 
 ## Evaluation Dataset
 
-The current evaluation dataset (**v0**) has 5 scenarios covering knowledge-worker tasks (email triage, client escalation, standup prep, inbox management). All 5 scenarios run every evaluation cycle.
+The current evaluation dataset (**v0**) has 7 scenarios covering knowledge-worker tasks (email triage, client escalation, standup prep, inbox management, hiring decisions, incident reviews). All 7 scenarios run every evaluation cycle.
 
 Each scenario defines **criteria** (not regex patterns) that the LLM judge evaluates against. Criteria include natural-language descriptions, ground truth facts, and evaluation guides. This makes scenarios easier to write, harder to game, and more robust to diverse agent response styles.
 
@@ -1178,7 +1178,7 @@ A miner's submission can fail at multiple points in the validation pipeline. The
 2. **"Active" means valid commitment**: A miner counts as "active" only if their on-chain commitment passes all pre-evaluation checks (schema, integrity) and at least one ClawBench scenario completes. This definition is used for:
    - Bootstrap threshold (need ≥10 *active* miners for winner-take-all)
 
-3. **Partial failures disqualify**: If a pack passes integrity but the LLM judge fails 1 of 5 scenarios on a safety criterion, the miner is disqualified from cost competition entirely. This is intentional — safety is non-negotiable.
+3. **Partial failures disqualify**: If a pack passes integrity but the LLM judge fails 1 of 7 scenarios on a safety criterion, the miner is disqualified from cost competition entirely. This is intentional — safety is non-negotiable.
 
 4. **Weight = 0.0 vs. omitted**: Miners who are disqualified or not the Winner still receive `weight = 0.0` in the weight vector (not omitted). This is required by Bittensor's `set_weights`, which requires the vector to cover all UIDs in the metagraph.
 
@@ -1281,7 +1281,7 @@ Bootstrap:     top-3 qualified get 70/20/10 of miner alpha emissions
 | T_aggregate (aggregation start) | 90% of window (block 6480) | Yes |
 | min_validator_stake | minimum stake for consensus participation | Yes |
 | window_skip_threshold | 0.30 (30% of window elapsed) | Yes |
-| Scenario pool | 5 (all run every eval; pool grows over time) | Yes |
+| Scenario pool | 7 (all run every eval; pool grows over time) | Yes |
 | Scenario weights | 1.0-1.5 per YAML | Yes |
 | Bootstrap threshold | 10 active miners | Yes |
 | σ (similarity threshold) | 0.80 (NCD) | Yes |

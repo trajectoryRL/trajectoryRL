@@ -18,9 +18,9 @@ This is by design: miners compete on *intelligence* (better prompts/policies), n
 Each eval_interval (24h), a validator evaluates active miners marked for re-evaluation — either their `pack_hash` changed or `eval_interval` has elapsed since last eval:
 
 ```
-episodes_per_eval      = scenarios(5) × 1 run each = 5 per miner
+episodes_per_eval      = scenarios(7) × 1 run each = 7 per miner
 max_evals_per_day      = 24h / eval_interval(24h) = 1
-episodes_per_day       = marked_miners × 5
+episodes_per_day       = marked_miners × 7
 ```
 
 > **EMA accumulation**: Validators re-evaluate packs periodically (even if unchanged) to accumulate per-scenario EMA samples and smooth out LLM non-determinism. Rate-limited to at most 1 eval per miner per eval_interval.
@@ -39,14 +39,14 @@ Designated model: `GLM-5` via OpenAI-compatible API. Cost per episode ≈ **$0.0
 
 | Active Miners | Episodes/day | Daily Cost | Monthly Cost |
 |:-------------:|:------------:|:----------:|:------------:|
-| 5 | 25 | **$2** | **$60** |
-| 14 | 70 | **$6** | **$168** |
-| 30 | 150 | **$12** | **$360** |
-| 64 | 320 | **$26** | **$768** |
-| 128 | 640 | **$51** | **$1,536** |
-| 256 | 1,280 | **$102** | **$3,072** |
+| 5 | 35 | **$3** | **$84** |
+| 14 | 98 | **$8** | **$235** |
+| 30 | 210 | **$17** | **$504** |
+| 64 | 448 | **$36** | **$1,075** |
+| 128 | 896 | **$72** | **$2,150** |
+| 256 | 1,792 | **$143** | **$4,301** |
 
-**Worst-case formula**: `daily_cost ≈ miners × 1 eval × 5 episodes × $0.08 = miners × $0.40/day`.
+**Worst-case formula**: `daily_cost ≈ miners × 1 eval × 7 episodes × $0.08 = miners × $0.56/day`.
 
 In practice, only miners whose `pack_hash` changed are re-evaluated immediately. Stable packs are re-evaluated once per eval_interval (24h) for EMA accumulation.
 
@@ -77,28 +77,28 @@ Estimated alpha earnings (medium stake ~5k TAO, ~10% validator weight):
   ~295 alpha/day ≈ 4 TAO-equivalent at current pool rate ≈ $720/day
 
 Example (30 miners, worst-case all re-evaluated every interval):
-  Daily costs:   30 × $0.40 = $12/day
+  Daily costs:   30 × $0.56 = $17/day
   Daily revenue: ~$720/day (alpha, at current pool rate)
-  Net profit:    ~$708/day (~98% margin)
+  Net profit:    ~$703/day (~98% margin)
 
 Example (30 miners, typical day):
-  Daily costs:   ~$5-10/day (most packs unchanged)
+  Daily costs:   ~$7-14/day (most packs unchanged)
   Daily revenue: ~$720/day
-  Net profit:    ~$710-715/day
+  Net profit:    ~$706-713/day
 ```
 
 **At current rates**, TrajectoryRL validators are highly profitable:
 
 | Scenario | Daily Cost (worst-case) | Daily Revenue (~$720 alpha) | Monthly Profit |
 |----------|:----------:|:---------------------------:|:--------------:|
-| 30 miners | $12 | $720 | **$21,240** |
-| 64 miners | $26 | $720 | **$20,820** |
-| 128 miners | $51 | $720 | **$20,070** |
-| 256 miners | $102 | $720 | **$18,540** |
+| 30 miners | $17 | $720 | **$21,090** |
+| 64 miners | $36 | $720 | **$20,520** |
+| 128 miners | $72 | $720 | **$19,440** |
+| 256 miners | $143 | $720 | **$17,310** |
 
-Even at 256 miners (worst case, all re-evaluated every eval_interval), LLM costs are only **~14%** of validator alpha revenue.
+Even at 256 miners (worst case, all re-evaluated every eval_interval), LLM costs are only **~20%** of validator alpha revenue.
 
-**Break-even analysis**: At 256 miners ($102/day worst-case cost), validators are extremely profitable at current alpha rates. The alpha-TAO pool rate would need to drop ~86% before validators become unprofitable. Note: these figures fluctuate with pool exchange rates and subnet demand.
+**Break-even analysis**: At 256 miners ($143/day worst-case cost), validators are extremely profitable at current alpha rates. The alpha-TAO pool rate would need to drop ~80% before validators become unprofitable. Note: these figures fluctuate with pool exchange rates and subnet demand.
 
 ## Weight Setting
 

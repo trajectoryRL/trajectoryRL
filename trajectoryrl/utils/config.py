@@ -63,6 +63,8 @@ class ValidatorConfig:
             "inbox_to_action",
             "team_standup",
             "inbox_triage",
+            "hiring_debrief",
+            "post_incident_review",
         ]
     )
     scenarios_path: Optional[Path] = None

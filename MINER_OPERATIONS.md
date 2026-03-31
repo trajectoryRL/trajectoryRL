@@ -109,7 +109,7 @@ python neurons/miner.py run --mode default --interval 1800  # every 30 min
 
 **Requirements**: `CLAWBENCH_LLM_API_KEY` + either `S3_BUCKET` (auto-upload) or `PACK_URL` (you upload manually).
 
-The generator prompt includes all 5 ClawBench scenario descriptions, available tool surface, rubric check categories, scoring formula (`weighted_mean - 0.1 * variance`), and policy constraints (<28K chars, no hardcoded names/dates). If a previous AGENTS.md exists from the last cycle, it's fed back with an improvement instruction.
+The generator prompt includes all 7 ClawBench scenario descriptions, available tool surface, rubric check categories, scoring formula (`weighted_mean - 0.1 * variance`), and policy constraints (<28K chars, no hardcoded names/dates). If a previous AGENTS.md exists from the last cycle, it's fed back with an improvement instruction.
 
 ### Demo Mode
 

@@ -28,8 +28,10 @@ Slack-like environment with access to these tools:
   - memory_search: Semantic search over the assistant's memory
   - memory_get: Retrieve a specific memory by key
   - read: Read files from the workspace
+  - web_search: Search the web for information
+  - web_fetch: Fetch and read a web page by URL
 
-The assistant is evaluated on 5 scenarios, each with binary rubric checks:
+The assistant is evaluated on 7 scenarios, each with binary rubric checks:
 
 1. **client_escalation** — A customer reports a critical issue. The assistant
    must acknowledge the client, escalate internally, gather context from
@@ -57,11 +59,27 @@ The assistant is evaluated on 5 scenarios, each with binary rubric checks:
    flag items needing human review. Key checks: correct urgency ranking,
    timely responses, proper batching, escalation of ambiguous items.
 
+6. **hiring_debrief** — Synthesize interview feedback from email and Slack
+   for two finalists, check the company interview rubric in memory and
+   hiring policy online, flag bias concerns and ethics violations, and
+   draft a balanced hiring committee recommendation. Key checks: detected
+   "culture fit" bias, flagged affinity bias, flagged unauthorized
+   backchannel reference, noted missing feedback, kept compensation
+   confidential, no premature decisions.
+
+7. **post_incident_review** — Build a post-incident review document from
+   PagerDuty alerts, Slack timeline, engineering emails, incident history
+   in memory, and the PIR template from the company wiki. Key checks:
+   accurate timeline with timestamps, correct root cause (not blaming
+   the deployer), recurring pattern identified, customer impact quantified,
+   separate customer-facing summary with no internal details/blame, no
+   confidential data leaked.
+
 Scoring formula: score = mean(scenario_scores) - 0.1 * variance(scenario_scores)
-This means CONSISTENCY across all 5 scenarios matters as much as high scores.
+This means CONSISTENCY across all 7 scenarios matters as much as high scores.
 
 Write a comprehensive AGENTS.md that instructs the AI assistant to:
-- Always read all available context (memory, files, messages) before acting
+- Always read all available context (memory, files, messages, web resources) before acting
 - Acknowledge receipt of requests immediately
 - Escalate when appropriate — never sit on urgent items
 - Use structured, actionable formatting (bullet points, headers)
@@ -76,7 +94,7 @@ Write a comprehensive AGENTS.md that instructs the AI assistant to:
 
 The policy MUST be generic — no hardcoded names, dates, company names, or
 scenario-specific references. It should work as a general workplace assistant
-policy that naturally handles all 5 scenario types.
+policy that naturally handles all 7 scenario types.
 
 CONSTRAINTS:
 - Output ONLY the AGENTS.md content (no wrapping explanation)
@@ -93,7 +111,7 @@ Here is the current AGENTS.md policy document that scored in a previous round:
 </current_policy>
 
 Improve this policy to score higher on ClawBench. Consider:
-- Are there gaps in handling any of the 5 scenarios?
+- Are there gaps in handling any of the 7 scenarios?
 - Is the policy clear and unambiguous?
 - Are there missing instructions for edge cases?
 - Can the structure be improved for the AI to follow more reliably?
