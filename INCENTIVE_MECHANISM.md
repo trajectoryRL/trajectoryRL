@@ -406,6 +406,7 @@ Where:
 - `winner_hotkey` — current winner's hotkey
 - `winner_pack_hash` — the pack hash when they won
 - `winner_cost` — the consensus cost when they won
+- `scoring_version` — the `SCORING_VERSION` when they won (state resets on version change)
 
 **Example Timeline**:
 ```
@@ -559,8 +560,8 @@ while running:
 
      If block_offset = T_publish (80%):
        # Submission phase — publish evaluation results
-       Upload payload to CAS (IPFS + GCS concurrently)
-       Write pointer on-chain via set_commitment("consensus:v|w|ipfs_cid;gcs_url")
+       Upload payload to CAS (IPFS → GCS fallback)
+       Write pointer on-chain via set_commitment("consensus:v|w|sv|addr")
 
      If block_offset ≥ T_aggregate (90%):
        # Aggregation phase — compute consensus
@@ -941,12 +942,13 @@ Window N (7200 blocks, ~20 tempos)
 │
 ├── [block 6480]               T_aggregate — consensus aggregation
 │   1. Read all commitments from chain (filter for "consensus:" prefix)
-│   2. Run filter pipeline (protocol → window → stake → integrity → version → zero-signal)
+│   2. Skip commitments with mismatched scoring_version (pre-download)
 │   3. Download valid payloads from CAS
-│   4. Compute stake-weighted majority qualification per miner
-│   5. Compute stake-weighted consensus cost (qualified votes only)
-│   6. Apply Winner Protection → select winner
-│   7. Store Window N consensus as latest_consensus
+│   4. Run filter pipeline (protocol → window → stake → integrity → version → scoring → zero-signal)
+│   5. Compute stake-weighted majority qualification per miner
+│   6. Compute stake-weighted consensus cost (qualified votes only)
+│   7. Apply Winner Protection → select winner
+│   8. Store Window N consensus as latest_consensus
 │
 └── [block 6480 ── 7200]       Consensus effective (10%)
     set_weights every tempo now using Window N consensus data
@@ -979,10 +981,12 @@ Evaluation payloads are too large for direct on-chain storage.
 
 **Solution**: Two-layer storage with on-chain pointer registration.
 
-1. **Content-Addressed Storage (CAS)**: Upload the full `ConsensusPayload` as canonical JSON to both IPFS (primary) and `trajrl.com`/GCS (fallback) concurrently. The content address serves as an integrity proof.
-2. **On-chain pointer**: Write a lightweight commitment via `subtensor.set_commitment()` with format: `consensus:{protocol_version}|{window_number}|{content_address}`. The `content_address` component uses a **dual-address** encoding when both backends succeed: `{ipfs_cid};{gcs_url}`. When only one backend succeeds, the raw CID or URL is used directly. Readers use `decode_dual_address` to split the string and try IPFS first, GCS as fallback.
+1. **Content-Addressed Storage (CAS)**: Upload the full evaluation payload. IPFS is the primary backend; `trajrl.com` acts as a GCS proxy fallback (stores payload to GCS, returns a public URL). The content address (IPFS CID or sha256 hash) serves as an integrity proof.
+2. **On-chain pointer**: Write a lightweight commitment via `subtensor.set_commitment()` with format: `consensus:{protocol_version}|{window_number}|{scoring_version}|{content_address}`.
 
-**`ConsensusPayload` wire format** (canonical JSON, sorted keys):
+Validator consensus commitments share the same commitment channel as miner pack commitments (`pack_hash|pack_url`). They are distinguished by the `consensus:` prefix. During aggregation, each validator reads `get_all_commitments(netuid)` and filters for entries starting with `consensus:`. Commitments with a mismatched `scoring_version` are skipped before CAS download.
+
+**Backward compatibility**: Old-format commitments (`consensus:{pv}|{window}|{content_address}`, 3 fields) are parsed with `scoring_version` defaulting to 1.
 
 ```json
 {
@@ -1025,9 +1029,8 @@ Validator consensus commitments share the same `set_commitment` / `get_all_commi
 
 **Examples**:
 ```
-consensus:1|42|QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG                         (IPFS only)
-consensus:1|42|https://storage.googleapis.com/trajrl-consensus/sha256_abc.json           (GCS only)
-consensus:1|42|QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG;https://storage.goog...   (dual-address)
+consensus:1|42|1|QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG   (IPFS)
+consensus:1|42|1|https://storage.googleapis.com/trajrl-consensus/sha256_abc.json  (GCS fallback)
 ```
 
 ### Submission Filter Pipeline
@@ -1053,7 +1056,11 @@ All submissions from on-chain commitments
   │   Discard submissions from validators running incompatible ClawBench major versions
   │   (different evaluation logic produces incomparable scores)
   │
-  └─ [6] Zero-signal exclusion
+  ├─ [6] Scoring version filter
+  │   Discard submissions with mismatched SCORING_VERSION
+  │   (different scenario sets or rubrics produce incomparable costs)
+  │
+  └─ [7] Zero-signal exclusion
       When at least one validator reports non-zero costs, discard
       all-zero submissions (prevents free-riding validators from
       diluting legitimate signals)
@@ -1110,7 +1117,7 @@ If winner exists and is qualified:
 - Self-update follows the same 10% rule — winner must beat their own winning cost by 10% to update their record
 - No automatic season reset — winner persists until beaten or disqualified. Manual reset available for operational control.
 
-**Validator local state** (`WinnerState`): Each validator persists `winner_hotkey`, `winner_pack_hash`, and `winner_cost` to a local JSON file. Since all validators process the same consensus data with the same deterministic algorithm, they converge on the same winner as long as they participate in each window.
+**Validator local state** (`WinnerState`): Each validator persists `winner_hotkey`, `winner_pack_hash`, `winner_cost`, and `scoring_version` to a local JSON file. When `SCORING_VERSION` changes (new scenario set), the winner state resets automatically. Since all validators process the same consensus data with the same deterministic algorithm, they converge on the same winner as long as they participate in each window.
 
 **Rate-limiting**: At most one evaluation per miner per `eval_interval`, regardless of how often the miner updates their commitment. Rapid commitment churn has no effect — validators note the latest `pack_hash` but only evaluate once per window (see [Evaluation Cadence](#evaluation-cadence)).
 
@@ -1248,15 +1255,15 @@ fully_qualified[hotkey]     = integrity[hotkey] AND qualified on ALL scenarios
 
 # ── Submission (T_publish) ──
 
-payload = ConsensusPayload(protocol_version, window_number, validator_hotkey,
-                           clawbench_version, costs, qualified, timestamp, disqualified)
-content_address = cas_upload(payload)        # IPFS + GCS concurrently → dual-address "{cid};{gcs_url}"
-subtensor.set_commitment("consensus:{version}|{window}|{content_address}")
+payload = { local_cost, qualified, clawbench_version, disqualified, metadata }
+content_address = cas_upload(payload)        # IPFS primary, GCS proxy fallback
+subtensor.set_commitment("consensus:{version}|{window}|{scoring_version}|{content_address}")
 
 # ── Consensus aggregation (T_aggregate) ──
 
 submissions = subtensor.get_all_commitments()  # filter for "consensus:" prefix
-valid = filter_pipeline(submissions)        # protocol → window → stake → integrity → version → zero-signal
+# skip mismatched scoring_version before CAS download
+valid = filter_pipeline(submissions)        # protocol → window → stake → integrity → version → scoring → zero-signal
 consensus_qualified[hotkey] = qualified_stake / total_stake > 0.50  # stake-weighted majority (all reporters)
 consensus_cost[hotkey] = Σ(stake_i × cost_i) / Σ(stake_i)         # qualified votes only
 
