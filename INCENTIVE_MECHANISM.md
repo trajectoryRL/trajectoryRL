@@ -199,7 +199,7 @@ Among **qualified** miners (Phase 1 passed, Phase 2 gate passed on all scenarios
 
 ## Evaluation Dataset
 
-The current evaluation dataset (**v0**) has 7 scenarios covering knowledge-worker tasks (email triage, client escalation, standup prep, inbox management, hiring decisions, incident reviews). All 7 scenarios run every evaluation cycle.
+The current evaluation dataset (**v0.1**) has 7 scenarios covering knowledge-worker tasks (client escalation, inbox-to-action, morning brief, team standup, inbox triage, hiring debrief, post-incident review). All 7 scenarios run every evaluation cycle.
 
 Each scenario defines **criteria** (not regex patterns) that the LLM judge evaluates against. Criteria include natural-language descriptions, ground truth facts, and evaluation guides. This makes scenarios easier to write, harder to game, and more robust to diverse agent response styles.
 
