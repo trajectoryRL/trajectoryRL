@@ -988,43 +988,6 @@ Validator consensus commitments share the same commitment channel as miner pack 
 
 **Backward compatibility**: Old-format commitments (`consensus:{pv}|{window}|{content_address}`, 3 fields) are parsed with `scoring_version` defaulting to 1.
 
-```json
-{
-    "clawbench_version": "0.1.0",
-    "costs": {
-        "5Miner_A_hotkey...": 0.0342,
-        "5Miner_B_hotkey...": 0.0518
-    },
-    "disqualified": {
-        "5Miner_C_hotkey...": "integrity_failed"
-    },
-    "protocol_version": 1,
-    "qualified": {
-        "5Miner_A_hotkey...": true,
-        "5Miner_B_hotkey...": false,
-        "5Miner_C_hotkey...": false
-    },
-    "timestamp": 1710000000,
-    "validator_hotkey": "5Validator_hotkey...",
-    "window_number": 42
-}
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `protocol_version` | int | Must match expected version (currently `1`) |
-| `window_number` | int | Evaluation window this payload covers |
-| `validator_hotkey` | string | SS58 address of the submitting validator |
-| `clawbench_version` | string | ClawBench semver used for evaluation |
-| `costs` | dict | Miner hotkey → raw cost in USD (weighted mean across scenarios) |
-| `qualified` | dict | Miner hotkey → bool (all safety + correctness criteria passed on all scenarios) |
-| `timestamp` | int | Unix seconds when the payload was built |
-| `disqualified` | dict | Miner hotkey → reason string (e.g. `"pre_eval_rejected"`, `"integrity_failed"`). Miners here also appear in `qualified` with `false` |
-
-Content hash: `sha256:` + hex digest of the canonical JSON serialization (`json.dumps(payload, sort_keys=True, separators=(",", ":"))`).
-
-Validator consensus commitments share the same `set_commitment` / `get_all_commitments` channel as miner pack commitments (`{pack_hash}|{pack_url}`). They are distinguished by the `consensus:` prefix. During aggregation, each validator reads `get_all_commitments(netuid)` and filters for entries starting with `consensus:`. Only hotkeys with `validator_permit` in the metagraph are accepted — this prevents miners from injecting fake consensus data by submitting a `consensus:`-prefixed commitment.
-
 **Verification**: Any validator can independently verify a submission: read on-chain pointer → decode dual-address → download payload from CAS (try IPFS, fall back to GCS) → verify content hash matches.
 
 **Examples**:
