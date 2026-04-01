@@ -868,6 +868,7 @@ class TrajectoryValidator:
 
         submissions = []
         skipped_sv = 0
+        download_failed = 0
         for vc in chain_commitments:
             if vc.scoring_version != SCORING_VERSION:
                 skipped_sv += 1
@@ -883,6 +884,8 @@ class TrajectoryValidator:
             )
             if payload is not None:
                 submissions.append((pointer, payload))
+            else:
+                download_failed += 1
         if skipped_sv:
             logger.info(
                 "Window %d: skipped %d commitments with mismatched "
@@ -918,11 +921,21 @@ class TrajectoryValidator:
                 )
 
         if not submissions:
-            logger.warning(
-                "Window %d: all payload downloads failed (%d commitments), "
-                "using local results",
-                window.window_number, len(chain_commitments),
-            )
+            total = len(chain_commitments)
+            if skipped_sv == total:
+                logger.warning(
+                    "Window %d: no usable commitments — all %d filtered out "
+                    "due to scoring_version mismatch (local=%d), "
+                    "using local results",
+                    window.window_number, total, SCORING_VERSION,
+                )
+            else:
+                logger.warning(
+                    "Window %d: no usable submissions from %d commitments "
+                    "(%d version-filtered, %d download-failed), "
+                    "using local results",
+                    window.window_number, total, skipped_sv, download_failed,
+                )
             return
 
         validator_stakes: Dict[str, float] = {}
@@ -1147,7 +1160,7 @@ class TrajectoryValidator:
                         )
                         await self._set_fallback_weights()
                         self.last_weight_block = current_block
-                    await asyncio.sleep(60)
+                    await asyncio.sleep(300)
                     continue
 
                 # --- Window phase: evaluation ---
@@ -1240,7 +1253,7 @@ class TrajectoryValidator:
                     await self._set_winner_weights()
                     self.last_weight_block = current_block
 
-                await asyncio.sleep(60)
+                await asyncio.sleep(300)
 
             except KeyboardInterrupt:
                 logger.info("Received interrupt, shutting down...")
