@@ -893,32 +893,16 @@ class TrajectoryValidator:
                 window.window_number, skipped_sv, SCORING_VERSION,
             )
 
-        # Check if own submission is present; inject local data if missing
         my_hotkey = self.wallet.hotkey.ss58_address
         own_found = any(
             p.validator_hotkey == my_hotkey for p, _ in submissions
         )
         if not own_found:
-            local_payload = self._build_local_consensus_payload(window)
-            if local_payload is not None:
-                local_pointer = ConsensusPointer(
-                    protocol_version=self.config.consensus_protocol_version,
-                    window_number=window.window_number,
-                    content_address="local:" + my_hotkey[:16],
-                    validator_hotkey=my_hotkey,
-                )
-                submissions.append((local_pointer, local_payload))
-                logger.info(
-                    "Window %d: own submission not found in CAS downloads, "
-                    "injected local in-memory evaluation data",
-                    window.window_number,
-                )
-            else:
-                logger.warning(
-                    "Window %d: own submission missing and no local eval data "
-                    "available to inject",
-                    window.window_number,
-                )
+            logger.info(
+                "Window %d: own submission not found in CAS downloads; "
+                "aggregating from other validators only",
+                window.window_number,
+            )
 
         if not submissions:
             total = len(chain_commitments)

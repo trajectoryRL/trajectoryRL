@@ -160,6 +160,7 @@ async def run(args):
     print(f"\n  Target window: {target_window}")
 
     # ---- 3. Download payloads (with per-source JSON validation) -------------
+    scoring_ver = args.scoring_version if args.scoring_version is not None else SCORING_VERSION
     max_retries = 3
     submissions = []
     skipped_sv = 0
@@ -214,7 +215,6 @@ async def run(args):
             validator_stakes[hotkey] = stake
 
     # ---- 5. Run filter pipeline ---------------------------------------------
-    scoring_ver = args.scoring_version if args.scoring_version is not None else SCORING_VERSION
     validated, stats = run_filter_pipeline(
         submissions=submissions,
         expected_window=target_window,
