@@ -21,7 +21,6 @@ services:
   validator:
     image: ghcr.io/trajectoryrl/trajectoryrl:latest
     container_name: trajectoryrl_validator
-    network_mode: host
     restart: unless-stopped
     env_file:
       - ../.env.validator

@@ -12,7 +12,6 @@ services:
   validator:
     image: ghcr.io/trajectoryrl/trajectoryrl:staging
     container_name: trajectoryrl_validator_staging
-    network_mode: host
     restart: unless-stopped
     env_file:
       - ../.env.validator
