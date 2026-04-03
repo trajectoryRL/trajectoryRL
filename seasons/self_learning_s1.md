@@ -168,16 +168,16 @@ Docker Container ("eval sandbox")
 ```
 Container lifecycle:
 
-  ┌─────────────────────────────────────────────┐
+  ┌──────────────────────────────────────────────┐
   │  Docker Sandbox (persistent across episodes) │
   │                                              │
-  │  /workspace/SKILL.md  ← PERSISTS            │
-  │  /workspace/learned/  ← PERSISTS            │
+  │  /workspace/SKILL.md  ← PERSISTS             │
+  │  /workspace/learned/  ← PERSISTS             │
   │                                              │
   │  Mock services        ← DATA RESETS each ep  │
   │  Shell history        ← CAPTURED each ep     │
   │  Agent process        ← RESTARTS each ep     │
-  └─────────────────────────────────────────────┘
+  └──────────────────────────────────────────────┘
 
 Between episodes:
   1. Capture: shell transcript, cost, service state
