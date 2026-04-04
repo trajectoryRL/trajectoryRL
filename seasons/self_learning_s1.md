@@ -226,6 +226,26 @@ The miner authors the initial `Instructions` section. The `Learned Patterns` and
 
 **Reference implementation:** [ivangdavila/self-improving](https://clawhub.ai/ivangdavila/self-improving) is an existing skill that uses three-tier memory (HOT/WARM/COLD) with auto-promotion of patterns after repeated use. It is instruction-only, framework-agnostic, and requires no external dependencies — exactly the kind of approach this evaluation is designed to test. A well-engineered SKILL.md should outperform it by optimizing specifically for cost reduction across episodes rather than general-purpose memory management.
 
+### Harness Adapters
+
+The miner declares which agent framework to use in `pack.yaml`. The validator has **predefined harness adapters** — no miner code executes, only whitelisted binaries.
+
+```yaml
+# pack.yaml (miner-provided)
+harness: claude-code    # from whitelist
+```
+
+| Harness | Validator copies SKILL.md to | Launches |
+|---------|------------------------------|----------|
+| `claude-code` | `/workspace/CLAUDE.md` | `claude --task "$PROMPT"` |
+| `cursor` | `/workspace/.cursor/rules` | `cursor-agent --task "$PROMPT"` |
+| `openclaw` | `/workspace/AGENTS.md` | `openclaw run --task "$PROMPT"` |
+| `raw-bash` | (reads directly) | `bash -c "cat SKILL.md && $PROMPT"` |
+
+After each episode, the adapter syncs back: e.g., `cp CLAUDE.md SKILL.md` so learned patterns persist in the canonical location.
+
+**Security:** Miners control SKILL.md content only — not execution. Adding a new framework = adding one adapter to the validator (a few lines of shell). The harness whitelist is part of the validator release, not configurable by miners.
+
 ---
 
 ## Mock Strategy
@@ -685,7 +705,6 @@ Four components. The judge already exists. The new work is: sandbox + episode ru
 2. **Mock service fidelity**: How closely do mock APIs need to match real ones? Basic CRUD or full query filter support?
 3. **SKILL.md size limit**: Cap to prevent unbounded growth? 500 lines? 10KB?
 4. **Cross-epoch learning**: Should SKILL.md persist across epochs (24h), or reset each epoch?
-5. **Harness specification**: How does the validator know which agent harness to run? Miner specifies in pack metadata?
-6. **Fixture hash consensus**: >50% stake agreement sufficient, or do we need a canonical generator?
-7. **Judge scoring rubric**: How many sub-criteria per scenario? More criteria = finer signal but higher judge cost. Structured rubric (binary per criterion) vs. holistic numeric score?
-8. **Judge consistency across validators**: Same trajectory may get different scores from different validators' judge calls. Median-of-validators? Or deterministic judge (structured rubric)?
+5. **Fixture hash consensus**: >50% stake agreement sufficient, or do we need a canonical generator?
+6. **Judge scoring rubric**: How many sub-criteria per scenario? More criteria = finer signal but higher judge cost. Structured rubric (binary per criterion) vs. holistic numeric score?
+7. **Judge consistency across validators**: Same trajectory may get different scores from different validators' judge calls. Median-of-validators? Or deterministic judge (structured rubric)?
