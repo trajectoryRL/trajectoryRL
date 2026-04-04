@@ -152,7 +152,7 @@ Docker Container ("eval sandbox")
 │   (Requires outbound access to LLM API only — all other egress blocked)
 │
 ├── Standard Tools (pre-installed, all optional — agent can use any method)
-│   ├── curl, jq, python3, git, node — universal
+│   ├── curl, jq, python3, git, node, gh — universal
 │   └── ~/.config/ pre-configured to point at local mock services
 │
 ├── Workspace
