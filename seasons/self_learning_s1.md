@@ -480,6 +480,24 @@ Using the LLM judge as the sole scoring mechanism eliminates a class of gaming s
 
 ---
 
+## High-Confidence Components
+
+These parts of the design solve real v1 problems regardless of how scoring evolves:
+
+1. **Docker sandbox.** Replacing regex mocks with real stateful services is a strict upgrade. Agents run real commands, mutations are real, scoring inspects actual state. This alone eliminates the exec god-function, the narrow command corridor, and the intent-vs-competence gap.
+
+2. **SKILL.md as pack format.** A plain markdown file any framework can read. No protocol, no API, no framework lock-in. The abstraction is minimal and correct.
+
+3. **Procedural data generation (Tier 3).** LLM-generated fixtures from seed + template eliminates memorization and removes the fixture maintenance burden. Deployable independently — even without the sandbox, this improves v1.
+
+4. **State-based scoring evidence.** Checking MailHog API for "is there an email to Dana?" instead of regex-matching `himalaya send` is a qualitative leap. Agents are free to use any tool or method. The scoring sees outcomes, not commands.
+
+5. **LLM judge as universal scorer.** Already proven in v1. Extending it from PASS/FAIL to quality scoring is incremental, not architectural. The judge is the one component that doesn't need to be built from scratch.
+
+The primary unknowns are in the **multi-episode learning signal** (how to reliably measure improvement with small N) and **cross-validator determinism** (Tier 2 mocks, judge variance). These are addressed in the risks section below.
+
+---
+
 ## Known Risks & Mitigations
 
 ### 1. Weak learning signal with small N
