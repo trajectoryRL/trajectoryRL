@@ -565,7 +565,12 @@ def compute_consensus_costs(
         if stake <= 0:
             continue
 
-        for miner_hk, cost in sub.payload.costs.items():
+        # Include miners that appear only in `qualified`/`disqualified` (no cost
+        # entry) so that validators who flagged a miner as integrity_failed still
+        # contribute their stake to the denominator even when they recorded no cost.
+        all_miners = set(sub.payload.costs.keys()) | set(sub.payload.qualified.keys())
+
+        for miner_hk in all_miners:
             if miner_hk not in miner_total_stake:
                 miner_total_stake[miner_hk] = 0.0
                 miner_qualified_stake[miner_hk] = 0.0
@@ -574,7 +579,8 @@ def compute_consensus_costs(
 
             miner_total_stake[miner_hk] += stake
 
-            if sub.payload.qualified.get(miner_hk, False):
+            if sub.payload.qualified.get(miner_hk, False) and miner_hk in sub.payload.costs:
+                cost = sub.payload.costs[miner_hk]
                 miner_qualified_stake[miner_hk] += stake
                 miner_qual_weighted_cost[miner_hk] += stake * cost
                 miner_qual_cost_stake[miner_hk] += stake
