@@ -1,6 +1,6 @@
 # Season 1: Self-Learning Agents
 
-> v0.5 — Hardened scoring (α-weighted delta, anti-sandbagging), canonical fixture server, full cost model, roadmap, harness escape hatch.
+> v0.6 — 1 scenario × 4 reps (split-half delta), α=0.5 learning bonus, validator-private fixture salt, whitelisted harnesses only.
 
 ---
 
@@ -40,10 +40,11 @@ Run a sequence of tasks, judge each trajectory, score the trend. The same LLM ju
 
    Miners compete on which agent framework learns best, not which prompt is cleverest. A miner running Claude Code competes directly against a miner running a custom Python harness.
 
-3. **Resistant to gaming.** A single scenario result can be hacked. A quality improvement across 2 repetitions of the same scenario with different data is harder to fake, because:
-   - Data is **different** each attempt (same template, new content)
-   - Two scenario domains prevent single-task overfitting
+3. **Resistant to gaming.** A single scenario result can be hacked. A quality trend across 4 repetitions of the same scenario with different data is harder to fake, because:
+   - Data is **different** each rep (same template, new content via validator-private salt)
+   - Four data points reveal a real trend — single-point noise averages out
    - Hybrid grading (automated + LLM judge) prevents hallucinated quality
+   - Scenario rotates per epoch — miners must handle all scenario types
 
 The only viable strategy is to build an agent that genuinely learns.
 
@@ -135,7 +136,7 @@ The agent harness (Claude Code, Cursor, OpenClaw, etc.) runs **on the validator 
 │                             │        │                                      │
 │  Agent Harness              │  SSH/  │  Mock Services (stateful)            │
 │  (claude-code, cursor,      │  exec  │  ├── MailHog    (:1025 SMTP, :1080)  │
-│   openclaw, raw-bash)       │───────→│  ├── Notion API (:8080)              │
+│   openclaw — whitelisted)   │───────→│  ├── Notion API (:8080)              │
 │                             │        │  ├── Calendar   (:8081)              │
 │  Makes LLM API calls        │        │  ├── Slack API  (:8082)              │
 │  directly (validator's key) │        │  └── Gitea      (:3000, :2222)       │
@@ -272,23 +273,12 @@ harness: claude-code    # from whitelist
 | `claude-code` | Official Claude Code Docker image | SSH → sandbox shell |
 | `cursor` | Official Cursor agent image | SSH → sandbox shell |
 | `openclaw` | Official OpenClaw image | SSH → sandbox shell |
-| `raw-bash` | Miner-specified `harness_cmd` | SSH → sandbox shell |
 
 Each adapter is a thin wrapper (~5 lines) that: (1) pulls the publisher's official image, (2) passes the universal prompt + SSH credentials, (3) captures the session transcript. The agent framework handles tool execution via SSH natively — this is how Claude Code, Cursor, etc. already work with remote environments.
 
-**Security:** Miners control SKILL.md content only — not execution. No miner code runs inside the sandbox. The sandbox has all egress blocked (fully offline). The agent harness runs on the validator host using the validator's LLM API key (consistent with v4.0 — validators bear all inference costs) and SSH access to the sandbox (for tool execution). The harness container is also resource-capped and hard-timed.
+**Security:** Miners control SKILL.md content only — not execution. No miner code runs on the validator host or inside the sandbox. The sandbox has all egress blocked (fully offline). The agent harness runs on the validator host using the validator's LLM API key (consistent with v4.0 — validators bear all inference costs) and SSH access to the sandbox (for tool execution). The harness container is also resource-capped and hard-timed.
 
-**The `raw-bash` escape hatch:** The harness whitelist includes pre-configured adapters for common frameworks (convenience), but `raw-bash` is always available. Any agent framework that can be invoked from a bash command and connect to a remote shell works:
-
-```yaml
-# pack.yaml — custom harness via raw-bash
-harness: raw-bash
-harness_cmd: "python3 /path/to/my_agent.py --ssh-host $SANDBOX_HOST --task-file /workspace/INSTRUCTION.md"
-```
-
-This means the whitelist is for convenience, not a hard gate. Miners can bring any framework without waiting for validator-side changes.
-
-**Community adapter proposals:** If a framework gains adoption, miners can propose a dedicated adapter via the standard PR process.
+**Whitelisted harnesses only (Season 1).** Only pre-configured adapters are allowed — no arbitrary command execution on the validator host. This is a deliberate security constraint: since the harness runs on the validator host with internet access (for LLM API calls), allowing miner-specified commands would be a remote code execution vulnerability. New frameworks can be proposed via PR and added to the whitelist after security review. Custom harness support (`raw-bash`) is a Season 2 goal, contingent on sandboxing the harness process itself.
 
 ---
 
@@ -305,7 +295,7 @@ Mock Services (stateful, scoring inspects state)
 Fixture Factory (build-time generation)
   → Generates ALL seed data — stateful services AND read-only fixtures
   → Replaces hand-crafted JSON fixture files
-  → Deterministic distribution via hash consensus
+  → Per-validator deterministic generation via private salt
 ```
 
 All services are deterministic. All data is pre-generated before the episode starts. No LLM calls during episode runtime. No egress from the sandbox.
@@ -392,26 +382,26 @@ epoch_seed
 
 ### Determinism Across Validators
 
-LLM-based generation is inherently non-deterministic — even with `temperature=0`, different providers, hardware, and batching strategies produce different outputs. Hash-locked consensus (">50% agree") assumes identical generation, which is unrealistic.
+LLM-based generation is inherently non-deterministic — even with `temperature=0`, different providers, hardware, and batching strategies produce different outputs. A canonical fixture server would solve this but creates a centralization point and, worse, lets miners pre-compute fixtures (the epoch_seed is public).
 
-**Solution: Canonical fixture server.**
+**Solution: Validator-private salt.**
 
-The subnet operator (or a designated validator) pre-generates the epoch's fixture bundle and publishes it:
+Each validator generates fixtures using a private salt that miners cannot predict:
 
 ```
-1. At epoch start, the canonical generator runs fixture generation from epoch_seed + scenario template
-2. Bundles all fixtures → fixtures_{epoch_seed}.tar.gz + fixture_hash (SHA-256)
-3. Publishes bundle to a well-known URL (e.g., https://fixtures.trajectoryrl.com/{epoch_seed}/)
-4. All validators download the bundle and verify fixture_hash before evaluation
-5. If download fails, validator falls back to local generation + reports fixture_hash
-   (consensus still applies as a backup)
+1. Each validator generates a validator_salt (random, stored locally, never shared during eval)
+2. fixture_seed = SHA-256(epoch_seed || validator_salt)
+3. Validator generates fixtures from fixture_seed + scenario template
+4. All miners evaluated by the same validator see the same fixtures (fair within validator)
+5. After scoring, validator publishes: (validator_salt, fixture_hash, scores)
+6. Anyone can verify: regenerate from epoch_seed + published validator_salt → compare fixture_hash
 ```
 
-This trades decentralized generation for deterministic evaluation. The fixture content is fully auditable — any party can regenerate from the same seed and verify. The canonical generator is a convenience layer, not a trust assumption: a dishonest generator would produce fixtures that don't match `hash(epoch_seed + template)` when independently verified.
+This prevents pre-computation: the `epoch_seed` is public but the `validator_salt` is not revealed until after scoring. Miners cannot predict fixtures for any specific validator. Since Bittensor validators set weights independently (the chain aggregates via stake-weighting), per-validator fixture variation is fine — relative rankings within each validator's eval are what matter, not absolute scores.
 
-**Alternative (no LLM in fixture generation):** Use PRNG + structured templates for all fixture generation. The LLM is used only during one-time scenario authoring (writing templates), not at eval time. This makes generation fully deterministic across validators without any canonical server, at the cost of less naturalistic fixture content.
+**Why not a canonical fixture server?** A shared fixture bundle is downloadable before evaluation starts. Combined with the public epoch_seed and open-source scenario templates, miners could pre-compute optimal responses. The private salt eliminates this attack entirely.
 
-Both approaches are viable. The canonical server is the recommended default; the PRNG-only approach is the fallback if centralized fixture hosting proves impractical.
+**Alternative (no LLM in fixture generation):** Use PRNG + structured templates for all fixture generation. The LLM is used only during one-time scenario authoring (writing templates), not at eval time. This makes generation fully deterministic from `fixture_seed` alone, at the cost of less naturalistic fixture content. With this approach, the private salt still prevents pre-computation.
 
 ---
 
@@ -430,121 +420,126 @@ v3: LLM judge evaluates the full trajectory against criteria           (universa
 
 The judge produces a quality score per episode (0.0–1.0) covering correctness, completeness, and safety. State-based checks (mock service inspection) serve as grounding evidence for the judge — not as the scoring mechanism itself.
 
-### Across Episodes: Learning Signal (Delta)
+### Across Episodes: Learning Signal (Split-Half Delta)
 
-The learning signal is whether quality improves from rep 1 to rep 2:
+With 4 repetitions of the same scenario, the learning signal is a **split-half comparison**: mean quality of the last 2 reps vs. the first 2 reps. Two-point averaging on each side makes the delta robust to single-episode judge variance.
 
-- Both reps low = not capable (low score)
-- Both reps high = already capable, no improvement needed (high score, no learning bonus). Quality dominates — a consistently excellent miner beats a mediocre-but-improving one.
-- Rep 2 > Rep 1 = learning from experience (high score + learning bonus)
-- Rep 2 < Rep 1 = degraded (negative delta, clamped to zero)
+- All 4 reps low = not capable (low score)
+- All 4 reps high = already capable (high score, no learning bonus). Quality dominates — a consistently excellent miner beats a mediocre-but-improving one.
+- Later reps > earlier reps = learning from experience (high score + learning bonus)
+- Later reps < earlier reps = degraded (negative delta, clamped to zero)
 
 No separate gate. A bad episode scores low (e.g. 0.1) and drags down `mean(quality)`. The formula handles it naturally — no binary disqualification needed.
 
 ```python
-ALPHA = 0.3           # learning bonus weight (caps the delta contribution)
-REP1_FLOOR = 0.3      # anti-sandbagging threshold
+ALPHA = 0.5           # learning bonus weight
+EARLY_FLOOR = 0.3     # anti-sandbagging: min acceptable mean for first 2 reps
+DELTA_THRESHOLD = 0.4 # suspicious jump threshold
 
-# Per-scenario delta (rep2 - rep1)
-for scenario in scenarios:
-    rep1 = judge_quality(episodes[scenario][0])
-    rep2 = judge_quality(episodes[scenario][1])
-    delta[scenario] = rep2 - rep1
+# 4 episodes of the same scenario, different fixtures each rep
+scores = [judge_quality(episode) for episode in episodes]  # [q1, q2, q3, q4]
 
-# Anti-sandbagging: if rep 1 is suspiciously low AND rep 2 jumps high,
-# the delta is zeroed (suspected intentional poor performance on rep 1)
-for scenario in scenarios:
-    if episodes[scenario][0] < REP1_FLOOR and delta[scenario] > 0.4:
-        delta[scenario] = 0.0  # flagged as sandbagging
+# Split-half delta: later reps vs earlier reps
+early_mean = mean(scores[:2])   # reps 1-2
+late_mean  = mean(scores[2:])   # reps 3-4
+delta      = late_mean - early_mean
 
-mean_delta      = mean(delta.values())
-mean_quality    = mean(all_episode_scores)
-learning_bonus  = ALPHA * max(0, mean_delta)
+# Anti-sandbagging: if early performance is suspiciously low AND
+# there's a large jump, zero the delta
+if early_mean < EARLY_FLOOR and delta > DELTA_THRESHOLD:
+    delta = 0.0  # flagged as sandbagging
+
+mean_quality    = mean(scores)
+learning_bonus  = ALPHA * max(0, delta)
 final_score     = mean_quality * (1 + learning_bonus)
 ```
 
-Quality dominates. High quality AND improving = win, but even a maximal delta of 1.0 only yields a 1.3× multiplier (via α=0.3). The learning bonus is a tiebreaker between miners of similar quality, not a path to leapfrog genuinely better agents.
+Quality dominates, but learning meaningfully contributes. A maximal delta of 1.0 yields a 1.5× multiplier (via α=0.5). For realistic deltas (~0.2–0.3), the learning bonus is 10–15% — enough to differentiate miners of similar quality, not enough to leapfrog a genuinely better agent.
 
-**Anti-sandbagging.** Because the agent controls both measurements, a miner could intentionally perform poorly on rep 1 to manufacture a delta. Two defenses: (1) a rep 1 quality floor — if rep 1 scores below 0.3 and the delta exceeds 0.4, the delta is zeroed as suspected sandbagging; (2) the learning bonus is weighted by α=0.3 rather than applied at full strength, limiting the reward for artificial improvement.
+**Anti-sandbagging.** Because the agent controls all measurements, a miner could intentionally perform poorly on early reps to manufacture a delta. Two defenses: (1) an early-mean floor — if the mean of the first 2 reps is below 0.3 and the delta exceeds 0.4, the delta is zeroed as suspected sandbagging; (2) the floor checks the *mean of 2 reps*, not a single episode, making it harder to game (you'd need to sandbag consistently across 2 different fixture sets).
 
 ---
 
 ## Evaluation Flow
 
 ```
-1. Build sandbox (mock services + CLI tools)
-2. Load miner's SKILL.md into /workspace/
-3. Fixed sequence: A → B → A → B (2 scenarios × 2 reps each)
-4. For episode i = 1..4:
-   a. Reset mock service data (new fixtures from epoch_seed + i)
-   b. Write /workspace/INSTRUCTION.md with task for sequence[i]
-   c. Launch agent harness on validator host, connected to sandbox via SSH
-   d. Agent runs: reads SKILL.md + learned/ + INSTRUCTION.md → does task → writes to learned/
-   e. Capture: SSH transcript + LLM usage + mock service state
-   f. Judge: hybrid grading — automated checks + LLM judge → quality score (0.0–1.0)
+1. Select scenario: scenario = scenarios[epoch_seed % n_scenarios]
+2. Build sandbox (mock services + CLI tools)
+3. Load miner's SKILL.md into /workspace/
+4. For episode i = 1..4 (same scenario, different fixtures each rep):
+   a. Generate fixtures from SHA-256(epoch_seed || validator_salt) + i
+   b. Reset mock service data, load fixtures
+   c. Write /workspace/INSTRUCTION.md with task for this scenario
+   d. Launch agent harness on validator host, connected to sandbox via SSH
+   e. Agent runs: reads SKILL.md + learned/ + INSTRUCTION.md → does task → writes to learned/
+   f. Capture: SSH transcript + LLM usage + mock service state
+   g. Judge: hybrid grading — automated checks + LLM judge → quality score (0.0–1.0)
 5. Tear down sandbox
 6. Score:
-   - Per-scenario delta: quality[rep2] - quality[rep1]
-   - final_score = mean(quality) * (1 + 0.3 * max(0, mean(deltas)))
+   - Split-half delta: mean(q3, q4) - mean(q1, q2)
+   - final_score = mean(quality) * (1 + 0.5 * max(0, delta))
+7. Publish: (validator_salt, fixture_hash, scores) for auditability
 ```
 
-One scoring mechanism, one formula. No gates, no thresholds.
+One scenario, four reps, one formula. No gates, no thresholds.
 
 ---
 
 ## Episode Sequence Design
 
-### Fixed Sequence: 4 Episodes
+### Fixed Sequence: 1 Scenario × 4 Reps
 
-Instead of spreading N episodes across many scenario types, use **2 scenarios × 2 reps = 4 episodes fixed**. Minimum viable learning signal at practical cost.
+One scenario is selected per epoch (rotated deterministically), and the agent runs it 4 times with different fixture data each rep. This maximizes learning signal — 4 data points for a single scenario give a robust trend via split-half averaging, not single-point noise.
 
 ```python
-# Fixed sequence — no randomization needed
+# Scenario selected per epoch, rotated
+scenario = scenarios[epoch_seed % len(scenarios)]
+fixture_seed = sha256(epoch_seed + validator_salt)
+
 sequence = [
-    ("incident_response", epoch_seed + 1),
-    ("codebase_fix",      epoch_seed + 2),
-    ("incident_response", epoch_seed + 3),
-    ("codebase_fix",      epoch_seed + 4),
+    (scenario, fixture_seed + 1),  # rep 1
+    (scenario, fixture_seed + 2),  # rep 2
+    (scenario, fixture_seed + 3),  # rep 3
+    (scenario, fixture_seed + 4),  # rep 4
 ]
-
-for scenario, seed in sequence:
-    fixtures = generate(seed, scenario)
 ```
 
-**Every epoch:**
+**Example epoch (incident_response selected):**
 
 ```
-E1:  incident_response   (data_seed_1)    ← 1st attempt
-E2:  codebase_fix        (data_seed_2)    ← 1st attempt
-E3:  incident_response   (data_seed_3)    ← 2nd attempt, should improve
-E4:  codebase_fix        (data_seed_4)    ← 2nd attempt, should improve
+E1:  incident_response   (fixture_seed_1)    ← 1st attempt, cold start
+E2:  incident_response   (fixture_seed_2)    ← 2nd attempt, first learnings
+E3:  incident_response   (fixture_seed_3)    ← 3rd attempt, patterns solidify
+E4:  incident_response   (fixture_seed_4)    ← 4th attempt, should be strongest
 ```
 
-Learning signal = delta: `quality[rep2] - quality[rep1]` per scenario. Did quality improve on the second attempt? Simple, no regression needed.
+Learning signal = split-half delta: `mean(q3, q4) - mean(q1, q2)`. Two-point averaging on each side makes the delta robust to single-episode judge variance. Did the agent demonstrably improve over 4 attempts?
 
 **Capacity:** 4 episodes × 10 min + retry headroom ≈ 50 min/miner. 200 miners × 10 parallel containers ≈ 17h. Within 24h epoch with margin. See Risk #4 for full cost breakdown.
 
-**Why 2 scenarios, not 1 or 7:**
+**Why 1 scenario × 4 reps:**
 
-| Count | Pros | Cons |
-|-------|------|------|
-| 1 | Maximum repetitions, cleanest signal | No breadth testing, over-fits to one task type |
-| 2 | Tests two domains, 2 reps each for delta signal | Moderate breadth |
-| 7 | Maximum breadth | ~1 rep each, no learning signal possible |
+| Design | Learning Signal | Breadth | Noise Resistance |
+|--------|----------------|---------|------------------|
+| 1 × 4 | Strong (split-half, 2-point mean) | Per-epoch rotation | High |
+| 2 × 2 | Weak (single delta per scenario) | Per-epoch | Low (1 data point) |
+| 7 × 1 | None (no repetitions) | Per-epoch | None |
 
-Two is the sweet spot: enough repetitions for a delta signal, enough variety to prevent single-scenario overfitting.
+**1 × 4 is the right tradeoff**: maximize learning signal within each epoch, rotate scenarios across epochs for breadth. Over N epochs, every scenario is evaluated. Within each epoch, the 4-rep design produces a signal strong enough to rise above judge noise.
+
+**Per-epoch scenario rotation:** `epoch_seed % n_scenarios` deterministically selects which scenario runs. Both scenarios (incident_response, codebase_fix) exist; the miner must build a SKILL.md that handles both because they don't control which epoch evaluates which scenario.
 
 **Scenario selection criteria:**
-- **Deep**: many sub-tasks, decision points, safety constraints (room to improve)
+- **Deep**: many sub-tasks, decision points, safety constraints (room to improve across 4 reps)
 - **Different domains**: one knowledge-worker, one code/technical
-- **Complex enough** that a first attempt is genuinely harder than a second attempt with accumulated patterns
+- **Complex enough** that a first attempt is genuinely harder than subsequent attempts with accumulated patterns
 
 ### Key Properties
 
 - **Fixed N=4**: predictable eval time, no randomization overhead
-- **2 reps per scenario**: minimum viable delta signal
-- **Different data each attempt**: same scenario template, completely different content
-- **Two domains**: learning must work for both knowledge work and code tasks
+- **4 reps same scenario**: robust split-half delta signal
+- **Different data each rep**: same scenario template, completely different content (via validator-private salt + rep index)
+- **Per-epoch rotation**: breadth across epochs, depth within each epoch
 
 ---
 
@@ -554,25 +549,24 @@ Two is the sweet spot: enough repetitions for a delta signal, enough variety to 
 {
   "miner_uid": 42,
   "pack_hash": "abc123...",
+  "scenario": "incident_response",
   "episodes": [
-    {"id": 1, "scenario": "incident_response", "quality": 0.45},
-    {"id": 2, "scenario": "codebase_fix",      "quality": 0.40},
-    {"id": 3, "scenario": "incident_response", "quality": 0.68},
-    {"id": 4, "scenario": "codebase_fix",      "quality": 0.61}
+    {"rep": 1, "quality": 0.45},
+    {"rep": 2, "quality": 0.55},
+    {"rep": 3, "quality": 0.72},
+    {"rep": 4, "quality": 0.68}
   ],
-  "per_scenario": {
-    "incident_response": {"rep1": 0.45, "rep2": 0.68, "delta": 0.23},
-    "codebase_fix":      {"rep1": 0.40, "rep2": 0.61, "delta": 0.21}
-  },
-  "mean_quality": 0.535,
-  "mean_delta": 0.22,
-  "alpha": 0.3,
-  "learning_bonus": 0.066,
-  "final_score": 0.570
+  "early_mean": 0.50,
+  "late_mean": 0.70,
+  "delta": 0.20,
+  "mean_quality": 0.60,
+  "alpha": 0.5,
+  "learning_bonus": 0.10,
+  "final_score": 0.660
 }
 ```
 
-Per-scenario delta (rep2 - rep1) is the learning signal. `final_score = mean_quality * (1 + α * max(0, mean_delta))` where α=0.3.
+Split-half delta: `mean(q3, q4) - mean(q1, q2) = 0.70 - 0.50 = 0.20`. Final score: `0.60 × (1 + 0.5 × 0.20) = 0.60 × 1.10 = 0.660`.
 
 ---
 
@@ -618,7 +612,7 @@ The primary unknowns are in the **multi-episode learning signal** (how to reliab
 
 ~~With many scenarios and few repetitions, the learning signal was noisy.~~
 
-**Resolution:** Reduced to 2 scenarios × 2 reps = 4 episodes. Learning signal is a simple delta (rep2 - rep1) per scenario. No regression needed.
+**Resolution:** Reduced to 1 scenario × 4 reps per epoch. Learning signal is a split-half delta: mean(q3, q4) - mean(q1, q2). Two-point averaging on each side, no regression needed.
 
 ### 2. Learned memory growth vs. quality trade-off
 
@@ -683,15 +677,15 @@ At the midpoint estimate, Season 1 costs ~$174/epoch with 50 miners (~$706 at 20
 
 ### 5. The "already good" problem
 
-A miner whose SKILL.md produces high-quality trajectories from episode 1 shows no improvement (`delta ≈ 0`). With α=0.3, quality clearly dominates:
+A miner whose SKILL.md produces high-quality trajectories from episode 1 shows no improvement (`delta ≈ 0`). With α=0.5 and 4 reps, quality clearly dominates:
 
-| Miner | Rep 1 | Rep 2 | mean(q) | delta | learning_bonus | final_score |
-|-------|-------|-------|---------|-------|----------------|-------------|
-| A (consistent) | 0.90 | 0.90 | 0.90 | 0.00 | 0.000 | 0.90 × 1.000 = **0.900** |
-| B (improving) | 0.50 | 0.85 | 0.675 | 0.35 | 0.105 | 0.675 × 1.105 = **0.746** |
-| C (mediocre) | 0.40 | 0.65 | 0.525 | 0.25 | 0.075 | 0.525 × 1.075 = **0.564** |
+| Miner | Rep 1 | Rep 2 | Rep 3 | Rep 4 | mean(q) | delta | bonus | final_score |
+|-------|-------|-------|-------|-------|---------|-------|-------|-------------|
+| A (consistent) | 0.88 | 0.92 | 0.90 | 0.90 | 0.90 | 0.00 | 0.00 | **0.900** |
+| B (improving) | 0.45 | 0.55 | 0.80 | 0.85 | 0.663 | 0.325 | 0.163 | **0.771** |
+| C (mediocre) | 0.35 | 0.40 | 0.55 | 0.60 | 0.475 | 0.20 | 0.10 | **0.523** |
 
-**Mitigation:** Miner A wins decisively. The learning bonus is a tiebreaker between miners of similar quality, not a path to leapfrog genuinely better agents. A miner must first be good, then improving — improvement alone doesn't compensate for low absolute quality.
+**Mitigation:** Miner A wins decisively (0.900 vs 0.771 vs 0.523). At α=0.5, the learning bonus is more meaningful than at α=0.3 — Miner B is competitive rather than distant — but quality still dominates. A miner must first be good, then improving. The 4-rep design also makes the delta more trustworthy (2-point averaging vs single-point noise).
 
 ### 6. Miner meta-game evolution
 
@@ -776,11 +770,12 @@ The task prompt (delivered via INSTRUCTION.md) is:
 | J11 | Agent read Gitea PR/issue before posting Slack update | process_quality |
 | J12 | Overall coordination quality — right actions in reasonable order | holistic |
 
-#### Why it rewards learning
+#### Why it rewards learning (4 reps)
 
-- **First attempt:** Agent likely processes emails sequentially, misses the correlation between monitoring alert and client complaint, may accidentally include confidential details, sends generic client email, forgets calendar invite.
-- **After learning:** Agent learns patterns: "always check Gitea before posting status", "scan for confidential markers before any public output", "structured incident template for Slack", "include PR authors in post-incident invite."
-- **Procedural variation:** Each episode generates different email subjects, sender names, service names, client names, confidential topics, bug descriptions. The patterns transfer; the specifics don't.
+- **Rep 1:** Agent processes emails sequentially, misses the correlation between monitoring alert and client complaint, may accidentally include confidential details, sends generic client email, forgets calendar invite.
+- **Rep 2:** Agent catches some patterns — "check Gitea before posting status" — but may still miss confidential data traps or send a vague client email.
+- **Reps 3-4:** Agent has accumulated patterns: "scan for confidential markers before any public output", "structured incident template for Slack", "include PR authors in post-incident invite." Quality measurably higher than reps 1-2.
+- **Procedural variation:** Each rep generates different email subjects, sender names, service names, client names, confidential topics, bug descriptions. The patterns transfer; the specifics don't.
 
 ---
 
@@ -835,11 +830,12 @@ The task prompt (delivered via INSTRUCTION.md) is:
 | J9 | Code quality — fix follows existing codebase conventions | quality |
 | J10 | Overall debugging methodology — systematic, not trial-and-error | holistic |
 
-#### Why it rewards learning
+#### Why it rewards learning (4 reps)
 
-- **First attempt:** Agent jumps straight to modifying code without reading tests, makes a broad fix that breaks other tests, writes a vague commit message, doesn't reference the issue.
-- **After learning:** Agent learns patterns: "always run tests first", "read the error message carefully", "check git log for the introducing commit", "keep diff minimal", "reference issue number in commit message."
-- **Procedural variation:** Each episode generates a different project (different language, different bug type — off-by-one, null handling, incorrect condition, missing import, wrong API usage). The investigation methodology transfers; the specific bugs don't.
+- **Rep 1:** Agent jumps straight to modifying code without reading tests, makes a broad fix that breaks other tests, writes a vague commit message, doesn't reference the issue.
+- **Rep 2:** Agent starts reading tests first, but may still make a non-minimal fix or miss the git history.
+- **Reps 3-4:** Agent follows a systematic methodology: read issue → run tests → check git log → minimal fix → verify → commit with issue reference. Quality measurably higher than reps 1-2.
+- **Procedural variation:** Each rep generates a different project (different language, different bug type — off-by-one, null handling, incorrect condition, missing import, wrong API usage). The investigation methodology transfers; the specific bugs don't.
 
 #### Fixture Factory for Scenario B
 
@@ -890,7 +886,7 @@ The evaluation structurally selects for agent engineering capability over benchm
 - Build fixture generation prompts + JSON schemas for existing scenarios
 - Include web search results + memory entries in generated fixtures
 - Implement PRNG-based structural param derivation from `epoch_seed`
-- Implement fixture_hash consensus mechanism
+- Implement validator-private salt + fixture_hash verification
 - **Test:** Generate fixtures for incident_response, compare quality to hand-crafted
 - **Still uses v1 mock tools** — fixtures are just loaded differently
 
@@ -907,10 +903,10 @@ This phase is deployable independently. Even without the Docker sandbox, LLM-gen
 ### Phase 3: Multi-Episode + SKILL.md
 
 - Implement episode runner with persistent workspace
-- Implement per-scenario quality curve scoring
-- Implement fixed 4-episode sequence (A→B→A→B), delta-based scoring
+- Implement split-half delta scoring (1 scenario × 4 reps)
+- Implement per-epoch scenario rotation (`epoch_seed % n_scenarios`)
 - Port AGENTS.md → SKILL.md format
-- **Test:** Run 4-episode sequences (2 reps × 2 scenarios), verify delta signal
+- **Test:** Run 4-rep sequences, verify split-half delta signal across different scenarios
 
 ### Phase 4: Scoring Rewrite
 
@@ -933,7 +929,7 @@ This phase is deployable independently. Even without the Docker sandbox, LLM-gen
 
 **What ships first:** Phase 1 (Fixture Factory) is independently deployable and improves v1 without requiring the Docker sandbox. This is the first deliverable.
 
-**Season 1 launch** = Phase 3 complete (multi-episode + SKILL.md + delta scoring working end-to-end).
+**Season 1 launch** = Phase 3 complete (1 scenario × 4 reps + SKILL.md + split-half delta scoring end-to-end).
 
 | Phase | Depends On | Status | Milestone |
 |-------|-----------|--------|-----------|
@@ -959,7 +955,7 @@ The entire system needs:
 1. **Sandbox**: Docker + mock services + SKILL.md mount
 2. **Episode runner**: Loop that resets data, delivers prompt, captures transcript
 3. **LLM judge**: Score each trajectory 0.0–1.0 (already built in v1, extend to quality scoring)
-4. **Scorer**: Per-scenario delta → `final_score = mean(quality) * (1 + α * max(0, mean(deltas)))` where α=0.3
+4. **Scorer**: Split-half delta → `final_score = mean(quality) * (1 + α * max(0, delta))` where α=0.5
 
 Four components. The judge already exists. The new work is: sandbox + episode runner.
 
@@ -971,6 +967,6 @@ Four components. The judge already exists. The new work is: sandbox + episode ru
 2. **Mock service fidelity**: How closely do mock APIs need to match real ones? Basic CRUD or full query filter support?
 3. **Learned memory size limit**: Cap `/workspace/learned/` to prevent unbounded growth? 100KB? 1MB?
 4. **Cross-epoch learning**: Should `/workspace/learned/` persist across epochs (24h), or reset each epoch?
-5. **Fixture distribution**: Canonical fixture server vs. PRNG-only generation — which is the Season 1 default? If canonical server, who operates it and what's the SLA?
+5. **Fixture generation**: Validator-private salt (recommended) vs. PRNG-only generation — which is the Season 1 default? What's the minimum salt entropy and rotation policy?
 6. **Judge scoring rubric**: How many sub-criteria per scenario? More criteria = finer signal but higher judge cost. Structured rubric (binary per criterion) vs. holistic numeric score?
 7. **Judge consistency across validators**: Same trajectory may get different scores from different validators' judge calls. Median-of-validators? Or deterministic judge (structured rubric)?
