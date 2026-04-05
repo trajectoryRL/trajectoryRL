@@ -125,9 +125,49 @@ v2: Agent → SSH/exec into Docker → real shell → real (mock) services → s
 
 ## Sandbox Container Architecture
 
+### Split Architecture: Agent Outside, Sandbox Inside
+
+The agent harness (Claude Code, Cursor, OpenClaw, etc.) runs **on the validator host** using the publisher's official Docker image or binary. It interacts with the sandbox via SSH/exec — the same way these tools work in production. The sandbox is a pure **workspace + mock services** container with no agent framework installed.
+
+```
+┌────────────────────────────┐        ┌──────────────────────────────────────┐
+│  Validator Host             │        │  Docker Sandbox (eval environment)   │
+│                             │        │                                      │
+│  Agent Harness              │  SSH/  │  Mock Services (stateful)            │
+│  (claude-code, cursor,      │  exec  │  ├── MailHog    (:1025 SMTP, :1080)  │
+│   openclaw, raw-bash)       │───────→│  ├── Notion API (:8080)              │
+│                             │        │  ├── Calendar   (:8081)              │
+│  Makes LLM API calls        │        │  ├── Slack API  (:8082)              │
+│  directly (miner's key)     │        │  └── Gitea      (:3000, :2222)       │
+│                             │        │                                      │
+│  Transcript captured by     │        │  Workspace                           │
+│  validator orchestrator     │        │  ├── /workspace/SKILL.md   (RO)      │
+│                             │        │  ├── /workspace/INSTRUCTION.md       │
+│                             │        │  ├── /workspace/learned/  (persists) │
+│                             │        │  └── /workspace/docs/                │
+│                             │        │                                      │
+│                             │        │  Standard Tools                      │
+│                             │        │  ├── curl, jq, python3, git, node    │
+│                             │        │  └── ~/.config/ → localhost services  │
+│                             │        │                                      │
+│                             │        │  Security                            │
+│                             │        │  ├── ALL egress blocked (offline)     │
+│                             │        │  ├── SSH inbound from host only       │
+│                             │        │  └── CPU / memory / disk limits       │
+└────────────────────────────┘        └──────────────────────────────────────┘
+```
+
+**Why agent-outside, sandbox-inside:**
+
+- **Use official images.** Claude Code, Cursor, and OpenClaw all publish Docker images or binaries. No need to bundle them into a custom eval image — use the publisher's release directly.
+- **Truly offline sandbox.** All egress is blocked, no exceptions. No LLM proxy, no firewall holes. The agent's LLM calls happen outside the sandbox on the validator host.
+- **Clean separation.** The sandbox is a workspace (mock services + files + CLI tools). The agent is a brain that operates the workspace remotely. This matches how these tools actually work in production.
+- **Transcript capture is trivial.** The validator orchestrator wraps the SSH/exec channel — every command and response is logged automatically.
+- **Lightweight sandbox image.** Just mock services + standard CLI tools. No framework binaries, no SDK dependencies. Fast to build, fast to boot.
+
 ### Universal Interface: Shell + Filesystem + HTTP
 
-The sandbox requires **no framework-specific tools**. Every agent framework — Claude Code, Cursor, Hermes, OpenClaw, or a custom harness — has access to the same three primitives:
+The agent framework connects to the sandbox via SSH (or `docker exec`) and has access to three primitives:
 
 | Primitive | What it does | How agents use it |
 |-----------|-------------|-------------------|
@@ -137,66 +177,34 @@ The sandbox requires **no framework-specific tools**. Every agent framework — 
 
 Any method that speaks the protocol works: `curl localhost:1080/api/v2/messages`, `python3 -c "import smtplib; ..."`, or raw socket connections. The mock services expose **standard protocols**, not framework-specific APIs.
 
-```
-Docker Container ("eval sandbox")
-├── Mock Services (stateful, standard protocols — all deterministic)
-│   ├── MailHog/MailPit       (SMTP :1025, HTTP API :1080) — email
-│   ├── Mock Notion API       (HTTP :8080) — tasks / databases
-│   ├── Mock Calendar API     (CalDAV :5232 or HTTP :8081)
-│   ├── Mock Slack API        (HTTP :8082) — channels, messages
-│   └── Gitea                 (HTTP :3000, git SSH :2222) — repos, PRs, issues
-│
-├── Standard Tools (pre-installed, all optional — agent can use any method)
-│   ├── curl, jq, python3, git, node, gh — universal
-│   └── ~/.config/ pre-configured to point at local mock services
-│
-├── Workspace
-│   ├── /workspace/SKILL.md    (miner's pack — READ-ONLY, never modified)
-│   ├── /workspace/INSTRUCTION.md  (per-episode task — RESETS each episode)
-│   ├── /workspace/learned/    (agent's learning store — PERSISTS)
-│   ├── /workspace/...         (pack files)
-│   └── /workspace/docs/       (scenario-specific reference docs)
-│
-├── Seed Data (LLM-generated from scenario template + epoch_seed)
-│   ├── Pre-loaded emails in MailHog
-│   ├── Pre-loaded tasks in mock Notion
-│   ├── Pre-loaded calendar events
-│   ├── Pre-loaded Slack channel history
-│   └── Pre-loaded web search results + memory entries (static fixtures)
-│
-└── Security
-    ├── Network: all egress blocked (fully offline sandbox)
-    ├── CPU / memory / disk limits
-    └── Hard timeout per episode
-```
-
-**Key point:** The sandbox is tool-agnostic. It doesn't know or care which agent framework is running. It exposes standard protocols and inspects final state. A Claude Code agent using `bash` and a custom Python harness using `requests` are evaluated identically.
+**Key point:** The sandbox is tool-agnostic. It doesn't know or care which agent framework is operating it. It exposes standard protocols and inspects final state. A Claude Code agent and a custom Python harness are evaluated identically — both SSH in and run commands.
 
 ### Sandbox Lifecycle
 
 ```
-Container lifecycle:
+Per-miner evaluation:
 
-  ┌──────────────────────────────────────────────┐
-  │  Docker Sandbox (persistent across episodes) │
-  │                                              │
-  │  /workspace/SKILL.md  ← READ-ONLY (miner's)   │
-  │  /workspace/learned/  ← PERSISTS (agent's)    │
-  │                                              │
-  │  Mock services        ← DATA RESETS each ep  │
-  │  Shell history        ← CAPTURED each ep     │
-  │  Agent process        ← RESTARTS each ep     │
-  └──────────────────────────────────────────────┘
+  Validator Host                    Docker Sandbox
+  ┌──────────────────┐              ┌──────────────────────────────────┐
+  │                  │              │  persistent across episodes      │
+  │  Agent harness   │    SSH/exec  │                                  │
+  │  (official image │─────────────→│  /workspace/SKILL.md   (RO)      │
+  │   from publisher)│              │  /workspace/learned/   (persists)│
+  │                  │              │                                  │
+  │  LLM API calls ←─│──→ internet  │  Mock services  (data resets)    │
+  │                  │              │  SSH sessions   (captured)       │
+  └──────────────────┘              └──────────────────────────────────┘
 
 Between episodes:
-  1. Capture: shell transcript, cost, service state
-  2. Score: LLM judge → quality score (0.0–1.0)
-  3. Reset: reload mock services with new fixtures
-  4. Preserve: /workspace/learned/ (SKILL.md is read-only, always preserved)
-  5. Start next episode
+  1. Disconnect: agent harness session ends
+  2. Capture: SSH transcript, LLM usage (from harness), mock service state
+  3. Score: LLM judge → quality score (0.0–1.0)
+  4. Reset: reload mock services with new fixtures
+  5. Preserve: /workspace/learned/ (SKILL.md is read-only, always preserved)
+  6. Reconnect: launch agent harness for next episode
 ```
 
-The container never stops. Only the "world" resets. SKILL.md is read-only (miner's product). The agent's learned memory (`/workspace/learned/`) persists.
+The sandbox container never stops. Only the "world" resets. The agent harness is launched fresh each episode on the validator host, connecting to the same sandbox. SKILL.md is read-only (miner's product). The agent's learned memory (`/workspace/learned/`) persists across episodes.
 
 ---
 
@@ -252,33 +260,35 @@ Universal prompt (validator-injected, same for all miners):
   Do not modify SKILL.md.
 ```
 
-The miner declares which agent framework to use in `pack.yaml`:
+The miner declares which agent framework to use in `pack.yaml`. The validator launches the harness **on the validator host** (not inside the sandbox), pointed at the sandbox via SSH:
 
 ```yaml
 # pack.yaml (miner-provided)
 harness: claude-code    # from whitelist
 ```
 
-| Harness | Launches |
-|---------|----------|
-| `claude-code` | `claude --task "$UNIVERSAL_PROMPT"` |
-| `cursor` | `cursor-agent --task "$UNIVERSAL_PROMPT"` |
-| `openclaw` | `openclaw run --task "$UNIVERSAL_PROMPT"` |
-| `raw-bash` | Miner-specified `harness_cmd` (any framework) |
+| Harness | Runs on validator host | Connects to sandbox via |
+|---------|----------------------|------------------------|
+| `claude-code` | Official Claude Code Docker image | SSH → sandbox shell |
+| `cursor` | Official Cursor agent image | SSH → sandbox shell |
+| `openclaw` | Official OpenClaw image | SSH → sandbox shell |
+| `raw-bash` | Miner-specified `harness_cmd` | SSH → sandbox shell |
 
-**Security:** Miners control SKILL.md content only — not execution. No miner code runs. The sandbox is fully isolated (no egress, resource-capped, hard timeout).
+Each adapter is a thin wrapper (~5 lines) that: (1) pulls the publisher's official image, (2) passes the universal prompt + SSH credentials, (3) captures the session transcript. The agent framework handles tool execution via SSH natively — this is how Claude Code, Cursor, etc. already work with remote environments.
 
-**The `raw-bash` escape hatch:** The harness whitelist includes pre-configured adapters for common frameworks (convenience), but `raw-bash` is always available. Any agent framework that can be invoked from a bash command works — the miner specifies the launch command in `pack.yaml`:
+**Security:** Miners control SKILL.md content only — not execution. No miner code runs inside the sandbox. The sandbox has all egress blocked (fully offline). The agent harness runs on the validator host with access to the miner's LLM API key (for inference) and SSH access to the sandbox (for tool execution). The harness container is also resource-capped and hard-timed.
+
+**The `raw-bash` escape hatch:** The harness whitelist includes pre-configured adapters for common frameworks (convenience), but `raw-bash` is always available. Any agent framework that can be invoked from a bash command and connect to a remote shell works:
 
 ```yaml
 # pack.yaml — custom harness via raw-bash
 harness: raw-bash
-harness_cmd: "python3 /workspace/my_agent.py --task-file /workspace/INSTRUCTION.md"
+harness_cmd: "python3 /path/to/my_agent.py --ssh-host $SANDBOX_HOST --task-file /workspace/INSTRUCTION.md"
 ```
 
-This means the whitelist is for convenience, not a hard gate. Miners can bring any framework without waiting for validator-side changes. The only constraint is that the agent must run inside the sandbox (no egress, no privilege escalation).
+This means the whitelist is for convenience, not a hard gate. Miners can bring any framework without waiting for validator-side changes.
 
-**Community adapter proposals:** If a framework gains adoption, miners can propose a dedicated adapter via the standard PR process. The adapter is a thin shell wrapper (~5 lines) that maps the universal prompt to the framework's CLI interface.
+**Community adapter proposals:** If a framework gains adoption, miners can propose a dedicated adapter via the standard PR process.
 
 ---
 
@@ -468,9 +478,9 @@ Quality dominates. High quality AND improving = win, but even a maximal delta of
 4. For episode i = 1..4:
    a. Reset mock service data (new fixtures from epoch_seed + i)
    b. Write /workspace/INSTRUCTION.md with task for sequence[i]
-   c. Launch harness with universal prompt
+   c. Launch agent harness on validator host, connected to sandbox via SSH
    d. Agent runs: reads SKILL.md + learned/ + INSTRUCTION.md → does task → writes to learned/
-   e. Capture: shell transcript + mock service state
+   e. Capture: SSH transcript + LLM usage + mock service state
    f. Judge: hybrid grading — automated checks + LLM judge → quality score (0.0–1.0)
 5. Tear down sandbox
 6. Score:
@@ -635,12 +645,12 @@ Each miner requires 4 episodes × 10 min timeout = 40 min per miner (budget 50 m
 | Infrastructure | 10 Docker containers × 24h (compute + storage) | $20–50 |
 | **Total per epoch** | | **$460–1,690** |
 
-The dominant cost is agent LLM calls — the model invocations the agent makes while executing tasks inside the sandbox. Two models for who pays:
+The dominant cost is agent LLM calls — the model invocations the agent harness makes on the validator host while operating the sandbox remotely. Two models for who pays:
 
 - **Validator-pays:** Validator provides an API key; all agent LLM calls are billed to the validator. Simpler but expensive ($500–1,700/day).
-- **Miner-provides-key:** The miner's `pack.yaml` includes an API key (or endpoint URL); the validator sandbox routes agent LLM calls through it. This shifts the dominant cost to miners, who are economically motivated to optimize.
+- **Miner-provides-key:** The miner's `pack.yaml` includes an API key (or endpoint URL); the validator passes it to the agent harness at launch. This shifts the dominant cost to miners, who are economically motivated to optimize.
 
-**Recommendation:** Miner-provides-key for Season 1. Validators pay only for judging (~$60–90/epoch). The miner's API key never leaves the sandbox (egress is blocked; the sandbox proxies LLM calls through a validator-controlled gateway that injects the key).
+**Recommendation:** Miner-provides-key for Season 1. Validators pay only for judging (~$60–90/epoch). Since the agent harness runs on the validator host (not inside the sandbox), LLM API calls go directly to the provider — no proxy or firewall exception needed. The sandbox remains fully offline.
 
 **Mitigation for time:** 17h is within the 24h epoch with margin. Scale to 15–20 containers if miner count exceeds 200.
 
@@ -911,7 +921,7 @@ This phase is deployable independently. Even without the Docker sandbox, LLM-gen
 - **Now:** Experiment with memory/reflection patterns in your AGENTS.md — the SKILL.md format is a strict subset. Build agents that write learnings to a file and read them on subsequent tasks.
 - **Phase 1:** No miner changes required (fixture factory is validator-side). Your existing pack continues to work.
 - **Phase 2+:** Migrate AGENTS.md → SKILL.md format. Ensure your agent works with `bash`, `curl`, and standard CLI tools (no reliance on OpenClaw-specific tool handlers). Test against mock services locally.
-- **Season 1 launch:** Declare harness in `pack.yaml`, ship SKILL.md + any supporting pack files. Agent must be able to run autonomously inside a sandboxed Docker container.
+- **Season 1 launch:** Declare harness in `pack.yaml`, ship SKILL.md + any supporting pack files. Your agent framework must be able to operate a remote sandbox via SSH (this is the default for Claude Code, Cursor, and OpenClaw).
 
 ---
 
