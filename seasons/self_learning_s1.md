@@ -636,25 +636,48 @@ The LLM judge is probabilistic. Validator A and Validator B may score the same t
 
 Each miner requires 4 episodes × 10 min timeout = 40 min per miner (budget 50 min with retry headroom). With 200 miners and 10 parallel containers: ~17 hours per epoch.
 
-**Cost breakdown (200-miner epoch estimate):**
+Consistent with v4.0, **validators bear all inference costs** (both agent execution and judge calls). Miners have zero ongoing cost — they ship a static SKILL.md and nothing else.
 
-| Component | Calculation | Estimated Cost |
-|-----------|------------|----------------|
-| Judge LLM calls | 200 miners × 4 episodes × ~$0.05/call | ~$40 |
-| Agent LLM calls (see below) | 200 miners × 4 episodes × $0.50–2.00/ep | $400–1,600 |
-| Infrastructure | 10 Docker containers × 24h (compute + storage) | $20–50 |
-| **Total per epoch** | | **$460–1,690** |
+**v4.0 baseline (live data, GLM-5 via OpenRouter, 21 qualified miners):**
 
-The dominant cost is agent LLM calls — the model invocations the agent harness makes on the validator host while operating the sandbox remotely. Consistent with v4.0, **validators bear all inference costs** (both agent execution and judge calls). Miners have zero ongoing cost — they ship a static SKILL.md and nothing else.
+| Scenario | Mean Cost | Mean Tokens | Mean LLM Calls |
+|----------|----------|-------------|----------------|
+| inbox_triage | $0.021 | 17.6K | 3.1 |
+| client_escalation | $0.022 | 16.7K | 2.3 |
+| team_standup | $0.024 | 18.7K | 2.2 |
+| morning_brief | $0.028 | 19.9K | 2.2 |
+| inbox_to_action | $0.032 | 21.8K | 2.5 |
+| hiring_debrief | $0.039 | 30.8K | 3.4 |
+| post_incident_review | $0.104 | 90.3K | 7.4 |
+| **Per-miner total (7 scenarios)** | **$0.27** | **216K** | **23** |
 
-This is a significant cost increase over v4.0. In v4.0, OpenClaw runs a single agent loop per scenario (~$0.02–0.10/scenario). In Season 1, a full agent framework (Claude Code, Cursor) running 10-minute episodes will consume substantially more tokens — each episode may involve dozens of LLM round-trips as the agent investigates, acts, and reflects.
+A full v4.0 eval costs ~$0.27/miner. 21 qualified miners × $0.27 = **~$5.67/epoch** for agent calls.
+
+**Season 1 projection:** Season 1 episodes are deeper (10-min timeout, investigate→act→reflect loops with persistent learning). Estimated call multiplier vs v4.0 per-scenario baseline:
+
+| Multiplier | Calls/Episode | Tokens/Episode | Cost/Episode | Cost (4 episodes) |
+|:----------:|:------------:|:--------------:|:------------:|:------------------:|
+| 5× (conservative) | ~33 | ~308K | ~$0.39 | $1.54 |
+| 10× (midpoint) | ~66 | ~617K | ~$0.77 | $3.08 |
+| 15× (aggressive) | ~100 | ~925K | ~$1.16 | $4.62 |
+
+**Cost breakdown (per epoch, midpoint 10× estimate):**
+
+| Component | 50 miners | 200 miners |
+|-----------|----------|------------|
+| Agent LLM calls | 50 × $3.08 = **$154** | 200 × $3.08 = **$616** |
+| Judge LLM calls | 50 × 4 × $0.05 = $10 | 200 × 4 × $0.05 = $40 |
+| Infrastructure (Docker) | $10–20 | $20–50 |
+| **Total per epoch** | **~$174** | **~$706** |
+
+At the midpoint estimate, Season 1 costs ~$174/epoch with 50 miners (~$706 at 200 miners). This is ~30× more than v4.0 ($5.67) but remains manageable for validators earning TAO emissions (~$720+/day for medium-stake validators).
 
 **Cost mitigation strategies:**
 
 - **Harness-aware cost caps.** The validator sets a per-episode token/dollar cap. The agent harness is killed if the cap is exceeded (episode scored as-is with whatever was completed). This bounds worst-case cost.
-- **Cheap default harness.** The default evaluation model remains GLM-5 (cheapest qualified model). Miners who want to use expensive models (Claude, GPT-5) must accept that their episodes cost more — but since Season 1 scores on quality (not cost), this is the miner's strategic choice expressed through SKILL.md instructions.
-- **Parallel containers amortize infra.** 10 Docker sandbox containers are lightweight (mock services only, no agent framework). The heavy resource is the agent harness on the validator host, which scales with available CPU/memory.
-- **Fewer miners in practice.** The 200-miner estimate is conservative. Early Season 1 will likely have 20–50 miners, bringing total cost to $50–400/epoch.
+- **Cheap default model.** The default evaluation model remains GLM-5 (cheapest qualified model). Season 1 scores on quality, not cost — but the validator always runs episodes with GLM-5 unless the miner's SKILL.md explicitly requests routing to other models.
+- **Lightweight sandbox.** Docker sandbox containers are lightweight (mock services only, no agent framework). The heavy resource is the agent harness on the validator host, which scales with available CPU/memory.
+- **Fewer qualified miners in practice.** v4.0 data shows only 11% of miners (21/191) qualify. Season 1's harder scenarios will likely have a similar or lower qualification rate.
 
 **Mitigation for time:** 17h is within the 24h epoch with margin. Scale to 15–20 containers if miner count exceeds 200.
 
