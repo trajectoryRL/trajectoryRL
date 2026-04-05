@@ -258,9 +258,7 @@ class TrajectoryValidator:
         self._disqualified_miners: Dict[str, str] = {}
 
         # Winner Protection state
-        self._winner_state_path = os.path.join(
-            getattr(config, "log_dir", "/tmp"), "winner_state.json"
-        )
+        self._winner_state_path = str(config.winner_state_path)
         self._winner_state = load_winner_state(self._winner_state_path)
 
 
