@@ -118,7 +118,7 @@ class ValidatorConfig:
     weight_interval_blocks: int = 360  # 1 tempo ≈ 72 min at 12s/block
 
     # Startup aggregation: run consensus aggregation before entering main loop
-    aggregate_when_start: bool = False
+    aggregate_when_start: bool = True
 
     # Disable winner protection to force all validators to converge on the
     # same lowest-cost winner (use once to clear divergent cached state).
@@ -227,7 +227,7 @@ class ValidatorConfig:
             ],
             consensus_api_url=os.getenv("CONSENSUS_API_URL", "https://trajrl.com"),
             # --- Startup aggregation ---
-            aggregate_when_start=os.getenv("AGGREGATE_WHEN_START", "0") == "1",
+            aggregate_when_start=os.getenv("AGGREGATE_WHEN_START", "1") == "1",
             disable_winner_protection=os.getenv("DISABLE_WINNER_PROTECTION", "0") == "1",
             # --- IM parameters are hardcoded (dataclass defaults) ---
             # Do NOT load from env: cost_delta,
