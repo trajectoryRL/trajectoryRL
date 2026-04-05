@@ -28,17 +28,9 @@ Run a sequence of tasks, judge each trajectory, score the trend. The same LLM ju
 
 1. **Single mechanism.** The LLM judge scores trajectories — same approach across any task type, any domain, any agent framework. No custom scoring infrastructure needed.
 
-2. **Agent-harness-agnostic.** The interface is: SSH into a sandbox, read SKILL.md, execute. The validator only sees a quality score per episode.
+2. **Agent-harness-agnostic.** The interface is: SSH into a sandbox, read SKILL.md + INSTRUCTION.md, execute. Every harness receives the same universal prompt — no framework-specific file naming, no translation layer. The validator only sees a quality score per episode.
 
-   | Framework | How it consumes SKILL.md |
-   |-----------|-------------------------|
-   | Claude Code | Reads as `CLAUDE.md` |
-   | OpenClaw | Reads as `AGENTS.md` |
-   | Hermes | Reads as task context |
-   | Custom harness | `cat /workspace/SKILL.md` |
-   | Raw LLM + bash | System prompt includes file |
-
-   Miners compete on which agent framework learns best, not which prompt is cleverest. A miner running Claude Code competes directly against a miner running a custom Python harness.
+   Miners compete on which agent framework learns best, not which prompt is cleverest. A miner running Claude Code competes directly against a miner running OpenClaw or Hermes.
 
 3. **Resistant to gaming.** A single scenario result can be hacked. A quality trend across 4 repetitions of the same scenario with different data is harder to fake, because:
    - Data is **different** each rep (same template, new content via validator-private salt)
