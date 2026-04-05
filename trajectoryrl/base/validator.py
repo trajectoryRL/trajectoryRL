@@ -2019,6 +2019,7 @@ class TrajectoryValidator:
         scenario_model_usage: Dict[str, List[Dict[str, Any]]] = {}
         scenario_judge_details: Dict[str, Dict[str, Any]] = {}
         scenario_session_keys: Dict[str, str] = {}
+        scenario_session_files: Dict[str, str] = {}
 
         total_scenarios = len(eval_scenarios)
         for scenario_idx, scenario_name in enumerate(eval_scenarios, 1):
@@ -2059,6 +2060,8 @@ class TrajectoryValidator:
                     scenario_model_usage[scenario_name] = result.model_usage
                 if result.session_key:
                     scenario_session_keys[scenario_name] = result.session_key
+                if result.session_file:
+                    scenario_session_files[scenario_name] = result.session_file
 
                 # Phase 2: LLM trajectory judge
                 scenario_config = self.scenarios.get(scenario_name, {})
@@ -2172,6 +2175,7 @@ class TrajectoryValidator:
             "model_usage": scenario_model_usage,
             "judge_details": scenario_judge_details,
             "session_keys": scenario_session_keys,
+            "session_files": scenario_session_files,
         }
 
     # ------------------------------------------------------------------
@@ -2370,6 +2374,7 @@ class TrajectoryValidator:
         validator_log_offset: int,
         miner_log_offset: int,
         session_keys: Dict[str, str],
+        session_files: Optional[Dict[str, str]] = None,
     ) -> Optional[bytes]:
         """Snapshot log files into *eval_dir* and package as tar.gz.
 
@@ -2385,6 +2390,8 @@ class TrajectoryValidator:
             validator_log_offset: Main validator log byte offset before eval.
             miner_log_offset: Per-miner log byte offset before eval.
             session_keys: Mapping of scenario name to OpenClaw session key.
+            session_files: Mapping of scenario name to actual session filename
+                (UUID.jsonl) in the OpenClaw sessions directory.
 
         Returns:
             Gzipped tar archive bytes, or None on failure / over-size.
@@ -2406,14 +2413,30 @@ class TrajectoryValidator:
                         (eval_dir / dst_name).write_bytes(segment)
 
             # Copy OpenClaw session transcript files (full LLM conversation logs)
+            # OpenClaw creates files with UUID names, not the logical session key.
+            # Use session_files (actual filenames) when available, fall back to
+            # session_keys for backwards compatibility.
             openclaw_sessions_dir = Path("/root/.openclaw/agents/main/sessions")
-            for scenario, session_key in session_keys.items():
-                if session_key:
-                    src = openclaw_sessions_dir / f"{session_key}.jsonl"
-                    if src.exists() and src.stat().st_size > 0:
-                        dst = eval_dir / f"{scenario}_conversation.jsonl"
-                        shutil.copy2(str(src), str(dst))
-                        logger.info(f"Copied session transcript for {scenario}: {session_key}")
+            _session_files = session_files or {}
+            for scenario in eval_scenarios:
+                src = None
+                # Prefer the actual session file detected by run_episode.py
+                fname = _session_files.get(scenario)
+                if fname:
+                    candidate = openclaw_sessions_dir / fname
+                    if candidate.exists() and candidate.stat().st_size > 0:
+                        src = candidate
+                # Fall back to session_key lookup (legacy, usually won't match)
+                if src is None:
+                    skey = session_keys.get(scenario)
+                    if skey:
+                        candidate = openclaw_sessions_dir / f"{skey}.jsonl"
+                        if candidate.exists() and candidate.stat().st_size > 0:
+                            src = candidate
+                if src:
+                    dst = eval_dir / f"{scenario}_conversation.jsonl"
+                    shutil.copy2(str(src), str(dst))
+                    logger.info(f"Copied session transcript for {scenario}: {src.name}")
 
             for scenario in eval_scenarios:
                 for suffix in ("_calls.jsonl", "_all_requests.jsonl"):
@@ -2452,9 +2475,11 @@ class TrajectoryValidator:
     ) -> None:
         """Collect and upload eval logs. Fire-and-forget."""
         session_keys = eval_result.get("session_keys", {}) if eval_result else {}
+        session_files = eval_result.get("session_files", {}) if eval_result else {}
         log_archive = self._collect_eval_logs(
             commitment.hotkey, eval_scenarios, eval_dir,
             validator_log_offset, miner_log_offset, session_keys,
+            session_files,
         )
         if log_archive:
             meta = {
