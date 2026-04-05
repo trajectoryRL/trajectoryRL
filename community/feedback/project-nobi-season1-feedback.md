@@ -65,4 +65,4 @@ We're excited about the learning trend signal — it rewards genuine intelligenc
 
 Looking forward to Season 1. Happy to test or provide feedback on the sandbox.
 
-— Project Nobi team | [projectnobi.ai](https://projectnobi.ai) | UID 205 on SN11
+— Project Nobi team | [projectnobi.ai](https://projectnobi.ai)
