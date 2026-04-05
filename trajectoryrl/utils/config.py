@@ -140,6 +140,11 @@ class ValidatorConfig:
         default_factory=lambda: Path("/var/lib/trajectoryrl/ema_state.json")
     )
 
+    # Winner Protection state persistence
+    winner_state_path: Path = field(
+        default_factory=lambda: Path("/var/lib/trajectoryrl/winner_state.json")
+    )
+
     # Pack caching
     pack_cache_dir: Path = field(
         default_factory=lambda: Path("/var/lib/trajectoryrl/packs")
@@ -202,6 +207,7 @@ class ValidatorConfig:
                 )
             ),
             ema_state_path=Path(os.getenv("EMA_STATE_PATH", "/var/lib/trajectoryrl/ema_state.json")),
+            winner_state_path=Path(os.getenv("WINNER_STATE_PATH", "/var/lib/trajectoryrl/winner_state.json")),
             # --- LLM ---
             clawbench_default_model=os.getenv("CLAWBENCH_DEFAULT_MODEL", DEFAULT_CLAWBENCH_MODEL),
             clawbench_api_key=os.getenv("CLAWBENCH_LLM_API_KEY", ""),
