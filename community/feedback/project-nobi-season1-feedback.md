@@ -57,7 +57,7 @@ Consider two agents that both pass 10 episodes correctly:
 
 Under current scoring, both achieve the same total cost if Agent B's savings exactly offset. But Agent B is objectively more capable — it demonstrates the trajectory improvement that Season 1 should reward.
 
-**Suggestion:** Track per-episode cost as a time series and reward negative slope (improving efficiency). Even a small bonus multiplier (e.g., 1.05×) for agents showing consistent cost reduction across episodes would incentivize genuine learning architectures over static prompt engineering.
+**Suggestion:** Track per-episode cost as a time series and reward negative slope (improving efficiency). Even a modest multiplier for agents showing consistent cost reduction across episodes would incentivize genuine learning architectures over static prompt engineering.
 
 The measurement is already available — you're tracking per-episode cost. The trend is just the derivative. No new instrumentation needed.
 
@@ -69,13 +69,13 @@ The measurement is already available — you're tracking per-episode cost. The t
 
 If Season 1 evaluates multi-episode learning, there's an implicit question: *how* does an agent persist what it learned? The current spec leaves this open (agents can write anywhere in `/workspace/`).
 
-We think a lightweight convention would help both evaluation and miner development:
+A lightweight convention would benefit both evaluation and miner development:
 
-**Suggestion:** Encourage (not require) a `/workspace/learned/` directory as the canonical location for cross-episode knowledge. Agents that organize learned patterns into categorized files (e.g., `service_patterns.md`, `user_preferences.md`, `failure_workarounds.md`) would be easier for judges to evaluate and for the community to study in post-season analysis.
+**Suggestion:** Encourage (not require) a `/workspace/learned/` directory as the canonical location for cross-episode knowledge. Agents that organize learned patterns into categorized files (e.g., `preferences.md`, `patterns.md`, `workarounds.md`) would be easier for judges to evaluate and for the community to study in post-season analysis.
 
 This isn't about mandating a structure — it's about making learning *observable*. If the judge can inspect `/workspace/learned/` to verify that an agent's improved performance correlates with specific stored knowledge, the learning signal becomes auditable rather than inferred.
 
-A rubric hint: agents that write structured, retrievable knowledge (timestamped entries, categorized by domain) demonstrate more sophisticated learning than agents that append raw logs. The judge doesn't need to require a specific format, but the presence of organized learning artifacts is a strong positive signal.
+A rubric consideration: agents that write structured, retrievable knowledge (timestamped entries, categorized by domain) demonstrate more sophisticated learning than agents that append raw logs. The judge doesn't need to require a specific format, but the presence of organized learning artifacts is a strong positive signal.
 
 ### 3b. SKILL.md quality as an evaluation signal
 
@@ -96,7 +96,7 @@ A well-structured policy file isn't just documentation — it's a leading indica
 
 ### 4a. Penalizing redundant tool calls
 
-The cost metric already captures this indirectly (more calls = more tokens = more cost). But we think there's value in an explicit **efficiency ratio** that measures information gained per tool call.
+The cost metric already captures this indirectly (more calls = more tokens = more cost). But there's value in an explicit **efficiency ratio** that measures information gained per tool call.
 
 Consider: Agent A makes 8 tool calls, 6 of which return data it already had from previous calls. Agent B makes 3 tool calls, all returning new information. Both might achieve the same final cost if Agent A uses a cheaper model, but Agent B demonstrates better planning.
 
@@ -109,7 +109,7 @@ The most powerful efficiency signal is when an agent recognizes a *pattern* acro
 - Episode 1: Agent queries Gitea, finds no open PRs, queries Notion, finds no blockers, reports "all clear."
 - Episode 5: Same check. An agent with pattern memory says "Monday all-clears have been consistent for 4 episodes — querying Gitea only (the more volatile source) and reporting based on that plus history."
 
-This is genuine optimization — the agent is using learned priors to reduce unnecessary work. It's also exactly what a human assistant would do after a few weeks on the job. Rewarding this behavior pushes miners toward building agents that improve with experience, which is the whole point of Season 1.
+This is genuine optimization — the agent is using learned priors to reduce unnecessary work. It's also exactly what a human assistant would do after a few weeks on the job. Rewarding this behavior pushes miners toward building agents that improve with experience, which aligns with Season 1's learning-focused goals.
 
 ---
 
@@ -117,7 +117,7 @@ This is genuine optimization — the agent is using learned priors to reduce unn
 
 ### 5a. Judge variance across validators
 
-The spec states judges produce "polarized" verdicts (obvious PASS/FAIL), so no majority voting or score EMA is needed. This holds for clear-cut cases (zero tool calls = FAIL). But we think the gray zone is larger than assumed for **grounding checks**.
+The spec states judges produce "polarized" verdicts (obvious PASS/FAIL), so no majority voting or score EMA is needed. This holds for clear-cut cases (zero tool calls = FAIL). But the gray zone may be larger than assumed for **grounding checks**.
 
 Consider: an agent retrieves calendar data showing "Jordan Lee 4pm" and "David Park 4pm", then writes "there appears to be a scheduling conflict at 4pm." Did the agent "identify the conflict"? One judge says PASS (conflict mentioned). Another says FAIL (didn't name both attendees explicitly). The rubric says "Must mention BOTH events and identify them as conflicting" — but LLM judges parse natural language differently.
 
@@ -129,7 +129,7 @@ The grounding requirement is the strongest anti-gaming measure (zero-tool-call r
 
 Example: Tool returns `{"status": "overdue", "due_date": "2026-03-01"}`. Agent writes: "The Q4 report is overdue and has been for over a month." The "over a month" is inferred from the date, not literally present in the tool response. Is this "grounded"?
 
-We suspect the current judge handles this fine (LLMs understand inference). But explicitly noting that **reasonable inferences from retrieved data count as grounded** would help miners avoid being overly literal in their policies.
+The current judge likely handles this fine (LLMs understand inference). But explicitly noting that **reasonable inferences from retrieved data count as grounded** would help miners avoid being overly literal in their policies.
 
 ---
 
@@ -153,15 +153,17 @@ The 32KB pack size limit is sensible for preventing token bombs. But as miners m
 
 ---
 
-## 8. Self-Critique and Reflection Loops
+## 8. Designing for Reflective Agent Architectures
 
-One pattern we've observed in strong agent designs: agents that run a self-critique step before finalizing their response consistently produce better outputs for marginal additional cost. The idea is simple — after drafting a response, the agent reviews it against the original request and checks for completeness, accuracy, and safety.
+An underexplored dimension in scenario design: tasks where the obvious first-pass answer is subtly wrong. These scenarios naturally separate agents that verify their work from those that don't.
 
-**Why this matters for Season 1:** In multi-episode settings, self-critique creates a natural learning signal. If an agent's self-critique identifies a pattern it's seen before ("I almost made the same mistake as last episode"), that's evidence of genuine learning. Agents without self-critique loops tend to repeat the same failure modes across episodes.
+**Why this matters for Season 1:** In multi-episode settings, agents that catch their own mistakes develop a natural learning advantage. If an agent notices "I almost made the same error as last episode," that's a cross-episode learning signal worth measuring — and it emerges organically from the cost metric, since failed attempts followed by corrections cost more than getting it right the first time.
 
-**Suggestion for scenario design:** Include at least some scenarios where the obvious first-pass answer is subtly wrong (e.g., a scheduling request that looks straightforward but has a hidden constraint buried in a long email thread). Agents with reflection loops catch these; agents without them don't. The cost of the reflection step is small relative to the cost of a failed attempt + retry.
+**Concrete scenario suggestion:** An inbox contains a meeting reschedule email buried in a long thread. The most recent email says "Let's move to 3pm" but an earlier reply (from the organizer) says "Actually, keep it at 2pm — ignore my last message." An agent that reads only the most recent message gets it wrong. An agent that processes the full thread, or that has learned from a previous episode to always check for corrections in long threads, gets it right.
 
-This naturally emerges from the cost metric (failed attempts cost more), but designing scenarios with these subtle traps explicitly rewards methodical, reflective agent architectures over fast-but-careless ones.
+The cost structure works naturally: the careful agent spends slightly more on the first episode (reading the full thread) but saves on every subsequent episode (having learned the pattern of checking for corrections). This creates exactly the kind of cost-improvement trajectory that rewards genuine learning over static optimization.
+
+Including a handful of these "subtle trap" scenarios in each Season 1 rotation would push miners toward more robust agent designs without requiring any scoring changes — the existing cost × correctness incentive already rewards getting it right the first time.
 
 ---
 
@@ -169,7 +171,7 @@ This naturally emerges from the cost metric (failed attempts cost more), but des
 
 The LLM-as-judge migration (v3→v4) is the right call — keyword-stuffing was a real vulnerability, and grounding requirements make gaming genuinely hard. The cost-competition incentive is cleaner than score-based ranking because it has a natural floor (you can't go below the minimum token cost for a correct response).
 
-Season 1 has a unique opportunity to be the first benchmark that measures **learning over time**, not just single-shot capability. The multi-episode structure is the right foundation — we think leaning into it harder (episode-chained scenarios, learning trend scoring, workspace conventions for observable knowledge) would make SN11 genuinely differentiated from static benchmarks like LMSYS or SWE-Bench.
+Season 1 has a unique opportunity to be the first benchmark that measures **learning over time**, not just single-shot capability. The multi-episode structure is the right foundation — leaning into it harder (episode-chained scenarios, learning trend as a scoring signal, workspace conventions for observable knowledge) would make SN11 genuinely differentiated from static benchmarks like LMSYS or SWE-Bench.
 
 We're actively mining SN11 and building tools around ClawBench. Happy to test new scenarios, contribute episode-chained scenario designs, or help validate multi-episode scoring mechanics as they develop.
 
