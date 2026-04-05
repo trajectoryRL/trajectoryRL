@@ -1,7 +1,7 @@
 # Season 1 Community Feedback — Project Nobi
 
-**From:** Project Nobi team — OpenClaw-native Bittensor agent platform
-**Context:** We run OpenClaw as our primary agent infrastructure (UID 205 on SN11). Season 1 is directly relevant to our work.
+**From:** Project Nobi team — Bittensor agent platform
+**Context:** 
 
 ---
 
