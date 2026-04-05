@@ -1,6 +1,6 @@
 # Season 1: Self-Learning Agents
 
-> v0.6 — 1 scenario × 4 reps (split-half delta), α=0.5 learning bonus, validator-private fixture salt, whitelisted harnesses only.
+> v0.7 — Three-container architecture (validator + harness + sandbox), 1 scenario × 4 reps (split-half delta), α=0.5 learning bonus, validator-private fixture salt, whitelisted harnesses only.
 
 ---
 
@@ -118,45 +118,57 @@ v2: Agent → SSH/exec into Docker → real shell → real (mock) services → s
 
 ## Sandbox Container Architecture
 
-### Split Architecture: Agent Outside, Sandbox Inside
+### Three-Container Architecture
 
-The agent harness (Claude Code, OpenClaw, Hermes, etc.) runs **on the validator host** using the publisher's official Docker image or binary. It interacts with the sandbox via SSH/exec — the same way these tools work in production. The sandbox is a pure **workspace + mock services** container with no agent framework installed.
+The validator spawns **two ephemeral sibling containers** per evaluation via Docker socket — one for the agent harness, one for the sandbox. Both are isolated. The validator container itself is persistent and Watchtower-managed, unchanged from v4.0.
 
 ```
-┌────────────────────────────┐        ┌──────────────────────────────────────┐
-│  Validator Host             │        │  Docker Sandbox (eval environment)   │
-│                             │        │                                      │
-│  Agent Harness              │  SSH/  │  Mock Services (stateful)            │
-│  (claude-code, openclaw,    │  exec  │  ├── MailHog    (:1025 SMTP, :1080)  │
-│   hermes — whitelisted)     │───────→│  ├── Notion API (:8080)              │
-│                             │        │  ├── Calendar   (:8081)              │
-│  Makes LLM API calls        │        │  ├── Slack API  (:8082)              │
-│  directly (validator's key) │        │  └── Gitea      (:3000, :2222)       │
-│                             │        │                                      │
-│  Transcript captured by     │        │  Workspace                           │
-│  validator orchestrator     │        │  ├── /workspace/SKILL.md   (RO)      │
-│                             │        │  ├── /workspace/INSTRUCTION.md       │
-│                             │        │  ├── /workspace/learned/  (persists) │
-│                             │        │  └── /workspace/docs/                │
-│                             │        │                                      │
-│                             │        │  Standard Tools                      │
-│                             │        │  ├── curl, jq, python3, git, node    │
-│                             │        │  └── ~/.config/ → localhost services  │
-│                             │        │                                      │
-│                             │        │  Security                            │
-│                             │        │  ├── ALL egress blocked (offline)     │
-│                             │        │  ├── SSH inbound from host only       │
-│                             │        │  └── CPU / memory / disk limits       │
-└────────────────────────────┘        └──────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  Docker Host                                                      │
+│                                                                   │
+│  Validator Container (persistent, Watchtower-managed)             │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │  Orchestrator · LLM Judge · Scorer                        │    │
+│  │  Spawns eval containers via Docker socket                  │    │
+│  └──────────────────────────────────────────────────────────┘    │
+│                            │ docker.sock                          │
+│                            ▼                                      │
+│  Per-miner eval (ephemeral containers on isolated eval_net):      │
+│                                                                   │
+│  ┌────────────────────┐  SSH/exec  ┌────────────────────────────┐│
+│  │ Harness Container   │──────────→│ Sandbox Container           ││
+│  │                     │           │                             ││
+│  │ claude-code /       │           │ Mock Services (stateful)    ││
+│  │ openclaw / hermes   │           │ MailHog, Notion, Calendar,  ││
+│  │                     │           │ Slack, Gitea                ││
+│  │ Egress: LLM API     │           │                             ││
+│  │ only (iptables)     │           │ /workspace/SKILL.md    (RO) ││
+│  │                     │           │ /workspace/INSTRUCTION.md   ││
+│  │ Validator's API key  │           │ /workspace/learned/ (persist)││
+│  │ Resource-capped     │           │                             ││
+│  │ Hard-timed (10 min) │           │ Egress: NONE (fully offline)││
+│  └────────────────────┘           └────────────────────────────┘│
+│                                                                   │
+│  Watchtower (manages validator image only)                        │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-**Why agent-outside, sandbox-inside:**
+**Three containers, three roles:**
 
-- **Use official images.** Claude Code, OpenClaw, and Hermes all publish Docker images or binaries. No need to bundle them into a custom eval image — use the publisher's release directly.
-- **Truly offline sandbox.** All egress is blocked, no exceptions. No LLM proxy, no firewall holes. The agent's LLM calls happen outside the sandbox on the validator host.
-- **Clean separation.** The sandbox is a workspace (mock services + files + CLI tools). The agent is a brain that operates the workspace remotely. This matches how these tools actually work in production.
-- **Transcript capture is trivial.** The validator orchestrator wraps the SSH/exec channel — every command and response is logged automatically.
-- **Lightweight sandbox image.** Just mock services + standard CLI tools. No framework binaries, no SDK dependencies. Fast to build, fast to boot.
+| Container | Lifecycle | Network | Image |
+|-----------|-----------|---------|-------|
+| **Validator** | Persistent, Watchtower-managed | Host network | `ghcr.io/trajectoryrl/trajectoryrl:latest` |
+| **Harness** | Ephemeral (per-episode) | `eval_net` + LLM API egress only | Publisher's official image (claude-code, openclaw, hermes) |
+| **Sandbox** | Ephemeral (per-miner, persists across episodes) | `eval_net` only, no egress | `ghcr.io/trajectoryrl/sandbox:latest` |
+
+**Why three containers:**
+
+- **Harness is sandboxed.** The harness runs in its own container with egress restricted to the LLM API endpoint (iptables whitelist). No access to the validator host, no arbitrary internet. The validator passes its API key as an environment variable — the harness never touches the host filesystem.
+- **Sandbox is fully offline.** All egress blocked, no exceptions. No LLM proxy, no firewall holes.
+- **Validator stays clean.** No third-party images run on the host. The validator only needs Docker socket access to spawn sibling containers — same pattern as CI systems (Jenkins, GitLab runners).
+- **Watchtower unchanged.** It manages the validator image. Eval containers are ephemeral and unlabeled — Watchtower ignores them.
+- **Use official images.** Claude Code, OpenClaw, and Hermes publish Docker images. The validator pulls them once and spawns instances per-eval.
+- **Transcript capture.** The validator creates the Docker network and captures the harness container's stdout/stderr + SSH session logs.
 
 ### Universal Interface: Shell + Filesystem + HTTP
 
@@ -172,32 +184,29 @@ Any method that speaks the protocol works: `curl localhost:1080/api/v2/messages`
 
 **Key point:** The sandbox is tool-agnostic. It doesn't know or care which agent framework is operating it. It exposes standard protocols and inspects final state. A Claude Code agent and a custom Python harness are evaluated identically — both SSH in and run commands.
 
-### Sandbox Lifecycle
+### Container Lifecycle
 
 ```
-Per-miner evaluation:
+Per-miner evaluation (validator orchestrates via docker.sock):
 
-  Validator Host                    Docker Sandbox
-  ┌──────────────────┐              ┌──────────────────────────────────┐
-  │                  │              │  persistent across episodes      │
-  │  Agent harness   │    SSH/exec  │                                  │
-  │  (official image │─────────────→│  /workspace/SKILL.md   (RO)      │
-  │   from publisher)│              │  /workspace/learned/   (persists)│
-  │                  │              │                                  │
-  │  LLM API calls ←─│──→ internet  │  Mock services  (data resets)    │
-  │                  │              │  SSH sessions   (captured)       │
-  └──────────────────┘              └──────────────────────────────────┘
+  1. Create eval_net (isolated Docker network)
+  2. Start sandbox container on eval_net (mock services + workspace)
+  3. Load SKILL.md + fixtures into sandbox
 
-Between episodes:
-  1. Disconnect: agent harness session ends
-  2. Capture: SSH transcript, LLM usage (from harness), mock service state
-  3. Score: LLM judge → quality score (0.0–1.0)
-  4. Reset: reload mock services with new fixtures
-  5. Preserve: /workspace/learned/ (SKILL.md is read-only, always preserved)
-  6. Reconnect: launch agent harness for next episode
+  Per episode (4 total):
+    a. Start harness container on eval_net (official agent image)
+       - env: CLAWBENCH_LLM_API_KEY, UNIVERSAL_PROMPT, SSH creds
+       - egress: LLM API endpoint only (iptables whitelist)
+    b. Harness SSHes into sandbox, reads SKILL.md + INSTRUCTION.md, does task
+    c. Harness container stops → validator captures logs
+    d. Validator scores episode (LLM judge)
+    e. Reset sandbox mock services with new fixtures
+    f. /workspace/learned/ persists across episodes
+
+  4. Destroy: sandbox container + eval_net removed
 ```
 
-The sandbox container never stops. Only the "world" resets. The agent harness is launched fresh each episode on the validator host, connecting to the same sandbox. SKILL.md is read-only (miner's product). The agent's learned memory (`/workspace/learned/`) persists across episodes.
+The sandbox container persists across all 4 episodes — only mock service data resets. A fresh harness container is spawned per episode. SKILL.md is read-only (miner's product). The agent's learned memory (`/workspace/learned/`) persists across episodes.
 
 ---
 
@@ -253,24 +262,28 @@ Universal prompt (validator-injected, same for all miners):
   Do not modify SKILL.md.
 ```
 
-The miner declares which agent framework to use in `pack.yaml`. The validator launches the harness **on the validator host** (not inside the sandbox), pointed at the sandbox via SSH:
+The miner declares which agent framework to use in `pack.yaml`. The validator spawns a **harness container** (from the publisher's official image) on the eval network, pointed at the sandbox:
 
 ```yaml
 # pack.yaml (miner-provided)
 harness: claude-code    # from whitelist
 ```
 
-| Harness | Runs on validator host | Connects to sandbox via |
-|---------|----------------------|------------------------|
+| Harness | Container image | Connects to sandbox via |
+|---------|----------------|------------------------|
 | `claude-code` | Official Claude Code Docker image | SSH → sandbox shell |
 | `openclaw` | Official OpenClaw image | SSH → sandbox shell |
 | `hermes` | Official Hermes image | SSH → sandbox shell |
 
-Each adapter is a thin wrapper (~5 lines) that: (1) pulls the publisher's official image, (2) passes the universal prompt + SSH credentials, (3) captures the session transcript. The agent framework handles tool execution via SSH natively — this is how Claude Code, OpenClaw, Hermes, etc. already work with remote environments.
+Each adapter is a thin wrapper that: (1) pulls the publisher's official image, (2) spawns a container on `eval_net` with the universal prompt + SSH credentials as env vars, (3) captures stdout/stderr when the container exits. The agent framework handles tool execution via SSH natively.
 
-**Security:** Miners control SKILL.md content only — not execution. No miner code runs on the validator host or inside the sandbox. The sandbox has all egress blocked (fully offline). The agent harness runs on the validator host using the validator's LLM API key (consistent with v4.0 — validators bear all inference costs) and SSH access to the sandbox (for tool execution). The harness container is also resource-capped and hard-timed.
+**Security:** Miners control SKILL.md content only — not execution. No miner code runs on the validator host. Both the harness and sandbox run in isolated containers:
 
-**Whitelisted harnesses only (Season 1).** Only pre-configured adapters are allowed — no arbitrary command execution on the validator host. This is a deliberate security constraint: since the harness runs on the validator host with internet access (for LLM API calls), allowing miner-specified commands would be a remote code execution vulnerability. New frameworks can be proposed via PR and added to the whitelist after security review. Custom harness support (`raw-bash`) is a Season 2 goal, contingent on sandboxing the harness process itself.
+- **Harness container:** Egress restricted to the LLM API endpoint only (iptables whitelist). Receives the validator's API key as an env var. Resource-capped, hard-timed (10 min). Cannot reach the validator container or host filesystem.
+- **Sandbox container:** All egress blocked (fully offline). Only reachable from the harness via `eval_net`. CPU/memory/disk limits.
+- **Validator container:** Only needs Docker socket access to orchestrate. No third-party images run on the host.
+
+**Whitelisted harnesses only (Season 1).** Only pre-configured adapters are allowed. New frameworks can be proposed via PR and added to the whitelist after security review. Since the harness is already containerized with restricted egress, custom harness support (`raw-bash`) becomes viable for Season 2 — the security boundary is the container, not the whitelist.
 
 ---
 
@@ -462,7 +475,7 @@ Quality dominates, but learning meaningfully contributes. A maximal delta of 1.0
    a. Generate fixtures from SHA-256(epoch_seed || validator_salt) + i
    b. Reset mock service data, load fixtures
    c. Write /workspace/INSTRUCTION.md with task for this scenario
-   d. Launch agent harness on validator host, connected to sandbox via SSH
+   d. Spawn harness container on eval_net, connected to sandbox via SSH
    e. Agent runs: reads SKILL.md + learned/ + INSTRUCTION.md → does task → writes to learned/
    f. Capture: SSH transcript + LLM usage + mock service state
    g. Judge: hybrid grading — automated checks + LLM judge → quality score (0.0–1.0)
@@ -662,7 +675,7 @@ At the midpoint estimate, Season 1 costs ~$174/epoch with 50 miners (~$706 at 20
 
 - **Harness-aware cost caps.** The validator sets a per-episode token/dollar cap. The agent harness is killed if the cap is exceeded (episode scored as-is with whatever was completed). This bounds worst-case cost.
 - **Cheap default model.** The default evaluation model remains GLM-5 (cheapest qualified model). Season 1 scores on quality, not cost — but the validator always runs episodes with GLM-5 unless the miner's SKILL.md explicitly requests routing to other models.
-- **Lightweight sandbox.** Docker sandbox containers are lightweight (mock services only, no agent framework). The heavy resource is the agent harness on the validator host, which scales with available CPU/memory.
+- **Lightweight containers.** Sandbox containers are lightweight (mock services only). Harness containers use official agent images. Both are ephemeral — created per-eval, destroyed after.
 - **Fewer qualified miners in practice.** v4.0 data shows only 11% of miners (21/191) qualify. Season 1's harder scenarios will likely have a similar or lower qualification rate.
 
 **Mitigation for time:** 17h is within the 24h epoch with margin. Scale to 15–20 containers if miner count exceeds 200.
