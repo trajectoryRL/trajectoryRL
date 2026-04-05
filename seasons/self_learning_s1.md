@@ -1,6 +1,6 @@
 # Season 1: Self-Learning Agents
 
-> v0.7 — Three-container architecture (validator + harness + sandbox), 1 scenario × 4 reps (split-half delta), α=0.5 learning bonus, validator-private fixture salt, whitelisted harnesses only.
+> v0.9 — Restructured as standalone proposal (history moved to appendix). Single launch scenario (incident_response), codebase_fix mid-season. Three-container architecture. Split-half delta scoring (α=0.5).
 
 ---
 
@@ -22,7 +22,7 @@ Quality (judge score)
 Score = the upward trend. Steeper = faster learner.
 ```
 
-Run a sequence of tasks, judge each trajectory, score the trend. The same LLM judge used in v1 evaluates every episode. An agent that learns produces higher-quality trajectories over time.
+Run a sequence of tasks, judge each trajectory, score the trend. An agent that learns produces higher-quality trajectories over time.
 
 **Key properties:**
 
@@ -36,91 +36,23 @@ Run a sequence of tasks, judge each trajectory, score the trend. The same LLM ju
    - Data is **different** each rep (same template, new content via validator-private salt)
    - Four data points reveal a real trend — single-point noise averages out
    - Hybrid grading (automated + LLM judge) prevents hallucinated quality
-   - Scenario rotates per epoch — miners must handle all scenario types
 
 The only viable strategy is to build an agent that genuinely learns.
 
 ---
 
-## What's Wrong with v1
+## Sandbox Architecture
 
-### 1. Stateless Mock Tools — The Fundamental Lie
+The agent operates inside a **Docker sandbox** — a prepared environment with real (mock) services, real shell access, and stateful behavior. The agent SSHs in, runs real commands, and interacts with real protocols. Scoring inspects the final state of the environment, not the commands used.
 
-Tools don't reflect mutations:
-
-- Agent sends email → `himalaya envelope list` still returns the original inbox
-- Agent creates a Notion task → next `databases/query` returns the same tasks
-- Agent deletes calendar event → event is still there on next read
-
-We can only score the agent's *intent* (did it try to send?), not its *competence* at handling state transitions. **Multi-step workflows where step 2 depends on step 1 are fundamentally untestable.**
-
-### 2. `exec` Is a God-Function with Brittle Regex
-
-The exec handler is a ~170-line chain of regex patterns covering 4 completely different systems (email, tasks, calendar, GitHub):
-
-- **Command variation kills agents**: `himalaya envelope list` works, `himalaya list envelope` doesn't.
-- **Creative agents are punished**: An agent that uses `curl` to hit the email API directly instead of `himalaya` gets a generic fallback.
-
-This creates a **narrow corridor of "correct" commands** that rewards pattern memorization over genuine capability.
-
-### 3. Fixture-Scenario Tight Coupling
-
-Each scenario is an isolated island with manually crafted fixture files:
-
-- **No composability**: Can't mix fixtures across scenarios.
-- **Manual data maintenance**: Adding a scenario means hand-writing 5-10 JSON fixture files. Slow and error-prone.
-- **No parameterized variation**: Can't test "same scenario but 50 emails instead of 5."
-
-### 4. Single-Turn, Single-Episode Limitation
-
-Can't express approval flows, clarification dialogues, follow-up evaluation, or long-running tasks. Miners have zero incentive to handle multi-turn interactions.
-
-### 5. No Error Simulation
-
-Tools always succeed. No rate limits, auth failures, timeouts. We can't evaluate agent **robustness** — only happy-path behavior.
-
-### 6. Knowledge-Worker Monoculture
-
-All 7 scenarios are office-worker email/calendar/tasks/Slack. The "cost competition" is really "who can write the shortest AGENTS.md that passes these 7 office scenarios."
-
-### 7. Fixed Fixture Pool Enables Memorization
-
-Miners can read every fixture email/task/event (open-source ClawBench). With only 7 scenarios and static data, miners can and do memorize the benchmark. Subtle optimization-through-memorization is structurally indistinguishable from genuine capability.
-
-### 8. No Self-Learning Evaluation
-
-The current system evaluates a single snapshot in time. There's no mechanism to test whether an agent can improve across tasks, retain corrections, or transfer learnings. Every episode is independent — the agent has no memory of what it did before.
-
----
-
-## The Solution: Docker Sandbox
-
-Instead of mock tool handlers that regex-match commands and return static fixtures, **the agent SSHs/execs into a prepared Docker sandbox** where real (mock) services run with real protocols and stateful behavior.
-
-### v1 → v2
-
-```
-v1: Agent → OpenClaw API → mock handler → regex match → static fixture → canned response
-v2: Agent → SSH/exec into Docker → real shell → real (mock) services → stateful environment
-```
-
-### What Changes
-
-**No exec god-function.** The agent runs real commands in a real shell. `curl localhost:1080/api/v2/messages`, `python3 -c "import imaplib; ..."`, raw `telnet localhost 1025` — all valid, all produce real results.
-
-**Stateful by default.** Agent sends email → it appears in the mock SMTP server's mailbox. Scoring inspects the final state of the environment, not the commands used.
-
-**Procedural data.** Fixture generation seeds different data each eval. Same structure, completely different content. Memorization is no longer a viable strategy.
-
-**Protocol-level interface.** Mock services respond to real protocols, not pattern-matched strings. Agents are free to use any tool or method that speaks the protocol.
-
----
-
-## Sandbox Container Architecture
+**Key properties:**
+- **Stateful.** Agent sends email → it appears in the mock SMTP server's mailbox. Agent creates a task → it's queryable. Multi-step workflows where step 2 depends on step 1 are fully testable.
+- **Protocol-level interface.** Mock services respond to real protocols. `curl`, `python3`, raw sockets — all valid, all produce real results. No command corridor, no regex matching.
+- **Procedural data.** Fixture generation seeds different data each eval. Same structure, completely different content. Memorization is not a viable strategy.
 
 ### Three-Container Architecture
 
-The validator spawns **two ephemeral sibling containers** per evaluation via Docker socket — one for the agent harness, one for the sandbox. Both are isolated. The validator container itself is persistent and Watchtower-managed, unchanged from v4.0.
+The validator spawns **two ephemeral sibling containers** per evaluation via Docker socket — one for the agent harness, one for the sandbox. Both are isolated. The validator container itself is persistent and Watchtower-managed.
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -161,13 +93,15 @@ The validator spawns **two ephemeral sibling containers** per evaluation via Doc
 | **Harness** | Ephemeral (per-episode) | `eval_net` + LLM API egress only | Publisher's official image (claude-code, openclaw, hermes) |
 | **Sandbox** | Ephemeral (per-miner, persists across episodes) | `eval_net` only, no egress | `ghcr.io/trajectoryrl/sandbox:latest` |
 
-**Why three containers:**
+**Why three containers (not two):**
+
+We considered merging harness + sandbox into a single container. The blocker is **egress control**: the harness needs LLM API access, the sandbox must be fully offline. Merging forces you to solve this with network namespaces or embedded proxies inside one container — more complex and harder to audit than two containers with different iptables rules. Additionally, merging means building custom images (harness + mock services bundled) instead of pulling official agent images. The two-container split is the same pattern as CI systems (GitHub Actions, GitLab runners) — well-understood, auditable, no custom images.
 
 - **Harness is sandboxed.** The harness runs in its own container with egress restricted to the LLM API endpoint (iptables whitelist). No access to the validator host, no arbitrary internet. The validator passes its API key as an environment variable — the harness never touches the host filesystem.
 - **Sandbox is fully offline.** All egress blocked, no exceptions. No LLM proxy, no firewall holes.
-- **Validator stays clean.** No third-party images run on the host. The validator only needs Docker socket access to spawn sibling containers — same pattern as CI systems (Jenkins, GitLab runners).
+- **Validator stays clean.** No third-party images run on the host. The validator only needs Docker socket access to spawn sibling containers.
 - **Watchtower unchanged.** It manages the validator image. Eval containers are ephemeral and unlabeled — Watchtower ignores them.
-- **Use official images.** Claude Code, OpenClaw, and Hermes publish Docker images. The validator pulls them once and spawns instances per-eval.
+- **Official images.** Claude Code, OpenClaw, and Hermes publish Docker images. The validator pulls them once and spawns instances per-eval. No custom bundled images to maintain.
 - **Transcript capture.** The validator creates the Docker network and captures the harness container's stdout/stderr + SSH session logs.
 
 ### Universal Interface: Shell + Filesystem + HTTP
@@ -212,7 +146,7 @@ The sandbox container persists across all 4 episodes — only mock service data 
 
 ## SKILL.md: Agent-Harness-Agnostic Pack Format
 
-Rename AGENTS.md → **SKILL.md**. A skill file is a plain markdown document that any agent framework can consume. The sandbox places it at `/workspace/SKILL.md`. The agent harness — whatever it is — reads it.
+**SKILL.md** is a plain markdown document that any agent framework can consume. The sandbox places it at `/workspace/SKILL.md`. The agent harness — whatever it is — reads it.
 
 SKILL.md is **static** — a finished product the miner ships. It contains domain knowledge, task execution patterns, safety rules, and memory management strategy. It does not contain workspace plumbing or meta-instructions (those come from the harness).
 
@@ -414,16 +348,7 @@ This prevents pre-computation: the `epoch_seed` is public but the `validator_sal
 
 ### Per-Episode: LLM Judge Evaluation
 
-The same LLM-as-judge approach from v1, applied to each episode's trajectory. The judge receives the shell transcript and mock service state, evaluates against scenario criteria.
-
-```
-v1: "Did the agent call `exec` with arg matching `/himalaya.*send/`?"  (regex)
-v2: "Query MailHog API — is there an email to dana@acme.com with      (state-based)
-     subject containing 'incident update'?"
-v3: LLM judge evaluates the full trajectory against criteria           (universal)
-```
-
-The judge produces a quality score per episode (0.0–1.0) covering correctness, completeness, and safety. State-based checks (mock service inspection) serve as grounding evidence for the judge — not as the scoring mechanism itself.
+The LLM judge receives the shell transcript and mock service state, evaluates against scenario criteria. It produces a quality score per episode (0.0–1.0) covering correctness, completeness, and safety. State-based checks (mock service inspection) serve as grounding evidence for the judge — not as the scoring mechanism itself.
 
 ### Across Episodes: Learning Signal (Split-Half Delta)
 
@@ -468,7 +393,7 @@ Quality dominates, but learning meaningfully contributes. A maximal delta of 1.0
 ## Evaluation Flow
 
 ```
-1. Select scenario: scenario = scenarios[epoch_seed % n_scenarios]
+1. Scenario: incident_response (single scenario for Season 1)
 2. Build sandbox (mock services + CLI tools)
 3. Load miner's SKILL.md into /workspace/
 4. For episode i = 1..4 (same scenario, different fixtures each rep):
@@ -494,11 +419,10 @@ One scenario, four reps, one formula. No gates, no thresholds.
 
 ### Fixed Sequence: 1 Scenario × 4 Reps
 
-One scenario is selected per epoch (rotated deterministically), and the agent runs it 4 times with different fixture data each rep. This maximizes learning signal — 4 data points for a single scenario give a robust trend via split-half averaging, not single-point noise.
+Season 1 launches with a **single scenario** (incident_response). The agent runs it 4 times per epoch with different fixture data each rep. This maximizes learning signal — 4 data points for a single scenario give a robust trend via split-half averaging, not single-point noise.
 
 ```python
-# Scenario selected per epoch, rotated
-scenario = scenarios[epoch_seed % len(scenarios)]
+scenario = "incident_response"  # single scenario for Season 1
 fixture_seed = sha256(epoch_seed + validator_salt)
 
 sequence = [
@@ -509,7 +433,7 @@ sequence = [
 ]
 ```
 
-**Example epoch (incident_response selected):**
+**Example epoch:**
 
 ```
 E1:  incident_response   (fixture_seed_1)    ← 1st attempt, cold start
@@ -524,19 +448,18 @@ Learning signal = split-half delta: `mean(q3, q4) - mean(q1, q2)`. Two-point ave
 
 **Why 1 scenario × 4 reps:**
 
-| Design | Learning Signal | Breadth | Noise Resistance |
-|--------|----------------|---------|------------------|
-| 1 × 4 | Strong (split-half, 2-point mean) | Per-epoch rotation | High |
-| 2 × 2 | Weak (single delta per scenario) | Per-epoch | Low (1 data point) |
-| 7 × 1 | None (no repetitions) | Per-epoch | None |
+| Design | Learning Signal | Noise Resistance |
+|--------|----------------|------------------|
+| 1 × 4 | Strong (split-half, 2-point mean) | High |
+| 2 × 2 | Weak (single delta per scenario) | Low (1 data point) |
+| 7 × 1 | None (no repetitions) | None |
 
-**1 × 4 is the right tradeoff**: maximize learning signal within each epoch, rotate scenarios across epochs for breadth. Over N epochs, every scenario is evaluated. Within each epoch, the 4-rep design produces a signal strong enough to rise above judge noise.
+**1 × 4 is the right tradeoff**: maximize learning signal within each epoch. The 4-rep design produces a signal strong enough to rise above judge noise.
 
-**Per-epoch scenario rotation:** `epoch_seed % n_scenarios` deterministically selects which scenario runs. Both scenarios (incident_response, codebase_fix) exist; the miner must build a SKILL.md that handles both because they don't control which epoch evaluates which scenario.
+**Why one scenario at launch:** Incident response is the strongest Season 1 scenario — 12 judge criteria, 6+ mock services, cross-service correlation requirements, safety constraints (confidential data), and rich procedural variation. It has the deepest learning curve: first-attempt agents consistently miss the correlation between monitoring alerts, client complaints, and GitHub issues. A second scenario (codebase_fix) is introduced later in Season 1 once the fixture factory for code generation is mature (see Scenario B below).
 
-**Scenario selection criteria:**
+**Scenario selection criteria (for adding future scenarios):**
 - **Deep**: many sub-tasks, decision points, safety constraints (room to improve across 4 reps)
-- **Different domains**: one knowledge-worker, one code/technical
 - **Complex enough** that a first attempt is genuinely harder than subsequent attempts with accumulated patterns
 
 ### Key Properties
@@ -544,7 +467,6 @@ Learning signal = split-half delta: `mean(q3, q4) - mean(q1, q2)`. Two-point ave
 - **Fixed N=4**: predictable eval time, no randomization overhead
 - **4 reps same scenario**: robust split-half delta signal
 - **Different data each rep**: same scenario template, completely different content (via validator-private salt + rep index)
-- **Per-epoch rotation**: breadth across epochs, depth within each epoch
 
 ---
 
@@ -593,74 +515,27 @@ Using the LLM judge as the sole scoring mechanism eliminates a class of gaming s
 
 ---
 
-## High-Confidence Components
-
-These parts of the design solve real v1 problems regardless of how scoring evolves:
-
-1. **Docker sandbox.** Replacing regex mocks with real stateful services is a strict upgrade. Agents run real commands, mutations are real, scoring inspects actual state. This alone eliminates the exec god-function, the narrow command corridor, and the intent-vs-competence gap.
-
-2. **SKILL.md as pack format.** A plain markdown file any framework can read. No protocol, no API, no framework lock-in. The abstraction is minimal and correct.
-
-3. **Procedural data generation (Fixture Factory).** LLM-generated fixtures from seed + template eliminates memorization and removes the fixture maintenance burden. Deployable independently — even without the sandbox, this improves v1.
-
-4. **State-based scoring evidence.** Checking MailHog API for "is there an email to Dana?" instead of regex-matching `himalaya send` is a qualitative leap. Agents are free to use any tool or method. The scoring sees outcomes, not commands.
-
-5. **LLM judge as universal scorer.** Already proven in v1. Extending it to continuous quality scoring (0.0–1.0) is incremental, not architectural. No separate gate mechanism — low quality episodes simply score low. The judge is the one component that doesn't need to be built from scratch.
-
-The primary unknowns are in the **multi-episode learning signal** (how to reliably measure improvement with small N) and **cross-validator determinism** (judge variance). These are addressed in the risks section below.
-
----
-
 ## Known Risks & Mitigations
 
-### 1. ~~Weak learning signal with small N~~ — Resolved
-
-~~With many scenarios and few repetitions, the learning signal was noisy.~~
-
-**Resolution:** Reduced to 1 scenario × 4 reps per epoch. Learning signal is a split-half delta: mean(q3, q4) - mean(q1, q2). Two-point averaging on each side, no regression needed.
-
-### 2. Learned memory growth vs. quality trade-off
+### 1. Learned memory growth vs. quality trade-off
 
 As `/workspace/learned/` accumulates patterns, the agent spends more tokens reading context before each task. Without pruning, later episodes may degrade as context bloat reduces agent effectiveness.
 
 **Mitigation:** This is intentionally part of the competition — miners must engineer SKILL.md with pruning and compression instructions. A disk cap on `/workspace/learned/` (Open Question #3) provides a hard bound.
 
-### 3. LLM judge variance across validators
+### 2. LLM judge variance across validators
 
 The LLM judge is probabilistic. Validator A and Validator B may score the same trajectory differently. With N=4 episodes per miner, per-episode variance directly affects `mean_quality` and `delta`.
 
 **Mitigation:** Use structured rubrics with binary sub-criteria per dimension (e.g., correctness, completeness, safety) rather than a single numeric score. Binary judgments are more reproducible across LLM calls. Quality score = fraction of criteria passed. Alternatively, use median-of-validators scoring.
 
-### 4. Evaluation cost and time
+### 3. Evaluation cost and time
 
 Each miner requires 4 episodes × 10 min timeout = 40 min per miner (budget 50 min with retry headroom). With 200 miners and 10 parallel containers: ~17 hours per epoch.
 
-Consistent with v4.0, **validators bear all inference costs** (both agent execution and judge calls). Miners have zero ongoing cost — they ship a static SKILL.md and nothing else.
+**Validators bear all inference costs** (both agent execution and judge calls). Miners have zero ongoing cost — they ship a static SKILL.md and nothing else.
 
-**v4.0 baseline (live data, GLM-5 via OpenRouter, 21 qualified miners):**
-
-| Scenario | Mean Cost | Mean Tokens | Mean LLM Calls |
-|----------|----------|-------------|----------------|
-| inbox_triage | $0.021 | 17.6K | 3.1 |
-| client_escalation | $0.022 | 16.7K | 2.3 |
-| team_standup | $0.024 | 18.7K | 2.2 |
-| morning_brief | $0.028 | 19.9K | 2.2 |
-| inbox_to_action | $0.032 | 21.8K | 2.5 |
-| hiring_debrief | $0.039 | 30.8K | 3.4 |
-| post_incident_review | $0.104 | 90.3K | 7.4 |
-| **Per-miner total (7 scenarios)** | **$0.27** | **216K** | **23** |
-
-A full v4.0 eval costs ~$0.27/miner. 21 qualified miners × $0.27 = **~$5.67/epoch** for agent calls.
-
-**Season 1 projection:** Season 1 episodes are deeper (10-min timeout, investigate→act→reflect loops with persistent learning). Estimated call multiplier vs v4.0 per-scenario baseline:
-
-| Multiplier | Calls/Episode | Tokens/Episode | Cost/Episode | Cost (4 episodes) |
-|:----------:|:------------:|:--------------:|:------------:|:------------------:|
-| 5× (conservative) | ~33 | ~308K | ~$0.39 | $1.54 |
-| 10× (midpoint) | ~66 | ~617K | ~$0.77 | $3.08 |
-| 15× (aggressive) | ~100 | ~925K | ~$1.16 | $4.62 |
-
-**Cost breakdown (per epoch, midpoint 10× estimate):**
+**Cost estimate (per epoch, midpoint):**
 
 | Component | 50 miners | 200 miners |
 |-----------|----------|------------|
@@ -669,18 +544,17 @@ A full v4.0 eval costs ~$0.27/miner. 21 qualified miners × $0.27 = **~$5.67/epo
 | Infrastructure (Docker) | $10–20 | $20–50 |
 | **Total per epoch** | **~$174** | **~$706** |
 
-At the midpoint estimate, Season 1 costs ~$174/epoch with 50 miners (~$706 at 200 miners). This is ~30× more than v4.0 ($5.67) but remains manageable for validators earning TAO emissions (~$720+/day for medium-stake validators).
+At the midpoint estimate, Season 1 costs ~$174/epoch with 50 miners (~$706 at 200 miners). Manageable for validators earning TAO emissions (~$720+/day for medium-stake validators).
 
 **Cost mitigation strategies:**
 
 - **Harness-aware cost caps.** The validator sets a per-episode token/dollar cap. The agent harness is killed if the cap is exceeded (episode scored as-is with whatever was completed). This bounds worst-case cost.
-- **Cheap default model.** The default evaluation model remains GLM-5 (cheapest qualified model). Season 1 scores on quality, not cost — but the validator always runs episodes with GLM-5 unless the miner's SKILL.md explicitly requests routing to other models.
+- **Cheap default model.** The default evaluation model is GLM-5 (cheapest qualified model). Season 1 scores on quality, not cost.
 - **Lightweight containers.** Sandbox containers are lightweight (mock services only). Harness containers use official agent images. Both are ephemeral — created per-eval, destroyed after.
-- **Fewer qualified miners in practice.** v4.0 data shows only 11% of miners (21/191) qualify. Season 1's harder scenarios will likely have a similar or lower qualification rate.
 
 **Mitigation for time:** 17h is within the 24h epoch with margin. Scale to 15–20 containers if miner count exceeds 200.
 
-### 5. The "already good" problem
+### 4. The "already good" problem
 
 A miner whose SKILL.md produces high-quality trajectories from episode 1 shows no improvement (`delta ≈ 0`). With α=0.5 and 4 reps, quality clearly dominates:
 
@@ -690,23 +564,23 @@ A miner whose SKILL.md produces high-quality trajectories from episode 1 shows n
 | B (improving) | 0.45 | 0.55 | 0.80 | 0.85 | 0.663 | 0.325 | 0.163 | **0.771** |
 | C (mediocre) | 0.35 | 0.40 | 0.55 | 0.60 | 0.475 | 0.20 | 0.10 | **0.523** |
 
-**Mitigation:** Miner A wins decisively (0.900 vs 0.771 vs 0.523). At α=0.5, the learning bonus is more meaningful than at α=0.3 — Miner B is competitive rather than distant — but quality still dominates. A miner must first be good, then improving. The 4-rep design also makes the delta more trustworthy (2-point averaging vs single-point noise).
+**Mitigation:** Miner A wins decisively (0.900 vs 0.771 vs 0.523). Quality dominates — Miner B is competitive but cannot leapfrog. A miner must first be good, then improving. The 4-rep design makes the delta trustworthy (2-point averaging vs single-point noise).
 
-### 6. Miner meta-game evolution
+### 5. Miner meta-game evolution
 
 **Week 1-2:** Basic SKILL.md files ("reflect after each task, write to learned/"). Low differentiation. Most miners produce similar quality trajectories.
 
 **Week 3-4:** Top miners discover that SKILL.md instruction quality matters — better memory management strategies, smarter pruning rules, domain-specific heuristics. Separation emerges.
 
-**Week 5-8:** Competition converges on optimal strategies. Meta stabilizes.
+**Week 5-8:** Competition converges on incident_response strategies. Meta stabilizes — then Scenario B (codebase_fix) goes live mid-season, disrupting miners who over-specialized.
 
-**Mitigation:** Season 1 is designed to run 1-2 months. When the meta stabilizes, Season 2 introduces new scenario categories and evaluation dimensions. Short seasons keep competitive pressure high.
+**Mitigation:** The mid-season scenario addition is the first shakeup. Season 2 introduces new scenario categories and evaluation dimensions. Short seasons keep competitive pressure high.
 
 ---
 
 ## Season 1 Scenarios
 
-Two deep, complex scenarios — one knowledge-worker, one code/technical. Each must have enough sub-tasks and decision points that a first attempt is genuinely harder than a second.
+Season 1 launches with **one scenario** (incident_response). A second scenario (codebase_fix) is added later in the season once the code-generation fixture factory is validated. Miners must build a SKILL.md that handles both — they won't know when the second scenario goes live.
 
 Design principles:
 
@@ -720,7 +594,7 @@ Design principles:
 
 ---
 
-### Scenario A: Incident Response Coordinator
+### Scenario A: Incident Response Coordinator (launch scenario)
 
 **Category:** Knowledge Worker | **Services:** Email, Slack, GitHub (Gitea), Tasks (Notion), Calendar | **Timeout:** 10 min
 
@@ -784,9 +658,11 @@ The task prompt (delivered via INSTRUCTION.md) is:
 
 ---
 
-### Scenario B: Codebase Investigation & Fix
+### Scenario B: Codebase Investigation & Fix (added mid-season)
 
 **Category:** Technical | **Services:** Gitea (git repo + issues + PRs), Terminal (test runner) | **Timeout:** 10 min
+
+**Ships after launch** once the code-generation fixture factory is validated. When Scenario B goes live, per-epoch rotation is enabled: `epoch_seed % 2` selects which scenario runs. Miners who only optimized for incident_response will be penalized on codebase_fix epochs.
 
 #### Situation
 
@@ -856,31 +732,13 @@ This produces a fresh, unique codebase each episode while maintaining consistent
 
 ---
 
-### Future Seasons
+### Future Scenarios
 
-Additional scenario types for Season 2+:
+Additional scenario types (Season 2+):
 - **Data analysis**: SQLite database + business questions → produce report with charts
 - **Customer support**: Ticket triage + SLA compliance + escalation rules
 - **Multi-repo coordination**: Fix spanning two repositories with dependency
 - **Error resilience**: Intermittent service failures the agent must handle gracefully
-
----
-
-## Competitive Dynamic Shift
-
-### Before (v1)
-
-Miners optimize for: "shortest AGENTS.md that passes 7 regex-checked office scenarios with static fixtures."
-
-Gaming surface: memorize fixture data, reverse-engineer check types, hardcode scenario-specific responses.
-
-### After (Season 1)
-
-Miners optimize for: "most capable self-learning agent that measurably improves across repeated attempts at complex tasks."
-
-Gaming surface: reduced — procedural data prevents memorization, LLM judge prevents regex gaming, hybrid grading prevents hallucinated quality.
-
-The evaluation structurally selects for agent engineering capability over benchmark optimization.
 
 ---
 
@@ -893,7 +751,7 @@ The evaluation structurally selects for agent engineering capability over benchm
 - Implement PRNG-based structural param derivation from `epoch_seed`
 - Implement validator-private salt + fixture_hash verification
 - **Test:** Generate fixtures for incident_response, compare quality to hand-crafted
-- **Still uses v1 mock tools** — fixtures are just loaded differently
+- **Deployable before sandbox** — fixtures are just loaded differently
 
 This phase is deployable independently. Even without the Docker sandbox, LLM-generated fixtures eliminate memorization and remove the fixture maintenance burden.
 
@@ -902,23 +760,29 @@ This phase is deployable independently. Even without the Docker sandbox, LLM-gen
 - Build base Docker image with MailHog + lightweight mock APIs (Notion, Calendar, Slack, web, memory)
 - Load fixtures into mock services at container start
 - Implement observation capture (transcript + service logs + fs diff)
-- Port incident_response and codebase_fix to sandbox format
-- **Test:** Run side-by-side with v1, compare scoring agreement
+- Port incident_response to sandbox format
+- **Test:** Run side-by-side with current eval, compare scoring agreement
 
 ### Phase 3: Multi-Episode + SKILL.md
 
 - Implement episode runner with persistent workspace
 - Implement split-half delta scoring (1 scenario × 4 reps)
-- Implement per-epoch scenario rotation (`epoch_seed % n_scenarios`)
 - Port AGENTS.md → SKILL.md format
-- **Test:** Run 4-rep sequences, verify split-half delta signal across different scenarios
+- **Test:** Run 4-rep sequences, verify split-half delta signal
+
+### Phase 3b: Scenario B (mid-season)
+
+- Build code-generation fixture factory (base projects, bug injection, test suite generation)
+- Port codebase_fix to sandbox format
+- Enable per-epoch rotation (`epoch_seed % 2`)
+- **Test:** Verify fixture factory produces solvable bugs with valid test suites
 
 ### Phase 4: Scoring Rewrite
 
 - Implement hybrid grading: automated checks (service state assertions) + LLM judge (qualitative rubric)
 - Automated checks verify objective criteria: file exists, email sent, tests pass, no confidential data leaked
 - LLM judge evaluates qualitative dimensions: reasoning quality, communication tone, investigation methodology
-- Per-scenario weight split: incident_response 40% automated / 60% judge, codebase_fix 50% / 50%
+- Weight split: incident_response 40% automated / 60% judge (codebase_fix 50/50 when added)
 - Define scoring spec YAML format mapping each criterion to check type and weight
 
 ### Phase 5: Season 2 Preparation
@@ -932,15 +796,16 @@ This phase is deployable independently. Even without the Docker sandbox, LLM-gen
 
 ### Roadmap & MVP Definition
 
-**What ships first:** Phase 1 (Fixture Factory) is independently deployable and improves v1 without requiring the Docker sandbox. This is the first deliverable.
+**What ships first:** Phase 1 (Fixture Factory) is independently deployable without the Docker sandbox. This is the first deliverable.
 
 **Season 1 launch** = Phase 3 complete (1 scenario × 4 reps + SKILL.md + split-half delta scoring end-to-end).
 
 | Phase | Depends On | Status | Milestone |
 |-------|-----------|--------|-----------|
-| 1. Fixture Factory | Nothing (standalone) | Design complete | First to ship — improves v1 immediately |
+| 1. Fixture Factory | Nothing (standalone) | Design complete | First to ship — deployable before sandbox |
 | 2. Sandbox Infrastructure | Phase 1 (fixtures load into sandbox) | Design complete | Docker sandbox with real mock services |
-| 3. Multi-Episode + SKILL.md | Phase 2 (sandbox exists) | Design complete | **Season 1 launch** |
+| 3. Multi-Episode + SKILL.md | Phase 2 (sandbox exists) | Design complete | **Season 1 launch** (incident_response only) |
+| 3b. Scenario B | Phase 3 (episode runner exists) | Design complete | Mid-season: adds codebase_fix + rotation |
 | 4. Scoring Rewrite | Phase 3 (episodes produce trajectories) | Spec complete | Ships with Season 1 |
 | 5. Season 2 Prep | Phase 4 (scoring stable) | Planned | After Season 1 stabilizes |
 
@@ -949,7 +814,8 @@ This phase is deployable independently. Even without the Docker sandbox, LLM-gen
 - **Now:** Experiment with memory/reflection patterns in your AGENTS.md — the SKILL.md format is a strict subset. Build agents that write learnings to a file and read them on subsequent tasks.
 - **Phase 1:** No miner changes required (fixture factory is validator-side). Your existing pack continues to work.
 - **Phase 2+:** Migrate AGENTS.md → SKILL.md format. Ensure your agent works with `bash`, `curl`, and standard CLI tools (no reliance on OpenClaw-specific tool handlers). Test against mock services locally.
-- **Season 1 launch:** Declare harness in `pack.yaml`, ship SKILL.md + any supporting pack files. Your agent framework must be able to operate a remote sandbox via SSH (this is the default for Claude Code, OpenClaw, and Hermes).
+- **Season 1 launch:** Declare harness in `pack.yaml`, ship SKILL.md + any supporting pack files. Your agent framework must be able to operate a remote sandbox via SSH (this is the default for Claude Code, OpenClaw, and Hermes). Launch evaluates incident_response only.
+- **Mid-season:** Scenario B (codebase_fix) goes live. SKILL.md must handle both scenarios — build general-purpose instructions, not scenario-specific hacks.
 
 ---
 
@@ -959,7 +825,7 @@ The entire system needs:
 
 1. **Sandbox**: Docker + mock services + SKILL.md mount
 2. **Episode runner**: Loop that resets data, delivers prompt, captures transcript
-3. **LLM judge**: Score each trajectory 0.0–1.0 (already built in v1, extend to quality scoring)
+3. **LLM judge**: Score each trajectory 0.0–1.0
 4. **Scorer**: Split-half delta → `final_score = mean(quality) * (1 + α * max(0, delta))` where α=0.5
 
 Four components. The judge already exists. The new work is: sandbox + episode runner.
@@ -975,3 +841,55 @@ Four components. The judge already exists. The new work is: sandbox + episode ru
 5. **Fixture generation**: Validator-private salt (recommended) vs. PRNG-only generation — which is the Season 1 default? What's the minimum salt entropy and rotation policy?
 6. **Judge scoring rubric**: How many sub-criteria per scenario? More criteria = finer signal but higher judge cost. Structured rubric (binary per criterion) vs. holistic numeric score?
 7. **Judge consistency across validators**: Same trajectory may get different scores from different validators' judge calls. Median-of-validators? Or deterministic judge (structured rubric)?
+
+---
+
+## Appendix
+
+### A. Problems with v4.0 (motivation for Season 1)
+
+1. **Stateless mock tools.** Tools don't reflect mutations — agent sends email but `himalaya envelope list` still returns the original inbox. We can only score intent, not competence at state transitions. Multi-step workflows where step 2 depends on step 1 are fundamentally untestable.
+
+2. **`exec` is a god-function with brittle regex.** The exec handler is a ~170-line chain of regex patterns covering 4 systems (email, tasks, calendar, GitHub). Command variation kills agents (`himalaya envelope list` works, `himalaya list envelope` doesn't). Creative agents that use `curl` directly are punished. This creates a narrow corridor of "correct" commands that rewards memorization over capability.
+
+3. **Fixture-scenario tight coupling.** Each scenario has manually crafted fixture files. No composability, no parameterized variation, slow to add new scenarios.
+
+4. **Single-turn, single-episode limitation.** No approval flows, clarification dialogues, or long-running tasks. No incentive for multi-turn interactions.
+
+5. **No error simulation.** Tools always succeed. No rate limits, auth failures, timeouts. Can't evaluate robustness.
+
+6. **Knowledge-worker monoculture.** All 7 scenarios are office-worker email/calendar/tasks/Slack.
+
+7. **Fixed fixture pool enables memorization.** Open-source fixtures + 7 static scenarios = miners memorize the benchmark. Optimization-through-memorization is structurally indistinguishable from genuine capability.
+
+8. **No self-learning evaluation.** The system evaluates a single snapshot. No mechanism to test whether an agent improves across tasks, retains corrections, or transfers learnings.
+
+### B. What Season 1 changes (compared to v4.0)
+
+| Dimension | v4.0 | Season 1 |
+|-----------|------|----------|
+| Environment | Regex mock handlers, static fixtures | Docker sandbox, stateful mock services |
+| Scoring | Regex + LLM judge (binary gate) | State-based + LLM judge (continuous 0.0–1.0) |
+| Data | 7 fixed scenarios, static fixtures | Procedurally generated fixtures per eval |
+| Episodes | 1 per scenario | 4 reps of same scenario (split-half delta) |
+| Learning | None (stateless) | Persistent `/workspace/learned/` across reps |
+| Pack format | AGENTS.md | SKILL.md (static, agent-agnostic) |
+| Interface | OpenClaw API → regex handler | SSH into Docker → real shell + real protocols |
+| Gaming surface | Memorize fixtures, reverse-engineer regexes | Procedural data, hybrid grading, LLM judge |
+
+### C. v4.0 cost baseline (live data)
+
+For reference, the current v4.0 eval costs per miner (GLM-5 via OpenRouter, 21 qualified miners):
+
+| Scenario | Mean Cost | Mean Tokens | Mean LLM Calls |
+|----------|----------|-------------|----------------|
+| inbox_triage | $0.021 | 17.6K | 3.1 |
+| client_escalation | $0.022 | 16.7K | 2.3 |
+| team_standup | $0.024 | 18.7K | 2.2 |
+| morning_brief | $0.028 | 19.9K | 2.2 |
+| inbox_to_action | $0.032 | 21.8K | 2.5 |
+| hiring_debrief | $0.039 | 30.8K | 3.4 |
+| post_incident_review | $0.104 | 90.3K | 7.4 |
+| **Per-miner total** | **$0.27** | **216K** | **23** |
+
+Full v4.0 epoch: 21 qualified miners × $0.27 = ~$5.67. Season 1 projection is ~30× higher (~$174/epoch at 50 miners) due to deeper episodes (10-min timeout, 4 reps).
