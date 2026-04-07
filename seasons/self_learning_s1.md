@@ -1,6 +1,6 @@
 # Season 1: Self-Learning Agents
 
-> v0.17: chained continuity across 4 reps (shared world + recurring element on rep 3 + evolving fact on rep 4) so the split-half delta measures real cross-episode memory, not just meta-pattern transfer. Addresses community feedback in PR #157 §2a.
+> v0.17: chained continuity across 4 reps (shared world + recurring element on rep 3 + evolving fact on rep 4) so the split-half delta measures real cross-episode memory, not just meta-pattern transfer. Also: published judge prompts (§5a), tool-call efficiency diagnostic (§4a), constraint-SAT scenario added to Season 2 backlog (§2a-C). Addresses community feedback in PR #157.
 > v0.16: OpenClaw as Season 1 framework, incentive mechanism amendment (quality-based WTA/NCD/Winner Protection).
 
 ---
@@ -505,10 +505,10 @@ fixture_generation:
   "pack_hash": "abc123...",
   "scenario": "incident_response",
   "episodes": [
-    {"rep": 1, "quality": 0.45},
-    {"rep": 2, "quality": 0.55},
-    {"rep": 3, "quality": 0.72},
-    {"rep": 4, "quality": 0.68}
+    {"rep": 1, "quality": 0.45, "tool_calls": 18, "novel_calls": 14},
+    {"rep": 2, "quality": 0.55, "tool_calls": 16, "novel_calls": 11},
+    {"rep": 3, "quality": 0.72, "tool_calls":  9, "novel_calls":  7},
+    {"rep": 4, "quality": 0.68, "tool_calls": 11, "novel_calls":  9}
   ],
   "early_mean": 0.50,
   "late_mean": 0.70,
@@ -521,6 +521,8 @@ fixture_generation:
 ```
 
 Split-half delta: `mean(q3, q4) - mean(q1, q2) = 0.70 - 0.50 = 0.20`. Final score: `0.60 × (1 + 0.5 × 0.20) = 0.60 × 1.10 = 0.660`.
+
+**Tool-call diagnostics (`tool_calls`, `novel_calls`).** These fields are *diagnostic only* and do not enter the scoring formula. `tool_calls` is the total number of tool invocations in the episode; `novel_calls` is the count of calls that returned information not already retrievable from the agent's prior calls in the same episode (computed by the validator from the captured transcript). The ratio `novel_calls / tool_calls` is an information-efficiency signal — agents that batch and plan score higher. We surface it on miner dashboards so the community can iterate on smarter tool use, but quality remains the only signal that drives `final_score` and weights. (PR #157 §4a.)
 
 ---
 
@@ -578,6 +580,7 @@ The LLM judge is probabilistic. Validator A and Validator B may score the same t
 
 1. **Structured rubrics.** Use binary sub-criteria per dimension (e.g., correctness, completeness, safety) rather than a single numeric score. Binary judgments are more reproducible across LLM calls. Quality score = fraction of criteria passed.
 2. **Cross-validator aggregation.** Each validator evaluates on different fixture data (via private salt) and produces an independent score. Stake-weighted averaging across validators suppresses per-validator noise and produces a consensus score that reflects the miner's expected quality over the fixture distribution. This is the same consensus mechanism used in v4.0 for cost aggregation (see INCENTIVE_MECHANISM.md).
+3. **Published judge prompts.** The exact prompts used by `PackIntegrityJudge` and `TrajectoryJudge` (in `trajectoryrl/utils/judge_prompts.py`) are part of the public spec, not validator-private. Miners can read the rubric verbatim and write SKILL.md against an unambiguous decision boundary. This does not enable gaming — the criteria are already public, and grounding requirements still force the agent to actually call tools — but it eliminates a class of "the judge interpreted my correct answer differently" disputes. Any change to a judge prompt is a versioned, announced change.
 
 ### 3. Evaluation cost and time
 
@@ -790,6 +793,7 @@ Additional scenario types (Season 2+):
 - **Customer support**: Ticket triage + SLA compliance + escalation rules
 - **Multi-repo coordination**: Fix spanning two repositories with dependency
 - **Error resilience**: Intermittent service failures the agent must handle gracefully
+- **Constraint satisfaction under ambiguity**: scheduling/packing problems with overlapping constraints (people availability, room availability, dependency chains) where the cheap path is *reasoning over fetched data* in one pass rather than enumerating with N tool calls. Naturally separates planning agents from lookup agents. (PR #157 §2a-C.)
 
 ---
 
