@@ -60,10 +60,10 @@ python3 tools/analyze_validator.py <hotkey> --dump      # dump raw JSON to file
 
 ### Dependencies
 
-Requires the `trajrl` package (from `trajrl/`). Install with:
+Requires the `trajrl` package (now a standalone repo: https://github.com/trajectoryRL/trajrl). Install with:
 
 ```bash
-pip install -e trajrl/
+pip install trajrl
 ```
 
 ## compare_pack_ncd.py — Pack deduplication similarity check

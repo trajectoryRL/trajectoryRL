@@ -231,7 +231,7 @@ trajrl logs --show                  # Download and display latest cycle log
 trajrl logs --type cycle            # List cycle log archives
 ```
 
-Outputs JSON automatically when piped, Rich tables when interactive. See [trajrl/README.md](trajrl/README.md) for full documentation.
+Outputs JSON automatically when piped, Rich tables when interactive. Source and full documentation: https://github.com/trajectoryRL/trajrl
 
 ## Documentation
 
@@ -239,7 +239,7 @@ Outputs JSON automatically when piped, Rich tables when interactive. See [trajrl
 - **[Validator Operations](VALIDATOR_OPERATIONS.md)** — Cost model, auto-updates, and operational guidance
 - **[Miner Operations](MINER_OPERATIONS.md)** — Pack format, run modes, local testing, and submission workflow
 - **[ClawBench](https://github.com/trajectoryRL/clawbench)** — Evaluation framework (scenarios, fixtures, scoring)
-- **[trajrl CLI](trajrl/README.md)** — Query live subnet data from the terminal
+- **[trajrl CLI](https://github.com/trajectoryRL/trajrl)** — Query live subnet data from the terminal
 
 ## Community
 
