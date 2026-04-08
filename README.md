@@ -1,12 +1,14 @@
 # TrajectoryRL
 
-> **Bittensor Subnet 11** — Optimize AI agent policies through decentralized competition
+> **Bittensor Subnet 11** — An open skill factory for AI agents
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Bittensor](https://img.shields.io/badge/bittensor-7.0+-green.svg)](https://github.com/opentensor/bittensor)
 
-TrajectoryRL is a Bittensor subnet where miners compete to optimize AI agent policies for real-world tasks. Validators evaluate policy packs using deterministic scenarios, rewarding agents that are **safe**, **efficient**, and **reliable**.
+TrajectoryRL leverages Bittensor's distributed compute and incentive layer with reinforcement learning to produce state-of-the-art **agent skills**. Miners compete every epoch to submit policies that pass strict safety and correctness gates at the lowest cost, validators evaluate them on real knowledge-worker tasks, and the winning policies are released as skills any AI agent can use.
+
+End users consume those skills through the official CLI, [`trajrl`](https://github.com/trajectoryRL/trajrl) — `pip install trajrl` and any agent (Claude Code, Cursor, Codex, OpenClaw, Hermes, Manus, …) gets immediate access to the latest catalog.
 
 ## Overview
 
