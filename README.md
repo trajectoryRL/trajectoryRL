@@ -1,12 +1,20 @@
 # TrajectoryRL
 
-> **Bittensor Subnet 11** — Optimize AI agent policies through decentralized competition
+> **Bittensor Subnet 11** — A reinforcement learning playground that continuously produces state-of-the-art skills for AI agents
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Bittensor](https://img.shields.io/badge/bittensor-7.0+-green.svg)](https://github.com/opentensor/bittensor)
 
-TrajectoryRL is a Bittensor subnet where miners compete to optimize AI agent policies for real-world tasks. Validators evaluate policy packs using deterministic scenarios, rewarding agents that are **safe**, **efficient**, and **reliable**.
+Every platform shift creates a new software category. PCs gave us desktop apps. Smartphones gave us mobile apps. Agents are the next platform, and **skills are the software that runs on them**. The volume of skills the world needs is far beyond what human developers can produce. Agents will write skills for other agents. TrajectoryRL is the RL playground where that happens.
+
+The competition runs 24/7 on Bittensor. Miners compete every epoch to produce the best agent skills, validators evaluate them in real sandboxes with real protocols, and the winning skills surface automatically. Every season the bar rises. You don't bring us your prompt. **Skills come out, you install them.**
+
+```bash
+pip install trajrl
+```
+
+One install gives any agent (Claude Code, Cursor, Codex, OpenClaw, Hermes, Manus, …) access to every skill the subnet has shipped. Source, catalog, and docs: [`trajrl`](https://github.com/trajectoryRL/trajrl).
 
 ## Overview
 
@@ -214,21 +222,18 @@ python scripts/run_batch.py
 
 See [MINER_OPERATIONS.md](MINER_OPERATIONS.md) for full details: automated mode, S3 upload, pack format, and scoring targets.
 
-## trajrl — the official CLI for TrajectoryRL skills
+## trajrl — consume what the playground produces
 
-TrajectoryRL is a skill factory: miners compete every epoch to produce policy packs that pass safety and correctness gates at the lowest cost, and the winning packs become **skills** — the subnet's product. `trajrl` is the official command-line tool that delivers those skills to end users.
+You don't interact with the competition. You consume its output. `trajrl` is the CLI that delivers battle-tested skills to your agent.
 
 ```bash
 pip install trajrl
-```
-
-One install gives any human or AI agent (Claude Code, Cursor, Codex, OpenClaw, Hermes, Manus, …) access to every skill the subnet has shipped. Each skill is a self-contained `SKILL.md` that agents can discover and follow directly. CLI output is JSON when piped, Rich tables when interactive.
-
-```bash
 trajrl subnet status                       # Network overview
 trajrl subnet analyze <validator-hotkey>   # Full validator analysis
 trajrl subnet analyze <hotkey> --deep      # Drill into top miners
 ```
+
+Each skill is a self-contained `SKILL.md` that any agent can discover and follow directly. CLI output is JSON when piped, Rich tables when interactive.
 
 Source, skill catalog, and full documentation: https://github.com/trajectoryRL/trajrl
 
