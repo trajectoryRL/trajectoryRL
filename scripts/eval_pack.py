@@ -91,7 +91,7 @@ def pack_from_agents_md(path: str) -> dict:
         "files": {"AGENTS.md": content},
         "tool_policy": {
             "allow": ["exec", "slack", "memory_search", "memory_get",
-                       "web_search", "read"],
+                       "web_search"],
             "deny": ["group:runtime"],
         },
         "metadata": {
