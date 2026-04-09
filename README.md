@@ -47,7 +47,7 @@ See [INCENTIVE_MECHANISM.md](INCENTIVE_MECHANISM.md) for full scoring, rewards, 
 ### Example ROI (1,000 tasks/day)
 
 ```
-Unoptimized GLM-5:                       $12,300/month
+Unoptimized GLM-5.1:                       $12,300/month
 
 Stage 1 — Prompt optimization (AGENTS.md tuning):
   Optimized prompts + stop rules:         $3,300/month  (73% reduction)
@@ -55,7 +55,7 @@ Stage 1 — Prompt optimization (AGENTS.md tuning):
 Stage 2 — Hybrid routing (AGENTS.md + injected skills):
   Multi-LLM dynamic routing:               $900/month  (93% reduction)
     ├─ Qwen 3.5 (Alibaba) handles 40% of sub-tasks (tool calls, lookups)
-    ├─ GLM-5 (Z.ai) handles 25% (structured extraction, formatting)
+    ├─ GLM-5.1 (Z.ai) handles 25% (structured extraction, formatting)
     ├─ Gemini 3 Flash (Google) handles 20% (search, summarization)
     ├─ GPT-5.2 (OpenAI) handles 10% (reasoning, drafting)
     └─ Claude Opus 4.6 (Anthropic) handles 5% (complex judgment calls)
@@ -93,7 +93,7 @@ NETUID=11
 NETWORK=finney
 CLAWBENCH_LLM_API_KEY=your-api-key
 CLAWBENCH_LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4/
-CLAWBENCH_DEFAULT_MODEL=zhipu/glm-5
+CLAWBENCH_DEFAULT_MODEL=zhipu/glm-5.1
 EOF
 ```
 
@@ -101,9 +101,9 @@ EOF
 
 | Provider | `CLAWBENCH_LLM_BASE_URL` | `CLAWBENCH_DEFAULT_MODEL` |
 |----------|--------------------------|---------------------------|
-| [Zhipu AI](https://bigmodel.cn) (default) | `https://open.bigmodel.cn/api/paas/v4` | `zhipu/glm-5` |
-| [Chutes](https://chutes.ai) | `https://llm.chutes.ai/v1` | `chutes/zai-org/GLM-5-TEE` |
-| [OpenRouter](https://openrouter.ai) | `https://openrouter.ai/api/v1` | `openrouter/zhipu/glm-5` |
+| [Zhipu AI](https://bigmodel.cn) (default) | `https://open.bigmodel.cn/api/paas/v4` | `zhipu/glm-5.1` |
+| [Chutes](https://chutes.ai) | `https://llm.chutes.ai/v1` | `chutes/zai-org/GLM-5.1-TEE` |
+| [OpenRouter](https://openrouter.ai) | `https://openrouter.ai/api/v1` | `openrouter/zhipu/glm-5.1` |
 
 | Variable | Required | Description |
 |----------|:--------:|-------------|
@@ -113,7 +113,7 @@ EOF
 | `NETWORK` | Yes | `finney`, `test`, or `local` |
 | `CLAWBENCH_LLM_API_KEY` | Yes | API key for the LLM provider (e.g. [Zhipu AI](https://bigmodel.cn), [Chutes](https://chutes.ai), [OpenRouter](https://openrouter.ai)) |
 | `CLAWBENCH_LLM_BASE_URL` | Yes | Base URL for the OpenAI-compatible API |
-| `CLAWBENCH_DEFAULT_MODEL` | Yes | LLM model for evaluation (default: `zhipu/glm-5`) |
+| `CLAWBENCH_DEFAULT_MODEL` | Yes | LLM model for evaluation (default: `zhipu/glm-5.1`) |
 | `JUDGE_MODEL` | No | LLM model for judge (defaults to `CLAWBENCH_DEFAULT_MODEL`) |
 | `JUDGE_API_KEY` | No | API key for judge (defaults to `CLAWBENCH_LLM_API_KEY`) |
 | `JUDGE_BASE_URL` | No | Base URL for judge (defaults to `CLAWBENCH_LLM_BASE_URL`) |
@@ -163,11 +163,11 @@ NETUID=11
 NETWORK=finney
 LLM_API_KEY=your-api-key
 LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4/
-LLM_MODEL=zhipu/glm-5
+LLM_MODEL=zhipu/glm-5.1
 EOF
 ```
 
-> **Tip:** Any OpenAI-compatible provider works. For OpenRouter, use `LLM_BASE_URL=https://openrouter.ai/api/v1` and `LLM_MODEL=zhipu/glm-5`.
+> **Tip:** Any OpenAI-compatible provider works. For OpenRouter, use `LLM_BASE_URL=https://openrouter.ai/api/v1` and `LLM_MODEL=zhipu/glm-5.1`.
 
 #### 3. Start mining
 
@@ -201,9 +201,9 @@ python neurons/miner.py status
 cd clawbench
 pip install -e .
 # Set CLAWBENCH_LLM_API_KEY, CLAWBENCH_LLM_BASE_URL, CLAWBENCH_DEFAULT_MODEL in .env
-# Example Zhipu:      CLAWBENCH_LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4/, CLAWBENCH_DEFAULT_MODEL=zhipu/glm-5
-# Example Chutes:     CLAWBENCH_LLM_BASE_URL=https://llm.chutes.ai/v1,              CLAWBENCH_DEFAULT_MODEL=chutes/zai-org/GLM-5-TEE
-# Example OpenRouter: CLAWBENCH_LLM_BASE_URL=https://openrouter.ai/api/v1,           CLAWBENCH_DEFAULT_MODEL=openrouter/zhipu/glm-5
+# Example Zhipu:      CLAWBENCH_LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4/, CLAWBENCH_DEFAULT_MODEL=zhipu/glm-5.1
+# Example Chutes:     CLAWBENCH_LLM_BASE_URL=https://llm.chutes.ai/v1,              CLAWBENCH_DEFAULT_MODEL=chutes/zai-org/GLM-5.1-TEE
+# Example OpenRouter: CLAWBENCH_LLM_BASE_URL=https://openrouter.ai/api/v1,           CLAWBENCH_DEFAULT_MODEL=openrouter/zhipu/glm-5.1
 
 # Test a single scenario
 python scripts/run_episode.py --scenario inbox_triage --variant optimized --json

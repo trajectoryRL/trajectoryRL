@@ -9,7 +9,7 @@ from typing import List, Optional
 logger = logging.getLogger(__name__)
 
 DEFAULT_LLM_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
-DEFAULT_LLM_MODEL = "glm-5"
+DEFAULT_LLM_MODEL = "glm-5.1"
 DEFAULT_CLAWBENCH_MODEL = f"zhipu/{DEFAULT_LLM_MODEL}"
 
 
@@ -251,7 +251,7 @@ class MinerConfig:
         log_level: Logging level
         llm_api_key: API key for the OpenAI-compatible LLM endpoint
         llm_base_url: Base URL for the OpenAI-compatible LLM endpoint
-        llm_model: Model name for AGENTS.md generation (e.g. glm-5)
+        llm_model: Model name for AGENTS.md generation (e.g. glm-5.1)
         pack_url: Pre-set pack URL (skips S3 upload if set)
     """
 

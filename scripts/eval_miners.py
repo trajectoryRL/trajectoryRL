@@ -37,7 +37,7 @@ Environment variables (also read from .env.validator):
     WALLET_HOTKEY             Hotkey name                  (default: default)
     NETUID                    Subnet UID                   (default: 11)
     NETWORK                   Subtensor network            (default: finney)
-    CLAWBENCH_DEFAULT_MODEL   LLM model                   (default: zhipu/glm-5)
+    CLAWBENCH_DEFAULT_MODEL   LLM model                   (default: zhipu/glm-5.1)
     CLAWBENCH_LLM_API_KEY     API key
     CLAWBENCH_LLM_BASE_URL    Base URL
     CLAWBENCH_PATH            Path to clawbench directory
@@ -305,7 +305,7 @@ async def run_evaluation(args):
 
     # --- 3. Prepare ClawBench harness ---
     clawbench_path = Path(args.clawbench_path)
-    model = args.model or os.getenv("CLAWBENCH_DEFAULT_MODEL", "zhipu/glm-5")
+    model = args.model or os.getenv("CLAWBENCH_DEFAULT_MODEL", "zhipu/glm-5.1")
     api_key = args.api_key or os.getenv("CLAWBENCH_LLM_API_KEY", "")
     base_url = args.base_url or os.getenv(
         "CLAWBENCH_LLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4"
@@ -468,7 +468,7 @@ def main():
     parser.add_argument("--timeout", type=int, default=120, help="Timeout per scenario in seconds (default: 120)")
 
     # LLM config
-    parser.add_argument("--model", type=str, default=None, help="LLM model (e.g. zhipu/glm-5)")
+    parser.add_argument("--model", type=str, default=None, help="LLM model (e.g. zhipu/glm-5.1)")
     parser.add_argument("--api-key", type=str, default=None, help="API key for the LLM provider")
     parser.add_argument("--base-url", type=str, default=None, help="Base URL for the LLM API")
 

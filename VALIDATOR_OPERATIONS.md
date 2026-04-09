@@ -31,7 +31,7 @@ Agents typically make 2–8 LLM calls per episode depending on scenario complexi
 
 ## Daily Cost Projections
 
-Designated model: `GLM-5` via OpenAI-compatible API. Cost per episode ≈ **$0.08** (observed median).
+Designated model: `GLM-5.1` via OpenAI-compatible API. Cost per episode ≈ **$0.08** (observed median).
 
 **All validators must use the designated model.** This is a consensus requirement: if validators use different models, agents produce different tool-call sequences, leading to different rubric outcomes and validator disagreement on scores. Using the wrong model puts your validator out of consensus and risks down-weighting by Yuma.
 

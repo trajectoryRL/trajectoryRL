@@ -137,7 +137,7 @@ cp .env.miner.example .env.miner
 | `NETWORK` | yes | `finney` | Bittensor network |
 | `CLAWBENCH_LLM_API_KEY` | default mode | — | API key for AGENTS.md generation |
 | `CLAWBENCH_LLM_BASE_URL` | no | `https://open.bigmodel.cn/api/paas/v4` | OpenAI-compatible API base URL |
-| `CLAWBENCH_DEFAULT_MODEL` | no | `glm-5` | Model for AGENTS.md generation |
+| `CLAWBENCH_DEFAULT_MODEL` | no | `glm-5.1` | Model for AGENTS.md generation |
 | `S3_BUCKET` | default mode* | — | S3-compatible bucket name |
 | `S3_ENDPOINT_URL` | no | — | Custom endpoint for GCS/R2/MinIO |
 | `S3_REGION` | no | `us-east-1` | Bucket region |
@@ -233,7 +233,7 @@ result = judge.evaluate(scenario_config, tool_calls, agent_response)
 print(f"Score: {result.overall_score}, Gate: {result.qualification_gate}")
 ```
 
-> **Important**: The judge model must produce output in the `content` field. Reasoning models like GLM-5-TEE put output in `reasoning_content` which the judge parser cannot read. Use a standard chat model (e.g., `deepseek-ai/DeepSeek-V3`) for the judge.
+> **Important**: The judge model must produce output in the `content` field. Reasoning models like GLM-5.1-TEE put output in `reasoning_content` which the judge parser cannot read. Use a standard chat model (e.g., `deepseek-ai/DeepSeek-V3`) for the judge.
 
 > **Note on score variation**: Validators choose their own judge model via `JUDGE_MODEL` env var. Different judge models may score the same trajectory differently, and misconfigured judges (e.g., reasoning models without the `thinkingFormat` fix) may score everything as 0. Your local scores may not match validator scores. See [issue #98](https://github.com/trajectoryRL/trajectoryRL/issues/98) for discussion.
 
@@ -297,14 +297,14 @@ python scripts/run_episode.py --scenario inbox_triage --workspace /tmp/workspace
 
 > **Note**: The regex checks from `run_episode.py --json` are useful for debugging tool usage but **do not reflect your actual validator score** — see "How Scoring Works" above.
 
-### Known Issues with GLM-5-TEE (Reasoning Models)
+### Known Issues with GLM-5.1-TEE (Reasoning Models)
 
-GLM-5 / GLM-5-TEE is a reasoning model that puts all output in `reasoning_content` instead of `content`. This affects two areas:
+GLM-5.1 / GLM-5.1-TEE is a reasoning model that puts all output in `reasoning_content` instead of `content`. This affects two areas:
 
 **1. Agent responses (OpenClaw gateway):** If you're getting empty agent responses (0 correctness checks passed, but tool calls are happening), add to the model definition in `config/openclaw.json.template`:
    ```json
    {
-     "id": "zai-org/GLM-5-TEE",
+     "id": "zai-org/GLM-5.1-TEE",
      "reasoning": true,
      "maxTokens": 32768,
      "compat": {

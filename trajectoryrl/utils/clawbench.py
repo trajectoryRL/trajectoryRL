@@ -63,7 +63,7 @@ class ClawBenchHarness:
         clawbench_path: Path,
         timeout: int = 120,
         workspace_path: Optional[Path] = None,
-        clawbench_default_model: str = "zhipu/glm-5",
+        clawbench_default_model: str = "zhipu/glm-5.1",
         clawbench_api_key: str = "",
         clawbench_base_url: str = "https://open.bigmodel.cn/api/paas/v4",
     ):
@@ -74,7 +74,7 @@ class ClawBenchHarness:
             timeout: Timeout in seconds for each scenario
             workspace_path: Shared workspace directory that OpenClaw reads from.
                 If None, uses WORKSPACE_PATH env var or clawbench_path/workspace.
-            clawbench_default_model: Model in ``provider/model`` format (e.g. ``zhipu/glm-5``).
+            clawbench_default_model: Model in ``provider/model`` format (e.g. ``zhipu/glm-5.1``).
             clawbench_api_key: API key for the LLM provider.
             clawbench_base_url: Base URL for the OpenAI-compatible API.
         """

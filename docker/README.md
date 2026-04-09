@@ -32,7 +32,7 @@ NETUID=11
 NETWORK=finney
 CLAWBENCH_LLM_API_KEY=...
 CLAWBENCH_LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
-CLAWBENCH_DEFAULT_MODEL=zhipu/glm-5
+CLAWBENCH_DEFAULT_MODEL=zhipu/glm-5.1
 
 # Optional
 LOG_LEVEL=INFO                    # DEBUG for development

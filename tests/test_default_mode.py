@@ -52,7 +52,7 @@ def _make_config(**overrides):
         log_level="WARNING",
         llm_api_key="sk-test-key",
         llm_base_url="https://open.bigmodel.cn/api/paas/v4",
-        llm_model="glm-5",
+        llm_model="glm-5.1",
         pack_url="",
     )
     defaults.update(overrides)

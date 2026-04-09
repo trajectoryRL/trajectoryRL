@@ -602,7 +602,7 @@ At the midpoint estimate, Season 1 costs ~$174/epoch with 50 miners (~$706 at 20
 **Cost mitigation strategies:**
 
 - **Harness-aware cost caps.** The validator sets a per-episode token/dollar cap. The agent harness is killed if the cap is exceeded (episode scored as-is with whatever was completed). This bounds worst-case cost.
-- **Cheap default model.** The default evaluation model is GLM-5 (cheapest qualified model). Season 1 scores on quality, not cost.
+- **Cheap default model.** The default evaluation model is GLM-5.1 (cheapest qualified model). Season 1 scores on quality, not cost.
 - **Lightweight containers.** Sandbox containers are lightweight (mock services only). Harness containers use official agent images. Both are ephemeral, created per-eval and destroyed after.
 
 **Mitigation for time:** 17h is within the 24h epoch with margin. Scale to 15–20 containers if miner count exceeds 200.

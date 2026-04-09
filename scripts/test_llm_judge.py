@@ -276,7 +276,7 @@ Auth migration is blocked waiting on Redis provisioning.
 
 
 def _strip_provider_prefix(model: str) -> str:
-    """Strip provider prefix from model name (e.g. 'zhipu/glm-5' -> 'glm-5')."""
+    """Strip provider prefix from model name (e.g. 'zhipu/glm-5.1' -> 'glm-5.1')."""
     if "/" in model:
         model = model.split("/", 1)[1]
     return model

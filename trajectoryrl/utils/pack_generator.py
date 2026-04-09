@@ -6,7 +6,7 @@ types, producing a generic policy that scores well across all five scenarios.
 
 Uses an OpenAI-compatible endpoint configured via ``CLAWBENCH_LLM_API_KEY``,
 ``CLAWBENCH_LLM_BASE_URL``, and ``CLAWBENCH_DEFAULT_MODEL`` environment variables.
-Default provider is Zhipu (https://open.bigmodel.cn/api/paas/v4) with GLM-5.
+Default provider is Zhipu (https://open.bigmodel.cn/api/paas/v4) with GLM-5.1.
 """
 
 import logging
@@ -123,7 +123,7 @@ Do NOT wrap the output in code fences.
 
 
 def generate_agents_md(
-    model: str = "zai-org/GLM-5-TEE",
+    model: str = "zai-org/GLM-5.1-TEE",
     api_key: str = "",
     base_url: str = "",
     previous_agents_md: Optional[str] = None,
@@ -132,7 +132,7 @@ def generate_agents_md(
     """Generate an AGENTS.md policy document via the unified LLM client.
 
     Args:
-        model: Model name (e.g. ``glm-5``).
+        model: Model name (e.g. ``glm-5.1``).
         api_key: Explicit API key (optional; auto-resolved from env if empty).
         base_url: Explicit base URL (optional; auto-resolved from env if empty).
         previous_agents_md: If provided, improve this existing policy

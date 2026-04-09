@@ -5,7 +5,7 @@ Configure via environment variables:
 
   CLAWBENCH_LLM_API_KEY      API key for the provider
   CLAWBENCH_LLM_BASE_URL     Base URL (e.g. https://open.bigmodel.cn/api/paas/v4)
-  CLAWBENCH_DEFAULT_MODEL        Model name (e.g. glm-5)
+  CLAWBENCH_DEFAULT_MODEL        Model name (e.g. glm-5.1)
 
 For Anthropic models, the native SDK is used instead of the OpenAI
 compatibility layer.
@@ -56,7 +56,7 @@ def _generate(
     Prefer ``async_generate`` in async contexts — this function blocks
     the calling thread until the HTTP request completes.
     """
-    model = model or os.environ.get("CLAWBENCH_DEFAULT_MODEL", "glm-5")
+    model = model or os.environ.get("CLAWBENCH_DEFAULT_MODEL", "glm-5.1")
     if "/" in model:
         model = model.split("/", 1)[1]
     key = resolve_api_key(api_key)

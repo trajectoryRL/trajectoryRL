@@ -12,7 +12,7 @@
 
 TrajectoryRL rewards miners who submit **policy packs** (PolicyBundles) that complete AI agent tasks at the **lowest cost** while passing all safety and correctness checks.
 
-The default evaluation model is **GLM-5** (via OpenAI-compatible API). The incentive is simple: **pass the gate, then compete on cost**.
+The default evaluation model is **GLM-5.1** (via OpenAI-compatible API). The incentive is simple: **pass the gate, then compete on cost**.
 
 1. **Pack integrity gate**: LLM-as-judge static analysis detects hardcoded responses, instruction overrides, and gaming attempts before any episode runs
 2. **Qualification gate**: LLM-as-judge evaluates the full agent trajectory — every safety and correctness criterion must pass, and all claims must be **grounded** in data the agent actually retrieved via tool calls
@@ -55,7 +55,7 @@ Stage 1 — Prompt optimization (AGENTS.md tuning):
 Stage 2 — Hybrid routing (AGENTS.md + injected skills):
   Multi-LLM dynamic routing:               $900/month  (93% reduction)
     ├─ Qwen 3.5 (Alibaba) handles 40% of sub-tasks (tool calls, lookups)
-    ├─ GLM-5 (Z.ai) handles 25% (structured extraction, formatting)
+    ├─ GLM-5.1 (Z.ai) handles 25% (structured extraction, formatting)
     ├─ Gemini 3 Flash (Google) handles 20% (search, summarization)
     ├─ GPT-5.2 (OpenAI) handles 10% (reasoning, drafting)
     └─ Claude Opus 4.6 (Anthropic) handles 5% (complex judgment calls)
@@ -171,7 +171,7 @@ cost_usd = Σ  rate(model_i, token_type) × token_count(model_i, token_type)
            i
 ```
 
-Cost is captured from the LLM provider's usage data after each episode. It includes all tokens consumed during the agent's tool-calling loop across **all models used** — a pack that routes sub-tasks to multiple models (e.g., GLM-5, Qwen 3.5, Gemini 3 Flash) accumulates cost from each model at its respective rate.
+Cost is captured from the LLM provider's usage data after each episode. It includes all tokens consumed during the agent's tool-calling loop across **all models used** — a pack that routes sub-tasks to multiple models (e.g., GLM-5.1, Qwen 3.5, Gemini 3 Flash) accumulates cost from each model at its respective rate.
 
 **Note**: The judge's own LLM cost is borne by the validator and is **not** counted toward the miner's episode cost.
 

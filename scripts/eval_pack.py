@@ -31,7 +31,7 @@ Usage:
     python scripts/eval_pack.py --pack pack.json -v -o results.json
 
 Environment variables:
-    CLAWBENCH_DEFAULT_MODEL   LLM model           (default: zhipu/glm-5)
+    CLAWBENCH_DEFAULT_MODEL   LLM model           (default: zhipu/glm-5.1)
     CLAWBENCH_LLM_API_KEY     API key for LLM
     CLAWBENCH_LLM_BASE_URL    LLM base URL        (default: https://open.bigmodel.cn/api/paas/v4)
 """
@@ -172,7 +172,7 @@ async def run(args) -> int:
 
     # ── 4. ClawBench harness ──────────────────────────────────────────────
     clawbench_path = Path(args.clawbench_path)
-    model = args.model or os.getenv("CLAWBENCH_DEFAULT_MODEL", "zhipu/glm-5")
+    model = args.model or os.getenv("CLAWBENCH_DEFAULT_MODEL", "zhipu/glm-5.1")
     api_key = args.api_key or os.getenv("CLAWBENCH_LLM_API_KEY", "")
     base_url = args.base_url or os.getenv(
         "CLAWBENCH_LLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4",
