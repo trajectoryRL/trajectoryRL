@@ -1,5 +1,6 @@
 # Season 1: Self-Learning Agents
 
+> v0.18: ClawsBench prior-art analysis (§6a). Adopted: SQLite-backed mock state for deterministic snapshot/restore, gosu privilege hardening in sandbox container, negative safety scores [-1, 1], conformance test suite for mock endpoints. External validation that scaffolding (SKILL.md) dominates model choice by +39-63pp — confirms Season 1 thesis.
 > v0.17: chained continuity across 4 reps (shared world + recurring element on rep 3 + evolving fact on rep 4) so the split-half delta measures real cross-episode memory, not just meta-pattern transfer. Also: published judge prompts (§5a), tool-call efficiency diagnostic (§4a), constraint-SAT scenario added to Season 2 backlog (§2a-C). Addresses community feedback in PR #157.
 > v0.16: OpenClaw as Season 1 framework, incentive mechanism amendment (quality-based WTA/NCD/Winner Protection).
 
@@ -794,6 +795,43 @@ Additional scenario types (Season 2+):
 - **Multi-repo coordination**: Fix spanning two repositories with dependency
 - **Error resilience**: Intermittent service failures the agent must handle gracefully
 - **Constraint satisfaction under ambiguity**: scheduling/packing problems with overlapping constraints (people availability, room availability, dependency chains) where the cheap path is *reasoning over fetched data* in one pass rather than enumerating with N tool calls. Naturally separates planning agents from lookup agents. (PR #157 §2a-C.)
+
+---
+
+## §6a: Prior Art — ClawsBench Analysis
+
+[ClawsBench](https://clawsbench.benchflow.ai/) (arXiv 2604.05172, April 2026) evaluates LLM productivity agents across 5 mock services (Gmail, Calendar, Docs, Drive, Slack), 44 tasks, 6 models, 4 harnesses, and 7,224 trials. Their key findings inform several Season 1 design decisions.
+
+### Headline finding: scaffolding dominates model choice
+
+ClawsBench's most important result: SKILL.md-style scaffolding adds **+39–63 percentage points** to task success rate. After adding domain skills, the top 5 models are **statistically indistinguishable** (53–63% TSR with Holm-Bonferroni correction). The scaffolding effect completely dwarfs model differences.
+
+This directly validates the Season 1 thesis: miners compete on SKILL.md instruction quality, not model selection. A well-engineered SKILL.md transforms a mediocre model into a competitive agent; a poorly-written one wastes a frontier model's capability.
+
+### Adopted design patterns
+
+**1. SQLite-backed mock services with snapshot/restore.** ClawsBench backs each mock service with standalone SQLite databases. State is serialized before each task and diffed after execution, making automated scoring fully deterministic (zero grading variance). Season 1 adopts this: mock services in `trajectory-sandbox` use SQLite storage with snapshot/restore between episodes instead of in-memory dict deepcopy. This makes automated checks (the 40% weight in incident_response) exactly reproducible across validators.
+
+**2. Privilege hardening via gosu.** ClawsBench runs agents under a restricted `agent` user via `gosu`. Task files (evaluation criteria, oracle solutions, seed data) are root-owned mode 700. Zero successful sandbox bypasses across 7,224 trials. Season 1 adopts this in the sandbox container: the agent SSH user cannot read scoring criteria, fixture metadata, or mock service internals.
+
+**3. Negative safety scores.** ClawsBench uses a [-1, 1] scoring range where harmful actions (data leakage, unauthorized modifications) produce negative scores via a "one-way-door" penalty pattern. Season 1 extends the quality score to [-1, 1]: an agent that completes the task but leaks confidential data in a public Slack channel receives a negative score for that episode, not just a zero. The split-half formula and anti-sandbagging checks work unchanged on the wider range.
+
+**4. Conformance test suite for mock services.** ClawsBench maintains 328 conformance tests verifying mock API fidelity against real service behavior, catching 11 recurring bug classes and 65 API quirks. Season 1 adds a conformance test suite for `trajectory-sandbox` mock endpoints — agents interact via `curl`/`smtplib` against real HTTP/SMTP protocols, so incorrect mock behavior would invalidate scores.
+
+### Where Season 1 goes further
+
+| Dimension | ClawsBench | Season 1 |
+|-----------|-----------|----------|
+| Learning signal | Single-shot per task | 4-rep split-half delta — measures cross-episode learning |
+| Cross-validator variation | Fixed golden fixtures (memorizable) | Private salt → procedural generation → Monte Carlo sampling |
+| Anti-gaming | Fixed seed data | Per-validator, per-epoch fixture generation from `epoch_seed ∥ validator_salt` |
+| Memory persistence | None | `/workspace/learned/` persists across episodes, rewards memory architecture |
+| Chained continuity | Independent tasks | Recurring element (rep 3) + evolving fact (rep 4) |
+| Competition target | Model capability ranking | SKILL.md engineering (instruction quality, not model choice) |
+
+ClawsBench demonstrates that static benchmarks with fixed fixtures converge quickly once agents are scaffolded well. Season 1's procedural generation and learning signal are designed to sustain competitive differentiation beyond that convergence point.
+
+**References:** [ClawsBench](https://clawsbench.benchflow.ai/) (arXiv 2604.05172), [Harbor](https://github.com/benchflow-ai/harbor) (eval orchestration), [gws CLI](https://github.com/benchflow-ai/cli) (Google Workspace CLI for agents)
 
 ---
 
