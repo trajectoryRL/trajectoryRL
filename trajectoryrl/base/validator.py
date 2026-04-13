@@ -35,6 +35,7 @@ import bittensor as bt
 from ..utils.opp_schema import validate_opp_schema
 from ..utils.config import ValidatorConfig
 from ..utils.clawbench import ClawBenchHarness, EvaluationResult
+from ..utils.sandbox_harness import TrajectorySandboxHarness, SandboxEvaluationResult
 from ..scoring import TrajectoryScorer
 from ..utils.github import PackFetcher
 from ..utils.epoch_context import generate_epoch_context, render_context_preamble
@@ -146,6 +147,13 @@ class TrajectoryValidator:
             clawbench_api_key=config.clawbench_api_key,
             clawbench_base_url=config.clawbench_base_url,
         )
+
+        # Season 1: trajectory-sandbox harness (optional, lazy-loaded)
+        self._sandbox_harness: TrajectorySandboxHarness | None = None
+        if config.evaluation_harness == "trajectory-sandbox":
+            logger.info("Season 1 mode: initializing trajectory-sandbox harness")
+            self._sandbox_harness = TrajectorySandboxHarness(config)
+        self._evaluation_harness = config.evaluation_harness
 
         self.scorer = TrajectoryScorer(
             consensus_epsilon=config.consensus_epsilon,
@@ -2087,6 +2095,16 @@ class TrajectoryValidator:
         self._hotkey_packs[commitment.hotkey] = pack
         self._pack_by_hash[commitment.pack_hash] = pack
 
+        # Season 1 path: use trajectory-sandbox harness
+        if self._evaluation_harness == "trajectory-sandbox" and self._sandbox_harness:
+            return await self._evaluate_miner_s1(
+                miner_uid=miner_uid,
+                commitment=commitment,
+                pack=pack,
+                epoch_seed=epoch_seed,
+                block_height=block_height,
+            )
+
         # Step 4+5: Run episodes and judge trajectories
         scenario_costs: Dict[str, float] = {}
         scenario_qualified: Dict[str, bool] = {}
@@ -2252,6 +2270,98 @@ class TrajectoryValidator:
             "session_keys": scenario_session_keys,
             "session_files": scenario_session_files,
         }
+
+    async def _evaluate_miner_s1(
+        self,
+        miner_uid: int,
+        commitment: "MinerCommitment",
+        pack: dict,
+        epoch_seed: int,
+        block_height: int = 0,
+    ) -> Optional[Dict]:
+        """Season 1 evaluation path: trajectory-sandbox with LLM judge.
+
+        Runs N episodes of the same scenario in an SSH sandbox with
+        Hermes Agent. Uses split-half delta scoring (quality-based,
+        not cost-based).
+
+        Returns same shape as _evaluate_miner for pipeline compatibility:
+            {"costs": {...}, "qualified": {...}, ...}
+        """
+        mlog = self._get_miner_logger(commitment.hotkey)
+        harness = self._sandbox_harness
+
+        # Extract SKILL.md from pack (S1 packs must include it)
+        skill_md = TrajectorySandboxHarness.extract_skill_md(pack)
+        if not skill_md:
+            mlog.warning("No SKILL.md found in pack — not a valid S1 submission")
+            self._disqualified_miners[commitment.hotkey] = "no_skill_md"
+            return None
+
+        mlog.info(
+            "S1 evaluation: %d episodes, skill_md=%d chars",
+            self.config.sandbox_num_episodes, len(skill_md),
+        )
+
+        try:
+            result = await harness.evaluate_miner(
+                skill_md=skill_md,
+                epoch_seed=epoch_seed,
+                pack_hash=commitment.pack_hash,
+                validator_salt=self._default_validator_salt(),
+            )
+        except Exception as e:
+            mlog.error("S1 evaluation failed: %s", e, exc_info=True)
+            self._disqualified_miners[commitment.hotkey] = "s1_eval_error"
+            return None
+
+        if result.error:
+            mlog.warning("S1 evaluation error: %s", result.error)
+            self._disqualified_miners[commitment.hotkey] = "s1_eval_error"
+            return None
+
+        # Map S1 result to validator pipeline format.
+        # S1 uses a single "scenario" (incident_response) with quality scoring.
+        scenario_name = result.scenario_name
+        qualified = result.success
+
+        mlog.info(
+            "S1 result: final_score=%.3f, mean_quality=%.3f, delta=%.3f, "
+            "episodes=%s, qualified=%s",
+            result.score, result.mean_quality, result.delta,
+            result.episode_qualities, qualified,
+        )
+
+        scenario_qualified = {scenario_name: qualified}
+        scenario_costs = {}  # S1 is quality-based, not cost-based
+        scenario_judge_details = {
+            scenario_name: {
+                "overall_score": round(result.score, 4),
+                "mean_quality": round(result.mean_quality, 4),
+                "delta": round(result.delta, 4),
+                "early_mean": round(result.early_mean, 4),
+                "late_mean": round(result.late_mean, 4),
+                "episode_qualities": [round(q, 4) for q in result.episode_qualities],
+                "qualification_gate": qualified,
+                "harness": "trajectory-sandbox",
+            },
+        }
+
+        return {
+            "costs": scenario_costs,
+            "qualified": scenario_qualified,
+            "token_usage": {},
+            "model_usage": {},
+            "judge_details": scenario_judge_details,
+            "session_keys": {},
+            "session_files": {},
+        }
+
+    def _default_validator_salt(self) -> str:
+        """Derive a stable validator salt from the wallet hotkey."""
+        import hashlib
+        data = f"{self.wallet.hotkey.ss58_address}:{self.config.netuid}"
+        return hashlib.sha256(data.encode()).hexdigest()[:16]
 
     # ------------------------------------------------------------------
     # Eval submission
