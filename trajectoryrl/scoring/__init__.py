@@ -527,11 +527,16 @@ class TrajectoryScorer:
 def compute_consensus_costs(
     validated_submissions: List[ValidatedSubmission],
     qualification_stake_threshold: float = 0.5,
+    min_validators_qualified: int = 2,
 ) -> Tuple[Dict[str, float], Dict[str, bool]]:
     """Compute stake-weighted consensus costs and qualification across validators.
 
     Qualification uses stake-weighted majority across ALL reporting validators:
         qual_ratio = qualified_stake / total_reporting_stake > threshold
+
+    Additionally, a miner must be reported as qualified by at least
+    ``min_validators_qualified`` distinct validators.  This prevents gaming
+    where a miner passes only a single dominant-stake validator.
 
     Consensus cost uses ONLY votes where the validator reported qualified=True:
         consensus_cost[miner] = Σ(stake_i × cost_i) / Σ(stake_i)
@@ -546,6 +551,11 @@ def compute_consensus_costs(
         qualification_stake_threshold: Fraction of reporting stake that must
             vote qualified=True for a miner to be considered qualified.
             Default 0.5 (simple majority by stake weight).
+        min_validators_qualified: Minimum number of distinct validators that
+            must report qualified=True for a miner to qualify.  Default 2.
+            When fewer than ``min_validators_qualified`` validators submitted
+            results overall, this gate is relaxed to the total validator count
+            so that small networks are not deadlocked.
 
     Returns:
         Tuple of (consensus_costs, consensus_qualified):
@@ -559,6 +569,7 @@ def compute_consensus_costs(
     miner_qualified_stake: Dict[str, float] = {}
     miner_qual_weighted_cost: Dict[str, float] = {}
     miner_qual_cost_stake: Dict[str, float] = {}
+    miner_qual_validator_count: Dict[str, int] = {}
 
     for sub in validated_submissions:
         stake = sub.validator_stake
@@ -576,6 +587,7 @@ def compute_consensus_costs(
                 miner_qualified_stake[miner_hk] = 0.0
                 miner_qual_weighted_cost[miner_hk] = 0.0
                 miner_qual_cost_stake[miner_hk] = 0.0
+                miner_qual_validator_count[miner_hk] = 0
 
             miner_total_stake[miner_hk] += stake
 
@@ -584,6 +596,12 @@ def compute_consensus_costs(
                 miner_qualified_stake[miner_hk] += stake
                 miner_qual_weighted_cost[miner_hk] += stake * cost
                 miner_qual_cost_stake[miner_hk] += stake
+                miner_qual_validator_count[miner_hk] += 1
+
+    # When the network has fewer validators than the minimum, relax the gate
+    # to the actual validator count so small networks are not deadlocked.
+    total_validators = len([s for s in validated_submissions if s.validator_stake > 0])
+    effective_min_validators = min(min_validators_qualified, total_validators)
 
     consensus_costs: Dict[str, float] = {}
     miner_qualified: Dict[str, bool] = {}
@@ -591,9 +609,14 @@ def compute_consensus_costs(
         total_stake = miner_total_stake[miner_hk]
         if total_stake > 0:
             qual_ratio = miner_qualified_stake[miner_hk] / total_stake
-            miner_qualified[miner_hk] = qual_ratio > qualification_stake_threshold
+            stake_ok = qual_ratio > qualification_stake_threshold
         else:
-            miner_qualified[miner_hk] = False
+            stake_ok = False
+
+        validator_count_ok = (
+            miner_qual_validator_count.get(miner_hk, 0) >= effective_min_validators
+        )
+        miner_qualified[miner_hk] = stake_ok and validator_count_ok
 
         qual_cost_stake = miner_qual_cost_stake[miner_hk]
         if qual_cost_stake > 0:
@@ -604,9 +627,11 @@ def compute_consensus_costs(
             consensus_costs[miner_hk] = 0.0
 
     logger.info(
-        "Consensus computed: %d miners, %d validators, qual_threshold=%.2f",
+        "Consensus computed: %d miners, %d validators, qual_threshold=%.2f, "
+        "min_validators=%d (effective=%d)",
         len(consensus_costs), len(validated_submissions),
-        qualification_stake_threshold,
+        qualification_stake_threshold, min_validators_qualified,
+        effective_min_validators,
     )
 
     return consensus_costs, miner_qualified

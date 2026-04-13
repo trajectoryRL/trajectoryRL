@@ -2537,6 +2537,7 @@ class TestConsensusAggregation:
         )
 
     def test_single_validator(self):
+        """With only 1 validator total, min_validators gate relaxes to 1."""
         subs = [self._make_validated("v1", 100.0, {"m1": 3.0, "m2": 5.0})]
         costs, quals = compute_consensus_costs(subs)
         assert costs["m1"] == pytest.approx(3.0)
@@ -2566,7 +2567,7 @@ class TestConsensusAggregation:
             self._make_validated("v1", 100.0, {"m1": 2.0, "m2": 4.0}),
             self._make_validated("v2", 100.0, {"m1": 6.0}),
         ]
-        costs, _ = compute_consensus_costs(subs)
+        costs, _ = compute_consensus_costs(subs, min_validators_qualified=1)
         assert costs["m1"] == pytest.approx(4.0)
         assert costs["m2"] == pytest.approx(4.0)
 
@@ -2593,7 +2594,7 @@ class TestConsensusAggregation:
             self._make_validated("v1", 300.0, {"m1": 2.0}, {"m1": True}),
             self._make_validated("v2", 100.0, {"m1": 3.0}, {"m1": False}),
         ]
-        _, quals = compute_consensus_costs(subs)
+        _, quals = compute_consensus_costs(subs, min_validators_qualified=1)
         assert quals["m1"] is True  # 300/(300+100) = 0.75 > 0.5
 
     def test_qualification_minority_stake_cannot_disqualify(self):
@@ -2622,11 +2623,14 @@ class TestConsensusAggregation:
             self._make_validated("v1", 200.0, {"m1": 2.0}, {"m1": True}),
             self._make_validated("v2", 100.0, {"m1": 3.0}, {"m1": False}),
         ]
-        # 200/300 ≈ 0.667 > 0.5 → qualified with default threshold
-        _, quals_default = compute_consensus_costs(subs)
+        # 200/300 ≈ 0.667 > 0.5 → stake ok, but only 1 validator qualified
+        # With min_validators=1, test pure stake threshold behavior
+        _, quals_default = compute_consensus_costs(subs, min_validators_qualified=1)
         assert quals_default["m1"] is True
         # 200/300 ≈ 0.667, NOT > 0.67 → disqualified with 2/3 threshold
-        _, quals_super = compute_consensus_costs(subs, qualification_stake_threshold=0.67)
+        _, quals_super = compute_consensus_costs(
+            subs, qualification_stake_threshold=0.67, min_validators_qualified=1,
+        )
         assert quals_super["m1"] is False
 
     def test_empty_submissions(self):
@@ -2652,7 +2656,7 @@ class TestConsensusAggregation:
             self._make_validated("v1", 200.0, {"m1": 0.02}, {"m1": False}),
             self._make_validated("v2", 300.0, {"m1": 0.05}, {"m1": True}),
         ]
-        costs, quals = compute_consensus_costs(subs)
+        costs, quals = compute_consensus_costs(subs, min_validators_qualified=1)
         assert quals["m1"] is True  # 300/500 = 0.6 > 0.5
         assert costs["m1"] == pytest.approx(0.05)  # only v2's cost
 
@@ -2678,6 +2682,30 @@ class TestConsensusAggregation:
         costs, quals = compute_consensus_costs(subs)
         assert quals["m1"] is False
         assert costs["m1"] == pytest.approx(0.0)
+
+    def test_min_validators_qualified_gate(self):
+        """Miner passing only one dominant-stake validator is disqualified.
+
+        This prevents gaming where a miner targets a single high-stake
+        validator and ignores the rest (issue #149).
+        """
+        subs = [
+            self._make_validated("v_dominant", 600.0, {"m1": 2.0}, {"m1": True}),
+            self._make_validated("v2", 100.0, {"m1": 3.0}, {"m1": False}),
+            self._make_validated("v3", 100.0, {"m1": 4.0}, {"m1": False}),
+        ]
+        # Stake majority: 600/800 = 0.75 > 0.5, but only 1 validator qualified
+        _, quals = compute_consensus_costs(subs)
+        assert quals["m1"] is False
+
+        # Same scenario with 2 validators qualified → passes
+        subs_ok = [
+            self._make_validated("v1", 300.0, {"m1": 2.0}, {"m1": True}),
+            self._make_validated("v2", 300.0, {"m1": 3.0}, {"m1": True}),
+            self._make_validated("v3", 100.0, {"m1": 4.0}, {"m1": False}),
+        ]
+        _, quals_ok = compute_consensus_costs(subs_ok)
+        assert quals_ok["m1"] is True
 
 
 # ---------------------------------------------------------------------------

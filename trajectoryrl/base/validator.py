@@ -949,6 +949,7 @@ class TrajectoryValidator:
         consensus_costs, consensus_qualified = compute_consensus_costs(
             validated,
             qualification_stake_threshold=self.config.qualification_stake_threshold,
+            min_validators_qualified=self.config.min_validators_qualified,
         )
 
         self._consensus_window = window.window_number
