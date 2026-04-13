@@ -140,6 +140,14 @@ class ValidatorConfig:
     judge_api_key: str = ""
     judge_base_url: str = ""
 
+    # Season 1 (trajectory-sandbox) configuration
+    # Set evaluation_harness = "trajectory-sandbox" to enable.
+    evaluation_harness: str = "clawbench"  # "clawbench" (v4.0) or "trajectory-sandbox" (S1)
+    sandbox_image: str = "ghcr.io/trajectoryrl/trajectory-sandbox:latest"
+    harness_image: str = "nousresearch/hermes-agent:latest"
+    sandbox_timeout_per_episode: int = 600  # 10 min per episode
+    sandbox_num_episodes: int = 4
+
     # EMA state persistence
     ema_state_path: Path = field(
         default_factory=lambda: Path("/var/lib/trajectoryrl/ema_state.json")
@@ -231,6 +239,12 @@ class ValidatorConfig:
                 if gw.strip()
             ],
             consensus_api_url=os.getenv("CONSENSUS_API_URL", "https://trajrl.com"),
+            # --- Season 1 (trajectory-sandbox) ---
+            evaluation_harness=os.getenv("EVALUATION_HARNESS", "clawbench"),
+            sandbox_image=os.getenv("SANDBOX_IMAGE", "ghcr.io/trajectoryrl/trajectory-sandbox:latest"),
+            harness_image=os.getenv("HARNESS_IMAGE", "nousresearch/hermes-agent:latest"),
+            sandbox_timeout_per_episode=int(os.getenv("SANDBOX_TIMEOUT_PER_EPISODE", "600")),
+            sandbox_num_episodes=int(os.getenv("SANDBOX_NUM_EPISODES", "4")),
             # --- Startup aggregation ---
             aggregate_when_start=os.getenv("AGGREGATE_WHEN_START", "1") == "1",
             full_cycle_on_startup=os.getenv("FULL_CYCLE_ON_STARTUP", "0") == "1",
