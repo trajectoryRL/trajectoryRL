@@ -93,6 +93,7 @@ class ValidatorConfig:
     consensus_epsilon: float = 0.02
     consensus_protocol_version: int = 1
     qualification_stake_threshold: float = 0.5  # stake-weighted majority for qualification
+    min_validators_qualified: int = 2  # minimum distinct validators that must report qualified
 
     # Consensus CAS: IPFS primary, trajrl.com API fallback
     ipfs_api_url: str = "http://ipfs.metahash73.com:5001/api/v0"
