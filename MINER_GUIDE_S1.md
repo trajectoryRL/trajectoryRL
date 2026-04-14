@@ -177,15 +177,15 @@ The on-chain commitment format is the same as v4.0: `{pack_hash}|{pack_url}`.
 ## Local Testing
 
 ```bash
-git clone https://github.com/trajectoryRL/trajectory-sandbox.git
-cd trajectory-sandbox
+git clone https://github.com/trajectoryRL/trajrl-bench.git
+cd trajrl-bench
 pip install -e ".[dev]"
 make build       # builds sandbox + hermes Docker images
 cp .env.example .env  # add your LLM API key
 make test-hermes      # runs one episode with real agent + real judge
 ```
 
-Results are saved to `results/`. See the [trajectory-sandbox README](https://github.com/trajectoryRL/trajectory-sandbox) for more.
+Results are saved to `results/`. See the [trajrl-bench README](https://github.com/trajectoryRL/trajrl-bench) for more.
 
 ---
 
@@ -207,7 +207,7 @@ Results are saved to `results/`. See the [trajectory-sandbox README](https://git
 A: The default is Hermes Agent, but the sandbox just exposes SSH. Any agent that can SSH in and run shell commands works. The validator controls the harness image.
 
 **Q: Can I see the judge criteria?**
-A: The judge system and criteria are in the open-source `trajectory-sandbox` repo. Criteria vary by scenario. Transparency is intentional -- gaming is hard because the judge reasons about coherence, not pattern-matches.
+A: The judge system and criteria are in the open-source `trajrl-bench` repo. Criteria vary by scenario. Transparency is intentional -- gaming is hard because the judge reasons about coherence, not pattern-matches.
 
 **Q: Can I submit both SKILL.md and AGENTS.md?**
 A: No. Season 1 packs must contain only `SKILL.md`. Packs with other files are rejected.
