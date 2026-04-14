@@ -208,6 +208,10 @@ class TrajectorySandboxHarness:
         self._llm_api_url = config.judge_base_url or config.clawbench_base_url
         self._llm_model = config.judge_model or config.clawbench_default_model
 
+        # Sandbox version — queried at pull time, included in consensus payloads
+        self.sandbox_version: str = "unknown"
+        self.sandbox_scenarios: list[str] = []
+
         logger.info(
             "TrajectorySandboxHarness initialized "
             "(sandbox=%s, harness=%s, episodes=%d, timeout=%ds)",
@@ -216,12 +220,12 @@ class TrajectorySandboxHarness:
         )
 
     async def pull_latest(self) -> None:
-        """Pull the latest sandbox image before eval. Gets new scenarios."""
+        """Pull latest images and query sandbox version. Gets new scenarios."""
         loop = asyncio.get_event_loop()
         try:
             await loop.run_in_executor(None, self._pull_sync)
         except Exception as e:
-            logger.warning("Failed to pull latest sandbox image: %s (using cached)", e)
+            logger.warning("Failed to pull latest images: %s (using cached)", e)
 
     def _pull_sync(self) -> None:
         for image in [self._sandbox_image, self._harness_image]:
@@ -230,6 +234,19 @@ class TrajectorySandboxHarness:
                 self.client.images.pull(image)
             except Exception as e:
                 logger.warning("Failed to pull %s: %s (using cached)", image, e)
+
+        # Query sandbox version and available scenarios
+        try:
+            info = _docker_run_json(
+                self.client, self._sandbox_image,
+                command=["python", "-m", "trajectory_sandbox.cli", "scenarios"],
+            )
+            self.sandbox_version = info.get("version", "unknown")
+            self.sandbox_scenarios = info.get("scenarios", [])
+            logger.info("Sandbox version: %s, scenarios: %s",
+                        self.sandbox_version, self.sandbox_scenarios)
+        except Exception as e:
+            logger.warning("Failed to query sandbox version: %s", e)
 
     async def evaluate_miner(
         self,
