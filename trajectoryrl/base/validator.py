@@ -952,12 +952,96 @@ class TrajectoryValidator:
             min_validators_qualified=self.config.min_validators_qualified,
         )
 
-        self._consensus_window = window.window_number
-
-        # Build hotkey → UID mapping (used by winner selection and logging)
+        # Build hotkey → UID mapping (used by pre-eval reporting, winner
+        # selection, and logging)
         hk_to_uid: Dict[str, int] = {}
         for uid in range(len(self.metagraph.hotkeys)):
             hk_to_uid[self.metagraph.hotkeys[uid]] = uid
+
+        # Pre-eval gate during aggregation: disqualify miners rejected by the
+        # platform before selecting a winner.  Mirrors the per-miner pre-eval
+        # check in the evaluation loop.
+        if os.getenv("TRAJECTORYRL_PRE_EVAL_ENABLED", "1") != "0":
+            miner_commitments = fetch_all_commitments(
+                self.subtensor, self.config.netuid, self.metagraph,
+            )
+            hk_to_commitment: Dict[str, MinerCommitment] = {
+                c.hotkey: c for c in miner_commitments.values()
+            }
+            current_block = self.subtensor.get_current_block()
+
+            # Build list of miners to check (must have a commitment on chain)
+            miners_to_check = [
+                (miner_hk, hk_to_commitment[miner_hk])
+                for miner_hk in consensus_qualified
+                if miner_hk in hk_to_commitment
+            ]
+
+            # Batch pre-eval calls with bounded concurrency
+            if miners_to_check:
+                sem = asyncio.Semaphore(8)
+
+                async def _limited_pre_eval(hk: str, c: MinerCommitment):
+                    async with sem:
+                        return await pre_eval(
+                            hk, c.pack_hash, c.pack_url, wallet=self.wallet,
+                        )
+
+                results = await asyncio.gather(*(
+                    _limited_pre_eval(miner_hk, commitment)
+                    for miner_hk, commitment in miners_to_check
+                ))
+
+                pre_eval_disqualified = 0
+                for (miner_hk, commitment), pre_eval_result in zip(miners_to_check, results):
+                    if pre_eval_result is not None and not pre_eval_result.get("allowed", True):
+                        reason = pre_eval_result.get("reason", "unknown")
+                        consensus_qualified[miner_hk] = False
+                        pre_eval_disqualified += 1
+                        _stage = "integrity_check" if reason == "hardcoded" else "pack_fetch"
+                        _detail = (
+                            f"pre-eval rejected: {reason}"
+                            + (
+                                f", banned_until={pre_eval_result['banned_until']}"
+                                if "banned_until" in pre_eval_result
+                                else ""
+                            )
+                        )
+                        logger.info(
+                            "Window %d: miner %s pre-eval rejected during "
+                            "aggregation (reason=%s) — marked disqualified",
+                            window.window_number, miner_hk[:8], reason,
+                        )
+                        asyncio.ensure_future(
+                            submit_eval(
+                                self.wallet,
+                                miner_hotkey=miner_hk,
+                                miner_uid=hk_to_uid.get(miner_hk, -1),
+                                block_height=current_block,
+                                score=0.0,
+                                ema_score=0.0,
+                                cost=0.0,
+                                ema_cost=0.0,
+                                weight=0.0,
+                                qualified=False,
+                                pack_url=commitment.pack_url,
+                                pack_hash=commitment.pack_hash,
+                                llm_base_url=self._judge_base_url,
+                                llm_model=self._judge_model,
+                                rejected=True,
+                                rejection_stage=_stage,
+                                rejection_detail=_detail,
+                                scoring_version=SCORING_VERSION,
+                            )
+                        )
+                if pre_eval_disqualified:
+                    logger.info(
+                        "Window %d: %d miner(s) disqualified by pre-eval "
+                        "during aggregation",
+                        window.window_number, pre_eval_disqualified,
+                    )
+
+        self._consensus_window = window.window_number
 
         # Apply Winner Protection (stores winner_uid so set_weights
         # can skip the metagraph lookup later)
