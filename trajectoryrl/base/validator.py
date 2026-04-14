@@ -966,7 +966,7 @@ class TrajectoryValidator:
                 self.subtensor, self.config.netuid, self.metagraph,
             )
             hk_to_commitment: Dict[str, MinerCommitment] = {
-                c.hotkey: c for c in miner_commitments
+                c.hotkey: c for c in miner_commitments.values()
             }
             current_block = self.subtensor.get_current_block()
 
