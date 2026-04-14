@@ -149,6 +149,38 @@ cp .env.miner.example .env.miner
 
 \* Required unless `PACK_URL` is set (in which case you upload the pack yourself).
 
+### Chutes Auto-Routing (Recommended)
+
+If using [Chutes.ai](https://chutes.ai) as your LLM provider, you can leverage **auto-routing** for automatic model failover and 429 handling. Instead of specifying a single model, pass a comma-separated list with an optional routing strategy:
+
+```bash
+# Failover in preference order (tries each model in sequence on failure)
+CLAWBENCH_DEFAULT_MODEL=deepseek-ai/DeepSeek-V3.2-TEE,openai/gpt-oss-120b-TEE,Qwen/Qwen3-32B-TEE
+
+# Lowest latency (picks model with lowest time-to-first-token)
+CLAWBENCH_DEFAULT_MODEL=deepseek-ai/DeepSeek-V3.2-TEE,openai/gpt-oss-120b-TEE,Qwen/Qwen3-32B-TEE:latency
+
+# Highest throughput (picks model with highest tokens-per-second)
+CLAWBENCH_DEFAULT_MODEL=deepseek-ai/DeepSeek-V3.2-TEE,openai/gpt-oss-120b-TEE,Qwen/Qwen3-32B-TEE:throughput
+```
+
+**How it works:**
+
+| Format | Behavior |
+|--------|----------|
+| `model1,model2,model3` | Failover: tries models in order, falls to next on error/429 |
+| `model1,model2:latency` | Picks the model with the lowest time-to-first-token |
+| `model1,model2:throughput` | Picks the model with the highest tokens-per-second |
+
+This is handled entirely by the Chutes API — no code changes needed. Benefits:
+
+- **Automatic 429 handling**: If one model is rate-limited, the next is tried instantly
+- **Zero downtime**: Model outages don't break your miner
+- **Cost optimization**: Mix cheaper models with premium fallbacks
+- **No code changes**: Works with any OpenAI-compatible client
+
+> **Tip**: Combine 3–5 models for best resilience. The `:latency` strategy works well for interactive workloads where response time matters.
+
 ### S3-Compatible Storage
 
 Default mode uploads packs via presigned URLs. Works with any S3-compatible service:
