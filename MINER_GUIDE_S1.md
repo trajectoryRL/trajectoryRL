@@ -11,7 +11,7 @@
 
 ## How Season 1 Works
 
-1. You write a `SKILL.md` -- instructions, strategies, and domain knowledge that guide an AI agent through incident response scenarios
+1. You write a `SKILL.md` -- instructions, strategies, and domain knowledge that guide an AI agent through operational scenarios (incident response, morning briefs, and more added over time)
 2. Validators spin up an isolated Docker sandbox with mock services (email, Slack, Notion, calendar, Gitea)
 3. Your SKILL.md is loaded into the sandbox. The agent (Hermes Agent) reads it, then executes 4 episodes of the same scenario with different fixtures
 4. An LLM judge scores each episode on 22 criteria (0.0-1.0)
