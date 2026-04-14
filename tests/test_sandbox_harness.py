@@ -1,4 +1,4 @@
-"""Tests for the Season 1 trajectory-sandbox harness adapter.
+"""Tests for the Season 1 trajrl-bench harness adapter.
 
 Tests the result mapping, config wiring, and SKILL.md extraction
 without requiring Docker or real LLM API calls.
@@ -116,8 +116,8 @@ class TestSessionResultScoring:
 # ---------------------------------------------------------------------------
 
 class TestConfigWiring:
-    def test_default_harness_is_trajectory_sandbox(self):
-        assert ValidatorConfig.evaluation_harness == "trajectory-sandbox"
+    def test_default_harness_is_trajrl_bench(self):
+        assert ValidatorConfig.evaluation_harness == "trajrl-bench"
 
     def test_season1_config_fields_exist(self):
         assert hasattr(ValidatorConfig, "evaluation_harness")

@@ -1,6 +1,6 @@
-"""Season 1 trajectory-sandbox harness for evaluating SKILL.md packs.
+"""Season 1 trajrl-bench harness for evaluating SKILL.md packs.
 
-Architecture: the validator does NOT import trajectory-sandbox as a Python
+Architecture: the validator does NOT import trajrl-bench as a Python
 dependency. Instead, it runs scenario logic inside the sandbox Docker image
 via `docker run`. This means:
 
@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Result types (no trajectory-sandbox import needed)
+# Result types (no trajrl-bench import needed)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -190,7 +190,7 @@ def _generate_keypair() -> tuple[str, str]:
 class TrajectorySandboxHarness:
     """Season 1 harness — all scenario logic runs inside the sandbox image.
 
-    The validator does NOT pip-install trajectory-sandbox. Instead:
+    The validator does NOT pip-install trajrl-bench. Instead:
     1. `docker pull` the sandbox image (gets latest scenarios)
     2. `docker run ... generate` to produce fixtures
     3. Start sandbox + harness containers, run agent episodes
@@ -253,7 +253,7 @@ class TrajectorySandboxHarness:
         try:
             info = _docker_run_json(
                 self.client, self._sandbox_image,
-                command=["python", "-m", "trajectory_sandbox.cli", "scenarios"],
+                command=["python", "-m", "trajrl_bench.cli", "scenarios"],
             )
             self.sandbox_version = info.get("version", "unknown")
             self.sandbox_scenarios = info.get("scenarios", [])
@@ -321,7 +321,7 @@ class TrajectorySandboxHarness:
         logger.info("[%s] Generating fixtures via sandbox image...", session_id)
         gen_data = _docker_run_json(
             self.client, self._sandbox_image,
-            command=["python", "-m", "trajectory_sandbox.cli", "generate",
+            command=["python", "-m", "trajrl_bench.cli", "generate",
                      "--seed", str(epoch_seed), "--salt", salt,
                      "--episodes", str(num_episodes)],
         )
@@ -548,7 +548,7 @@ class TrajectorySandboxHarness:
                 score_output = self.client.containers.run(
                     self._sandbox_image,
                     command=[
-                        "python", "-m", "trajectory_sandbox.cli", "score",
+                        "python", "-m", "trajrl_bench.cli", "score",
                         "--world", "/data/world.json",
                         "--episode", "/data/episode.json",
                         "--transcript", "/data/transcript.txt",

@@ -141,10 +141,10 @@ class ValidatorConfig:
     judge_base_url: str = ""
 
     # Evaluation harness
-    # "trajectory-sandbox": Season 1 (SKILL.md packs, SSH sandbox, LLM judge)
+    # "trajrl-bench": Season 1 (SKILL.md packs, SSH sandbox, LLM judge)
     # "clawbench": v4.0 legacy (AGENTS.md packs, OpenClaw, cost-based)
-    evaluation_harness: str = "trajectory-sandbox"
-    sandbox_image: str = "ghcr.io/trajectoryrl/trajectory-sandbox:latest"
+    evaluation_harness: str = "trajrl-bench"
+    sandbox_image: str = "ghcr.io/trajectoryrl/trajrl-bench:latest"
     harness_image: str = "nousresearch/hermes-agent:latest"
     sandbox_timeout_per_episode: int = 600  # 10 min per episode
     sandbox_num_episodes: int = 4
@@ -240,9 +240,9 @@ class ValidatorConfig:
                 if gw.strip()
             ],
             consensus_api_url=os.getenv("CONSENSUS_API_URL", "https://trajrl.com"),
-            # --- Season 1 (trajectory-sandbox) ---
-            evaluation_harness=os.getenv("EVALUATION_HARNESS", "trajectory-sandbox"),
-            sandbox_image=os.getenv("SANDBOX_IMAGE", "ghcr.io/trajectoryrl/trajectory-sandbox:latest"),
+            # --- Season 1 (trajrl-bench) ---
+            evaluation_harness=os.getenv("EVALUATION_HARNESS", "trajrl-bench"),
+            sandbox_image=os.getenv("SANDBOX_IMAGE", "ghcr.io/trajectoryrl/trajrl-bench:latest"),
             harness_image=os.getenv("HARNESS_IMAGE", "nousresearch/hermes-agent:latest"),
             sandbox_timeout_per_episode=int(os.getenv("SANDBOX_TIMEOUT_PER_EPISODE", "600")),
             sandbox_num_episodes=int(os.getenv("SANDBOX_NUM_EPISODES", "4")),

@@ -176,8 +176,8 @@ trajrl pack submit --url https://your-host.com/pack.json
 #### 3. Test locally (optional)
 
 ```bash
-git clone https://github.com/trajectoryRL/trajectory-sandbox.git
-cd trajectory-sandbox
+git clone https://github.com/trajectoryRL/trajrl-bench.git
+cd trajrl-bench
 pip install -e ".[dev]"
 make build                # build sandbox + agent Docker images
 cp .env.example .env      # add your LLM API key
@@ -186,7 +186,7 @@ make test-hermes          # run one episode with real agent + real judge
 
 See [MINER_GUIDE_S1.md](MINER_GUIDE_S1.md) for the full guide: SKILL.md authoring, sandbox environment, scoring, and tips.
 
-> **v4.0 miners**: The previous AGENTS.md + ClawBench flow is documented in [MINER_OPERATIONS.md](MINER_OPERATIONS.md). Season 1 replaces this with SKILL.md + trajectory-sandbox.
+> **v4.0 miners**: The previous AGENTS.md + ClawBench flow is documented in [MINER_OPERATIONS.md](MINER_OPERATIONS.md). Season 1 replaces this with SKILL.md + trajrl-bench.
 
 ## trajrl — consume what the playground produces
 
@@ -207,7 +207,7 @@ Source, skill catalog, and full documentation: https://github.com/trajectoryRL/t
 
 - **[Season 1 Miner Guide](MINER_GUIDE_S1.md)** — SKILL.md authoring, sandbox environment, scoring, and submission
 - **[Season 1 Spec](seasons/self_learning_s1.md)** — Design doc: sandbox architecture, scoring formula, scenarios
-- **[trajectory-sandbox](https://github.com/trajectoryRL/trajectory-sandbox)** — SSH sandbox for S1 evaluations (mock services, LLM judge, Docker)
+- **[trajrl-bench](https://github.com/trajectoryRL/trajrl-bench)** — SSH sandbox for S1 evaluations (mock services, LLM judge, Docker)
 - **[Incentive Mechanism](INCENTIVE_MECHANISM.md)** — Scoring, rewards, winner-take-all, and anti-copy protection
 - **[Validator Operations](VALIDATOR_OPERATIONS.md)** — Cost model, auto-updates, and operational guidance
 - **[Miner Operations (v4.0)](MINER_OPERATIONS.md)** — Legacy: AGENTS.md pack format, ClawBench testing
@@ -227,4 +227,4 @@ All miner-submitted policy packs are public and released under the same MIT Lice
 
 ---
 
-**Built on [Bittensor](https://bittensor.com)** | **Season 1: [trajectory-sandbox](https://github.com/trajectoryRL/trajectory-sandbox)**
+**Built on [Bittensor](https://bittensor.com)** | **Season 1: [trajrl-bench](https://github.com/trajectoryRL/trajrl-bench)**

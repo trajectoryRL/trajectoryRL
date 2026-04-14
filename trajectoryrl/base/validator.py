@@ -154,10 +154,10 @@ class TrajectoryValidator:
             clawbench_base_url=config.clawbench_base_url,
         )
 
-        # Season 1: trajectory-sandbox harness
+        # Season 1: trajrl-bench harness
         self._sandbox_harness: TrajectorySandboxHarness | None = None
-        if config.evaluation_harness == "trajectory-sandbox":
-            logger.info("Season 1 mode: initializing trajectory-sandbox harness")
+        if config.evaluation_harness == "trajrl-bench":
+            logger.info("Season 1 mode: initializing trajrl-bench harness")
             self._sandbox_harness = TrajectorySandboxHarness(config)
         self._evaluation_harness = config.evaluation_harness
 
@@ -2198,8 +2198,8 @@ class TrajectoryValidator:
         self._hotkey_packs[commitment.hotkey] = pack
         self._pack_by_hash[commitment.pack_hash] = pack
 
-        # Season 1 path: use trajectory-sandbox harness
-        if self._evaluation_harness == "trajectory-sandbox" and self._sandbox_harness:
+        # Season 1 path: use trajrl-bench harness
+        if self._evaluation_harness == "trajrl-bench" and self._sandbox_harness:
             return await self._evaluate_miner_s1(
                 miner_uid=miner_uid,
                 commitment=commitment,
@@ -2382,7 +2382,7 @@ class TrajectoryValidator:
         epoch_seed: int,
         block_height: int = 0,
     ) -> Optional[Dict]:
-        """Season 1 evaluation path: trajectory-sandbox with LLM judge.
+        """Season 1 evaluation path: trajrl-bench with LLM judge.
 
         Runs N episodes of the same scenario in an SSH sandbox with
         Hermes Agent. Uses split-half delta scoring (quality-based,
@@ -2454,7 +2454,7 @@ class TrajectoryValidator:
                 "late_mean": round(result.late_mean, 4),
                 "episode_qualities": [round(q, 4) for q in result.episode_qualities],
                 "qualification_gate": qualified,
-                "harness": "trajectory-sandbox",
+                "harness": "trajrl-bench",
                 "sandbox_version": harness.sandbox_version,
             },
         }
