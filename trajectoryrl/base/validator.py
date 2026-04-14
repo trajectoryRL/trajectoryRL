@@ -154,10 +154,12 @@ class TrajectoryValidator:
             clawbench_base_url=config.clawbench_base_url,
         )
 
-        # Season 1: trajectory-sandbox harness (optional, lazy-loaded)
+        # Season 1: trajectory-sandbox harness
+        # In "auto" mode, both harnesses are available — pack content decides.
         self._sandbox_harness: TrajectorySandboxHarness | None = None
-        if config.evaluation_harness == "trajectory-sandbox":
-            logger.info("Season 1 mode: initializing trajectory-sandbox harness")
+        if config.evaluation_harness in ("trajectory-sandbox", "auto"):
+            logger.info("Initializing trajectory-sandbox harness (mode=%s)",
+                        config.evaluation_harness)
             self._sandbox_harness = TrajectorySandboxHarness(config)
         self._evaluation_harness = config.evaluation_harness
 
@@ -2113,8 +2115,19 @@ class TrajectoryValidator:
         self._hotkey_packs[commitment.hotkey] = pack
         self._pack_by_hash[commitment.pack_hash] = pack
 
-        # Season 1 path: use trajectory-sandbox harness
-        if self._evaluation_harness == "trajectory-sandbox" and self._sandbox_harness:
+        # Determine harness: auto-detect from pack content or use config override
+        files = pack.get("files", {})
+        has_skill = "SKILL.md" in files or "skill.md" in files
+        has_agents = "AGENTS.md" in files
+
+        use_s1 = False
+        if self._evaluation_harness == "trajectory-sandbox":
+            use_s1 = True
+        elif self._evaluation_harness == "auto" and has_skill:
+            use_s1 = True
+        # "clawbench" or "auto" without SKILL.md → v4.0 path
+
+        if use_s1 and self._sandbox_harness:
             return await self._evaluate_miner_s1(
                 miner_uid=miner_uid,
                 commitment=commitment,

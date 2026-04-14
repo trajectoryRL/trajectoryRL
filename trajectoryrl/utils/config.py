@@ -140,8 +140,10 @@ class ValidatorConfig:
     judge_base_url: str = ""
 
     # Season 1 (trajectory-sandbox) configuration
-    # Set evaluation_harness = "trajectory-sandbox" to enable.
-    evaluation_harness: str = "clawbench"  # "clawbench" (v4.0) or "trajectory-sandbox" (S1)
+    # "auto": detect from pack (SKILL.md → S1, AGENTS.md → v4.0)
+    # "clawbench": force v4.0 for all miners
+    # "trajectory-sandbox": force S1 for all miners
+    evaluation_harness: str = "auto"
     sandbox_image: str = "ghcr.io/trajectoryrl/trajectory-sandbox:latest"
     harness_image: str = "nousresearch/hermes-agent:latest"
     sandbox_timeout_per_episode: int = 600  # 10 min per episode
@@ -239,7 +241,7 @@ class ValidatorConfig:
             ],
             consensus_api_url=os.getenv("CONSENSUS_API_URL", "https://trajrl.com"),
             # --- Season 1 (trajectory-sandbox) ---
-            evaluation_harness=os.getenv("EVALUATION_HARNESS", "clawbench"),
+            evaluation_harness=os.getenv("EVALUATION_HARNESS", "auto"),
             sandbox_image=os.getenv("SANDBOX_IMAGE", "ghcr.io/trajectoryrl/trajectory-sandbox:latest"),
             harness_image=os.getenv("HARNESS_IMAGE", "nousresearch/hermes-agent:latest"),
             sandbox_timeout_per_episode=int(os.getenv("SANDBOX_TIMEOUT_PER_EPISODE", "600")),
