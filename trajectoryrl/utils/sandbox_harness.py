@@ -152,18 +152,10 @@ class TrajectorySandboxHarness:
             pack_hash[:12] if pack_hash else "?", epoch_seed, num_episodes,
         )
 
-        # Select scenario: rotate based on epoch_seed across available scenarios
-        from trajectory_sandbox.fixture_factory import SCENARIOS
-        scenario = SCENARIOS[epoch_seed % len(SCENARIOS)]
-
-        logger.info("S1 scenario selected: %s (seed=%d, pool=%s)",
-                     scenario, epoch_seed, SCENARIOS)
-
         # Generate fixtures deterministically
         factory = self._FixtureFactory(
             epoch_seed=str(epoch_seed),
             validator_salt=validator_salt or self._default_salt(),
-            scenario=scenario,
         )
         world = factory.generate_world()
         episodes_fixtures = [factory.generate_episode(i, world) for i in range(num_episodes)]
@@ -175,7 +167,7 @@ class TrajectorySandboxHarness:
         # Build per-episode scorers (evidence + LLM judge)
         judge = self._EpisodeJudge()  # picks up LLM_API_KEY etc. from env
         scorers = [
-            self._EpisodeScorer.for_scenario(scenario, world, ef, judge=judge)
+            self._EpisodeScorer.for_incident_response(world, ef, judge=judge)
             for ef in episodes_fixtures
         ]
 
@@ -199,7 +191,7 @@ class TrajectorySandboxHarness:
             result.error = str(e)
             return result
 
-        result = SandboxEvaluationResult(session_result, scenario_name=scenario)
+        result = SandboxEvaluationResult(session_result)
         result.session_result.pack_hash = pack_hash
         result.session_result.validator_salt = validator_salt
 
