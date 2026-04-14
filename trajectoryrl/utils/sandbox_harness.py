@@ -208,9 +208,23 @@ class TrajectorySandboxHarness:
         self._llm_api_url = config.judge_base_url or config.clawbench_base_url
         self._llm_model = config.judge_model or config.clawbench_default_model
 
-        # Sandbox version — queried at pull time, included in consensus payloads
+        # Sandbox version — queried at pull time, drives scoring_version
         self.sandbox_version: str = "unknown"
         self.sandbox_scenarios: list[str] = []
+
+    @property
+    def scoring_version(self) -> int:
+        """Derive scoring version from sandbox major version.
+
+        v1.0.0 → 1, v2.0.0 → 2, etc. Falls back to 1 if unparseable.
+        Validators with different sandbox major versions will not mix
+        results during consensus aggregation.
+        """
+        try:
+            major = self.sandbox_version.lstrip("v").split(".")[0]
+            return int(major)
+        except (ValueError, IndexError):
+            return 1
 
         logger.info(
             "TrajectorySandboxHarness initialized "

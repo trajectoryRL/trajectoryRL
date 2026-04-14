@@ -44,10 +44,16 @@ from ..utils.eval_window import (
     compute_window, is_new_window, can_evaluate,
     should_submit, should_aggregate,
 )
+from ..utils import consensus as _consensus_mod
 from ..utils.consensus import (
     ConsensusPayload, ConsensusPointer,
-    CONSENSUS_PROTOCOL_VERSION, SCORING_VERSION,
+    CONSENSUS_PROTOCOL_VERSION,
 )
+
+def _scoring_version() -> int:
+    """Get current scoring version. In S1 mode this is set dynamically
+    from the sandbox image major version at the start of each eval cycle."""
+    return _consensus_mod.SCORING_VERSION
 from ..utils.consensus_store import (
     ConsensusStore, IPFSBackend, TrajRLAPIBackend,
 )
@@ -393,11 +399,11 @@ class TrajectoryValidator:
             data = json.loads(path.read_text())
 
             file_sv = data.get("scoring_version", 1)
-            if file_sv != SCORING_VERSION:
+            if file_sv != _scoring_version():
                 logger.info(
                     "EMA state scoring_version mismatch (%d != %d), "
                     "invalidating all eval state",
-                    file_sv, SCORING_VERSION,
+                    file_sv, _scoring_version(),
                 )
                 return
 
@@ -430,7 +436,7 @@ class TrajectoryValidator:
     def _save_ema_state(self):
         """Persist evaluation state to disk for restart recovery."""
         data = {
-            "scoring_version": SCORING_VERSION,
+            "scoring_version": _scoring_version(),
             "scenario_config_hash": self._scenario_config_hash,
             "raw_costs": self.raw_costs,
             "scenario_qualified": self.scenario_qualified,
@@ -464,7 +470,7 @@ class TrajectoryValidator:
         """Load eval result cache from disk, pruning entries older than TTL.
 
         The cache file carries a ``scoring_version`` header.  When the
-        version does not match the running ``SCORING_VERSION``, the entire
+        version does not match the running scoring version, the entire
         cache is discarded because evaluation criteria have changed and
         all prior results are invalid.
         """
@@ -484,11 +490,11 @@ class TrajectoryValidator:
                 file_sv = 1
                 entries = raw
 
-            if file_sv != SCORING_VERSION:
+            if file_sv != _scoring_version():
                 logger.info(
                     "Eval cache scoring_version mismatch (%d != %d), "
                     "discarding %d cached entries",
-                    file_sv, SCORING_VERSION, len(entries),
+                    file_sv, _scoring_version(), len(entries),
                 )
                 return
 
@@ -512,7 +518,7 @@ class TrajectoryValidator:
         try:
             self._eval_cache_path.parent.mkdir(parents=True, exist_ok=True)
             wrapper = {
-                "scoring_version": SCORING_VERSION,
+                "scoring_version": _scoring_version(),
                 "entries": self._eval_cache,
             }
             self._eval_cache_path.write_text(
@@ -770,7 +776,7 @@ class TrajectoryValidator:
             protocol_version=self.config.consensus_protocol_version,
             window_number=window.window_number,
             content_address=content_address,
-            scoring_version=SCORING_VERSION,
+            scoring_version=_scoring_version(),
         )
 
         if len(commitment_str.encode("utf-8")) > MAX_COMMITMENT_BYTES:
@@ -780,7 +786,7 @@ class TrajectoryValidator:
                 protocol_version=self.config.consensus_protocol_version,
                 window_number=window.window_number,
                 content_address=fallback_address,
-                scoring_version=SCORING_VERSION,
+                scoring_version=_scoring_version(),
             )
             logger.warning(
                 "Window %d: commitment too long with dual address, "
@@ -848,7 +854,7 @@ class TrajectoryValidator:
             costs=costs_by_hotkey,
             qualified=qualified_by_hotkey,
             timestamp=int(time.time()),
-            scoring_version=SCORING_VERSION,
+            scoring_version=_scoring_version(),
             disqualified=disqualified_by_hotkey,
         )
 
@@ -876,7 +882,7 @@ class TrajectoryValidator:
         skipped_sv = 0
         download_failed = 0
         for vc in chain_commitments:
-            if vc.scoring_version != SCORING_VERSION:
+            if vc.scoring_version != _scoring_version():
                 skipped_sv += 1
                 continue
             pointer = ConsensusPointer(
@@ -896,7 +902,7 @@ class TrajectoryValidator:
             logger.info(
                 "Window %d: skipped %d commitments with mismatched "
                 "scoring_version (expected %d)",
-                window.window_number, skipped_sv, SCORING_VERSION,
+                window.window_number, skipped_sv, _scoring_version(),
             )
 
         my_hotkey = self.wallet.hotkey.ss58_address
@@ -917,7 +923,7 @@ class TrajectoryValidator:
                     "Window %d: no usable commitments — all %d filtered out "
                     "due to scoring_version mismatch (local=%d), "
                     "using local results",
-                    window.window_number, total, SCORING_VERSION,
+                    window.window_number, total, _scoring_version(),
                 )
             else:
                 logger.warning(
@@ -944,7 +950,7 @@ class TrajectoryValidator:
             min_stake=min_stake,
             local_version=clawbench_version,
             expected_protocol=self.config.consensus_protocol_version,
-            expected_scoring_version=SCORING_VERSION,
+            expected_scoring_version=_scoring_version(),
         )
 
         if not validated:
@@ -1538,9 +1544,17 @@ class TrajectoryValidator:
 
         self._disqualified_miners = {}
 
-        # Pull latest sandbox image before eval (gets new scenarios)
+        # Pull latest sandbox image before eval (gets new scenarios + version)
         if self._sandbox_harness:
             await self._sandbox_harness.pull_latest()
+            # S1: scoring version = sandbox image major version (v1.0.0 → 1)
+            # Update the module-level constant so all consensus/cache/filter
+            # code in this process uses the sandbox-derived version.
+            import trajectoryrl.utils.consensus as _consensus
+            _consensus_mod.SCORING_VERSION = self._sandbox_harness.scoring_version
+            logger.info("S1 scoring_version=%d (sandbox %s)",
+                        self._sandbox_harness.scoring_version,
+                        self._sandbox_harness.sandbox_version)
 
         # Epoch seed for context variation
         epoch = current_block // self.config.eval_interval_blocks
@@ -1691,7 +1705,7 @@ class TrajectoryValidator:
                         rejected=True,
                         rejection_stage="integrity_check",
                         rejection_detail=detail,
-                        scoring_version=SCORING_VERSION,
+                        scoring_version=_scoring_version(),
                     )
                 )
                 self.raw_costs.pop(hotkey, None)
@@ -1745,7 +1759,7 @@ class TrajectoryValidator:
                             rejected=True,
                             rejection_stage=_stage,
                             rejection_detail=_detail,
-                            scoring_version=SCORING_VERSION,
+                            scoring_version=_scoring_version(),
                         )
                     )
                     self._disqualified_miners[hotkey] = f"pre_eval_rejected:{reason}"
@@ -2167,7 +2181,7 @@ class TrajectoryValidator:
                     rejected=True,
                     rejection_stage="integrity_check",
                     rejection_detail=integrity.summary,
-                    scoring_version=SCORING_VERSION,
+                    scoring_version=_scoring_version(),
                 )
             )
             self._disqualified_miners[commitment.hotkey] = "integrity_failed"
@@ -2582,7 +2596,7 @@ class TrajectoryValidator:
             scenario_results=scenario_results,
             llm_base_url=self._judge_base_url,
             llm_model=self._judge_model,
-            scoring_version=SCORING_VERSION,
+            scoring_version=_scoring_version(),
         )
 
     # ------------------------------------------------------------------
