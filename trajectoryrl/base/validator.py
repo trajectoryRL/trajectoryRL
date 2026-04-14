@@ -1453,6 +1453,10 @@ class TrajectoryValidator:
 
         self._disqualified_miners = {}
 
+        # Pull latest sandbox image before eval (gets new scenarios)
+        if self._sandbox_harness:
+            await self._sandbox_harness.pull_latest()
+
         # Epoch seed for context variation
         epoch = current_block // self.config.eval_interval_blocks
         epoch_seed = self.compute_epoch_seed(epoch, self.config.netuid)

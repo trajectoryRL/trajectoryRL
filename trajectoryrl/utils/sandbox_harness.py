@@ -1,64 +1,104 @@
 """Season 1 trajectory-sandbox harness for evaluating SKILL.md packs.
 
-Wraps trajectory-sandbox's EvalSession to produce EvaluationResult objects
-compatible with the existing validator pipeline. Replaces ClawBench for S1.
+Architecture: the validator does NOT import trajectory-sandbox as a Python
+dependency. Instead, it runs scenario logic inside the sandbox Docker image
+via `docker run`. This means:
 
-Season 1 differences from v4.0 (ClawBench):
-  - Miners submit SKILL.md (static instruction pack) instead of pack.json
-  - Agent runs in SSH sandbox with mock services (not OpenClaw tool-call API)
-  - 4 episodes of same scenario with different fixtures (not 1 episode × N scenarios)
-  - Split-half delta scoring: quality × (1 + 0.5 × max(0, delta))
-  - 100% LLM judge scoring (no rule-based checks)
-  - Default harness: Hermes Agent (not OpenClaw)
+  - Updating scenarios = rebuild sandbox image only (CI does this)
+  - Watchtower or `docker pull` before eval gets the latest scenarios
+  - Validator image is stable — just orchestration + bittensor
+
+The flow:
+  1. docker pull sandbox image (get latest scenarios)
+  2. docker run sandbox generate (fixtures + instruction + world JSON)
+  3. For each episode: start sandbox + harness containers, run agent, capture state
+  4. docker run sandbox score (transcript + state → quality via LLM judge)
+  5. Compute split-half delta from 4 quality scores
 
 Usage:
     harness = TrajectorySandboxHarness(config)
     result = await harness.evaluate_miner(skill_md, epoch_seed)
-    # result.score = final_score (split-half delta)
-    # result.success = final_score > 0
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
+import json
 import logging
-from functools import partial
+import secrets
+import tarfile
+import time
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+
+import docker
+from docker.models.containers import Container
+from docker.models.networks import Network
+from docker.types import LogConfig
 
 from ..utils.config import ValidatorConfig
 
 logger = logging.getLogger(__name__)
 
 
-def _import_sandbox():
-    """Lazy import trajectory-sandbox to keep it optional."""
-    try:
-        from trajectory_sandbox import (
-            EvalSession,
-            SandboxConfig,
-            FixtureFactory,
-            EvalSessionResult,
-        )
-        from trajectory_sandbox.episode_scorer import EpisodeScorer
-        from trajectory_sandbox.judge import EpisodeJudge
-        return EvalSession, SandboxConfig, FixtureFactory, EvalSessionResult, EpisodeScorer, EpisodeJudge
-    except ImportError as e:
-        raise ImportError(
-            "trajectory-sandbox is required for Season 1 evaluation. "
-            "Install with: pip install trajectoryrl[season1]"
-        ) from e
+# ---------------------------------------------------------------------------
+# Result types (no trajectory-sandbox import needed)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _EpisodeResult:
+    episode_index: int
+    quality: float = 0.0
+    tool_calls: int = 0
+    transcript: str = ""
+    mock_state: dict = field(default_factory=dict)
+    timed_out: bool = False
+    error: str | None = None
+    duration_s: float = 0.0
+    judge_result: dict = field(default_factory=dict)
+
+
+@dataclass
+class _SessionResult:
+    episodes: list[_EpisodeResult] = field(default_factory=list)
+    early_mean: float = 0.0
+    late_mean: float = 0.0
+    delta: float = 0.0
+    mean_quality: float = 0.0
+    learning_bonus: float = 0.0
+    final_score: float = 0.0
+    pack_hash: str = ""
+    validator_salt: str = ""
+    scenario: str = ""
+
+    def compute_scores(self, alpha: float = 0.5, early_floor: float = 0.3,
+                       delta_threshold: float = 0.4) -> None:
+        scores = [ep.quality for ep in self.episodes]
+        if len(scores) < 4:
+            self.mean_quality = sum(scores) / len(scores) if scores else 0.0
+            self.final_score = self.mean_quality
+            return
+        self.early_mean = (scores[0] + scores[1]) / 2
+        self.late_mean = (scores[2] + scores[3]) / 2
+        self.delta = self.late_mean - self.early_mean
+        if self.early_mean < early_floor and self.delta > delta_threshold:
+            self.delta = 0.0
+        self.mean_quality = sum(scores) / len(scores)
+        self.learning_bonus = alpha * max(0.0, self.delta)
+        self.final_score = self.mean_quality * (1 + self.learning_bonus)
 
 
 class SandboxEvaluationResult:
     """Result from a Season 1 sandbox evaluation.
 
-    Maps trajectory-sandbox's EvalSessionResult to the fields the validator
-    pipeline needs. Intentionally duck-type compatible with
-    clawbench.EvaluationResult for the fields the validator reads.
+    Duck-type compatible with clawbench.EvaluationResult for the fields
+    the validator pipeline reads.
     """
 
-    def __init__(self, session_result, scenario_name: str = "incident_response"):
+    def __init__(self, session_result: _SessionResult,
+                 scenario_name: str = "incident_response"):
         self.scenario_name = scenario_name
         self.score = session_result.final_score
         self.success = session_result.final_score > 0.0
@@ -67,7 +107,7 @@ class SandboxEvaluationResult:
         self.rubric = {}
         self.error: Optional[str] = None
 
-        # Cost: not directly tracked in S1 (quality-based, not cost-based)
+        # Cost: not tracked in S1 (quality-based, not cost-based)
         self.cost_usd: Optional[float] = None
         self.token_usage: Optional[Dict[str, int]] = None
         self.model_usage: Optional[List[Dict[str, Any]]] = None
@@ -78,7 +118,7 @@ class SandboxEvaluationResult:
         self.session_key: Optional[str] = None
         self.session_file: Optional[str] = None
 
-        # S1-specific fields
+        # S1-specific
         self.session_result = session_result
         self.early_mean = session_result.early_mean
         self.late_mean = session_result.late_mean
@@ -88,40 +128,105 @@ class SandboxEvaluationResult:
         self.episode_qualities = [ep.quality for ep in session_result.episodes]
 
 
+# ---------------------------------------------------------------------------
+# Docker helpers
+# ---------------------------------------------------------------------------
+
+def _docker_run_json(client: docker.DockerClient, image: str,
+                     command: list[str], environment: dict | None = None,
+                     timeout: int = 120) -> dict:
+    """Run a command in a container and parse JSON stdout."""
+    try:
+        output = client.containers.run(
+            image, command=command,
+            environment=environment or {},
+            remove=True, stdout=True, stderr=True,
+            mem_limit="2g", cpu_quota=100000,
+        )
+        return json.loads(output.decode())
+    except docker.errors.ContainerError as e:
+        stderr = e.stderr.decode() if e.stderr else ""
+        raise RuntimeError(f"Container command failed: {stderr}") from e
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Failed to parse container output as JSON: {e}") from e
+
+
+def _put_file(container: Container, path: str, content: str | bytes) -> None:
+    """Write a file into a running container via tar archive."""
+    import posixpath
+    dir_name = posixpath.dirname(path)
+    file_name = posixpath.basename(path)
+    data = content.encode() if isinstance(content, str) else content
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        info = tarfile.TarInfo(name=file_name)
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    buf.seek(0)
+    container.put_archive(dir_name, buf)
+
+
+def _generate_keypair() -> tuple[str, str]:
+    """Generate ephemeral Ed25519 SSH keypair. Returns (private_key, public_key)."""
+    import subprocess
+    import tempfile
+    import os
+    with tempfile.TemporaryDirectory() as tmpdir:
+        key_path = os.path.join(tmpdir, "key")
+        subprocess.run(
+            ["ssh-keygen", "-t", "ed25519", "-f", key_path, "-N", "",
+             "-C", "eval-session", "-q"],
+            check=True,
+        )
+        private_key = open(key_path).read()
+        public_key = open(f"{key_path}.pub").read().strip()
+    return private_key, public_key
+
+
+# ---------------------------------------------------------------------------
+# Harness
+# ---------------------------------------------------------------------------
+
 class TrajectorySandboxHarness:
-    """Season 1 harness using trajectory-sandbox for SSH-based evaluations."""
+    """Season 1 harness — all scenario logic runs inside the sandbox image.
+
+    The validator does NOT pip-install trajectory-sandbox. Instead:
+    1. `docker pull` the sandbox image (gets latest scenarios)
+    2. `docker run ... generate` to produce fixtures
+    3. Start sandbox + harness containers, run agent episodes
+    4. `docker run ... score` to judge each episode
+    5. Compute split-half delta locally (simple math)
+    """
 
     def __init__(self, config: ValidatorConfig):
         self.config = config
+        self.client = docker.from_env()
 
-        # Lazy import — only fail when actually used
-        (
-            self._EvalSession,
-            self._SandboxConfig,
-            self._FixtureFactory,
-            self._EvalSessionResult,
-            self._EpisodeScorer,
-            self._EpisodeJudge,
-        ) = _import_sandbox()
-
-        # Build sandbox config from validator config
-        self._sandbox_config = self._SandboxConfig(
-            sandbox_image=config.sandbox_image,
-            harness_image=config.harness_image,
-            llm_api_url=config.judge_base_url or config.clawbench_base_url,
-            llm_api_key=config.judge_api_key or config.clawbench_api_key,
-            llm_model=config.judge_model or config.clawbench_default_model,
-            harness_timeout_s=config.sandbox_timeout_per_episode,
-        )
+        self._sandbox_image = config.sandbox_image
+        self._harness_image = config.harness_image
+        self._llm_api_key = config.judge_api_key or config.clawbench_api_key
+        self._llm_api_url = config.judge_base_url or config.clawbench_base_url
+        self._llm_model = config.judge_model or config.clawbench_default_model
 
         logger.info(
             "TrajectorySandboxHarness initialized "
             "(sandbox=%s, harness=%s, episodes=%d, timeout=%ds)",
-            config.sandbox_image,
-            config.harness_image,
-            config.sandbox_num_episodes,
-            config.sandbox_timeout_per_episode,
+            self._sandbox_image, self._harness_image,
+            config.sandbox_num_episodes, config.sandbox_timeout_per_episode,
         )
+
+    async def pull_latest(self) -> None:
+        """Pull the latest sandbox image before eval. Gets new scenarios."""
+        loop = asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(None, self._pull_sync)
+        except Exception as e:
+            logger.warning("Failed to pull latest sandbox image: %s (using cached)", e)
+
+    def _pull_sync(self) -> None:
+        logger.info("Pulling latest sandbox image: %s", self._sandbox_image)
+        self.client.images.pull(self._sandbox_image)
+        logger.info("Sandbox image updated")
 
     async def evaluate_miner(
         self,
@@ -130,110 +235,327 @@ class TrajectorySandboxHarness:
         pack_hash: str = "",
         validator_salt: str = "",
     ) -> SandboxEvaluationResult:
-        """Run a full Season 1 evaluation for one miner.
+        """Run a full Season 1 evaluation.
 
-        Generates fixtures deterministically from epoch_seed + validator_salt,
-        runs N episodes in the sandbox with LLM judge scoring, and returns
-        the split-half delta final score.
-
-        Args:
-            skill_md: Miner's SKILL.md content (extracted from pack)
-            epoch_seed: Epoch seed for deterministic fixture generation
-            pack_hash: Pack hash for logging/tracing
-            validator_salt: Validator-specific salt for fixture variation
-
-        Returns:
-            SandboxEvaluationResult with final_score and episode details
+        All scenario logic (fixture generation, LLM judge scoring) runs
+        inside the sandbox Docker image. The validator only orchestrates
+        containers and computes the final split-half delta.
         """
         num_episodes = self.config.sandbox_num_episodes
+        salt = validator_salt or self._default_salt()
 
         logger.info(
             "S1 evaluation starting: pack_hash=%s, seed=%d, episodes=%d",
             pack_hash[:12] if pack_hash else "?", epoch_seed, num_episodes,
         )
 
-        # Generate fixtures deterministically
-        factory = self._FixtureFactory(
-            epoch_seed=str(epoch_seed),
-            validator_salt=validator_salt or self._default_salt(),
-        )
-        world = factory.generate_world()
-        episodes_fixtures = [factory.generate_episode(i, world) for i in range(num_episodes)]
-
-        # Build instructions and fixture dicts
-        instructions = [ef.instruction_md for ef in episodes_fixtures]
-        fixtures_per_episode = [ef.to_dict() for ef in episodes_fixtures]
-
-        # Build per-episode scorers (evidence + LLM judge)
-        judge = self._EpisodeJudge()  # picks up LLM_API_KEY etc. from env
-        scorers = [
-            self._EpisodeScorer.for_incident_response(world, ef, judge=judge)
-            for ef in episodes_fixtures
-        ]
-
-        # Run in executor to avoid blocking the async event loop
-        # (EvalSession uses synchronous Docker SDK calls)
         loop = asyncio.get_event_loop()
         try:
             session_result = await loop.run_in_executor(
-                None,
-                partial(
-                    self._run_session_sync,
-                    skill_md=skill_md,
-                    instructions=instructions,
-                    fixtures_per_episode=fixtures_per_episode,
-                    scorers=scorers,
+                None, lambda: self._run_eval_sync(
+                    skill_md, epoch_seed, salt, num_episodes, pack_hash,
                 ),
             )
         except Exception as e:
             logger.error("S1 evaluation failed: %s", e, exc_info=True)
-            result = SandboxEvaluationResult(self._EvalSessionResult())
+            session_result = _SessionResult()
+            result = SandboxEvaluationResult(session_result)
             result.error = str(e)
             return result
 
-        result = SandboxEvaluationResult(session_result)
-        result.session_result.pack_hash = pack_hash
-        result.session_result.validator_salt = validator_salt
-
+        result = SandboxEvaluationResult(session_result, scenario_name=session_result.scenario)
         logger.info(
             "S1 evaluation complete: final_score=%.3f "
             "(mean_q=%.3f, delta=%.3f, episodes=%s)",
-            result.score,
-            result.mean_quality,
-            result.delta,
+            result.score, result.mean_quality, result.delta,
             result.episode_qualities,
         )
         return result
 
-    def _run_session_sync(
-        self,
-        skill_md: str,
-        instructions: list[str],
-        fixtures_per_episode: list[dict],
-        scorers: list,
-    ):
-        """Run the sandbox session synchronously (called from executor)."""
-        with self._EvalSession(self._sandbox_config) as session:
-            return session.run_all_episodes(
-                skill_md=skill_md,
-                instructions=instructions,
-                fixtures_per_episode=fixtures_per_episode,
-                scorer=scorers,
+    def _run_eval_sync(
+        self, skill_md: str, epoch_seed: int, salt: str,
+        num_episodes: int, pack_hash: str,
+    ) -> _SessionResult:
+        """Synchronous eval: generate → run episodes → score → delta."""
+
+        session_id = secrets.token_hex(6)
+        session_result = _SessionResult(pack_hash=pack_hash, validator_salt=salt)
+
+        # -----------------------------------------------------------
+        # Step 1: Generate fixtures via docker run
+        # -----------------------------------------------------------
+        logger.info("[%s] Generating fixtures via sandbox image...", session_id)
+        gen_data = _docker_run_json(
+            self.client, self._sandbox_image,
+            command=["python", "-m", "trajectory_sandbox.cli", "generate",
+                     "--seed", str(epoch_seed), "--salt", salt,
+                     "--episodes", str(num_episodes)],
+        )
+
+        scenario = gen_data["scenario"]
+        world_data = gen_data["world"]
+        episodes_data = gen_data["episodes"]
+        session_result.scenario = scenario
+
+        logger.info("[%s] Scenario: %s, World: %s", session_id, scenario,
+                    world_data["company"])
+
+        # -----------------------------------------------------------
+        # Step 2: Run episodes (sandbox + harness containers)
+        # -----------------------------------------------------------
+        private_key, public_key = _generate_keypair()
+        network = None
+        sandbox = None
+
+        try:
+            # Create isolated network
+            network_name = f"eval_{session_id}"
+            network = self.client.networks.create(
+                network_name, driver="bridge", internal=True,
+                labels={"trajectoryrl.role": "eval_net"},
             )
 
+            # Start sandbox container
+            sandbox = self.client.containers.run(
+                self._sandbox_image,
+                name=f"sandbox_{session_id}",
+                detach=True, network=network.name,
+                environment={
+                    "SSH_PUBLIC_KEY": public_key,
+                    "SSH_USER": "agent",
+                },
+                mem_limit="2g", cpu_quota=100000,
+                labels={"trajectoryrl.role": "sandbox",
+                        "trajectoryrl.session": session_id},
+                log_config=LogConfig(type=LogConfig.types.JSON,
+                                     config={"max-size": "50m"}),
+            )
+
+            # Wait for sandbox healthy
+            for _ in range(60):
+                time.sleep(1)
+                try:
+                    code, _ = sandbox.exec_run("echo ok")
+                    if code == 0:
+                        break
+                except Exception:
+                    pass
+            else:
+                raise RuntimeError("Sandbox failed to start")
+
+            # Wait for mock services
+            for _ in range(30):
+                code, out = sandbox.exec_run(
+                    ["sh", "-c", "curl -s http://localhost:8090/health"])
+                if code == 0 and out:
+                    try:
+                        health = json.loads(out.decode())
+                        if health.get("status") == "ok":
+                            break
+                    except Exception:
+                        pass
+                time.sleep(1)
+
+            sandbox.reload()
+            sandbox_ip = sandbox.attrs["NetworkSettings"]["Networks"][network.name]["IPAddress"]
+
+            # Load SKILL.md
+            _put_file(sandbox, "/workspace/SKILL.md", skill_md)
+            sandbox.exec_run(["mkdir", "-p", "/workspace/learned"])
+
+            # Run each episode
+            for i, ep_data in enumerate(episodes_data):
+                episode = self._run_episode(
+                    session_id=session_id,
+                    episode_index=i,
+                    ep_data=ep_data,
+                    world_data=world_data,
+                    scenario=scenario,
+                    sandbox=sandbox,
+                    sandbox_ip=sandbox_ip,
+                    network=network,
+                    private_key=private_key,
+                )
+                session_result.episodes.append(episode)
+
+        finally:
+            if sandbox:
+                try:
+                    sandbox.stop(timeout=5)
+                    sandbox.remove(force=True)
+                except Exception:
+                    pass
+            if network:
+                try:
+                    network.remove()
+                except Exception:
+                    pass
+
+        # -----------------------------------------------------------
+        # Step 3: Compute split-half delta (simple math, no imports)
+        # -----------------------------------------------------------
+        session_result.compute_scores()
+        return session_result
+
+    def _run_episode(
+        self, session_id: str, episode_index: int, ep_data: dict,
+        world_data: dict, scenario: str,
+        sandbox: Container, sandbox_ip: str,
+        network: Network, private_key: str,
+    ) -> _EpisodeResult:
+        """Run a single episode: load fixtures, start harness, capture, score."""
+
+        episode = _EpisodeResult(episode_index=episode_index)
+        t0 = time.time()
+        logger.info("[%s] Episode %d starting", session_id, episode_index)
+
+        try:
+            # Load fixtures into sandbox
+            sandbox.exec_run(["sh", "-c", "curl -s -X POST http://localhost:8090/reset"])
+            fixtures_json = json.dumps(ep_data["fixtures"])
+            _put_file(sandbox, "/tmp/fixtures.json", fixtures_json)
+            sandbox.exec_run(["sh", "-c",
+                "curl -s -X POST http://localhost:8090/load_fixtures "
+                "-H 'Content-Type: application/json' -d @/tmp/fixtures.json"])
+            _put_file(sandbox, "/workspace/INSTRUCTION.md", ep_data["instruction_md"])
+
+            # Start harness container
+            harness_name = f"harness_{session_id}_ep{episode_index}"
+            harness_prompt = (
+                "Read /workspace/SKILL.md for your approach. "
+                "Read /workspace/INSTRUCTION.md for the task. "
+                "Check /workspace/learned/ for notes from prior episodes. "
+                "Services are at http://localhost:8090 - start with /health. "
+                "Do not modify SKILL.md."
+            )
+
+            harness = self.client.containers.run(
+                self._harness_image,
+                command=["chat", "-q", harness_prompt,
+                         "--quiet", "--yolo", "--max-turns", "30"],
+                name=harness_name, detach=True, network=network.name,
+                environment={
+                    "OPENROUTER_API_KEY": self._llm_api_key,
+                    "LLM_API_KEY": self._llm_api_key,
+                },
+                mem_limit="4g", cpu_quota=200000,
+                cap_add=["NET_ADMIN"],
+                labels={"trajectoryrl.role": "harness",
+                        "trajectoryrl.session": session_id},
+                log_config=LogConfig(type=LogConfig.types.JSON,
+                                     config={"max-size": "50m"}),
+            )
+
+            try:
+                # Wait for harness to complete
+                timeout = self.config.sandbox_timeout_per_episode
+                try:
+                    result = harness.wait(timeout=timeout)
+                    exit_code = result.get("StatusCode", -1)
+                except Exception:
+                    logger.warning("[%s] Episode %d timed out after %ds",
+                                   session_id, episode_index, timeout)
+                    try:
+                        harness.kill()
+                    except Exception:
+                        pass
+                    episode.timed_out = True
+
+                # Capture transcript
+                try:
+                    episode.transcript = harness.logs(
+                        stdout=True, stderr=False
+                    ).decode(errors="replace")
+                except Exception:
+                    pass
+
+            finally:
+                try:
+                    harness.stop(timeout=3)
+                    harness.remove(force=True)
+                except Exception:
+                    pass
+
+            # Capture mock state
+            code, state_raw = sandbox.exec_run(
+                ["sh", "-c", "curl -s http://localhost:8090/state"])
+            if code == 0 and state_raw:
+                try:
+                    episode.mock_state = json.loads(state_raw.decode())
+                except Exception:
+                    pass
+
+            # -----------------------------------------------------------
+            # Score via docker run (LLM judge runs inside sandbox image)
+            # -----------------------------------------------------------
+            logger.info("[%s] Episode %d scoring via sandbox image...",
+                        session_id, episode_index)
+
+            # Write scoring inputs to temp files, mount into scorer container
+            import tempfile
+            import os
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # Write inputs
+                world_path = os.path.join(tmpdir, "world.json")
+                episode_path = os.path.join(tmpdir, "episode.json")
+                transcript_path = os.path.join(tmpdir, "transcript.txt")
+                state_path = os.path.join(tmpdir, "state.json")
+
+                with open(world_path, "w") as f:
+                    json.dump(world_data, f)
+                with open(episode_path, "w") as f:
+                    json.dump(ep_data, f)
+                with open(transcript_path, "w") as f:
+                    f.write(episode.transcript)
+                with open(state_path, "w") as f:
+                    json.dump(episode.mock_state, f)
+
+                # Run scorer in sandbox image
+                score_output = self.client.containers.run(
+                    self._sandbox_image,
+                    command=[
+                        "python", "-m", "trajectory_sandbox.cli", "score",
+                        "--world", "/data/world.json",
+                        "--episode", "/data/episode.json",
+                        "--transcript", "/data/transcript.txt",
+                        "--state", "/data/state.json",
+                        "--scenario", scenario,
+                    ],
+                    environment={
+                        "LLM_API_KEY": self._llm_api_key,
+                        "LLM_BASE_URL": self._llm_api_url,
+                        "LLM_MODEL": self._llm_model,
+                    },
+                    volumes={tmpdir: {"bind": "/data", "mode": "ro"}},
+                    remove=True, stdout=True, stderr=True,
+                    mem_limit="2g",
+                )
+
+                score_data = json.loads(score_output.decode())
+                episode.quality = score_data.get("quality", 0.0)
+                episode.judge_result = score_data
+
+                if score_data.get("error"):
+                    logger.warning("[%s] Episode %d judge error: %s",
+                                   session_id, episode_index, score_data["error"])
+
+            logger.info("[%s] Episode %d quality=%.3f",
+                        session_id, episode_index, episode.quality)
+
+        except Exception as e:
+            episode.error = str(e)
+            logger.error("[%s] Episode %d failed: %s",
+                         session_id, episode_index, e, exc_info=True)
+
+        episode.duration_s = time.time() - t0
+        return episode
+
     def _default_salt(self) -> str:
-        """Derive a stable salt from the validator's hotkey."""
-        # Use a hash of config values as fallback salt
         data = f"{self.config.wallet_hotkey}:{self.config.netuid}"
         return hashlib.sha256(data.encode()).hexdigest()[:16]
 
     @staticmethod
     def extract_skill_md(pack: dict) -> str | None:
-        """Extract SKILL.md content from a miner's pack.
-
-        Season 1 packs include SKILL.md in the files dict.
-        Returns None if no SKILL.md found (not an S1 pack).
-        """
+        """Extract SKILL.md content from a miner's pack."""
         files = pack.get("files", {})
-        # Try SKILL.md first, then skill.md
         return files.get("SKILL.md") or files.get("skill.md")

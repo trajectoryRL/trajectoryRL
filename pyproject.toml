@@ -36,7 +36,6 @@ dependencies = [
 
 [project.optional-dependencies]
 season1 = [
-    "trajectory-sandbox @ git+https://github.com/trajectoryRL/trajectory-sandbox.git",
     "docker>=7.0.0",
 ]
 dev = [
