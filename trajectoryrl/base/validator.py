@@ -2348,6 +2348,7 @@ class TrajectoryValidator:
                 "episode_qualities": [round(q, 4) for q in result.episode_qualities],
                 "qualification_gate": qualified,
                 "harness": "trajectory-sandbox",
+                "sandbox_version": harness.sandbox_version,
             },
         }
 
