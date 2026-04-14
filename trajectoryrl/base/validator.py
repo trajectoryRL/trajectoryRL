@@ -977,15 +977,18 @@ class TrajectoryValidator:
                 if miner_hk in hk_to_commitment
             ]
 
-            # Batch pre-eval calls concurrently
+            # Batch pre-eval calls with bounded concurrency
             if miners_to_check:
+                sem = asyncio.Semaphore(8)
+
+                async def _limited_pre_eval(hk: str, c: MinerCommitment):
+                    async with sem:
+                        return await pre_eval(
+                            hk, c.pack_hash, c.pack_url, wallet=self.wallet,
+                        )
+
                 results = await asyncio.gather(*(
-                    pre_eval(
-                        miner_hk,
-                        commitment.pack_hash,
-                        commitment.pack_url,
-                        wallet=self.wallet,
-                    )
+                    _limited_pre_eval(miner_hk, commitment)
                     for miner_hk, commitment in miners_to_check
                 ))
 
