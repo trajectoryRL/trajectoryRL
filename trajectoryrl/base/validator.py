@@ -2309,11 +2309,19 @@ class TrajectoryValidator:
         mlog = self._get_miner_logger(commitment.hotkey)
         harness = self._sandbox_harness
 
-        # Extract SKILL.md from pack (S1 packs must include it)
-        skill_md = TrajectorySandboxHarness.extract_skill_md(pack)
+        # S1 packs must contain ONLY SKILL.md (no AGENTS.md or other files)
+        files = pack.get("files", {})
+        skill_md = files.get("SKILL.md") or files.get("skill.md")
         if not skill_md:
             mlog.warning("No SKILL.md found in pack — not a valid S1 submission")
             self._disqualified_miners[commitment.hotkey] = "no_skill_md"
+            return None
+
+        allowed = {"SKILL.md", "skill.md"}
+        extra = set(files.keys()) - allowed
+        if extra:
+            mlog.warning("S1 pack contains disallowed files: %s — only SKILL.md permitted", extra)
+            self._disqualified_miners[commitment.hotkey] = "extra_files"
             return None
 
         mlog.info(

@@ -24,14 +24,13 @@
 
 ## Pack Format
 
-Season 1 packs use the same OPP v1 JSON format but MUST include `SKILL.md` in the `files` dict:
+Season 1 packs use the same OPP v1 JSON format. The `files` dict must contain **only `SKILL.md`** -- no `AGENTS.md` or other files. Packs with extra files are rejected.
 
 ```json
 {
   "schema_version": 1,
   "files": {
-    "SKILL.md": "# Your skill content here...",
-    "AGENTS.md": "(optional, for backward compat)"
+    "SKILL.md": "# Your skill content here..."
   },
   "metadata": {
     "pack_name": "my-s1-pack",
