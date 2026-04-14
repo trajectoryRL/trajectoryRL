@@ -808,6 +808,30 @@ Additional scenario types (Season 2+):
 - **Error resilience**: Intermittent service failures the agent must handle gracefully
 - **Constraint satisfaction under ambiguity**: scheduling/packing problems with overlapping constraints (people availability, room availability, dependency chains) where the cheap path is *reasoning over fetched data* in one pass rather than enumerating with N tool calls. Naturally separates planning agents from lookup agents. (PR #157 §2a-C.)
 
+### Future: Concurrent Seasons (Multi-Season Evaluation)
+
+When the subnet runs multiple concurrent seasons (e.g. S1 incident response + S2 code fix + S3 data analysis), each season is an independent contest with its own scoring and leaderboard. Miners can compete in one or many.
+
+**Pack format extension:**
+
+```json
+{
+  "schema_version": 2,
+  "skills": {
+    "incident_response": { "SKILL.md": "..." },
+    "codebase_fix": { "SKILL.md": "..." }
+  }
+}
+```
+
+One pack, one hash, one URL. The validator extracts the right SKILL.md per season. A miner who only competes in S1 submits only the `incident_response` skill. A miner competing in all seasons submits all of them.
+
+**Scoring:** Each season produces an independent `final_score`. Weight allocation across seasons is governance-configured (e.g. S1 gets 50% of emissions, S2 gets 30%, S3 gets 20%). A miner's total weight is the sum of their per-season weights.
+
+**On-chain:** The commitment format doesn't change — still `{pack_hash}|{pack_url}`. The pack just contains more skills. The `scoring_version` field (derived from sandbox major version) ensures validators evaluating different scenario sets don't mix results.
+
+**Implementation:** The validator iterates over the `skills` dict, runs each season's eval independently (different sandbox scenarios, different judges), and aggregates. Each season maps to a scenario pool in the sandbox image. Adding a new season = adding scenarios to the sandbox + setting the weight allocation.
+
 ---
 
 ## §6a: Prior Art — ClawsBench Analysis

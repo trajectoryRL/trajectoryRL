@@ -116,8 +116,8 @@ class TestSessionResultScoring:
 # ---------------------------------------------------------------------------
 
 class TestConfigWiring:
-    def test_default_harness_is_auto(self):
-        assert ValidatorConfig.evaluation_harness == "auto"
+    def test_default_harness_is_trajectory_sandbox(self):
+        assert ValidatorConfig.evaluation_harness == "trajectory-sandbox"
 
     def test_season1_config_fields_exist(self):
         assert hasattr(ValidatorConfig, "evaluation_harness")
