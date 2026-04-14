@@ -955,31 +955,50 @@ class TrajectoryValidator:
         # Pre-eval gate during aggregation: disqualify miners rejected by the
         # platform before selecting a winner.  Mirrors the per-miner pre-eval
         # check in the evaluation loop.
-        pre_eval_disqualified = 0
-        for miner_hk in list(consensus_qualified.keys()):
-            pack_hash = self._eval_pack_hash.get(miner_hk)
-            if pack_hash is None:
-                continue
-            pre_eval_result = await pre_eval(
-                miner_hk,
-                pack_hash,
-                wallet=self.wallet,
+        if os.getenv("TRAJECTORYRL_PRE_EVAL_ENABLED", "1") != "0":
+            miner_commitments = fetch_all_commitments(
+                self.subtensor, self.config.netuid, self.metagraph,
             )
-            if pre_eval_result is not None and not pre_eval_result.get("allowed", True):
-                reason = pre_eval_result.get("reason", "unknown")
-                consensus_qualified[miner_hk] = False
-                pre_eval_disqualified += 1
-                logger.info(
-                    "Window %d: miner %s pre-eval rejected during "
-                    "aggregation (reason=%s) — marked disqualified",
-                    window.window_number, miner_hk[:8], reason,
-                )
-        if pre_eval_disqualified:
-            logger.info(
-                "Window %d: %d miner(s) disqualified by pre-eval "
-                "during aggregation",
-                window.window_number, pre_eval_disqualified,
-            )
+            hk_to_commitment: Dict[str, MinerCommitment] = {
+                c.hotkey: c for c in miner_commitments
+            }
+
+            # Build list of miners to check (must have a commitment on chain)
+            miners_to_check = [
+                (miner_hk, hk_to_commitment[miner_hk])
+                for miner_hk in consensus_qualified
+                if miner_hk in hk_to_commitment
+            ]
+
+            # Batch pre-eval calls concurrently
+            if miners_to_check:
+                results = await asyncio.gather(*(
+                    pre_eval(
+                        miner_hk,
+                        commitment.pack_hash,
+                        commitment.pack_url,
+                        wallet=self.wallet,
+                    )
+                    for miner_hk, commitment in miners_to_check
+                ))
+
+                pre_eval_disqualified = 0
+                for (miner_hk, _), pre_eval_result in zip(miners_to_check, results):
+                    if pre_eval_result is not None and not pre_eval_result.get("allowed", True):
+                        reason = pre_eval_result.get("reason", "unknown")
+                        consensus_qualified[miner_hk] = False
+                        pre_eval_disqualified += 1
+                        logger.info(
+                            "Window %d: miner %s pre-eval rejected during "
+                            "aggregation (reason=%s) — marked disqualified",
+                            window.window_number, miner_hk[:8], reason,
+                        )
+                if pre_eval_disqualified:
+                    logger.info(
+                        "Window %d: %d miner(s) disqualified by pre-eval "
+                        "during aggregation",
+                        window.window_number, pre_eval_disqualified,
+                    )
 
         self._consensus_window = window.window_number
 
