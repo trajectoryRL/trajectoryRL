@@ -45,7 +45,7 @@ One install gives any agent (Claude Code, Cursor, Codex, OpenClaw, Hermes, Manus
 ```
 
 - **No server required** — Miners upload packs to any HTTP endpoint and commit metadata on-chain. No public IP, no uptime needed.
-- **Two-phase evaluation** — [ClawBench](https://github.com/trajectoryRL/clawbench) scenarios with fixed fixtures; LLM-as-judge scores trajectories against natural-language criteria (Phase 1: pack integrity, Phase 2: trajectory quality)
+- **Season 1 evaluation** — Agent SSHes into isolated sandbox with mock services (email, Slack, Notion, calendar, Gitea). 100% LLM judge scoring across 4 episodes. Quality-based competition.
 - **Content-addressed** — Packs identified by SHA256 hash, verified against on-chain commitment
 - **Winner-take-all** — Best miner gets 100% of rewards; first-mover advantage protects early innovators
 - **Anti-copy** — On-chain block timestamps + NCD similarity detection + first-mover threshold (delta=0.10)
@@ -146,9 +146,9 @@ The Docker container reads wallet keyfiles from the mounted `~/.bittensor/wallet
 
 See [VALIDATOR_OPERATIONS.md](VALIDATOR_OPERATIONS.md) for cost model, auto-update details, and operational guidance.
 
-### For Miners
+### For Miners (Season 1)
 
-Mining means writing **policy packs** — system prompts, tool usage rules, and stop conditions — that make AI agents perform tasks safely and cheaply. No GPU, no server, no uptime required.
+Mining means writing a **SKILL.md** — instructions and strategies that teach an AI agent how to handle operational scenarios. The agent SSHes into an isolated sandbox with mock services, executes tasks, and gets scored by an LLM judge on quality. No GPU, no server, no uptime required.
 
 > **IP Notice:** All policy packs submitted to TrajectoryRL are published to public repositories and licensed under the [MIT License](LICENSE). By submitting a pack, you agree that your submission is freely available for anyone — including TrajectoryRL, other miners, and third parties — to use, modify, and redistribute. Do not submit content you are not willing to release publicly under MIT.
 
@@ -161,66 +161,32 @@ btcli wallet create --wallet-name my-miner
 btcli subnets register --wallet-name my-miner --hotkey default --netuid 11
 ```
 
-#### 2. Configure environment
+#### 2. Write your SKILL.md and submit
 
 ```bash
-cat > .env.miner <<'EOF'
-WALLET_NAME=my-miner
-WALLET_HOTKEY=default
-NETUID=11
-NETWORK=finney
-LLM_API_KEY=your-api-key
-LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4/
-LLM_MODEL=zhipu/glm-5.1
-EOF
+pip install trajrl
+
+# Build pack from your SKILL.md
+trajrl pack build --skill-md ./SKILL.md
+
+# Submit on-chain
+trajrl pack submit --url https://your-host.com/pack.json
 ```
 
-> **Tip:** Any OpenAI-compatible provider works. For OpenRouter, use `LLM_BASE_URL=https://openrouter.ai/api/v1` and `LLM_MODEL=zhipu/glm-5.1`.
-
-#### 3. Start mining
+#### 3. Test locally (optional)
 
 ```bash
-git clone https://github.com/trajectoryRL/trajectoryRL.git
-cd trajectoryRL
-pip install -e .
-
-# Run in default mode: generates AGENTS.md → builds pack → uploads → submits
-python neurons/miner.py run --mode default
+git clone https://github.com/trajectoryRL/trajectory-sandbox.git
+cd trajectory-sandbox
+pip install -e ".[dev]"
+make build                # build sandbox + agent Docker images
+cp .env.example .env      # add your LLM API key
+make test-hermes          # run one episode with real agent + real judge
 ```
 
-> **Note**: Simply letting the LLM randomly generate AGENTS.md may not get you a good score. You need to actively optimize and improve your policy pack — study the ClawBench scenarios, understand what makes an agent perform well, and iteratively refine your prompts, tool rules, and stop conditions.
+See [MINER_GUIDE_S1.md](MINER_GUIDE_S1.md) for the full guide: SKILL.md authoring, sandbox environment, scoring, and tips.
 
-#### 4. Manual operations (optional)
-
-```bash
-# Build pack from your own AGENTS.md
-python neurons/miner.py build --agents-md ./AGENTS.md -o pack.json
-
-# Validate pack locally
-python neurons/miner.py validate pack.json
-
-# Check on-chain status
-python neurons/miner.py status
-```
-
-#### 5. Local testing with ClawBench
-
-```bash
-cd clawbench
-pip install -e .
-# Set CLAWBENCH_LLM_API_KEY, CLAWBENCH_LLM_BASE_URL, CLAWBENCH_DEFAULT_MODEL in .env
-# Example Zhipu:      CLAWBENCH_LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4/, CLAWBENCH_DEFAULT_MODEL=zhipu/glm-5.1
-# Example Chutes:     CLAWBENCH_LLM_BASE_URL=https://llm.chutes.ai/v1,              CLAWBENCH_DEFAULT_MODEL=chutes/zai-org/GLM-5.1-TEE
-# Example OpenRouter: CLAWBENCH_LLM_BASE_URL=https://openrouter.ai/api/v1,           CLAWBENCH_DEFAULT_MODEL=openrouter/z-ai/glm-5.1
-
-# Test a single scenario
-python scripts/run_episode.py --scenario inbox_triage --variant optimized --json
-
-# Test all scenarios
-python scripts/run_batch.py
-```
-
-See [MINER_OPERATIONS.md](MINER_OPERATIONS.md) for full details: automated mode, S3 upload, pack format, and scoring targets.
+> **v4.0 miners**: The previous AGENTS.md + ClawBench flow is documented in [MINER_OPERATIONS.md](MINER_OPERATIONS.md). Season 1 replaces this with SKILL.md + trajectory-sandbox.
 
 ## trajrl — consume what the playground produces
 
@@ -239,10 +205,13 @@ Source, skill catalog, and full documentation: https://github.com/trajectoryRL/t
 
 ## Documentation
 
+- **[Season 1 Miner Guide](MINER_GUIDE_S1.md)** — SKILL.md authoring, sandbox environment, scoring, and submission
+- **[Season 1 Spec](seasons/self_learning_s1.md)** — Design doc: sandbox architecture, scoring formula, scenarios
+- **[trajectory-sandbox](https://github.com/trajectoryRL/trajectory-sandbox)** — SSH sandbox for S1 evaluations (mock services, LLM judge, Docker)
 - **[Incentive Mechanism](INCENTIVE_MECHANISM.md)** — Scoring, rewards, winner-take-all, and anti-copy protection
 - **[Validator Operations](VALIDATOR_OPERATIONS.md)** — Cost model, auto-updates, and operational guidance
-- **[Miner Operations](MINER_OPERATIONS.md)** — Pack format, run modes, local testing, and submission workflow
-- **[ClawBench](https://github.com/trajectoryRL/clawbench)** — Evaluation framework (scenarios, fixtures, scoring)
+- **[Miner Operations (v4.0)](MINER_OPERATIONS.md)** — Legacy: AGENTS.md pack format, ClawBench testing
+- **[ClawBench (v4.0)](https://github.com/trajectoryRL/clawbench)** — Legacy evaluation framework
 - **[trajrl](https://github.com/trajectoryRL/trajrl)** — Official CLI delivering the subnet's skills to end users
 
 ## Community
@@ -258,4 +227,4 @@ All miner-submitted policy packs are public and released under the same MIT Lice
 
 ---
 
-**Built on [Bittensor](https://bittensor.com)** | **Powered by [ClawBench](https://github.com/trajectoryRL/clawbench)**
+**Built on [Bittensor](https://bittensor.com)** | **Season 1: [trajectory-sandbox](https://github.com/trajectoryRL/trajectory-sandbox)**
