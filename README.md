@@ -24,16 +24,15 @@ One install gives any agent (Claude Code, Cursor, Codex, OpenClaw, Hermes, Manus
 │                                                              │
 │  MINERS                              VALIDATORS              │
 │  ┌───────────────┐                   ┌───────────────────┐   │
-│  │ Write SKILL.md│   on-chain        │ Read commitments  │   │
-│  │ Upload pack   │   commitment      │ from chain        │   │
-│  │ to public URL │─────────────────> │                   │   │
-│  │               │                   │ Fetch packs,      │   │
-│  └───────────────┘                   │ verify hash       │   │
+│  │ Upload        │   on-chain        │ Read commitments  │   │
+│  │ pack.json to  │   commitment      │ from chain        │   │
+│  │ public HTTP   │─────────────────> │                   │   │
+│  │ endpoint      │                   │ Fetch packs via   │   │
+│  └───────────────┘                   │ HTTP, verify      │   │
+│        │                             │ hash + timestamp  │   │
 │        │                             │                   │   │
 │        │                             │ Evaluate via      │   │
-│        │                             │ TrajRL-Bench      │   │
-│        │                             │ (SSH sandbox +    │   │
-│        │                             │  LLM judge)       │   │
+│        │                             │ ClawBench         │   │
 │        │                             └───────────────────┘   │
 │        │                                      │              │
 │        │                                      │ set_weights  │
@@ -45,39 +44,113 @@ One install gives any agent (Claude Code, Cursor, Codex, OpenClaw, Hermes, Manus
 └──────────────────────────────────────────────────────────────┘
 ```
 
-- **No server required** — Miners upload packs to any HTTP endpoint and commit on-chain. No GPU, no uptime needed.
-- **Quality-based competition** — Agent SSHes into isolated sandbox with mock services. 100% LLM judge scoring across 4 episodes. Best quality wins.
+- **No server required** — Miners upload packs to any HTTP endpoint and commit metadata on-chain. No public IP, no uptime needed.
+- **Two-phase evaluation** — [ClawBench](https://github.com/trajectoryRL/clawbench) scenarios with fixed fixtures; LLM-as-judge scores trajectories against natural-language criteria (Phase 1: pack integrity, Phase 2: trajectory quality)
 - **Content-addressed** — Packs identified by SHA256 hash, verified against on-chain commitment
 - **Winner-take-all** — Best miner gets 100% of rewards; first-mover advantage protects early innovators
-- **Anti-copy** — NCD similarity detection + first-mover threshold
+- **Anti-copy** — On-chain block timestamps + NCD similarity detection + first-mover threshold (delta=0.10)
+
+See [INCENTIVE_MECHANISM.md](INCENTIVE_MECHANISM.md) for full scoring, rewards, and anti-gaming details.
+
+### Example ROI (1,000 tasks/day)
+
+```
+Unoptimized GLM-5.1:                       $12,300/month
+
+Stage 1 — Prompt optimization (AGENTS.md tuning):
+  Optimized prompts + stop rules:         $3,300/month  (73% reduction)
+
+Stage 2 — Hybrid routing (AGENTS.md + injected skills):
+  Multi-LLM dynamic routing:               $900/month  (93% reduction)
+    ├─ Qwen 3.5 (Alibaba) handles 40% of sub-tasks (tool calls, lookups)
+    ├─ GLM-5.1 (Z.ai) handles 25% (structured extraction, formatting)
+    ├─ Gemini 3 Flash (Google) handles 20% (search, summarization)
+    ├─ GPT-5.2 (OpenAI) handles 10% (reasoning, drafting)
+    └─ Claude Opus 4.6 (Anthropic) handles 5% (complex judgment calls)
+```
 
 ## Quick Start
 
 ### For Validators
 
-Validators run via Docker with automatic updates via Watchtower. The validator pulls the latest TrajRL-Bench image before each eval cycle — new scenarios are picked up automatically.
+Validators run via Docker with automatic updates from GHCR via Watchtower. When new code is pushed to `prod`, GitHub Actions builds a new image and Watchtower auto-pulls and restarts within 5 minutes.
+
+#### 1. Prerequisites (one-time)
 
 ```bash
-# 1. Create wallet + register
+# Install btcli
 pip install bittensor-cli
+
+# Create or import your wallet
 btcli wallet create --wallet-name my-validator
+
+# Register hotkey on SN11 (~0.2 TAO burn fee)
 btcli subnets register --wallet-name my-validator --hotkey default --netuid 11
+
+# Stake alpha so your weights count (must be top 64 by stake for validator permit)
 btcli stake add --wallet-name my-validator --hotkey default --netuid 11 --amount 100
+```
 
-# 2. Configure
-cp .env.validator.example .env.validator
-# Edit: set WALLET_NAME, CLAWBENCH_LLM_API_KEY, etc.
+#### 2. Configure environment
 
-# 3. Start
+```bash
+cat > .env.validator <<'EOF'
+WALLET_NAME=my-validator
+WALLET_HOTKEY=default
+NETUID=11
+NETWORK=finney
+CLAWBENCH_LLM_API_KEY=your-api-key
+CLAWBENCH_LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4/
+CLAWBENCH_DEFAULT_MODEL=zhipu/glm-5.1
+EOF
+```
+
+**Supported providers** (any OpenAI-compatible API works):
+
+| Provider | `CLAWBENCH_LLM_BASE_URL` | `CLAWBENCH_DEFAULT_MODEL` |
+|----------|--------------------------|---------------------------|
+| [Zhipu AI](https://bigmodel.cn) (default) | `https://open.bigmodel.cn/api/paas/v4` | `zhipu/glm-5.1` |
+| [Chutes](https://chutes.ai) | `https://llm.chutes.ai/v1` | `chutes/zai-org/GLM-5.1-TEE` |
+| [OpenRouter](https://openrouter.ai) | `https://openrouter.ai/api/v1` | `openrouter/z-ai/glm-5.1` |
+
+| Variable | Required | Description |
+|----------|:--------:|-------------|
+| `WALLET_NAME` | Yes | Bittensor wallet name |
+| `WALLET_HOTKEY` | Yes | Hotkey name (usually `default`) |
+| `NETUID` | Yes | Subnet UID (`11`) |
+| `NETWORK` | Yes | `finney`, `test`, or `local` |
+| `CLAWBENCH_LLM_API_KEY` | Yes | API key for the LLM provider (e.g. [Zhipu AI](https://bigmodel.cn), [Chutes](https://chutes.ai), [OpenRouter](https://openrouter.ai)) |
+| `CLAWBENCH_LLM_BASE_URL` | Yes | Base URL for the OpenAI-compatible API |
+| `CLAWBENCH_DEFAULT_MODEL` | Yes | LLM model for evaluation (default: `zhipu/glm-5.1`) |
+| `JUDGE_MODEL` | No | LLM model for judge (defaults to `CLAWBENCH_DEFAULT_MODEL`) |
+| `JUDGE_API_KEY` | No | API key for judge (defaults to `CLAWBENCH_LLM_API_KEY`) |
+| `JUDGE_BASE_URL` | No | Base URL for judge (defaults to `CLAWBENCH_LLM_BASE_URL`) |
+
+#### 3. Start validator
+
+```bash
+# Start validator + Watchtower (auto-updates from GHCR)
 docker compose -f docker/docker-compose.validator.yml --env-file .env.validator up -d
+
+# View logs
 docker compose -f docker/docker-compose.validator.yml logs -f validator
 ```
 
-See [.env.validator.example](.env.validator.example) for all config options.
+The Docker container reads wallet keyfiles from the mounted `~/.bittensor/wallets/` directory. No btcli is needed inside the container.
+
+> **Tip:** Watchtower checks for new images every 5 minutes. To update immediately:
+> ```bash
+> docker compose -f docker/docker-compose.validator.yml pull
+> docker compose -f docker/docker-compose.validator.yml --env-file .env.validator up -d
+> ```
+
+See [VALIDATOR_OPERATIONS.md](VALIDATOR_OPERATIONS.md) for cost model, auto-update details, and operational guidance.
 
 ### For Miners
 
-Mining means writing a **SKILL.md** -- instructions and strategies that teach an AI agent how to handle operational scenarios. The agent SSHes into an isolated sandbox with mock services, executes tasks, and gets scored by an LLM judge on quality. No GPU, no server, no uptime required.
+Mining means writing **policy packs** — system prompts, tool usage rules, and stop conditions — that make AI agents perform tasks safely and cheaply. No GPU, no server, no uptime required.
+
+> **IP Notice:** All policy packs submitted to TrajectoryRL are published to public repositories and licensed under the [MIT License](LICENSE). By submitting a pack, you agree that your submission is freely available for anyone — including TrajectoryRL, other miners, and third parties — to use, modify, and redistribute. Do not submit content you are not willing to release publicly under MIT.
 
 #### 1. Prerequisites (one-time)
 
@@ -88,30 +161,66 @@ btcli wallet create --wallet-name my-miner
 btcli subnets register --wallet-name my-miner --hotkey default --netuid 11
 ```
 
-#### 2. Write your SKILL.md and submit
+#### 2. Configure environment
 
 ```bash
-pip install trajrl
-
-# Build pack from your SKILL.md
-trajrl pack build --skill-md ./SKILL.md
-
-# Submit on-chain
-trajrl pack submit --url https://your-host.com/pack.json
+cat > .env.miner <<'EOF'
+WALLET_NAME=my-miner
+WALLET_HOTKEY=default
+NETUID=11
+NETWORK=finney
+LLM_API_KEY=your-api-key
+LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4/
+LLM_MODEL=zhipu/glm-5.1
+EOF
 ```
 
-#### 3. Test locally (optional)
+> **Tip:** Any OpenAI-compatible provider works. For OpenRouter, use `LLM_BASE_URL=https://openrouter.ai/api/v1` and `LLM_MODEL=zhipu/glm-5.1`.
+
+#### 3. Start mining
 
 ```bash
-git clone https://github.com/trajectoryRL/trajrl-bench.git
-cd trajrl-bench
-pip install -e ".[dev]"
-make build                # build sandbox + agent Docker images
-cp .env.example .env      # add your LLM API key
-make test-hermes          # run one episode with real agent + real judge
+git clone https://github.com/trajectoryRL/trajectoryRL.git
+cd trajectoryRL
+pip install -e .
+
+# Run in default mode: generates AGENTS.md → builds pack → uploads → submits
+python neurons/miner.py run --mode default
 ```
 
-See [MINER_GUIDE_S1.md](MINER_GUIDE_S1.md) for the full guide: SKILL.md authoring, sandbox environment, scoring, and tips.
+> **Note**: Simply letting the LLM randomly generate AGENTS.md may not get you a good score. You need to actively optimize and improve your policy pack — study the ClawBench scenarios, understand what makes an agent perform well, and iteratively refine your prompts, tool rules, and stop conditions.
+
+#### 4. Manual operations (optional)
+
+```bash
+# Build pack from your own AGENTS.md
+python neurons/miner.py build --agents-md ./AGENTS.md -o pack.json
+
+# Validate pack locally
+python neurons/miner.py validate pack.json
+
+# Check on-chain status
+python neurons/miner.py status
+```
+
+#### 5. Local testing with ClawBench
+
+```bash
+cd clawbench
+pip install -e .
+# Set CLAWBENCH_LLM_API_KEY, CLAWBENCH_LLM_BASE_URL, CLAWBENCH_DEFAULT_MODEL in .env
+# Example Zhipu:      CLAWBENCH_LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4/, CLAWBENCH_DEFAULT_MODEL=zhipu/glm-5.1
+# Example Chutes:     CLAWBENCH_LLM_BASE_URL=https://llm.chutes.ai/v1,              CLAWBENCH_DEFAULT_MODEL=chutes/zai-org/GLM-5.1-TEE
+# Example OpenRouter: CLAWBENCH_LLM_BASE_URL=https://openrouter.ai/api/v1,           CLAWBENCH_DEFAULT_MODEL=openrouter/z-ai/glm-5.1
+
+# Test a single scenario
+python scripts/run_episode.py --scenario inbox_triage --variant optimized --json
+
+# Test all scenarios
+python scripts/run_batch.py
+```
+
+See [MINER_OPERATIONS.md](MINER_OPERATIONS.md) for full details: automated mode, S3 upload, pack format, and scoring targets.
 
 ## trajrl — consume what the playground produces
 
@@ -130,10 +239,11 @@ Source, skill catalog, and full documentation: https://github.com/trajectoryRL/t
 
 ## Documentation
 
-- **[Miner Guide](MINER_GUIDE_S1.md)** — SKILL.md authoring, sandbox environment, scoring, and submission
-- **[Season 1 Spec](seasons/self_learning_s1.md)** — Design doc: sandbox architecture, scoring formula, scenarios
-- **[TrajRL-Bench](https://github.com/trajectoryRL/trajrl-bench)** — Agent skills benchmark (mock services, LLM judge, Docker)
-- **[trajrl CLI](https://github.com/trajectoryRL/trajrl)** — Install and use skills produced by the subnet
+- **[Incentive Mechanism](INCENTIVE_MECHANISM.md)** — Scoring, rewards, winner-take-all, and anti-copy protection
+- **[Validator Operations](VALIDATOR_OPERATIONS.md)** — Cost model, auto-updates, and operational guidance
+- **[Miner Operations](MINER_OPERATIONS.md)** — Pack format, run modes, local testing, and submission workflow
+- **[ClawBench](https://github.com/trajectoryRL/clawbench)** — Evaluation framework (scenarios, fixtures, scoring)
+- **[trajrl](https://github.com/trajectoryRL/trajrl)** — Official CLI delivering the subnet's skills to end users
 
 ## Community
 
@@ -148,4 +258,4 @@ All miner-submitted policy packs are public and released under the same MIT Lice
 
 ---
 
-**Built on [Bittensor](https://bittensor.com)** | **Season 1: [trajrl-bench](https://github.com/trajectoryRL/trajrl-bench)**
+**Built on [Bittensor](https://bittensor.com)** | **Powered by [ClawBench](https://github.com/trajectoryRL/clawbench)**

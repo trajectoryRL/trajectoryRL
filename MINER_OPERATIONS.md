@@ -1,9 +1,7 @@
-# Miner Operations Guide (v4.0 -- Legacy)
+# Miner Operations Guide
 
 **Subnet**: SN11 (TrajectoryRL)
 **Date**: 2026-03-04
-
-> **Season 1 is live.** This guide covers the v4.0 ClawBench / AGENTS.md flow. For Season 1 (SKILL.md, SSH sandbox, quality-based scoring), see **[MINER_GUIDE_S1.md](MINER_GUIDE_S1.md)**.
 
 > For mechanism design and scoring rules, see [INCENTIVE_MECHANISM.md](INCENTIVE_MECHANISM.md).
 
