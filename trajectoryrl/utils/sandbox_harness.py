@@ -224,9 +224,12 @@ class TrajectorySandboxHarness:
             logger.warning("Failed to pull latest sandbox image: %s (using cached)", e)
 
     def _pull_sync(self) -> None:
-        logger.info("Pulling latest sandbox image: %s", self._sandbox_image)
-        self.client.images.pull(self._sandbox_image)
-        logger.info("Sandbox image updated")
+        for image in [self._sandbox_image, self._harness_image]:
+            try:
+                logger.info("Pulling latest image: %s", image)
+                self.client.images.pull(image)
+            except Exception as e:
+                logger.warning("Failed to pull %s: %s (using cached)", image, e)
 
     async def evaluate_miner(
         self,
