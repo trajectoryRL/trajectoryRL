@@ -94,8 +94,8 @@ The validator spawns **two ephemeral sibling containers** per evaluation via Doc
 | Container | Lifecycle | Network | Image |
 |-----------|-----------|---------|-------|
 | **Validator** | Persistent, Watchtower-managed | Host network | `ghcr.io/trajectoryrl/trajectoryrl:latest` |
-| **Harness** | Ephemeral (per-episode) | `eval_net` + LLM API egress only | `nousresearch/hermes-agent` (Hermes Agent for Season 1) |
-| **Sandbox** | Ephemeral (per-miner, persists across episodes) | `eval_net` only, no egress | `ghcr.io/trajectoryrl/sandbox:latest` |
+| **Harness** | Ephemeral (per-episode) | `eval_net` + LLM API egress only | `ghcr.io/trajectoryrl/hermes-agent:latest` |
+| **Sandbox** | Ephemeral (per-miner, persists across episodes) | `eval_net` only, no egress | `ghcr.io/trajectoryrl/trajrl-bench:latest` |
 
 **Why two eval containers (harness + sandbox):**
 
