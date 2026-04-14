@@ -952,6 +952,35 @@ class TrajectoryValidator:
             min_validators_qualified=self.config.min_validators_qualified,
         )
 
+        # Pre-eval gate during aggregation: disqualify miners rejected by the
+        # platform before selecting a winner.  Mirrors the per-miner pre-eval
+        # check in the evaluation loop.
+        pre_eval_disqualified = 0
+        for miner_hk in list(consensus_qualified.keys()):
+            pack_hash = self._eval_pack_hash.get(miner_hk)
+            if pack_hash is None:
+                continue
+            pre_eval_result = await pre_eval(
+                miner_hk,
+                pack_hash,
+                wallet=self.wallet,
+            )
+            if pre_eval_result is not None and not pre_eval_result.get("allowed", True):
+                reason = pre_eval_result.get("reason", "unknown")
+                consensus_qualified[miner_hk] = False
+                pre_eval_disqualified += 1
+                logger.info(
+                    "Window %d: miner %s pre-eval rejected during "
+                    "aggregation (reason=%s) — marked disqualified",
+                    window.window_number, miner_hk[:8], reason,
+                )
+        if pre_eval_disqualified:
+            logger.info(
+                "Window %d: %d miner(s) disqualified by pre-eval "
+                "during aggregation",
+                window.window_number, pre_eval_disqualified,
+            )
+
         self._consensus_window = window.window_number
 
         # Build hotkey → UID mapping (used by winner selection and logging)
