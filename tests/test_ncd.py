@@ -266,6 +266,7 @@ class TestPRTestPlan:
         mock_subtensor.get_current_block.return_value = 100000
 
         mock_metagraph = MagicMock()
+        mock_metagraph.n = 2
         mock_metagraph.hotkeys = ["hk_0", "hk_1"]
         mock_metagraph.validator_permit = [False, False]
         mock_metagraph.S = [100.0, 100.0]
@@ -284,6 +285,14 @@ class TestPRTestPlan:
         v._hotkey_uid_map = {}
         v.scenarios = {"client_escalation": {"weight": 1.0}}
         v.wallet = MagicMock()
+        v.last_weight_block = 0
+        v._sandbox_harness = None
+        v._disqualified_miners = {}
+
+        # Winner state (used by _set_winner_weights, called in _execute_evaluation_cycle)
+        from trajectoryrl.utils.winner_state import WinnerState
+        v._winner_state = WinnerState()
+        v._winner_state_path = "/tmp/test_winner_state.json"
 
         # Simulate stale data from a previous cycle: a deregistered miner
         stale_pack = _pack("# Stale miner policy that should be cleared")
@@ -303,6 +312,8 @@ class TestPRTestPlan:
             TrajectoryValidator, "_check_llm_keys", return_value=True
         ), patch.object(
             TrajectoryValidator, "_get_validator_log_offset", return_value=0,
+        ), patch.object(
+            v, "_set_winner_weights", new_callable=AsyncMock,
         ), patch(
             "trajectoryrl.base.validator.fetch_all_commitments",
             return_value={},

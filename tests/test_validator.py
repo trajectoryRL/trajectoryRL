@@ -46,7 +46,7 @@ from trajectoryrl.utils.eval_window import (
 )
 from trajectoryrl.utils.consensus import (
     ConsensusPayload, ConsensusPointer,
-    verify_payload_integrity, CONSENSUS_PROTOCOL_VERSION,
+    verify_payload_integrity, CONSENSUS_PROTOCOL_VERSION, SCORING_VERSION,
 )
 from trajectoryrl.utils.consensus_filter import (
     run_filter_pipeline, FilterStats, ValidatedSubmission,
@@ -879,7 +879,7 @@ class TestClawBenchHarness:
             assert list(workspace.iterdir()) == []
 
     def test_evaluate_pack_missing_scenario(self, harness, valid_pack):
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             harness.evaluate_pack(
                 pack=valid_pack,
                 scenario_name="nonexistent_scenario",
@@ -967,7 +967,7 @@ class TestPackFetcher:
                 fetcher, "_fetch_pack",
                 new_callable=AsyncMock, return_value=pack_json,
             ):
-                result = asyncio.get_event_loop().run_until_complete(
+                result = asyncio.run(
                     fetcher.verify_submission(
                         pack_url="https://trajrl.com/samples/pack.json",
                         pack_hash=pack_hash,
@@ -988,7 +988,7 @@ class TestPackFetcher:
                 fetcher, "_fetch_pack",
                 new_callable=AsyncMock, return_value=pack_json,
             ):
-                result = asyncio.get_event_loop().run_until_complete(
+                result = asyncio.run(
                     fetcher.verify_submission(
                         pack_url="https://trajrl.com/samples/pack.json",
                         pack_hash="f" * 64,
@@ -1007,7 +1007,7 @@ class TestPackFetcher:
                 fetcher, "_fetch_pack",
                 new_callable=AsyncMock, return_value=None,
             ):
-                result = asyncio.get_event_loop().run_until_complete(
+                result = asyncio.run(
                     fetcher.verify_submission(
                         pack_url="https://trajrl.com/samples/pack.json",
                         pack_hash="a" * 64,
@@ -1026,7 +1026,7 @@ class TestPackFetcher:
                 fetcher, "_fetch_pack",
                 new_callable=AsyncMock, return_value="not json {{{",
             ):
-                result = asyncio.get_event_loop().run_until_complete(
+                result = asyncio.run(
                     fetcher.verify_submission(
                         pack_url="https://trajrl.com/samples/pack.json",
                         pack_hash="a" * 64,
@@ -1053,7 +1053,7 @@ class TestPackFetcher:
                 fetcher, "_fetch_pack",
                 new_callable=AsyncMock,
             ) as mock_fetch:
-                result = asyncio.get_event_loop().run_until_complete(
+                result = asyncio.run(
                     fetcher.verify_submission(
                         pack_url="https://trajrl.com/samples/pack.json",
                         pack_hash=pack_hash,
@@ -1081,7 +1081,7 @@ class TestPackFetcher:
                 mock_client_instance.__aexit__ = AsyncMock(return_value=False)
                 MockClient.return_value = mock_client_instance
 
-                result = asyncio.get_event_loop().run_until_complete(
+                result = asyncio.run(
                     fetcher._fetch_pack("https://trajrl.com/samples/pack.json")
                 )
 
@@ -1108,7 +1108,7 @@ class TestPackFetcher:
                 mock_client_instance.__aexit__ = AsyncMock(return_value=False)
                 MockClient.return_value = mock_client_instance
 
-                result = asyncio.get_event_loop().run_until_complete(
+                result = asyncio.run(
                     fetcher._fetch_pack("https://trajrl.com/samples/pack.json")
                 )
 
@@ -1495,6 +1495,7 @@ class TestPerScenarioEMA:
             validator._miner_log_dir.mkdir(parents=True, exist_ok=True)
             validator._consensus_costs = {}
             validator._consensus_qualified = {}
+            validator._consensus_window = -1
             validator.scenarios = {
                 "client_escalation": {"weight": 1.5},
                 "morning_brief": {"weight": 1.0},
@@ -2343,7 +2344,7 @@ class TestConsensusFilter:
 
     def _make_submission(
         self, hotkey="val_a", window=42, protocol=1, version="0.1.0",
-        costs=None, qualified=None,
+        costs=None, qualified=None, scoring_version=SCORING_VERSION,
     ):
         if costs is None:
             costs = {"miner_x": 3.0}
@@ -2357,6 +2358,7 @@ class TestConsensusFilter:
             costs=costs,
             qualified=qualified,
             timestamp=1000,
+            scoring_version=scoring_version,
         )
         pointer = ConsensusPointer(
             protocol_version=protocol,
@@ -2865,30 +2867,32 @@ class TestConsensusCommitments:
 
     def test_format_consensus_commitment(self):
         result = format_consensus_commitment(1, 42, "QmXxx123")
-        assert result == "consensus:1|42|QmXxx123"
+        assert result == "consensus:1|42|1|QmXxx123"
 
     def test_format_with_gcs_url(self):
         url = "https://storage.googleapis.com/trajrl-consensus/sha256_abc.json"
         result = format_consensus_commitment(1, 42, url)
-        assert result == f"consensus:1|42|{url}"
+        assert result == f"consensus:1|42|1|{url}"
 
     def test_parse_consensus_commitment_ipfs(self):
-        raw = "consensus:1|42|QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
+        raw = "consensus:1|42|1|QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
         parsed = parse_consensus_commitment(raw)
         assert parsed is not None
-        pv, wn, addr = parsed
+        pv, wn, addr, sv = parsed
         assert pv == 1
         assert wn == 42
         assert addr == "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
+        assert sv == 1
 
     def test_parse_consensus_commitment_gcs(self):
-        raw = "consensus:1|42|https://storage.googleapis.com/trajrl/sha256_abc.json"
+        raw = "consensus:1|42|1|https://storage.googleapis.com/trajrl/sha256_abc.json"
         parsed = parse_consensus_commitment(raw)
         assert parsed is not None
-        pv, wn, addr = parsed
+        pv, wn, addr, sv = parsed
         assert pv == 1
         assert wn == 42
         assert addr == "https://storage.googleapis.com/trajrl/sha256_abc.json"
+        assert sv == 1
 
     def test_parse_consensus_commitment_invalid_prefix(self):
         assert parse_consensus_commitment("notconsensus:1|42|QmXxx") is None
@@ -2912,7 +2916,7 @@ class TestConsensusCommitments:
     def test_roundtrip(self):
         original = format_consensus_commitment(1, 99, "QmTestCID123")
         parsed = parse_consensus_commitment(original)
-        assert parsed == (1, 99, "QmTestCID123")
+        assert parsed == (1, 99, "QmTestCID123", 1)
 
     def test_is_consensus_commitment(self):
         assert is_consensus_commitment("consensus:1|42|QmXxx") is True
@@ -2936,12 +2940,13 @@ class TestConsensusCommitments:
         assert result[1] == "https://example.com/pack.json"
 
     def test_pipes_in_url_preserved(self):
-        """Content address with pipes should be handled (split maxsplit=2)."""
-        raw = "consensus:1|42|https://example.com/path?a=1|extra"
+        """Content address with pipes should be handled (split maxsplit=3)."""
+        raw = "consensus:1|42|1|https://example.com/path?a=1|extra"
         parsed = parse_consensus_commitment(raw)
         assert parsed is not None
-        _, _, addr = parsed
+        _, _, addr, sv = parsed
         assert addr == "https://example.com/path?a=1|extra"
+        assert sv == 1
 
 
 # ---------------------------------------------------------------------------

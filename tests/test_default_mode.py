@@ -221,6 +221,12 @@ class TestOSSStorage:
         assert req.get_header("Content-type") == "application/json"
 
 
+@pytest.fixture(autouse=True)
+def _set_llm_api_key(monkeypatch):
+    """Ensure has_api_key() returns True for all tests in this module."""
+    monkeypatch.setenv("CLAWBENCH_LLM_API_KEY", "sk-test-key")
+
+
 class TestRunDefaultFlow:
     """Integration test for the full _run_default loop."""
 

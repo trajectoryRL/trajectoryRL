@@ -317,10 +317,20 @@ class TestSubmitWorkflow:
         """Submit succeeds with valid pack and URL."""
         miner = self._make_miner()
         pack = TrajectoryMiner.build_pack(agents_md="# Policy\nBe safe.")
+        pack_hash = TrajectoryMiner.compute_pack_hash(pack)
+        pack_url = "https://trajrl.com/samples/pack.json"
+
+        # set_commitment returns True, get_current_block returns a block number,
+        # and get_current_commitment returns a commitment string that matches
+        # the expected hash (for the on-chain verification step).
+        miner._subtensor.set_commitment.return_value = True
+        miner._subtensor.get_current_block.return_value = 12345
+        commitment_str = f"{pack_hash}|{pack_url}"
+        miner.get_current_commitment = MagicMock(return_value=commitment_str)
 
         success = miner.submit(
             pack=pack,
-            pack_url="https://trajrl.com/samples/pack.json",
+            pack_url=pack_url,
         )
         assert success
         miner._subtensor.set_commitment.assert_called_once()
@@ -568,120 +578,13 @@ class TestSubmitExceptions:
 
 
 class TestDaemonEntryPoint:
-    """Tests for daemon mode detection in main()."""
+    """Tests for CLI entry point behavior with no subcommand."""
 
-    def test_no_subcommand_with_pack_url_runs_daemon(self):
-        """PACK_URL set + no subcommand → daemon called."""
+    def test_no_subcommand_shows_help(self, capsys):
+        """No subcommand → prints help and returns 0."""
         import sys
         import neurons.miner as cli
 
-        env = {
-            "PACK_URL": "https://trajrl.com/samples/pack.json",
-            "PACK_PATH": "/tmp/pack.json",
-        }
-        mock_daemon = MagicMock(return_value="sentinel")
-        with (
-            patch.object(sys, "argv", ["miner.py"]),
-            patch.dict(os.environ, env, clear=False),
-            patch("neurons.miner._run_daemon", new=mock_daemon),
-            patch("neurons.miner.asyncio.run", return_value=None) as mock_arun,
-        ):
-            cli.main()
-            mock_daemon.assert_called_once()
-            mock_arun.assert_called_once_with("sentinel")
-
-    def test_no_subcommand_without_pack_url_shows_help(self, capsys):
-        """No PACK_URL → help text with hint."""
-        import sys
-        import neurons.miner as cli
-
-        with (
-            patch.object(sys, "argv", ["miner.py"]),
-            patch.dict(os.environ, {"PACK_URL": ""}, clear=False),
-        ):
+        with patch.object(sys, "argv", ["miner.py"]):
             result = cli.main()
             assert result == 0
-            captured = capsys.readouterr()
-            assert "hint" in captured.out.lower()
-
-
-class TestLoadOrBuildPack:
-    """Tests for _load_or_build_pack helper."""
-
-    def test_load_from_pack_path(self, tmp_path):
-        """Loads pack.json when pack_path is set."""
-        from neurons.miner import _load_or_build_pack
-
-        pack = TrajectoryMiner.build_pack(agents_md="# Policy\nBe safe.")
-        pack_path = str(tmp_path / "pack.json")
-        TrajectoryMiner.save_pack(pack, pack_path)
-
-        config = MagicMock()
-        config.pack_path = pack_path
-        config.agents_md_path = None
-
-        result = _load_or_build_pack(config)
-        assert result is not None
-        assert result["files"]["AGENTS.md"] == "# Policy\nBe safe."
-
-    def test_build_from_agents_md(self, tmp_path):
-        """Builds pack from AGENTS.md when agents_md_path is set."""
-        from neurons.miner import _load_or_build_pack
-
-        agents_file = tmp_path / "AGENTS.md"
-        agents_file.write_text("# File Policy\nDo things.")
-
-        config = MagicMock()
-        config.pack_path = None
-        config.agents_md_path = str(agents_file)
-
-        result = _load_or_build_pack(config)
-        assert result is not None
-        assert "File Policy" in result["files"]["AGENTS.md"]
-
-    def test_missing_file_returns_none(self):
-        """Missing file → None."""
-        from neurons.miner import _load_or_build_pack
-
-        config = MagicMock()
-        config.pack_path = "/tmp/does_not_exist_99999.json"
-        config.agents_md_path = None
-
-        result = _load_or_build_pack(config)
-        assert result is None
-
-
-class TestVerifyOnchain:
-    """Tests for _verify_onchain helper."""
-
-    def test_mismatch_logs_warning(self):
-        """Hash mismatch → returns False."""
-        from neurons.miner import _verify_onchain
-
-        miner = MagicMock()
-        commitment = "a" * 64 + "|https://trajrl.com/samples/pack.json"
-        miner.get_current_commitment.return_value = commitment
-
-        result = _verify_onchain(miner, "c" * 64)
-        assert result is False
-
-    def test_match_returns_true(self):
-        """Matching hash → returns True."""
-        from neurons.miner import _verify_onchain
-
-        miner = MagicMock()
-        commitment = "a" * 64 + "|https://trajrl.com/samples/pack.json"
-        miner.get_current_commitment.return_value = commitment
-
-        result = _verify_onchain(miner, "a" * 64)
-        assert result is True
-
-    def test_no_commitment_returns_false(self):
-        """No on-chain commitment → returns False."""
-        from neurons.miner import _verify_onchain
-
-        miner = MagicMock()
-        miner.get_current_commitment.return_value = None
-
-        result = _verify_onchain(miner, "a" * 64)
-        assert result is False

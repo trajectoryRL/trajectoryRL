@@ -145,7 +145,8 @@ def generate_agents_md(
     Raises:
         ValueError: If generated content is empty.
     """
-    from .llm_client import generate
+    import anthropic
+    from .llm_client import resolve_api_key
 
     if previous_agents_md:
         user_message = IMPROVE_PROMPT.format(previous_agents_md=previous_agents_md)
@@ -157,14 +158,15 @@ def generate_agents_md(
 
     logger.info("Generating AGENTS.md with model=%s (improve=%s)", model, bool(previous_agents_md))
 
-    content = generate(
+    key = resolve_api_key(api_key)
+    client = anthropic.Anthropic(api_key=key)
+    response = client.messages.create(
         model=model,
         system=SYSTEM_PROMPT,
-        user_message=user_message,
+        messages=[{"role": "user", "content": user_message}],
         max_tokens=max_tokens,
-        api_key=api_key,
-        base_url=base_url,
     )
+    content = response.content[0].text
 
     # Strip code fences if the model wrapped the output
     content = re.sub(r"^```(?:markdown|md)?\s*\n", "", content)
