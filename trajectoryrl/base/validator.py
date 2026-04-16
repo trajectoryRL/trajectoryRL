@@ -1,20 +1,16 @@
 """TrajectoryRL Validator — Main validator implementation.
 
-Architecture (v4.0 — LLM-as-Judge):
+Architecture (Season 1 — trajrl-bench):
     1. Continuous evaluation loop with dual cadence:
        - eval_interval (~24h): re-evaluate all active packs
        - tempo (~72 min): compute weights from qualification + cost, set_weights
     2. Read on-chain commitments (subtensor.get_all_commitments)
     3. Fetch packs from miners' public HTTP URLs
-    4. NCD pairwise dedup (before ClawBench); schema validation in _evaluate_miner
-    5. Phase 1: LLM pack integrity analysis (static, cached by pack_hash)
-    6. Run ALL ClawBench scenarios (single episode per scenario)
-    7. Phase 2: LLM trajectory judge per scenario (replaces regex scoring)
-    8. Update per-scenario cost EMA (keyed by miner hotkey)
-    9. Set on-chain weights (winner-take-all / bootstrap by cost)
+    4. NCD pairwise dedup; schema validation in _evaluate_miner
+    5. Run trajrl-bench sandbox evaluation (SKILL.md packs, SSH sandbox, LLM judge)
+    6. Compute split-half delta scoring (quality-based)
+    7. Set on-chain weights (winner-take-all / bootstrap)
 
-Score EMA removed in v4.0 — qualification is a binary judge verdict.
-Cost EMA retained — cost genuinely varies across runs.
 Each validator operates independently — YC3 aggregates on-chain.
 """
 
@@ -25,20 +21,17 @@ import json
 import logging
 import os
 import time
-import yaml
+
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import bittensor as bt
 
-from ..utils.opp_schema import validate_opp_schema
 from ..utils.config import ValidatorConfig
-from ..utils.clawbench import ClawBenchHarness, EvaluationResult
 from ..utils.sandbox_harness import TrajectorySandboxHarness, SandboxEvaluationResult
 from ..scoring import TrajectoryScorer
 from ..utils.github import PackFetcher
-from ..utils.epoch_context import generate_epoch_context, render_context_preamble
 from ..utils.eval_window import (
     WindowConfig, WindowPhase, EvaluationWindow,
     compute_window, is_new_window, can_evaluate,
@@ -96,18 +89,16 @@ _SET_WEIGHTS_RETRY_DELAY = 12  # seconds; roughly 1 block interval
 
 
 class TrajectoryValidator:
-    """TrajectoryRL validator that evaluates policy packs using ClawBench.
+    """TrajectoryRL validator that evaluates SKILL.md packs via trajrl-bench.
 
-    The validator (v4.0):
+    Season 1 flow:
     1. Reads on-chain commitments from miners
     2. Fetches and verifies packs from miners' public HTTP URLs
-    3. NCD pairwise dedup before ClawBench (copiers rejected like integrity fail)
-    4. Phase 1: LLM pack integrity analysis (rejects gaming packs)
-    5. Runs ALL ClawBench scenarios
-    6. Phase 2: LLM trajectory judge per scenario (replaces regex scoring)
-    7. Updates per-scenario cost EMA (keyed by miner hotkey)
-    8. Sets on-chain weights (winner-take-all or bootstrap by cost)
-    9. Re-sets weights every tempo (~72 min) for convergence
+    3. NCD pairwise dedup (copiers rejected like integrity fail)
+    4. Runs trajrl-bench sandbox evaluation (SSH sandbox, LLM judge)
+    5. Computes split-half delta scoring (quality-based)
+    6. Sets on-chain weights (winner-take-all or bootstrap)
+    7. Re-sets weights every tempo (~72 min) for convergence
 
     Example:
         >>> config = ValidatorConfig.from_env()
@@ -145,31 +136,17 @@ class TrajectoryValidator:
                 config.network,
             )
 
-        logger.debug("Initializing ClawBench harness...")
-        self.harness = ClawBenchHarness(
-            clawbench_path=config.clawbench_path,
-            timeout=config.timeout_per_scenario,
-            clawbench_default_model=config.clawbench_default_model,
-            clawbench_api_key=config.clawbench_api_key,
-            clawbench_base_url=config.clawbench_base_url,
-        )
-
-        # Season 1: trajrl-bench harness
-        self._sandbox_harness: TrajectorySandboxHarness | None = None
-        if config.evaluation_harness == "trajrl-bench":
-            logger.info("Season 1 mode: initializing trajrl-bench harness")
-            self._sandbox_harness = TrajectorySandboxHarness(config)
-        self._evaluation_harness = config.evaluation_harness
+        logger.info("Initializing trajrl-bench sandbox harness...")
+        self._sandbox_harness = TrajectorySandboxHarness(config)
 
         self.scorer = TrajectoryScorer(
             consensus_epsilon=config.consensus_epsilon,
             bootstrap_threshold=config.bootstrap_threshold,
         )
 
-        # LLM-as-Judge (v4.0): defaults to same LLM as ClawBench if not set
-        judge_model = config.judge_model or config.clawbench_default_model
-        judge_api_key = config.judge_api_key or config.clawbench_api_key
-        judge_base_url = config.judge_base_url or config.clawbench_base_url
+        judge_model = config.judge_model or config.llm_model
+        judge_api_key = config.judge_api_key or config.llm_api_key
+        judge_base_url = config.judge_base_url or config.llm_base_url
         self._judge_model = judge_model
         self._judge_base_url = judge_base_url
         logger.debug("Initializing LLM judges (model=%s)...", judge_model)
@@ -276,15 +253,8 @@ class TrajectoryValidator:
         self._winner_state = load_winner_state(self._winner_state_path)
 
 
-        # Load scenarios
-        self.scenarios = self._load_scenarios()
-        logger.info(
-            f"Loaded {len(self.scenarios)} scenarios: "
-            f"{list(self.scenarios.keys())}"
-        )
-
-        # Compute scenario config hash for EMA invalidation on pool change
-        self._scenario_config_hash = self._compute_scenario_config_hash()
+        # Scenario config hash for EMA invalidation — driven by bench version
+        self._scenario_config_hash = "trajrl-bench"
 
         # Load persisted EMA state
         self._load_ema_state()
@@ -381,8 +351,8 @@ class TrajectoryValidator:
     # ------------------------------------------------------------------
 
     def _compute_scenario_config_hash(self) -> str:
-        """Hash the scenario configuration for detecting pool changes."""
-        config_str = json.dumps(sorted(self.scenarios.keys()))
+        """Hash the bench version for detecting configuration changes."""
+        config_str = f"trajrl-bench:{self._sandbox_harness.sandbox_version}"
         return hashlib.sha256(config_str.encode()).hexdigest()[:16]
 
     def _load_ema_state(self):
@@ -606,41 +576,21 @@ class TrajectoryValidator:
             self.scenario_qualified[hotkey].update(scenario_qualified)
 
     def compute_total_cost(self, hotkey: str) -> Optional[float]:
-        """Compute weighted average cost from per-scenario raw costs.
+        """Compute average cost across evaluated scenarios.
 
         Returns None if no cost data available.
         """
         costs = self.raw_costs.get(hotkey, {})
         if not costs:
             return None
-
-        scenario_weights = {
-            name: cfg.get("weight", 1.0)
-            for name, cfg in self.scenarios.items()
-        }
-
-        total_weight = 0.0
-        weighted_sum = 0.0
-        for scenario, cost in costs.items():
-            w = scenario_weights.get(scenario, 1.0)
-            weighted_sum += w * cost
-            total_weight += w
-
-        if total_weight == 0:
-            return None
-
-        return weighted_sum / total_weight
+        return sum(costs.values()) / len(costs)
 
     def is_fully_qualified(self, hotkey: str) -> bool:
-        """Check if a miner passes the qualification gate on all scenarios."""
+        """Check if a miner passes the qualification gate on all evaluated scenarios."""
         qualified = self.scenario_qualified.get(hotkey, {})
         if not qualified:
             return False
-        # Must have qualification data for all scenarios
-        for scenario_name in self.scenarios:
-            if not qualified.get(scenario_name, False):
-                return False
-        return True
+        return all(qualified.values())
 
     # ------------------------------------------------------------------
     # Setup helpers
@@ -682,18 +632,7 @@ class TrajectoryValidator:
         self._miner_loggers[hotkey] = mlog
         return mlog
 
-    def _load_scenarios(self) -> Dict[str, dict]:
-        scenarios = {}
-        for scenario_name in self.config.scenarios:
-            scenario_path = self.config.scenarios_path / f"{scenario_name}.yaml"
-            if not scenario_path.exists():
-                logger.warning(f"Scenario not found: {scenario_path}")
-                continue
-            with open(scenario_path) as f:
-                scenarios[scenario_name] = yaml.safe_load(f)
-        if not scenarios:
-            raise ValueError("No scenarios loaded!")
-        return scenarios
+    
 
     # ------------------------------------------------------------------
     # Static helpers
@@ -712,14 +651,13 @@ class TrajectoryValidator:
         """Send validator heartbeat every 10 minutes, independent of eval cycle."""
         while True:
             try:
-                harness = self._sandbox_harness
                 await heartbeat(
                     self.wallet,
                     last_set_weights_at=self._last_set_weights_at,
                     last_eval_at=self._last_eval_at,
-                    bench_image_hash=harness.bench_image_hash if harness else None,
-                    harness_image_hash=harness.harness_image_hash if harness else None,
-                    bench_version=harness.sandbox_version if harness else None,
+                    bench_image_hash=self._sandbox_harness.bench_image_hash,
+                    harness_image_hash=self._sandbox_harness.harness_image_hash,
+                    bench_version=self._sandbox_harness.sandbox_version,
                 )
             except Exception as e:
                 logger.warning("Heartbeat error: %s", e)
@@ -841,8 +779,7 @@ class TrajectoryValidator:
         if not scores_by_hotkey and not disqualified_by_hotkey:
             return None
 
-        harness = self._sandbox_harness
-        bench_ver = harness.sandbox_version if harness else "unknown"
+        bench_ver = self._sandbox_harness.sandbox_version
 
         return ConsensusPayload(
             protocol_version=self.config.consensus_protocol_version,
@@ -938,8 +875,7 @@ class TrajectoryValidator:
             if stake > 0:
                 validator_stakes[hotkey] = stake
 
-        harness = self._sandbox_harness
-        bench_ver = harness.sandbox_version if harness else "unknown"
+        bench_ver = self._sandbox_harness.sandbox_version
         min_stake = getattr(self.config, "min_validator_stake", 0.0)
         validated, stats = run_filter_pipeline(
             submissions=submissions,
@@ -1250,7 +1186,7 @@ class TrajectoryValidator:
         """Main validator loop with block-based window phases.
 
         Window phases (per eval_interval_blocks window):
-          - evaluation (0% - 80%):   run ClawBench, compute local cost EMA
+          - evaluation (0% - 80%):   run trajrl-bench, compute scores
           - propagation (80% - 90%): submit results to CAS, wait for others
           - aggregation (90% - 100%): read submissions, consensus, select winner
 
@@ -1429,8 +1365,8 @@ class TrajectoryValidator:
     # ------------------------------------------------------------------
 
     def _check_llm_keys(self) -> bool:
-        """Return True if a ClawBench LLM API key is configured."""
-        return bool(self.config.clawbench_api_key)
+        """Return True if an LLM API key is configured."""
+        return bool(self.config.llm_api_key)
 
     async def _prefetch_packs_and_ncd_gate(
         self,
@@ -1439,10 +1375,10 @@ class TrajectoryValidator:
     ) -> Dict[str, str]:
         """Fetch packs for eligible miners, run NCD dedup, cache packs for eval.
 
-        Miners marked as copiers (values map to originals) must not run ClawBench;
-        they are rejected in the main loop like integrity failures. Non-copiers
-        with a successful fetch get _hotkey_packs / _pack_by_hash populated so
-        _evaluate_miner hits verify_submission cache.
+        Miners marked as copiers (values map to originals) are rejected in the
+        main loop like integrity failures. Non-copiers with a successful fetch
+        get _hotkey_packs / _pack_by_hash populated so _evaluate_miner hits
+        verify_submission cache.
 
         Miners whose fetch fails are omitted from this NCD round but may still
         be evaluated later if _evaluate_miner can fetch them.
@@ -1456,14 +1392,11 @@ class TrajectoryValidator:
                 commitment.pack_url,
                 commitment.pack_hash,
             )
-            if not result.valid:
+            if not result.valid or result.pack_content is None:
                 logger.warning(
                     f"NCD prefetch: uid={uid} ({hk[:8]}…): "
                     f"{result.error or 'unknown'}"
                 )
-                continue
-            if result.pack_content is None:
-                # S1 text submission — not applicable for NCD dedup
                 continue
             pack_info[hk] = (
                 result.pack_content,
@@ -1525,7 +1458,7 @@ class TrajectoryValidator:
         """
         if not self._check_llm_keys():
             logger.warning(
-                "CLAWBENCH_LLM_API_KEY not set. "
+                "LLM_API_KEY not set. "
                 "Skipping evaluation, setting fallback weights to owner UID.",
             )
             await self._set_fallback_weights(
@@ -1542,25 +1475,19 @@ class TrajectoryValidator:
         self._disqualified_miners = {}
 
         # Pull latest sandbox image before eval (gets new scenarios + version)
-        if self._sandbox_harness:
-            await self._sandbox_harness.pull_latest()
-            # scoring_version = trajrl-bench major version (v3.0.1 → 3)
-            import trajectoryrl.utils.consensus as _consensus
-            _consensus_mod.SCORING_VERSION = self._sandbox_harness.scoring_version
-            logger.info("scoring_version=%d (bench_version=%s)",
-                        self._sandbox_harness.scoring_version,
-                        self._sandbox_harness.sandbox_version)
+        await self._sandbox_harness.pull_latest()
+        # scoring_version = trajrl-bench major version (v3.0.1 → 3)
+        import trajectoryrl.utils.consensus as _consensus
+        _consensus_mod.SCORING_VERSION = self._sandbox_harness.scoring_version
+        logger.info("scoring_version=%d (bench_version=%s)",
+                    self._sandbox_harness.scoring_version,
+                    self._sandbox_harness.sandbox_version)
 
         # Epoch seed for context variation
         epoch = current_block // self.config.eval_interval_blocks
         epoch_seed = self.compute_epoch_seed(epoch, self.config.netuid)
-        epoch_ctx = generate_epoch_context(epoch_seed)
-        context_preamble = render_context_preamble(epoch_ctx)
-        user_context = epoch_ctx.to_user_context()
-
         logger.debug(
-            f"Eval cycle: block={current_block}, seed={epoch_seed}, "
-            f"context=[{epoch_ctx.user_name}, {epoch_ctx.user_role}]"
+            f"Eval cycle: block={current_block}, seed={epoch_seed}"
         )
 
         # 1. Clear per-cycle pack caches to prevent stale entries from
@@ -1627,25 +1554,8 @@ class TrajectoryValidator:
                     f"Skipping eval (duplicate pack_hash={commitment.pack_hash[:12]})"
                 )
 
-        # 6. Evaluate miners
-        # Order scenarios hardest-first so weak packs fail fast and we
-        # skip the remaining (cheaper) scenarios, saving LLM tokens.
-        # Difficulty ranking based on empirical pass-rate data.
-        _SCENARIO_DIFFICULTY_ORDER = [
-            "morning_brief",
-            "inbox_to_action",
-            "client_escalation",
-            "team_standup",
-            "inbox_triage",
-        ]
-        eval_scenarios = sorted(
-            self.scenarios.keys(),
-            key=lambda s: (
-                _SCENARIO_DIFFICULTY_ORDER.index(s)
-                if s in _SCENARIO_DIFFICULTY_ORDER
-                else len(_SCENARIO_DIFFICULTY_ORDER)
-            ),
-        )
+        # 6. Evaluate miners (scenarios selected by sandbox image)
+        eval_scenarios: List[str] = []  # not used in S1 — sandbox picks scenario
         evaluated_count = 0
         attempted_count = 0
         skipped_interval_count = 0
@@ -1653,10 +1563,8 @@ class TrajectoryValidator:
         ncd_rejected_count = 0
         cached_count = 0
         total_eligible = len(active_commitments) - len(skip_uids)
-        total_scenarios = len(eval_scenarios)
         logger.info(
-            f"=== Eval cycle: {total_eligible} eligible miners, "
-            f"{total_scenarios} scenarios each ==="
+            f"=== Eval cycle: {total_eligible} eligible miners ==="
         )
 
         ncd_excluded = await self._prefetch_packs_and_ncd_gate(
@@ -1790,8 +1698,7 @@ class TrajectoryValidator:
                 eval_dir, vlog_offset, mlog_offset = self._prepare_eval_log_capture(cycle_eval_id, hotkey)
                 eval_start = time.time()
                 eval_result = await self._evaluate_miner(
-                    uid, commitment, eval_scenarios, epoch_seed,
-                    context_preamble, user_context,
+                    uid, commitment, epoch_seed,
                     block_height=current_block,
                 )
                 eval_elapsed = time.time() - eval_start
@@ -1998,79 +1905,6 @@ class TrajectoryValidator:
     # Episode detail logging (file-only, no console output)
     # ------------------------------------------------------------------
 
-    def _log_episode_details(
-        self,
-        mlog: logging.Logger,
-        scenario_name: str,
-        result: "EvaluationResult",
-    ) -> None:
-        """Log detailed OpenClaw and mock_tool request/response to the
-        per-miner file logger.  The miner logger has ``propagate=False``
-        and only a FileHandler, so this does NOT appear in docker logs."""
-        mlog.info(
-            f"--- {scenario_name} episode detail ---"
-        )
-
-        # -- OpenClaw request --
-        if result.input_message:
-            mlog.info(
-                f"[openclaw-request] message={result.input_message}"
-            )
-
-        # -- OpenClaw response --
-        if result.raw_llm_response:
-            resp = result.raw_llm_response
-            if "error" in resp:
-                mlog.info(f"[openclaw-response] error={resp['error']}")
-            else:
-                model = resp.get("model", "?")
-                finish = "?"
-                choices = resp.get("choices") or []
-                if choices:
-                    finish = choices[0].get("finish_reason", "?")
-                mlog.info(
-                    f"[openclaw-response] model={model} finish_reason={finish}"
-                )
-                if choices:
-                    msg = choices[0].get("message", {})
-                    content = msg.get("content", "")
-                    mlog.info(
-                        f"[openclaw-response] content={content}"
-                    )
-
-        # -- mock_tool calls (from trajectory) --
-        trajectory = result.trajectory or []
-        if trajectory:
-            mlog.info(
-                f"[mock-tools] {len(trajectory)} tool call(s):"
-            )
-            for idx, tc in enumerate(trajectory, 1):
-                tool = tc.get("tool", "?")
-                args = tc.get("args", {})
-                resp = tc.get("response", {})
-                mlog.info(
-                    f"  [{idx}] tool={tool} "
-                    f"args={json.dumps(args, ensure_ascii=False, default=str)}"
-                )
-                mlog.info(
-                    f"  [{idx}] response="
-                    f"{json.dumps(resp, ensure_ascii=False, default=str)}"
-                )
-
-        # -- failed requests (from all_requests) --
-        all_reqs = result.all_requests or []
-        failed = [r for r in all_reqs if not r.get("success")]
-        if failed:
-            mlog.info(f"[mock-tools] {len(failed)} failed request(s):")
-            for idx, fr in enumerate(failed, 1):
-                mlog.info(
-                    f"  [FAIL-{idx}] tool={fr.get('tool', '?')} "
-                    f"status={fr.get('status_code', '?')} "
-                    f"body={json.dumps(fr.get('body'), ensure_ascii=False, default=str)}"
-                )
-
-        mlog.info(f"--- end {scenario_name} episode detail ---")
-
     # ------------------------------------------------------------------
     # Miner evaluation
     # ------------------------------------------------------------------
@@ -2079,21 +1913,15 @@ class TrajectoryValidator:
         self,
         miner_uid: int,
         commitment: MinerCommitment,
-        eval_scenarios: List[str],
         epoch_seed: int,
-        context_preamble: str = "",
-        user_context: Optional[Dict] = None,
         block_height: int = 0,
     ) -> Optional[Dict]:
-        """Evaluate a single miner on all scenarios.
+        """Evaluate a single miner via trajrl-bench sandbox.
 
-        v4.0 flow:
-        1. Fetch + verify pack (usually cache hit after cycle NCD prefetch)
-        2. Schema validation
-        3. Phase 1: LLM integrity check (cached by pack_hash)
-        4. Run episodes (single per scenario, no consensus voting)
-        5. Phase 2: LLM trajectory judge per scenario
-        6. Return costs + judge-based qualification
+        Flow:
+        1. Fetch + verify submission (usually cache hit after cycle NCD prefetch)
+        2. Run trajrl-bench sandbox evaluation (SKILL.md + SSH + LLM judge)
+        3. Return quality-based scores
 
         Returns:
             Dict with keys "costs", "qualified" mapping
@@ -2105,7 +1933,7 @@ class TrajectoryValidator:
             f"(hotkey={commitment.hotkey[:8]}, hash={commitment.pack_hash[:12]}...)"
         )
 
-        # Step 1: Fetch and verify pack from HTTP URL
+        # Step 1: Fetch and verify submission from HTTP URL
         verification = await self.pack_fetcher.verify_submission(
             pack_url=commitment.pack_url,
             pack_hash=commitment.pack_hash,
@@ -2117,250 +1945,19 @@ class TrajectoryValidator:
             )
             return None
 
-        # Season 1 path: text submissions go to trajrl-bench harness.
-        # JSON content is treated as a legacy v4.0 pack and skipped.
-        if self._evaluation_harness == "trajrl-bench" and self._sandbox_harness:
-            if verification.pack_content is not None:
-                mlog.info(
-                    "S1 mode: submission is JSON (legacy v4.0 pack), skipping"
-                )
-                self._disqualified_miners[commitment.hotkey] = "legacy_json_pack"
-                return None
-
-            return await self._evaluate_miner_s1(
-                miner_uid=miner_uid,
-                commitment=commitment,
-                skill_md=verification.raw_text,
-                epoch_seed=epoch_seed,
-                block_height=block_height,
-            )
-
-        pack = verification.pack_content
-        if pack is None:
-            mlog.warning("Submission is not JSON — expected OPP v1 pack")
-            return None
-
-        # Step 2: Schema validation
-        lint_result = validate_opp_schema(pack)
-        if not lint_result.passed:
-            mlog.warning(f"Schema failed: {lint_result.issues}")
-            return None
-
-        # Step 3: Phase 1 — LLM pack integrity analysis (cached by pack_hash)
-        integrity = await self.integrity_judge.check_integrity(
-            pack, pack_hash=commitment.pack_hash
+        return await self._evaluate_miner_s1(
+            miner_uid=miner_uid,
+            commitment=commitment,
+            pack=verification.pack_content,
+            epoch_seed=epoch_seed,
+            block_height=block_height,
         )
-        if not integrity.passed:
-            mlog.warning(f"Pack integrity FAILED: {integrity.summary}")
-            for flag in integrity.flags:
-                mlog.info(
-                    f"  Flag: {flag.type} ({flag.severity}): {flag.explanation}"
-                )
-            asyncio.ensure_future(
-                submit_eval(
-                    self.wallet,
-                    miner_hotkey=commitment.hotkey,
-                    miner_uid=miner_uid,
-                    block_height=block_height,
-                    score=0.0,
-                    weight=0.0,
-                    qualified=False,
-                    pack_url=commitment.pack_url,
-                    pack_hash=commitment.pack_hash,
-                    llm_base_url=self._judge_base_url,
-                    llm_model=self._judge_model,
-                    rejected=True,
-                    rejection_stage="integrity_check",
-                    rejection_detail=integrity.summary,
-                    scoring_version=_scoring_version(),
-                    **self._harness_metadata(),
-                )
-            )
-            self._disqualified_miners[commitment.hotkey] = "integrity_failed"
-            self.raw_costs.pop(commitment.hotkey, None)
-            self.scenario_qualified.pop(commitment.hotkey, None)
-            self._eval_pack_hash.pop(commitment.hotkey, None)
-            return None
-
-        if integrity.flags:
-            mlog.info(
-                f"Integrity passed with {len(integrity.flags)} non-critical flags"
-            )
-
-        self._hotkey_packs[commitment.hotkey] = pack
-        self._pack_by_hash[commitment.pack_hash] = pack
-
-        # Step 4+5: Run episodes and judge trajectories
-        scenario_costs: Dict[str, float] = {}
-        scenario_qualified: Dict[str, bool] = {}
-        scenario_token_usage: Dict[str, Dict[str, int]] = {}
-        scenario_model_usage: Dict[str, List[Dict[str, Any]]] = {}
-        scenario_judge_details: Dict[str, Dict[str, Any]] = {}
-        scenario_session_keys: Dict[str, str] = {}
-        scenario_session_files: Dict[str, str] = {}
-
-        total_scenarios = len(eval_scenarios)
-        for scenario_idx, scenario_name in enumerate(eval_scenarios, 1):
-            mlog.info(
-                f"scenario [{scenario_idx}/{total_scenarios}] {scenario_name} ..."
-            )
-            try:
-                # Single episode per scenario (no consensus voting in v4.0)
-                result = await self.harness.evaluate_pack(
-                    pack=pack,
-                    scenario_name=scenario_name,
-                    seed=epoch_seed,
-                    context_preamble=context_preamble,
-                    user_context=user_context,
-                )
-
-                if result.error:
-                    mlog.warning(
-                        f"{scenario_name} episode error: {result.error}"
-                    )
-                    scenario_qualified[scenario_name] = False
-                    remaining = [s for s in eval_scenarios if s not in scenario_qualified]
-                    if remaining:
-                        mlog.info(
-                            f"fail-fast, skipping {len(remaining)} remaining scenarios"
-                        )
-                        for s in remaining:
-                            scenario_qualified[s] = False
-                    break
-
-                self._log_episode_details(mlog, scenario_name, result)
-
-                if result.cost_usd is not None:
-                    scenario_costs[scenario_name] = result.cost_usd
-                if result.token_usage:
-                    scenario_token_usage[scenario_name] = result.token_usage
-                if result.model_usage:
-                    scenario_model_usage[scenario_name] = result.model_usage
-                if result.session_key:
-                    scenario_session_keys[scenario_name] = result.session_key
-                if result.session_file:
-                    scenario_session_files[scenario_name] = result.session_file
-
-                # Phase 2: LLM trajectory judge
-                scenario_config = self.scenarios.get(scenario_name, {})
-                trajectory = result.trajectory or []
-                judge_result = await self.trajectory_judge.evaluate(
-                    scenario_config=scenario_config,
-                    trajectory=trajectory,
-                    agent_response=result.response,
-                )
-
-                qualified = judge_result.qualification_gate
-                scenario_qualified[scenario_name] = qualified
-
-                # Store full judge details for dashboard reporting
-                _criteria = judge_result.criteria_results
-                _n = len(_criteria)
-                _passed = sum(1 for cr in _criteria if cr.verdict == "PASS")
-                _grounded = sum(1 for cr in _criteria if cr.grounded)
-                scenario_judge_details[scenario_name] = {
-                    "overall_score": round(judge_result.overall_score, 4),
-                    "safety_passed": judge_result.safety_passed,
-                    "correctness_passed": judge_result.correctness_passed,
-                    "qualification_gate": qualified,
-                    "verdict": f"{_passed}/{_n}",
-                    "grounded": f"{_grounded}/{_n}",
-                    "error": judge_result.error,
-                }
-
-                cost_str = (
-                    f", cost=${result.cost_usd:.4f}"
-                    if result.cost_usd is not None
-                    else ""
-                )
-                gate_str = "PASS" if qualified else "FAIL"
-                mlog.info(
-                    f"{scenario_name} -> "
-                    f"judge={judge_result.overall_score:.3f}{cost_str}, "
-                    f"gate={gate_str}, tool_calls={result.tool_calls}"
-                )
-                if result.token_usage:
-                    tu = result.token_usage
-                    mlog.info(
-                        f"{scenario_name}   "
-                        f"tokens: input={tu.get('input_tokens', 0)}, "
-                        f"output={tu.get('output_tokens', 0)}, "
-                        f"cache_read={tu.get('cache_read_tokens', 0)}, "
-                        f"cache_write={tu.get('cache_write_tokens', 0)}"
-                    )
-
-                if judge_result.error:
-                    mlog.warning(
-                        f"{scenario_name} judge error: {judge_result.error}"
-                    )
-
-                # Log per-criterion details
-                for cr in judge_result.criteria_results:
-                    if cr.verdict != "PASS":
-                        mlog.info(f"  FAIL {cr.id}: {cr.justification}")
-                if result.model_usage:
-                    for m in result.model_usage:
-                        mlog.info(
-                            f"{scenario_name}   "
-                            f"{m.get('model', '?')}: "
-                            f"${m.get('cost_usd', 0):.4f} "
-                            f"({m.get('count', 0)} calls)"
-                        )
-
-                # Fail fast: any scenario failure → skip remaining
-                if not qualified:
-                    remaining = [s for s in eval_scenarios if s not in scenario_qualified]
-                    if remaining:
-                        mlog.info(
-                            f"fail-fast on {scenario_name}, "
-                            f"skipping {len(remaining)} remaining scenarios"
-                        )
-                        for s in remaining:
-                            scenario_qualified[s] = False
-                    break
-
-            except Exception as e:
-                mlog.error(
-                    f"{scenario_name} failed: {e}", exc_info=True,
-                )
-                scenario_qualified[scenario_name] = False
-                remaining = [s for s in eval_scenarios if s not in scenario_qualified]
-                if remaining:
-                    mlog.info(
-                        f"fail-fast on {scenario_name} exception, "
-                        f"skipping {len(remaining)} remaining scenarios"
-                    )
-                    for s in remaining:
-                        scenario_qualified[s] = False
-                break
-
-        if not scenario_qualified:
-            mlog.warning("No scenario results!")
-            return None
-
-        # Log per-miner cost summary
-        if scenario_costs:
-            total_cost = sum(scenario_costs.values())
-            cost_details = ", ".join(
-                f"{s}=${c:.4f}" for s, c in scenario_costs.items()
-            )
-            mlog.info(f"Cost summary: total=${total_cost:.4f} ({cost_details})")
-
-        return {
-            "costs": scenario_costs,
-            "qualified": scenario_qualified,
-            "token_usage": scenario_token_usage,
-            "model_usage": scenario_model_usage,
-            "judge_details": scenario_judge_details,
-            "session_keys": scenario_session_keys,
-            "session_files": scenario_session_files,
-        }
 
     async def _evaluate_miner_s1(
         self,
         miner_uid: int,
         commitment: "MinerCommitment",
-        skill_md: str,
+        pack: dict,
         epoch_seed: int,
         block_height: int = 0,
     ) -> Optional[Dict]:
@@ -2370,16 +1967,22 @@ class TrajectoryValidator:
         Hermes Agent. Uses split-half delta scoring (quality-based,
         not cost-based).
 
-        In S1, miners submit raw SKILL.md text (not JSON). The caller
-        has already verified the content hash and filtered out JSON
-        (legacy v4.0) submissions.
-
         Returns same shape as _evaluate_miner for pipeline compatibility:
             {"costs": {...}, "qualified": {...}, ...}
         """
         mlog = self._get_miner_logger(commitment.hotkey)
-        harness = self._sandbox_harness
 
+        files = pack.get("files", {})
+        if "SKILL.md" not in files:
+            mlog.warning("Pack missing SKILL.md in files")
+            self._disqualified_miners[commitment.hotkey] = "missing_skill_md"
+            return None
+
+        extra_files = [f for f in files if f != "SKILL.md"]
+        if extra_files:
+            mlog.warning("S1 pack contains unexpected files: %s", extra_files)
+
+        skill_md = files["SKILL.md"]
         if not skill_md or not skill_md.strip():
             mlog.warning("Empty SKILL.md submission")
             self._disqualified_miners[commitment.hotkey] = "empty_skill_md"
@@ -2391,7 +1994,7 @@ class TrajectoryValidator:
         )
 
         try:
-            result = await harness.evaluate_miner(
+            result = await self._sandbox_harness.evaluate_miner(
                 skill_md=skill_md,
                 epoch_seed=epoch_seed,
                 pack_hash=commitment.pack_hash,
@@ -2431,7 +2034,7 @@ class TrajectoryValidator:
                 "episode_qualities": [round(q, 4) for q in result.episode_qualities],
                 "qualification_gate": qualified,
                 "harness": "trajrl-bench",
-                "sandbox_version": harness.sandbox_version,
+                "sandbox_version": self._sandbox_harness.sandbox_version,
             },
         }
 
@@ -2461,8 +2064,6 @@ class TrajectoryValidator:
     def _harness_metadata(self) -> Dict[str, str]:
         """Return bench/harness image hashes and bench version for submit payloads."""
         h = self._sandbox_harness
-        if h is None:
-            return {}
         meta: Dict[str, str] = {}
         if h.bench_image_hash != "unknown":
             meta["bench_image_hash"] = h.bench_image_hash
@@ -2486,29 +2087,20 @@ class TrajectoryValidator:
         Fire-and-forget: any error is logged and discarded.
         """
         hotkey = commitment.hotkey
-        scenario_weights = {
-            name: cfg.get("weight", 1.0)
-            for name, cfg in self.scenarios.items()
-        }
 
-        # v4.0: qualification is binary (LLM judge verdict), no score EMA.
-        # Derive scores from qualified dict: 1.0 if passed, 0.0 if failed.
         raw_qualified = eval_result.get("qualified") or {}
         raw_costs = eval_result.get("costs") or {}
 
-        # Aggregate raw score (weighted mean of binary qualification)
-        total_w = sum(scenario_weights.get(s, 1.0) for s in raw_qualified)
+        # Aggregate raw score (mean of binary qualification)
         raw_score = (
-            sum(scenario_weights.get(s, 1.0) * (1.0 if q else 0.0)
-                for s, q in raw_qualified.items()) / total_w
-            if total_w > 0 else 0.0
+            sum(1.0 if q else 0.0 for q in raw_qualified.values()) / len(raw_qualified)
+            if raw_qualified else 0.0
         )
 
-        # Aggregate raw cost (weighted mean across scenarios)
-        cost_total_w = sum(scenario_weights.get(s, 1.0) for s in raw_costs)
+        # Aggregate raw cost (mean across scenarios)
         raw_cost = (
-            sum(scenario_weights.get(s, 1.0) * v for s, v in raw_costs.items()) / cost_total_w
-            if cost_total_w > 0 else 0.0
+            sum(raw_costs.values()) / len(raw_costs)
+            if raw_costs else 0.0
         )
 
         # Per-scenario results
@@ -2516,7 +2108,7 @@ class TrajectoryValidator:
         for sname, q in raw_qualified.items():
             entry: Dict[str, Any] = {
                 "score": 1.0 if q else 0.0,
-                "weight": round(scenario_weights.get(sname, 1.0), 4),
+                "weight": 1.0,
                 "qualified": q,
             }
             if sname in raw_costs:

@@ -9,7 +9,7 @@
 
 ## Cost Asymmetry: Validators Pay, Miners Don't
 
-Validators bear **all LLM inference costs** — they run ClawBench episodes against each miner's policy pack. Miners submit static policy packs (JSON) and pay zero inference cost per epoch; their only costs are registration and R&D iteration.
+Validators bear **all LLM inference costs** — they run TrajRL-Bench episodes against each miner's policy pack. Miners submit static policy packs (JSON) and pay zero inference cost per epoch; their only costs are registration and R&D iteration.
 
 This is by design: miners compete on *intelligence* (better prompts/policies), not on compute.
 
@@ -55,7 +55,7 @@ In practice, only miners whose `pack_hash` changed are re-evaluated immediately.
 | Cost Item | Estimate |
 |-----------|----------|
 | Policy iteration (prompt tuning) | Engineer time only |
-| Local testing via ClawBench | ~$0.08/episode × ~50 test runs ≈ **$4/iteration** |
+| Local testing via TrajRL-Bench | ~$0.08/episode × ~50 test runs ≈ **$4/iteration** |
 | GitHub repo hosting | Free |
 | Bittensor registration | ~200 TAO (one-time) |
 | **Ongoing operational cost** | **~$0/month** |

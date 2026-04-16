@@ -1,10 +1,10 @@
-# TrajectoryRL Validator — Production Compose (all-in-one)
+# TrajectoryRL Validator — Production Compose
 #
-# Single image contains everything: validator + mock-tools + OpenClaw gateway.
-# Watchtower auto-updates the image from GHCR.
+# Season 1: validator orchestrates trajrl-bench sandbox containers via
+# Docker API.  Watchtower auto-updates the image from GHCR.
 #
 # Setup:
-#   1. Create .env.validator in repo root (see docker/README.md)
+#   1. Create .env.validator in repo root (see .env.validator.example)
 #   2. docker compose --env-file .env.validator -f docker/docker-compose.validator.yml up -d
 #   3. docker compose -f docker/docker-compose.validator.yml logs -f validator
 #
@@ -13,9 +13,9 @@
 #   WALLET_HOTKEY=default
 #   NETUID=11
 #   NETWORK=finney
-#   CLAWBENCH_LLM_API_KEY=...
-#   CLAWBENCH_LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
-#   CLAWBENCH_DEFAULT_MODEL=zhipu/glm-5.1
+#   LLM_API_KEY=...
+#   LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
+#   LLM_MODEL=glm-5.1
 
 services:
   validator:
@@ -27,6 +27,7 @@ services:
     volumes:
       - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
       - trajectoryrl_data:/var/lib/trajectoryrl
+      - /var/run/docker.sock:/var/run/docker.sock
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
     logging:

@@ -123,17 +123,11 @@ async def evaluate_single_miner(
         pack_hash=commitment.pack_hash,
     )
 
-    if not verification.valid:
+    if not verification.valid or verification.pack_content is None:
         logger.error(f"Pack verification failed: {verification.error}")
         return None
 
     pack = verification.pack_content
-    if pack is None:
-        logger.info(
-            "Submission is plain text, not a JSON pack — "
-            "skipping ClawBench evaluation"
-        )
-        return None
 
     logger.info(f"Pack verified: {len(pack.get('files', {}))} files")
     for fname in pack.get("files", {}):

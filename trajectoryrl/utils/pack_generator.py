@@ -1,11 +1,9 @@
 """LLM-based AGENTS.md generator (multi-provider).
 
-Generates a policy document (AGENTS.md) optimized for ClawBench scenarios.
-The generator understands the scoring rubric, available tools, and scenario
-types, producing a generic policy that scores well across all five scenarios.
+Generates a policy document (AGENTS.md) for miner submissions.
 
-Uses an OpenAI-compatible endpoint configured via ``CLAWBENCH_LLM_API_KEY``,
-``CLAWBENCH_LLM_BASE_URL``, and ``CLAWBENCH_DEFAULT_MODEL`` environment variables.
+Uses an OpenAI-compatible endpoint configured via ``LLM_API_KEY``,
+``LLM_BASE_URL``, and ``LLM_MODEL`` environment variables.
 Default provider is Zhipu (https://open.bigmodel.cn/api/paas/v4) with GLM-5.1.
 """
 
@@ -18,7 +16,7 @@ logger = logging.getLogger(__name__)
 MAX_AGENTS_MD_CHARS = 28_000
 
 SYSTEM_PROMPT = """\
-You are an expert AI policy engineer for the ClawBench evaluation suite.
+You are an expert AI policy engineer for the TrajectoryRL evaluation suite.
 Your task is to write an AGENTS.md policy document that an AI assistant will
 follow when handling workplace scenarios. The assistant operates inside a
 Slack-like environment with access to these tools:
@@ -110,7 +108,7 @@ Here is the current AGENTS.md policy document that scored in a previous round:
 {previous_agents_md}
 </current_policy>
 
-Improve this policy to score higher on ClawBench. Consider:
+Improve this policy to score higher. Consider:
 - Are there gaps in handling any of the 7 scenarios?
 - Is the policy clear and unambiguous?
 - Are there missing instructions for edge cases?
@@ -153,7 +151,7 @@ def generate_agents_md(
     else:
         user_message = (
             "Generate a high-quality AGENTS.md policy document optimized for "
-            "ClawBench. Output ONLY the markdown content."
+            "workplace scenarios. Output ONLY the markdown content."
         )
 
     logger.info("Generating AGENTS.md with model=%s (improve=%s)", model, bool(previous_agents_md))

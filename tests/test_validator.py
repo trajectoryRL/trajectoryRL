@@ -1,7 +1,7 @@
 """Tests for TrajectoryRL validator components.
 
-Tests the scoring, ClawBench harness, OPP schema validation,
-EMA scoring, and config without requiring a live Bittensor network.
+Tests the scoring, OPP schema validation, EMA scoring, and config
+without requiring a live Bittensor network.
 """
 
 import asyncio
@@ -30,7 +30,6 @@ _mock_bt.Synapse = _MockSynapse
 sys.modules["bittensor"] = _mock_bt
 
 # Now safe to import
-from trajectoryrl.utils.clawbench import ClawBenchHarness, EvaluationResult
 from trajectoryrl.utils.opp_schema import validate_opp_schema, ValidationResult
 from trajectoryrl.scoring import TrajectoryScorer, AggregatedScore
 from trajectoryrl.utils.github import PackFetcher, PackVerificationResult
@@ -52,9 +51,9 @@ from trajectoryrl.utils.consensus_filter import (
     run_filter_pipeline, FilterStats, ValidatedSubmission,
     filter_protocol_version, filter_window_number,
     filter_trust_threshold, filter_data_integrity,
-    filter_clawbench_version, filter_zero_signal,
+    filter_bench_version, filter_zero_signal,
 )
-from trajectoryrl.scoring import compute_consensus_costs
+from trajectoryrl.scoring import compute_consensus_scores
 from trajectoryrl.utils.winner_state import (
     WinnerState, select_winner_with_protection,
     save_winner_state, load_winner_state,
@@ -69,8 +68,7 @@ from trajectoryrl.utils.commitments import (
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-REPO_ROOT = Path(__file__).resolve().parent.parent  # /data2/trajectory_rl
-CLAWBENCH_PATH = REPO_ROOT / "clawbench"
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 # ---------------------------------------------------------------------------
@@ -83,11 +81,6 @@ def scorer():
         rho_reliability=0.1,
         consensus_epsilon=0.02,
     )
-
-
-@pytest.fixture
-def harness():
-    return ClawBenchHarness(clawbench_path=CLAWBENCH_PATH, timeout=120)
 
 
 @pytest.fixture
@@ -105,16 +98,31 @@ def valid_pack():
         "metadata": {
             "pack_name": "test_pack",
             "pack_version": "1.0.0",
-            "target_suite": "clawbench_v1",
+            "target_suite": "trajrl-bench",
         },
     }
 
 
+from dataclasses import dataclass as _dc, field as _f
+from typing import Any as _Any, Optional as _Opt, Dict as _Dict
+
+
+@_dc
+class _MockResult:
+    """Minimal result object for scoring tests."""
+    scenario_name: str = ""
+    score: float = 0.0
+    success: bool = False
+    tool_calls: int = 0
+    response: str = ""
+    rubric: _Dict[str, _Any] = _f(default_factory=dict)
+
+
 @pytest.fixture
 def sample_results():
-    """Sample EvaluationResults for scoring tests."""
+    """Sample results for scoring tests."""
     return [
-        EvaluationResult(
+        _MockResult(
             scenario_name="client_escalation",
             score=0.92,
             success=True,
@@ -122,7 +130,7 @@ def sample_results():
             response="Escalation summary...",
             rubric={"by_category": {"safety": {"score": 1.0}}},
         ),
-        EvaluationResult(
+        _MockResult(
             scenario_name="morning_brief",
             score=0.85,
             success=True,
@@ -130,7 +138,7 @@ def sample_results():
             response="Daily brief...",
             rubric={"by_category": {"safety": {"score": 1.0}}},
         ),
-        EvaluationResult(
+        _MockResult(
             scenario_name="inbox_to_action",
             score=0.78,
             success=True,
@@ -138,7 +146,7 @@ def sample_results():
             response="Action queue...",
             rubric={"by_category": {"safety": {"score": 0.9}}},
         ),
-        EvaluationResult(
+        _MockResult(
             scenario_name="team_standup",
             score=0.88,
             success=True,
@@ -239,7 +247,7 @@ class TestTrajectoryScorer:
 
     def test_aggregate_single_result(self, scorer):
         results = [
-            EvaluationResult(
+            _MockResult(
                 scenario_name="test",
                 score=0.85,
                 success=True,
@@ -267,8 +275,8 @@ class TestTrajectoryScorer:
 
     def test_aggregate_with_failures(self, scorer):
         results = [
-            EvaluationResult("a", score=0.9, success=True, tool_calls=5, response="", rubric={}),
-            EvaluationResult("b", score=0.0, success=False, tool_calls=0, response="", rubric={}),
+            _MockResult("a", score=0.9, success=True, tool_calls=5, response="", rubric={}),
+            _MockResult("b", score=0.0, success=False, tool_calls=0, response="", rubric={}),
         ]
         agg = scorer.aggregate_scores(results)
         assert agg.success_rate == 0.5
@@ -509,437 +517,11 @@ class TestEpochContext:
         uc = ctx.to_user_context()
         assert uc["USER_FIRST_NAME"] == "Sam"
 
-    def test_fill_templates_basic(self):
-        """ClawBench fill_templates replaces {{PLACEHOLDER}} markers."""
-        import sys as _sys
-        _sys.path.insert(0, str(CLAWBENCH_PATH / "scripts"))
-        from run_episode import fill_templates
-
-        content = "Hello {{USER_NAME}}, welcome to {{COMPANY}}."
-        ctx = {"USER_NAME": "Jordan Rivera", "COMPANY": "Vertex Labs"}
-        result = fill_templates(content, ctx)
-        assert result == "Hello Jordan Rivera, welcome to Vertex Labs."
-
-    def test_fill_templates_auto_first_name(self):
-        """fill_templates auto-derives USER_FIRST_NAME from USER_NAME."""
-        import sys as _sys
-        _sys.path.insert(0, str(CLAWBENCH_PATH / "scripts"))
-        from run_episode import fill_templates
-
-        content = 'Sign off: "Best, {{USER_FIRST_NAME}}"'
-        ctx = {"USER_NAME": "Jordan Rivera"}
-        result = fill_templates(content, ctx)
-        assert result == 'Sign off: "Best, Jordan"'
-
-    def test_fill_templates_preserves_unknown(self):
-        """Unknown {{PLACEHOLDER}} markers are left as-is."""
-        import sys as _sys
-        _sys.path.insert(0, str(CLAWBENCH_PATH / "scripts"))
-        from run_episode import fill_templates
-
-        content = "{{USER_NAME}} and {{UNKNOWN}}"
-        ctx = {"USER_NAME": "Jordan Rivera"}
-        result = fill_templates(content, ctx)
-        assert "Jordan Rivera" in result
-        assert "{{UNKNOWN}}" in result
-
-    def test_fill_templates_on_real_fixture(self):
-        """Template substitution works on a real fixture USER.md."""
-        fixture_path = CLAWBENCH_PATH / "fixtures" / "client_escalation" / "USER.md"
-        if not fixture_path.exists():
-            pytest.skip("ClawBench fixtures not available")
-
-        import sys as _sys
-        _sys.path.insert(0, str(CLAWBENCH_PATH / "scripts"))
-        from run_episode import fill_templates
-
-        content = fixture_path.read_text()
-        ctx = {
-            "USER_NAME": "Sam Patel",
-            "USER_FIRST_NAME": "Sam",
-            "USER_ROLE": "Design Lead",
-            "COMPANY": "Cascade Systems",
-        }
-        result = fill_templates(content, ctx)
-        # Identity replaced
-        assert "Sam Patel" in result
-        assert "Cascade Systems" in result
-        assert "{{USER_NAME}}" not in result
-        assert "{{COMPANY}}" not in result
-        # Team members preserved (not templated)
-        assert "Sarah Kim" in result
-        assert "David Park" in result
-
-    def test_fill_templates_preserves_non_template_content(self):
-        """Scenario-specific content is preserved by template substitution."""
-        import sys as _sys
-        _sys.path.insert(0, str(CLAWBENCH_PATH / "scripts"))
-        from run_episode import fill_templates
-
-        content = (
-            "**Name:** {{USER_NAME}}\n"
-            "Reports to: Sarah Kim (Eng Manager)\n"
-            "Sprint 13 ends Friday Feb 7\n"
-        )
-        ctx = {"USER_NAME": "Morgan Kim", "COMPANY": "Summit Innovations"}
-        result = fill_templates(content, ctx)
-        assert "Morgan Kim" in result
-        assert "Sarah Kim" in result
-        assert "Sprint 13" in result
-
-    def test_epoch_context_to_user_context_roundtrip(self):
-        """Generate epoch context → to_user_context → fill_templates works."""
-        import sys as _sys
-        _sys.path.insert(0, str(CLAWBENCH_PATH / "scripts"))
-        from run_episode import fill_templates
-
-        ctx = generate_epoch_context(42)
-        uc = ctx.to_user_context()
-        content = "{{USER_NAME}} works as {{USER_ROLE}} at {{COMPANY}}"
-        result = fill_templates(content, uc)
-        assert ctx.user_name in result
-        assert ctx.user_role in result
-        assert ctx.company in result
-        assert "{{" not in result
 
 
 # ===================================================================
 # Consensus Evaluation Tests
 # ===================================================================
-
-
-class TestConsensusEvaluation:
-    """Tests for majority-vote consensus evaluation."""
-
-    def test_majority_vote_rubric_all_pass(self):
-        """All runs agree → all checks pass."""
-        rubrics = [
-            {"check_a": {"passed": True, "points": 4}, "check_b": {"passed": True, "points": 3}},
-            {"check_a": {"passed": True, "points": 4}, "check_b": {"passed": True, "points": 3}},
-            {"check_a": {"passed": True, "points": 4}, "check_b": {"passed": True, "points": 3}},
-        ]
-        voted = ClawBenchHarness._majority_vote_rubric(rubrics, quorum=2)
-        assert voted["check_a"]["passed"] is True
-        assert voted["check_b"]["passed"] is True
-
-    def test_majority_vote_rubric_2_of_3(self):
-        """2/3 runs pass → check passes."""
-        rubrics = [
-            {"check_a": {"passed": True, "points": 4}},
-            {"check_a": {"passed": True, "points": 4}},
-            {"check_a": {"passed": False, "points": 4}},
-        ]
-        voted = ClawBenchHarness._majority_vote_rubric(rubrics, quorum=2)
-        assert voted["check_a"]["passed"] is True
-        assert voted["check_a"]["_votes"] == "2/3"
-
-    def test_majority_vote_rubric_1_of_3(self):
-        """1/3 runs pass → check fails."""
-        rubrics = [
-            {"check_a": {"passed": True, "points": 4}},
-            {"check_a": {"passed": False, "points": 4}},
-            {"check_a": {"passed": False, "points": 4}},
-        ]
-        voted = ClawBenchHarness._majority_vote_rubric(rubrics, quorum=2)
-        assert voted["check_a"]["passed"] is False
-
-    def test_majority_vote_rubric_empty(self):
-        voted = ClawBenchHarness._majority_vote_rubric([], quorum=2)
-        assert voted == {}
-
-    def test_score_from_rubric(self):
-        """Score is earned_points / total_points."""
-        rubric = {
-            "a": {"passed": True, "points": 4},
-            "b": {"passed": False, "points": 3},
-            "c": {"passed": True, "points": 3},
-        }
-        score = ClawBenchHarness._score_from_rubric(rubric)
-        assert abs(score - 7 / 10) < 1e-6
-
-    def test_score_from_rubric_all_pass(self):
-        rubric = {
-            "a": {"passed": True, "points": 5},
-            "b": {"passed": True, "points": 5},
-        }
-        assert ClawBenchHarness._score_from_rubric(rubric) == 1.0
-
-    def test_score_from_rubric_empty(self):
-        assert ClawBenchHarness._score_from_rubric({}) == 0.0
-
-    def test_score_from_rubric_bool_values(self):
-        """Rubric with plain bool values (no dict)."""
-        rubric = {"a": True, "b": False, "c": True}
-        score = ClawBenchHarness._score_from_rubric(rubric)
-        assert abs(score - 2 / 3) < 1e-6
-
-    # --- Tests for real score_episode() output format (bug fix coverage) ---
-
-    def test_majority_vote_rubric_real_format(self):
-        """Rubrics in the real score_episode() format with top-level metadata
-        and a nested 'checks' list should be handled correctly."""
-        rubrics = [
-            {
-                "score": 0.5, "points_earned": 5, "points_possible": 10,
-                "passed": 2, "failed": 2, "total_checks": 4,
-                "checks": [
-                    {"id": "c1", "passed": True, "points": 3, "max_points": 3},
-                    {"id": "c2", "passed": False, "points": 0, "max_points": 3},
-                    {"id": "c3", "passed": True, "points": 2, "max_points": 2},
-                    {"id": "c4", "passed": False, "points": 0, "max_points": 2},
-                ],
-                "by_category": {},
-            },
-            {
-                "score": 0.5, "points_earned": 5, "points_possible": 10,
-                "passed": 2, "failed": 2, "total_checks": 4,
-                "checks": [
-                    {"id": "c1", "passed": True, "points": 3, "max_points": 3},
-                    {"id": "c2", "passed": True, "points": 3, "max_points": 3},
-                    {"id": "c3", "passed": False, "points": 0, "max_points": 2},
-                    {"id": "c4", "passed": False, "points": 0, "max_points": 2},
-                ],
-                "by_category": {},
-            },
-            {
-                "score": 0.3, "points_earned": 3, "points_possible": 10,
-                "passed": 1, "failed": 3, "total_checks": 4,
-                "checks": [
-                    {"id": "c1", "passed": True, "points": 3, "max_points": 3},
-                    {"id": "c2", "passed": False, "points": 0, "max_points": 3},
-                    {"id": "c3", "passed": False, "points": 0, "max_points": 2},
-                    {"id": "c4", "passed": False, "points": 0, "max_points": 2},
-                ],
-                "by_category": {},
-            },
-        ]
-        voted = ClawBenchHarness._majority_vote_rubric(rubrics, quorum=2)
-        # c1: 3/3 pass → True
-        assert voted["c1"]["passed"] is True
-        # c2: 1/3 pass → False
-        assert voted["c2"]["passed"] is False
-        # c3: 1/3 pass → False
-        assert voted["c3"]["passed"] is False
-        # c4: 0/3 pass → False
-        assert voted["c4"]["passed"] is False
-        # Should only have the 4 check IDs, not top-level keys like "score"
-        assert set(voted.keys()) == {"c1", "c2", "c3", "c4"}
-
-    def test_score_from_rubric_max_points(self):
-        """Failed checks have points=0 but max_points>0.
-        Score must use max_points as the denominator weight so failed checks
-        are NOT excluded from the total."""
-        rubric = {
-            "c1": {"passed": True, "points": 3, "max_points": 3},
-            "c2": {"passed": False, "points": 0, "max_points": 3},
-            "c3": {"passed": True, "points": 2, "max_points": 2},
-            "c4": {"passed": False, "points": 0, "max_points": 2},
-        }
-        score = ClawBenchHarness._score_from_rubric(rubric)
-        # earned = 3 + 2 = 5, total = 3 + 3 + 2 + 2 = 10 → 0.5
-        assert abs(score - 0.5) < 1e-6
-
-    def test_score_from_rubric_all_fail_not_100_percent(self):
-        """When all checks fail, score should be 0, not 100%.
-        This was the core symptom of using points (0 for failures) as weight."""
-        rubric = {
-            "c1": {"passed": False, "points": 0, "max_points": 5},
-            "c2": {"passed": False, "points": 0, "max_points": 5},
-        }
-        score = ClawBenchHarness._score_from_rubric(rubric)
-        assert score == 0.0
-
-    def test_majority_vote_then_score_real_format(self):
-        """End-to-end: majority vote on real-format rubrics then score."""
-        rubric_template = {
-            "score": 0.0, "points_earned": 0, "points_possible": 6,
-            "passed": 0, "failed": 2, "total_checks": 2,
-            "checks": [
-                {"id": "greeting", "passed": True, "points": 3, "max_points": 3},
-                {"id": "farewell", "passed": False, "points": 0, "max_points": 3},
-            ],
-            "by_category": {},
-        }
-        rubrics = [rubric_template, rubric_template, rubric_template]
-        voted = ClawBenchHarness._majority_vote_rubric(rubrics, quorum=2)
-        score = ClawBenchHarness._score_from_rubric(voted)
-        # greeting passes (3/3), farewell fails (0/3) → 3/6 = 0.5
-        assert abs(score - 0.5) < 1e-6
-
-
-# ===================================================================
-# ClawBenchHarness Tests
-# ===================================================================
-
-class TestClawBenchHarness:
-
-    def test_init_validates_paths(self):
-        with pytest.raises(ValueError, match="scripts not found"):
-            ClawBenchHarness(clawbench_path=Path("/nonexistent"))
-
-    def test_init_with_valid_path(self, harness):
-        assert harness.clawbench_path == CLAWBENCH_PATH
-        assert harness.timeout == 120
-
-    def test_parse_episode_output_clean_json(self, harness):
-        output = '{"success": true, "checks_passed": 8, "checks_total": 10, "tool_calls": 8, "response": "test", "rubric": {}}'
-        result = harness._parse_episode_output(output)
-        assert result["success"] is True
-        assert result["checks_passed"] == 8
-        assert result["tool_calls"] == 8
-
-    def test_parse_episode_output_json_after_logs(self, harness):
-        output = (
-            "Some log line\n"
-            "Another log line\n"
-            '{"success": false, "checks_passed": 3, "checks_total": 10, "tool_calls": 3, "response": "", "rubric": {}}'
-        )
-        result = harness._parse_episode_output(output)
-        assert result["success"] is False
-        assert result["checks_passed"] == 3
-
-    def test_parse_episode_output_no_json(self, harness):
-        result = harness._parse_episode_output("no json here at all")
-        assert result["success"] is False
-        assert "error" in result
-
-    def test_parse_episode_output_invalid_json(self, harness):
-        result = harness._parse_episode_output("{invalid json}")
-        assert result["success"] is False
-        assert "error" in result
-
-    def test_parse_episode_output_empty(self, harness):
-        result = harness._parse_episode_output("")
-        assert result["success"] is False
-        assert "error" in result
-
-    def test_parse_episode_output_full_rubric(self, harness):
-        """Test parsing a realistic scored output with full rubric."""
-        data = {
-            "success": False,
-            "checks_passed": 10,
-            "checks_total": 15,
-            "tool_calls": 5,
-            "response": "Here is the summary...",
-            "rubric": {
-                "passed": 10,
-                "total": 15,
-                "checks": [
-                    {"id": "safety_1", "category": "safety", "passed": True},
-                    {"id": "correct_1", "category": "correctness", "passed": False},
-                ],
-                "failed_ids": ["correct_1"],
-            },
-            "cost": {
-                "input_tokens": 1000,
-                "output_tokens": 500,
-                "cache_read_tokens": 200,
-                "cache_write_tokens": 100,
-                "total_usd": 0.042,
-                "model": "anthropic/claude-sonnet-4-5-20250929",
-            },
-        }
-        output = json.dumps(data)
-        result = harness._parse_episode_output(output)
-        assert result["checks_passed"] == 10
-        assert result["cost"]["total_usd"] == 0.042
-
-    def test_compute_hash(self, harness, valid_pack):
-        h = harness._compute_hash(valid_pack)
-        expected = hashlib.sha256(
-            json.dumps(valid_pack, sort_keys=True).encode()
-        ).hexdigest()
-        assert h == expected
-
-    def test_compute_hash_deterministic(self, harness, valid_pack):
-        h1 = harness._compute_hash(valid_pack)
-        h2 = harness._compute_hash(valid_pack)
-        assert h1 == h2
-
-    def test_apply_pack_to_workspace(self, harness, valid_pack):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            workspace = Path(tmpdir) / "workspace"
-            harness._apply_pack_to_workspace(valid_pack, workspace)
-
-            agents_file = workspace / "AGENTS.md"
-            soul_file = workspace / "SOUL.md"
-
-            assert agents_file.exists()
-            assert soul_file.exists()
-            assert agents_file.read_text() == valid_pack["files"]["AGENTS.md"]
-            assert soul_file.read_text() == valid_pack["files"]["SOUL.md"]
-
-    def test_apply_pack_empty_files(self, harness):
-        pack = {"files": {}}
-        with tempfile.TemporaryDirectory() as tmpdir:
-            workspace = Path(tmpdir) / "workspace"
-            harness._apply_pack_to_workspace(pack, workspace)
-            assert workspace.exists()
-            # No files written
-            assert list(workspace.iterdir()) == []
-
-    def test_evaluate_pack_missing_scenario(self, harness, valid_pack):
-        result = asyncio.run(
-            harness.evaluate_pack(
-                pack=valid_pack,
-                scenario_name="nonexistent_scenario",
-                seed=0,
-            )
-        )
-        assert result.score == 0.0
-        assert result.error is not None
-        assert "not found" in result.error.lower()
-
-
-# ===================================================================
-# EvaluationResult Tests
-# ===================================================================
-
-class TestEvaluationResult:
-
-    def test_creation(self):
-        r = EvaluationResult(
-            scenario_name="test",
-            score=0.85,
-            success=True,
-            tool_calls=10,
-            response="hello",
-            rubric={"key": "value"},
-        )
-        assert r.scenario_name == "test"
-        assert r.score == 0.85
-        assert r.error is None
-        assert r.cost_usd is None
-        assert r.token_usage is None
-
-    def test_with_cost(self):
-        r = EvaluationResult(
-            scenario_name="test",
-            score=0.85,
-            success=True,
-            tool_calls=10,
-            response="hello",
-            rubric={},
-            cost_usd=0.042,
-            token_usage={"input_tokens": 1000, "output_tokens": 500,
-                         "cache_read_tokens": 200, "cache_write_tokens": 100},
-        )
-        assert r.cost_usd == 0.042
-        assert r.token_usage["input_tokens"] == 1000
-
-    def test_error_result(self):
-        r = EvaluationResult(
-            scenario_name="test",
-            score=0.0,
-            success=False,
-            tool_calls=0,
-            response="",
-            rubric={},
-            error="Timeout after 120s",
-        )
-        assert r.error == "Timeout after 120s"
-        assert r.score == 0.0
-        assert r.cost_usd is None
 
 
 # ===================================================================
@@ -976,30 +558,27 @@ class TestPackFetcher:
 
             assert result.valid is True
             assert result.pack_content == pack
-            assert result.raw_text == pack_json
 
-    def test_verify_valid_text(self):
-        """Valid plain-text submission (S1 SKILL.md) + matching hash → passes."""
-        skill_md = "# My Skill\n\nDo good work."
-        text_hash = hashlib.sha256(skill_md.encode()).hexdigest()
+    def test_verify_invalid_json(self):
+        """Non-JSON content → verification fails."""
+        raw = "this is not json"
 
         with tempfile.TemporaryDirectory() as tmpdir:
             fetcher = PackFetcher(cache_dir=Path(tmpdir))
 
             with patch.object(
                 fetcher, "_fetch_pack",
-                new_callable=AsyncMock, return_value=skill_md,
+                new_callable=AsyncMock, return_value=raw,
             ):
                 result = asyncio.run(
                     fetcher.verify_submission(
                         pack_url="https://example.com/skill.md",
-                        pack_hash=text_hash,
+                        pack_hash="deadbeef" * 8,
                     )
                 )
 
-            assert result.valid is True
-            assert result.pack_content is None
-            assert result.raw_text == skill_md
+            assert result.valid is False
+            assert "Invalid JSON" in result.error
 
     def test_verify_hash_mismatch(self):
         """Content doesn't match expected hash → verification fails."""
@@ -1436,9 +1015,8 @@ class TestPerScenarioEMA:
     def _make_validator(self):
         """Create a minimal validator with mocked Bittensor components."""
         with patch("trajectoryrl.base.validator.bt") as mock_bt, \
-             patch("trajectoryrl.base.validator.ClawBenchHarness"), \
+             patch("trajectoryrl.base.validator.TrajectorySandboxHarness"), \
              patch("trajectoryrl.base.validator.PackFetcher"), \
-             patch("trajectoryrl.base.validator.yaml") as mock_yaml, \
              patch("trajectoryrl.base.validator.ValidatorConfig") as MockConfig:
 
             config = MagicMock()
@@ -1446,7 +1024,7 @@ class TestPerScenarioEMA:
             config.wallet_hotkey = "default"
             config.network = "test"
             config.netuid = 11
-            config.clawbench_path = Path("/tmp/test_clawbench")
+            config.sandbox_image = "trajrl-bench:latest"
             config.timeout_per_scenario = 120
             config.rho_reliability = 0.1
             config.consensus_epsilon = 0.02
@@ -1689,9 +1267,8 @@ class TestInactivityBlocks:
     def _make_validator(self):
         """Create a minimal validator with mocked Bittensor components."""
         with patch("trajectoryrl.base.validator.bt") as mock_bt, \
-             patch("trajectoryrl.base.validator.ClawBenchHarness"), \
+             patch("trajectoryrl.base.validator.TrajectorySandboxHarness"), \
              patch("trajectoryrl.base.validator.PackFetcher"), \
-             patch("trajectoryrl.base.validator.yaml") as mock_yaml, \
              patch("trajectoryrl.base.validator.ValidatorConfig") as MockConfig:
 
             config = MagicMock()
@@ -1699,7 +1276,7 @@ class TestInactivityBlocks:
             config.wallet_hotkey = "default"
             config.network = "test"
             config.netuid = 11
-            config.clawbench_path = Path("/tmp/test_clawbench")
+            config.sandbox_image = "trajrl-bench:latest"
             config.timeout_per_scenario = 120
             config.rho_reliability = 0.1
             config.consensus_epsilon = 0.02
@@ -1836,51 +1413,11 @@ class TestInactivityBlocks:
 
 
 # ===================================================================
-# Integration: ClawBench Scoring → Validator Scoring Pipeline
+# Integration: Scoring Pipeline
 # ===================================================================
 
 class TestScoringIntegration:
-    """Tests the full data flow from ClawBench output to validator weights."""
-
-    def test_json_output_to_evaluation_result(self, harness):
-        """ClawBench --json output → _parse_episode_output → EvaluationResult."""
-        json_output = json.dumps({
-            "success": True,
-            "checks_passed": 25,
-            "checks_total": 25,
-            "tool_calls": 11,
-            "response": "Summary of actions taken...",
-            "rubric": {
-                "passed": 25,
-                "total": 25,
-                "checks": [],
-                "failed_ids": [],
-            },
-            "cost": {
-                "input_tokens": 1000,
-                "output_tokens": 500,
-                "total_usd": 0.042,
-            },
-        })
-
-        parsed = harness._parse_episode_output(json_output)
-        checks_passed = parsed.get("checks_passed", 0)
-        checks_total = parsed.get("checks_total", 0)
-        score = checks_passed / checks_total if checks_total > 0 else 0.0
-        result = EvaluationResult(
-            scenario_name="client_escalation",
-            score=score,
-            success=parsed["success"],
-            tool_calls=parsed["tool_calls"],
-            response=parsed["response"],
-            rubric=parsed["rubric"],
-            cost_usd=parsed.get("cost", {}).get("total_usd"),
-        )
-
-        assert result.score == 1.0
-        assert result.success is True
-        assert result.tool_calls == 11
-        assert result.cost_usd == 0.042
+    """Tests for the scoring pipeline."""
 
     def test_cost_based_winner_selection(self, scorer):
         """Lowest-cost qualified miner beats champion beyond delta threshold."""
@@ -1981,68 +1518,6 @@ class TestScoringIntegration:
         assert weights[0] == 0.0
         assert weights[1] == 0.0
 
-    def test_clawbench_scoring_roundtrip(self):
-        """Test that clawbench scoring.py output matches what harness expects."""
-        sys.path.insert(0, str(CLAWBENCH_PATH))
-        from clawbench.scoring import score_episode
-        import yaml
-
-        with open(CLAWBENCH_PATH / "scenarios" / "client_escalation.yaml") as f:
-            scenario = yaml.safe_load(f)
-
-        # Simulate a good result
-        tool_calls = [{"tool": "exec"}] * 5 + [{"tool": "slack"}] * 3
-        from collections import Counter
-        tool_counts = dict(Counter(tc["tool"] for tc in tool_calls))
-
-        scorable = {
-            "response": (
-                "## P0 Status: Data Export Incident\n\n"
-                "Root cause: cursor reset regression in v2.14.5.\n"
-                "Fix: PR #356 ready, staging validated. ETA: deploy by 1pm today.\n"
-                "Affected: Zenith Financial, GlobalTech, Meridian Health.\n"
-                "Calendar conflict: 2pm interview overlaps with Acme call.\n"
-                "SOC 2 findings noted — defer until P0 resolved.\n\n"
-                "Recommended action plan:\n"
-                "1. Approve Marcus's hotfix deploy\n"
-                "2. Draft reply to Dana Reeves for your approval\n"
-            ),
-            "tool_calls_raw": tool_calls,
-            "tool_calls_by_type": tool_counts,
-            "tool_calls_total": len(tool_calls),
-        }
-
-        score_result = score_episode(scorable, scenario["scoring"])
-
-        # Build the JSON output that run_episode.py --json would produce
-        output = {
-            "score": score_result["score"],
-            "success": score_result.get("failed", 1) == 0,
-            "tool_calls": len(tool_calls),
-            "response": scorable["response"],
-            "rubric": score_result,
-        }
-
-        # Parse it like the validator harness would
-        harness = ClawBenchHarness(clawbench_path=CLAWBENCH_PATH)
-        parsed = harness._parse_episode_output(json.dumps(output))
-
-        assert parsed["score"] == score_result["score"]
-        assert "by_category" in parsed["rubric"]
-        assert parsed["tool_calls"] == 8
-
-        # Feed into EvaluationResult
-        eval_result = EvaluationResult(
-            scenario_name="client_escalation",
-            score=parsed["score"],
-            success=parsed["success"],
-            tool_calls=parsed["tool_calls"],
-            response=parsed["response"],
-            rubric=parsed["rubric"],
-        )
-
-        # Score should be high for this good result
-        assert eval_result.score >= 0.7, f"Expected good score, got {eval_result.score}"
 
 
 # ---------------------------------------------------------------------------
@@ -2212,9 +1687,8 @@ class TestConsensusPayload:
             "protocol_version": 1,
             "window_number": 42,
             "validator_hotkey": "5FFApaS75bvpgP9gQ5hTUdZHiTc6LB2VPP9gvHN6VQCNug6f",
-            "clawbench_version": "0.1.0",
-            "costs": {"miner_a": 3.42, "miner_b": 5.18},
-            "qualified": {"miner_a": True, "miner_b": False},
+            "bench_version": "0.1.0",
+            "scores": {"miner_a": 0.85, "miner_b": 0.42},
             "timestamp": 1710000000,
         }
         defaults.update(overrides)
@@ -2227,8 +1701,7 @@ class TestConsensusPayload:
         assert p.protocol_version == p2.protocol_version
         assert p.window_number == p2.window_number
         assert p.validator_hotkey == p2.validator_hotkey
-        assert p.costs == p2.costs
-        assert p.qualified == p2.qualified
+        assert p.scores == p2.scores
 
     def test_content_hash_deterministic(self):
         p = self._make_payload()
@@ -2293,7 +1766,7 @@ class TestConsensusPayload:
             "miner_c": "pre_eval_rejected:banned",
             "miner_d": "integrity_failed",
         })
-        assert p.qualified.get("miner_a") is True
+        assert "miner_a" in p.scores
         data = p.serialize()
         p2 = ConsensusPayload.deserialize(data)
         assert p2.disqualified == {
@@ -2317,20 +1790,18 @@ class TestConsensusPayload:
         p2 = ConsensusPayload.deserialize(data)
         assert p2.disqualified == {}
 
-    def test_deserialize_legacy_software_version(self):
-        """Payloads from older validators with software_version instead of clawbench_version."""
+    def test_deserialize_missing_bench_version(self):
+        """Payloads without bench_version default to empty string."""
         raw = {
             "protocol_version": 1,
             "window_number": 42,
             "validator_hotkey": "val_x",
-            "software_version": "4.1.0",
-            "costs": {"m1": 3.0},
-            "qualified": {"m1": True},
+            "scores": {"m1": 0.9},
             "timestamp": 1000,
         }
         data = json.dumps(raw, sort_keys=True, separators=(",", ":")).encode()
         p = ConsensusPayload.deserialize(data)
-        assert p.clawbench_version == "4.1.0"
+        assert p.bench_version == ""
 
 
 # ---------------------------------------------------------------------------
@@ -2342,19 +1813,16 @@ class TestConsensusFilter:
 
     def _make_submission(
         self, hotkey="val_a", window=42, protocol=1, version="0.1.0",
-        costs=None, qualified=None, scoring_version=SCORING_VERSION,
+        scores=None, scoring_version=SCORING_VERSION,
     ):
-        if costs is None:
-            costs = {"miner_x": 3.0}
-        if qualified is None:
-            qualified = {"miner_x": True}
+        if scores is None:
+            scores = {"miner_x": 0.85}
         payload = ConsensusPayload(
             protocol_version=protocol,
             window_number=window,
             validator_hotkey=hotkey,
-            clawbench_version=version,
-            costs=costs,
-            qualified=qualified,
+            bench_version=version,
+            scores=scores,
             timestamp=1000,
             scoring_version=scoring_version,
         )
@@ -2442,29 +1910,29 @@ class TestConsensusFilter:
         assert len(passed) == 1
         assert skipped == 0
 
-    def test_filter_clawbench_version_major_mismatch(self):
+    def test_filter_bench_version_major_mismatch(self):
         subs = [
             self._make_submission(hotkey="val_a", version="0.1.0"),
             self._make_submission(hotkey="val_b", version="1.0.0"),
         ]
-        passed, skipped = filter_clawbench_version(subs, local_version="0.2.0")
+        passed, skipped = filter_bench_version(subs, local_version="0.2.0")
         assert len(passed) == 1
         assert skipped == 1
         assert passed[0][0].validator_hotkey == "val_a"
 
-    def test_filter_clawbench_version_same_major(self):
+    def test_filter_bench_version_same_major(self):
         subs = [
             self._make_submission(hotkey="val_a", version="0.1.0"),
             self._make_submission(hotkey="val_b", version="0.9.9"),
         ]
-        passed, skipped = filter_clawbench_version(subs, local_version="0.2.0")
+        passed, skipped = filter_bench_version(subs, local_version="0.2.0")
         assert len(passed) == 2
         assert skipped == 0
 
     def test_filter_zero_signal_with_nonzero(self):
         subs = [
-            self._make_submission(hotkey="val_a", costs={"m": 3.0}),
-            self._make_submission(hotkey="val_b", costs={"m": 0.0}),
+            self._make_submission(hotkey="val_a", scores={"m": 0.85}),
+            self._make_submission(hotkey="val_b", scores={"m": 0.0}),
         ]
         passed, skipped = filter_zero_signal(subs)
         assert len(passed) == 1
@@ -2473,8 +1941,8 @@ class TestConsensusFilter:
 
     def test_filter_zero_signal_all_zero_passes(self):
         subs = [
-            self._make_submission(hotkey="val_a", costs={"m": 0.0}),
-            self._make_submission(hotkey="val_b", costs={"m": 0.0}),
+            self._make_submission(hotkey="val_a", scores={"m": 0.0}),
+            self._make_submission(hotkey="val_b", scores={"m": 0.0}),
         ]
         passed, skipped = filter_zero_signal(subs)
         assert len(passed) == 2
@@ -2482,15 +1950,15 @@ class TestConsensusFilter:
 
     def test_full_pipeline_cascading_filters(self):
         subs = [
-            self._make_submission(hotkey="good", window=42, protocol=1, version="0.1.0", costs={"m": 3.0}),
+            self._make_submission(hotkey="good", window=42, protocol=1, version="0.1.0", scores={"m": 0.85}),
             self._make_submission(hotkey="bad_proto", window=42, protocol=2, version="0.1.0"),
             self._make_submission(hotkey="bad_window", window=41, protocol=1, version="0.1.0"),
             self._make_submission(hotkey="low_stake", window=42, protocol=1, version="0.1.0"),
             self._make_submission(hotkey="bad_version", window=42, protocol=1, version="1.0.0"),
-            self._make_submission(hotkey="zero_cost", window=42, protocol=1, version="0.1.0", costs={"m": 0.0}),
+            self._make_submission(hotkey="zero_score", window=42, protocol=1, version="0.1.0", scores={"m": 0.0}),
         ]
         stakes = {"good": 100.0, "bad_proto": 100.0, "bad_window": 100.0,
-                  "low_stake": 1.0, "bad_version": 100.0, "zero_cost": 100.0}
+                  "low_stake": 1.0, "bad_version": 100.0, "zero_score": 100.0}
         validated, stats = run_filter_pipeline(
             subs, expected_window=42, validator_stakes=stakes,
             min_stake=10.0, local_version="0.1.0",
@@ -2517,15 +1985,14 @@ class TestConsensusFilter:
 # ---------------------------------------------------------------------------
 
 class TestConsensusAggregation:
-    """Tests for compute_consensus_costs."""
+    """Tests for compute_consensus_scores."""
 
-    def _make_validated(self, hotkey, stake, costs, qualified=None):
-        if qualified is None:
-            qualified = {k: True for k in costs}
+    def _make_validated(self, hotkey, stake, scores, disqualified=None):
         payload = ConsensusPayload(
             protocol_version=1, window_number=42,
-            validator_hotkey=hotkey, clawbench_version="0.1.0",
-            costs=costs, qualified=qualified, timestamp=1000,
+            validator_hotkey=hotkey, bench_version="0.1.0",
+            scores=scores, timestamp=1000,
+            disqualified=disqualified or {},
         )
         pointer = ConsensusPointer(
             protocol_version=1, window_number=42,
@@ -2537,175 +2004,135 @@ class TestConsensusAggregation:
         )
 
     def test_single_validator(self):
-        """With only 1 validator total, min_validators gate relaxes to 1."""
-        subs = [self._make_validated("v1", 100.0, {"m1": 3.0, "m2": 5.0})]
-        costs, quals = compute_consensus_costs(subs)
-        assert costs["m1"] == pytest.approx(3.0)
-        assert costs["m2"] == pytest.approx(5.0)
-        assert quals["m1"] is True
-        assert quals["m2"] is True
+        subs = [self._make_validated("v1", 100.0, {"m1": 0.8, "m2": 0.6})]
+        scores, disqualified = compute_consensus_scores(subs)
+        assert scores["m1"] == pytest.approx(0.8)
+        assert scores["m2"] == pytest.approx(0.6)
+        assert "m1" not in disqualified
+        assert "m2" not in disqualified
 
     def test_equal_stake_average(self):
         subs = [
-            self._make_validated("v1", 100.0, {"m1": 2.0}),
-            self._make_validated("v2", 100.0, {"m1": 4.0}),
+            self._make_validated("v1", 100.0, {"m1": 0.4}),
+            self._make_validated("v2", 100.0, {"m1": 0.8}),
         ]
-        costs, _ = compute_consensus_costs(subs)
-        assert costs["m1"] == pytest.approx(3.0)
+        scores, _ = compute_consensus_scores(subs)
+        assert scores["m1"] == pytest.approx(0.6)
 
     def test_stake_weighted_average(self):
         subs = [
-            self._make_validated("v1", 300.0, {"m1": 2.0}),
-            self._make_validated("v2", 100.0, {"m1": 6.0}),
+            self._make_validated("v1", 300.0, {"m1": 0.4}),
+            self._make_validated("v2", 100.0, {"m1": 0.8}),
         ]
-        costs, _ = compute_consensus_costs(subs)
-        # (300*2 + 100*6) / (300+100) = (600+600)/400 = 3.0
-        assert costs["m1"] == pytest.approx(3.0)
+        scores, _ = compute_consensus_scores(subs)
+        # (300*0.4 + 100*0.8) / (300+100) = (120+80)/400 = 0.5
+        assert scores["m1"] == pytest.approx(0.5)
 
     def test_different_miners_per_validator(self):
         subs = [
-            self._make_validated("v1", 100.0, {"m1": 2.0, "m2": 4.0}),
-            self._make_validated("v2", 100.0, {"m1": 6.0}),
+            self._make_validated("v1", 100.0, {"m1": 0.4, "m2": 0.6}),
+            self._make_validated("v2", 100.0, {"m1": 0.8}),
         ]
-        costs, _ = compute_consensus_costs(subs, min_validators_qualified=1)
-        assert costs["m1"] == pytest.approx(4.0)
-        assert costs["m2"] == pytest.approx(4.0)
+        scores, _ = compute_consensus_scores(subs)
+        assert scores["m1"] == pytest.approx(0.6)
+        assert scores["m2"] == pytest.approx(0.6)
 
-    def test_qualification_equal_stake_split_fails(self):
-        """50/50 stake split: qualified_ratio = 0.5, NOT > 0.5, so disqualified."""
+    def test_disqualification_equal_stake_split_not_disqualified(self):
+        """50/50 stake split: disq_ratio = 0.5, NOT > 0.5, so NOT disqualified."""
         subs = [
-            self._make_validated("v1", 100.0, {"m1": 2.0}, {"m1": True}),
-            self._make_validated("v2", 100.0, {"m1": 3.0}, {"m1": False}),
+            self._make_validated("v1", 100.0, {"m1": 0.8}),
+            self._make_validated("v2", 100.0, {}, {"m1": "policy_violation"}),
         ]
-        _, quals = compute_consensus_costs(subs)
-        assert quals["m1"] is False
+        _, disqualified = compute_consensus_scores(subs)
+        assert "m1" not in disqualified
 
-    def test_qualification_all_true(self):
+    def test_no_disqualification_when_none_flag(self):
         subs = [
-            self._make_validated("v1", 100.0, {"m1": 2.0}, {"m1": True}),
-            self._make_validated("v2", 100.0, {"m1": 3.0}, {"m1": True}),
+            self._make_validated("v1", 100.0, {"m1": 0.7}),
+            self._make_validated("v2", 100.0, {"m1": 0.9}),
         ]
-        _, quals = compute_consensus_costs(subs)
-        assert quals["m1"] is True
+        _, disqualified = compute_consensus_scores(subs)
+        assert "m1" not in disqualified
 
-    def test_qualification_stake_weighted_majority(self):
-        """High-stake validator says qualified, low-stake says not: miner survives."""
+    def test_disqualification_stake_weighted_majority(self):
+        """High-stake validator does not disqualify, low-stake does: miner survives."""
         subs = [
-            self._make_validated("v1", 300.0, {"m1": 2.0}, {"m1": True}),
-            self._make_validated("v2", 100.0, {"m1": 3.0}, {"m1": False}),
+            self._make_validated("v1", 300.0, {"m1": 0.7}),
+            self._make_validated("v2", 100.0, {}, {"m1": "policy_violation"}),
         ]
-        _, quals = compute_consensus_costs(subs, min_validators_qualified=1)
-        assert quals["m1"] is True  # 300/(300+100) = 0.75 > 0.5
+        _, disqualified = compute_consensus_scores(subs)
+        # disq_ratio = 100/(300+100) = 0.25, NOT > 0.5
+        assert "m1" not in disqualified
 
-    def test_qualification_minority_stake_cannot_disqualify(self):
+    def test_minority_stake_cannot_disqualify(self):
         """A low-stake malicious validator cannot disqualify a miner alone."""
         subs = [
-            self._make_validated("v1", 500.0, {"m1": 2.0}, {"m1": True}),
-            self._make_validated("v2", 200.0, {"m1": 3.0}, {"m1": True}),
-            self._make_validated("v_malicious", 50.0, {"m1": 4.0}, {"m1": False}),
+            self._make_validated("v1", 500.0, {"m1": 0.8}),
+            self._make_validated("v2", 200.0, {"m1": 0.7}),
+            self._make_validated("v_malicious", 50.0, {}, {"m1": "fake_reason"}),
         ]
-        _, quals = compute_consensus_costs(subs)
-        assert quals["m1"] is True  # 700/750 ≈ 0.93 > 0.5
+        _, disqualified = compute_consensus_scores(subs)
+        # disq_ratio = 50/750 ≈ 0.067, NOT > 0.5
+        assert "m1" not in disqualified
 
-    def test_qualification_majority_stake_disqualifies(self):
+    def test_majority_stake_disqualifies(self):
         """When >50% of stake says disqualified, miner is disqualified."""
         subs = [
-            self._make_validated("v1", 100.0, {"m1": 2.0}, {"m1": True}),
-            self._make_validated("v2", 300.0, {"m1": 3.0}, {"m1": False}),
-            self._make_validated("v3", 200.0, {"m1": 4.0}, {"m1": False}),
+            self._make_validated("v1", 100.0, {"m1": 0.8}),
+            self._make_validated("v2", 300.0, {}, {"m1": "policy_violation"}),
+            self._make_validated("v3", 200.0, {}, {"m1": "policy_violation"}),
         ]
-        _, quals = compute_consensus_costs(subs)
-        assert quals["m1"] is False  # 100/600 ≈ 0.17 < 0.5
-
-    def test_qualification_custom_threshold(self):
-        """Custom threshold (e.g. 2/3 supermajority)."""
-        subs = [
-            self._make_validated("v1", 200.0, {"m1": 2.0}, {"m1": True}),
-            self._make_validated("v2", 100.0, {"m1": 3.0}, {"m1": False}),
-        ]
-        # 200/300 ≈ 0.667 > 0.5 → stake ok, but only 1 validator qualified
-        # With min_validators=1, test pure stake threshold behavior
-        _, quals_default = compute_consensus_costs(subs, min_validators_qualified=1)
-        assert quals_default["m1"] is True
-        # 200/300 ≈ 0.667, NOT > 0.67 → disqualified with 2/3 threshold
-        _, quals_super = compute_consensus_costs(
-            subs, qualification_stake_threshold=0.67, min_validators_qualified=1,
-        )
-        assert quals_super["m1"] is False
+        _, disqualified = compute_consensus_scores(subs)
+        # disq_ratio = 500/600 ≈ 0.83 > 0.5
+        assert "m1" in disqualified
 
     def test_empty_submissions(self):
-        costs, quals = compute_consensus_costs([])
-        assert costs == {}
-        assert quals == {}
+        scores, disqualified = compute_consensus_scores([])
+        assert scores == {}
+        assert disqualified == {}
 
     def test_zero_stake_ignored(self):
         subs = [
-            self._make_validated("v1", 0.0, {"m1": 100.0}),
-            self._make_validated("v2", 50.0, {"m1": 3.0}),
+            self._make_validated("v1", 0.0, {"m1": 0.99}),
+            self._make_validated("v2", 50.0, {"m1": 0.7}),
         ]
-        costs, _ = compute_consensus_costs(subs)
-        assert costs["m1"] == pytest.approx(3.0)
+        scores, _ = compute_consensus_scores(subs)
+        assert scores["m1"] == pytest.approx(0.7)
 
-    def test_cost_excludes_not_qualified_votes(self):
-        """Costs from validators that voted not-qualified are excluded.
-
-        Prevents fail-fast partial evaluations (low cost from incomplete
-        scenario runs) from pulling down the consensus cost.
-        """
+    def test_score_excludes_disqualified_votes(self):
+        """Scores from validators that disqualified a miner are excluded."""
         subs = [
-            self._make_validated("v1", 200.0, {"m1": 0.02}, {"m1": False}),
-            self._make_validated("v2", 300.0, {"m1": 0.05}, {"m1": True}),
+            self._make_validated("v1", 200.0, {}, {"m1": "policy_violation"}),
+            self._make_validated("v2", 300.0, {"m1": 0.85}),
         ]
-        costs, quals = compute_consensus_costs(subs, min_validators_qualified=1)
-        assert quals["m1"] is True  # 300/500 = 0.6 > 0.5
-        assert costs["m1"] == pytest.approx(0.05)  # only v2's cost
+        scores, disqualified = compute_consensus_scores(subs)
+        # disq_ratio = 200/500 = 0.4, NOT > 0.5
+        assert "m1" not in disqualified
+        assert scores["m1"] == pytest.approx(0.85)
 
-    def test_cost_uses_only_qualified_stake_weighted(self):
-        """When multiple validators vote qualified, cost is stake-weighted
-        among qualified votes only."""
+    def test_score_uses_only_non_disqualified_stake_weighted(self):
+        """When multiple validators have scores, result is stake-weighted
+        among non-disqualifying votes only."""
         subs = [
-            self._make_validated("v1", 300.0, {"m1": 0.04}, {"m1": True}),
-            self._make_validated("v2", 100.0, {"m1": 0.08}, {"m1": True}),
-            self._make_validated("v3", 50.0,  {"m1": 0.01}, {"m1": False}),
+            self._make_validated("v1", 300.0, {"m1": 0.8}),
+            self._make_validated("v2", 100.0, {"m1": 0.6}),
+            self._make_validated("v3", 50.0, {}, {"m1": "policy_violation"}),
         ]
-        costs, quals = compute_consensus_costs(subs)
-        assert quals["m1"] is True  # 400/450 > 0.5
-        # cost = (300*0.04 + 100*0.08) / (300+100) = (12+8)/400 = 0.05
-        assert costs["m1"] == pytest.approx(0.05)
+        scores, disqualified = compute_consensus_scores(subs)
+        # disq_ratio = 50/450 ≈ 0.11, NOT > 0.5
+        assert "m1" not in disqualified
+        # score = (300*0.8 + 100*0.6) / (300+100) = (240+60)/400 = 0.75
+        assert scores["m1"] == pytest.approx(0.75)
 
-    def test_cost_zero_when_no_qualified_votes(self):
-        """If no validator voted qualified, cost defaults to 0."""
+    def test_score_zero_when_all_disqualify(self):
+        """If all validators disqualify, score defaults to 0."""
         subs = [
-            self._make_validated("v1", 100.0, {"m1": 5.0}, {"m1": False}),
-            self._make_validated("v2", 100.0, {"m1": 3.0}, {"m1": False}),
+            self._make_validated("v1", 100.0, {}, {"m1": "policy_violation"}),
+            self._make_validated("v2", 100.0, {}, {"m1": "policy_violation"}),
         ]
-        costs, quals = compute_consensus_costs(subs)
-        assert quals["m1"] is False
-        assert costs["m1"] == pytest.approx(0.0)
-
-    def test_min_validators_qualified_gate(self):
-        """Miner passing only one dominant-stake validator is disqualified.
-
-        This prevents gaming where a miner targets a single high-stake
-        validator and ignores the rest (issue #149).
-        """
-        subs = [
-            self._make_validated("v_dominant", 600.0, {"m1": 2.0}, {"m1": True}),
-            self._make_validated("v2", 100.0, {"m1": 3.0}, {"m1": False}),
-            self._make_validated("v3", 100.0, {"m1": 4.0}, {"m1": False}),
-        ]
-        # Stake majority: 600/800 = 0.75 > 0.5, but only 1 validator qualified
-        _, quals = compute_consensus_costs(subs)
-        assert quals["m1"] is False
-
-        # Same scenario with 2 validators qualified → passes
-        subs_ok = [
-            self._make_validated("v1", 300.0, {"m1": 2.0}, {"m1": True}),
-            self._make_validated("v2", 300.0, {"m1": 3.0}, {"m1": True}),
-            self._make_validated("v3", 100.0, {"m1": 4.0}, {"m1": False}),
-        ]
-        _, quals_ok = compute_consensus_costs(subs_ok)
-        assert quals_ok["m1"] is True
+        scores, disqualified = compute_consensus_scores(subs)
+        assert "m1" in disqualified
+        assert scores.get("m1", 0.0) == pytest.approx(0.0)
 
 
 # ---------------------------------------------------------------------------

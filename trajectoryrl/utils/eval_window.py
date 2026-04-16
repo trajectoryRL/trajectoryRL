@@ -9,7 +9,7 @@ Any validator can independently compute the current epoch number and window --
 no central coordination needed.
 
 Windows within an epoch (80/10/10 split):
-  - evaluation  (block 0 .. T_publish):     run ClawBench, record raw costs
+  - evaluation  (block 0 .. T_publish):     run trajrl-bench, record scores
   - propagation (T_publish .. T_aggregate):  upload payload to CAS, wait for others
   - aggregation (T_aggregate .. end):        read submissions, filter, consensus
 """
@@ -136,7 +136,7 @@ def should_aggregate(current_block: int, config: WindowConfig) -> bool:
 
 
 def can_evaluate(current_block: int, config: WindowConfig) -> bool:
-    """Check if we are in the evaluation phase (safe to run ClawBench)."""
+    """Check if we are in the evaluation phase (safe to run evaluations)."""
     window = compute_window(current_block, config)
     return window.phase == WindowPhase.EVALUATION
 

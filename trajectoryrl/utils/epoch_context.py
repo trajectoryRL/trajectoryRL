@@ -1,9 +1,8 @@
 """Epoch context generation for evaluation variation.
 
 Each epoch generates a unique evaluation context (persona, date, company, etc.)
-from the deterministic epoch seed.  This context is prepended to the miner's
-AGENTS.md before evaluation, and converted to a user_context dict that
-ClawBench uses for {{PLACEHOLDER}} template substitution in USER.md.
+from the deterministic epoch seed. This context provides deterministic variation
+for sandbox evaluation across epochs.
 
 Variation space: ~35 million unique contexts
 (365 dates × 20 names × 10 roles × 10 companies × 8 departments × 6 timezones)
@@ -69,11 +68,10 @@ class EpochContext:
     timezone_abbr: str  # "ET"
 
     def to_user_context(self) -> Dict[str, str]:
-        """Convert to a user_context dict for ClawBench {{PLACEHOLDER}} substitution.
+        """Convert to a user_context dict for template substitution.
 
         Returns:
-            Dict with keys matching template variables in USER.md fixtures:
-            USER_NAME, USER_FIRST_NAME, USER_ROLE, COMPANY.
+            Dict with keys: USER_NAME, USER_FIRST_NAME, USER_ROLE, COMPANY.
         """
         return {
             "USER_NAME": self.user_name,

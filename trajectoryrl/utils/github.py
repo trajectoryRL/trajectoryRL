@@ -34,12 +34,10 @@ class PackVerificationResult:
     Attributes:
         valid: Whether verification passed
         pack_content: Parsed pack dict (if valid)
-        raw_text: Raw text content before JSON parsing (if valid)
         error: Error message (if invalid)
     """
     valid: bool
     pack_content: Optional[dict] = None
-    raw_text: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -140,7 +138,7 @@ class PackFetcher:
             logger.info(f"Cache hit for hash={pack_hash[:12]}…")
             return PackVerificationResult(valid=True, pack_content=cached)
 
-        # Step 2: Fetch raw content via HTTP
+        # Step 2: Fetch pack via HTTP
         raw_content = await self._fetch_pack(pack_url)
         if raw_content is None:
             return PackVerificationResult(
@@ -148,35 +146,34 @@ class PackFetcher:
                 error=f"Failed to fetch pack from {pack_url}"
             )
 
-        # Step 3: Try JSON parse — determines hash verification strategy
+        # Step 3: Parse JSON
         try:
             pack_content = json.loads(raw_content)
-        except (json.JSONDecodeError, ValueError):
-            pack_content = None
+        except json.JSONDecodeError as e:
+            return PackVerificationResult(
+                valid=False,
+                error=f"Invalid JSON at {pack_url}: {e}"
+            )
 
-        if pack_content is not None:
-            # JSON pack (v4.0): hash the canonical re-serialization
-            canonical = json.dumps(pack_content, sort_keys=True).encode()
-            computed_hash = hashlib.sha256(canonical).hexdigest()
-        else:
-            # Plain text (S1): hash raw bytes as-is
-            computed_hash = hashlib.sha256(raw_content.encode()).hexdigest()
+        # Step 4: Verify content hash
+        computed_hash = hashlib.sha256(
+            json.dumps(pack_content, sort_keys=True).encode()
+        ).hexdigest()
 
         if computed_hash != pack_hash:
             return PackVerificationResult(
                 valid=False,
-                error=f"Hash mismatch: expected {pack_hash[:8]}, got {computed_hash[:8]}"
+                error=f"Pack hash mismatch: expected {pack_hash[:8]}, got {computed_hash[:8]}"
             )
 
         logger.info(f"Verification passed for {pack_url} (hash={pack_hash[:12]}…)")
 
-        if pack_content is not None:
-            self._save_to_cache(pack_hash, pack_content)
+        # Step 5: Cache for future use
+        self._save_to_cache(pack_hash, pack_content)
 
         return PackVerificationResult(
             valid=True,
             pack_content=pack_content,
-            raw_text=raw_content,
         )
 
     async def _fetch_pack(self, pack_url: str) -> Optional[str]:
@@ -193,7 +190,7 @@ class PackFetcher:
                 resp = await client.get(
                     pack_url,
                     timeout=_HTTP_TIMEOUT,
-                    headers={"Accept": "*/*"},
+                    headers={"Accept": "application/json"},
                 )
 
                 if resp.status_code != 200:

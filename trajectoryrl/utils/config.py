@@ -10,7 +10,6 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_LLM_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
 DEFAULT_LLM_MODEL = "glm-5.1"
-DEFAULT_CLAWBENCH_MODEL = f"zhipu/{DEFAULT_LLM_MODEL}"
 
 
 @dataclass
@@ -24,15 +23,8 @@ class ValidatorConfig:
         netuid: Subnet UID (11 for TrajectoryRL)
         network: Bittensor network (finney, test, local)
 
-        # ClawBench config
-        clawbench_path: Path to clawbench directory
-        scenarios: List of scenario names to evaluate
-        scenarios_path: Path to scenarios directory
-
         # Evaluation config
-        seeds_per_task: Number of seeds to run per task (for variance)
         eval_interval_blocks: Blocks between re-evaluations (~24 hours)
-        timeout_per_scenario: Max seconds per scenario evaluation
 
         # Scoring config
         delta_threshold: First-mover advantage threshold (0-1)
@@ -52,28 +44,9 @@ class ValidatorConfig:
     netuid: int = 11
     network: str = "finney"
 
-    # ClawBench config
-    clawbench_path: Path = field(
-        default_factory=lambda: Path(__file__).parent.parent.parent.parent / "clawbench"
-    )
-    scenarios: List[str] = field(
-        default_factory=lambda: [
-            "client_escalation",
-            "morning_brief",
-            "inbox_to_action",
-            "team_standup",
-            "inbox_triage",
-            "hiring_debrief",
-            "post_incident_review",
-        ]
-    )
-    scenarios_path: Optional[Path] = None
-
     # Evaluation config
-    seeds_per_task: int = 1
     eval_interval_blocks: int = 7200  # ~24 hours at 12s/block (window length)
     eval_utc_hour: int = 0           # UTC hour to trigger daily eval cycle (0 = midnight)
-    timeout_per_scenario: int = 300  # 5 minutes max per scenario
 
     # Evaluation window config (block-aligned consensus protocol)
     global_anchor_block: int = 0     # anchor block for window alignment
@@ -127,21 +100,19 @@ class ValidatorConfig:
     # same lowest-cost winner (use once to clear divergent cached state).
     disable_winner_protection: bool = False
 
-    # ClawBench LLM configuration (passed to init container & OpenClaw gateway)
-    clawbench_default_model: str = DEFAULT_CLAWBENCH_MODEL
-    clawbench_api_key: str = ""
-    clawbench_base_url: str = DEFAULT_LLM_BASE_URL
+    # LLM configuration (used by sandbox harness and LLM judges).
+    # Backward-compatible with legacy CLAWBENCH_LLM_* env vars.
+    llm_model: str = DEFAULT_LLM_MODEL
+    llm_api_key: str = ""
+    llm_base_url: str = DEFAULT_LLM_BASE_URL
 
     # LLM Judge configuration (Phase 1 integrity + Phase 2 trajectory)
-    # Defaults to same LLM as ClawBench episodes if left empty.
+    # Defaults to the primary LLM config if left empty.
     judge_model: str = ""
     judge_api_key: str = ""
     judge_base_url: str = ""
 
-    # Evaluation harness
-    # "trajrl-bench": Season 1 (SKILL.md packs, SSH sandbox, LLM judge)
-    # "clawbench": v4.0 legacy (AGENTS.md packs, OpenClaw, cost-based)
-    evaluation_harness: str = "trajrl-bench"
+    # trajrl-bench sandbox evaluation
     sandbox_image: str = "ghcr.io/trajectoryrl/trajrl-bench:latest"
     harness_image: str = "ghcr.io/trajectoryrl/hermes-agent:latest"
     sandbox_timeout_per_episode: int = 180  # 3 min per episode
@@ -170,23 +141,9 @@ class ValidatorConfig:
     )
 
     def __post_init__(self):
-        """Set derived paths and create directories."""
-        if self.scenarios_path is None:
-            self.scenarios_path = self.clawbench_path / "scenarios"
-
+        """Create required directories."""
         self.pack_cache_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
-
-        if not self.clawbench_path.exists():
-            raise ValueError(
-                f"clawbench_path does not exist: {self.clawbench_path}\n"
-                f"Run: git submodule update --init --recursive"
-            )
-        if not self.scenarios_path.exists():
-            raise ValueError(
-                f"scenarios_path does not exist: {self.scenarios_path}"
-            )
-
 
     @classmethod
     def from_env(cls, dotenv_path: Optional[Path] = None) -> "ValidatorConfig":
@@ -212,19 +169,13 @@ class ValidatorConfig:
             netuid=int(os.getenv("NETUID", "11")),
             network=os.getenv("NETWORK", "finney"),
             # --- Paths ---
-            clawbench_path=Path(
-                os.getenv(
-                    "CLAWBENCH_PATH",
-                    str(Path(__file__).parent.parent.parent / "clawbench")
-                )
-            ),
             ema_state_path=Path(os.getenv("EMA_STATE_PATH", "/var/lib/trajectoryrl/ema_state.json")),
             winner_state_path=Path(os.getenv("WINNER_STATE_PATH", "/var/lib/trajectoryrl/winner_state.json")),
-            # --- LLM ---
-            clawbench_default_model=os.getenv("CLAWBENCH_DEFAULT_MODEL", DEFAULT_CLAWBENCH_MODEL),
-            clawbench_api_key=os.getenv("CLAWBENCH_LLM_API_KEY", ""),
-            clawbench_base_url=os.getenv("CLAWBENCH_LLM_BASE_URL", DEFAULT_LLM_BASE_URL),
-            # --- LLM Judge (optional, falls back to clawbench LLM if empty) ---
+            # --- LLM (new names preferred, legacy CLAWBENCH_* still supported) ---
+            llm_model=os.getenv("LLM_MODEL") or os.getenv("CLAWBENCH_DEFAULT_MODEL", DEFAULT_LLM_MODEL),
+            llm_api_key=os.getenv("LLM_API_KEY") or os.getenv("CLAWBENCH_LLM_API_KEY", ""),
+            llm_base_url=os.getenv("LLM_BASE_URL") or os.getenv("CLAWBENCH_LLM_BASE_URL", DEFAULT_LLM_BASE_URL),
+            # --- LLM Judge (optional, falls back to primary LLM if empty) ---
             judge_model=os.getenv("JUDGE_MODEL", ""),
             judge_api_key=os.getenv("JUDGE_API_KEY", ""),
             judge_base_url=os.getenv("JUDGE_BASE_URL", ""),
@@ -238,8 +189,7 @@ class ValidatorConfig:
                 if gw.strip()
             ],
             consensus_api_url=os.getenv("CONSENSUS_API_URL", "https://trajrl.com"),
-            # --- Season 1 (trajrl-bench) ---
-            evaluation_harness=os.getenv("EVALUATION_HARNESS", "trajrl-bench"),
+            # --- trajrl-bench ---
             sandbox_image=os.getenv("SANDBOX_IMAGE", "ghcr.io/trajectoryrl/trajrl-bench:latest"),
             harness_image=os.getenv("HARNESS_IMAGE", "ghcr.io/trajectoryrl/hermes-agent:latest"),
             sandbox_timeout_per_episode=int(os.getenv("SANDBOX_TIMEOUT_PER_EPISODE", "180")),
@@ -313,8 +263,8 @@ class MinerConfig:
             network=os.getenv("NETWORK", "finney"),
             check_interval=int(os.getenv("CHECK_INTERVAL", "3600")),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
-            llm_api_key=os.getenv("CLAWBENCH_LLM_API_KEY", ""),
-            llm_base_url=os.getenv("CLAWBENCH_LLM_BASE_URL", DEFAULT_LLM_BASE_URL),
-            llm_model=os.getenv("CLAWBENCH_DEFAULT_MODEL", DEFAULT_LLM_MODEL),
+            llm_api_key=os.getenv("LLM_API_KEY") or os.getenv("CLAWBENCH_LLM_API_KEY", ""),
+            llm_base_url=os.getenv("LLM_BASE_URL") or os.getenv("CLAWBENCH_LLM_BASE_URL", DEFAULT_LLM_BASE_URL),
+            llm_model=os.getenv("LLM_MODEL") or os.getenv("CLAWBENCH_DEFAULT_MODEL", DEFAULT_LLM_MODEL),
             pack_url=os.getenv("PACK_URL", ""),
         )

@@ -5,7 +5,6 @@ import numpy as np
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 
-from ..utils.clawbench import EvaluationResult
 from ..utils.consensus_filter import ValidatedSubmission
 
 logger = logging.getLogger(__name__)
@@ -32,7 +31,7 @@ class AggregatedScore:
 
 
 class TrajectoryScorer:
-    """Scores policy packs based on ClawBench scenario results."""
+    """Scores policy packs based on trajrl-bench evaluation results."""
 
     def __init__(
         self,
@@ -60,7 +59,7 @@ class TrajectoryScorer:
 
     def aggregate_scores(
         self,
-        results: List[EvaluationResult],
+        results: list,
         scenario_weights: Optional[Dict[str, float]] = None,
     ) -> AggregatedScore:
         """Aggregate multiple evaluation results with optional scenario weights.
@@ -70,7 +69,7 @@ class TrajectoryScorer:
         read from the ``weight`` field in each scenario YAML (default 1.0).
 
         Args:
-            results: List of EvaluationResult from multiple scenarios/seeds
+            results: List of result objects with .scenario_name, .score, .success
             scenario_weights: Optional dict of scenario_name -> weight.
                 If None, all scenarios are weighted equally.
 

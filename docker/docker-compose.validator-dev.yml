@@ -1,6 +1,6 @@
-# TrajectoryRL Validator — Local Development (all-in-one)
+# TrajectoryRL Validator — Local Development
 #
-# Builds the all-in-one image locally. Bind-mounts source code for
+# Builds the image locally. Bind-mounts source code for
 # hot reload of validator Python code (requires container restart).
 #
 # Usage:
@@ -25,6 +25,7 @@ services:
       - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
       - ../neurons:/app/neurons
       - ../trajectoryrl:/app/trajectoryrl
+      - /var/run/docker.sock:/var/run/docker.sock
     logging:
       driver: "json-file"
       options:

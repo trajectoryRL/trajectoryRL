@@ -1,57 +1,21 @@
-# TrajectoryRL Validator — All-in-One Image
+# TrajectoryRL Validator
 #
-# Single image containing validator + mock-tools + OpenClaw gateway.
-# Multi-stage build: Stage 1 compiles OpenClaw, Stage 2 is the runtime.
+# Season 1: validator orchestrates trajrl-bench sandbox containers via
+# Docker API.  No embedded OpenClaw or mock-tools needed.
 #
 # Build (from repo root):
 #   docker build -f docker/Dockerfile.validator -t trajectoryrl-validator .
 #
 # Run:
 #   docker run --network host --env-file .env.validator \
+#     -v /var/run/docker.sock:/var/run/docker.sock \
 #     -v ~/.bittensor/wallets:/root/.bittensor/wallets:ro \
 #     trajectoryrl-validator
 
-# =====================================================================
-# Stage 1: Build OpenClaw (Node.js)
-# =====================================================================
-FROM node:22-bookworm AS openclaw-builder
-
-RUN curl -fsSL https://bun.sh/install | bash
-ENV PATH="/root/.bun/bin:${PATH}"
-
-RUN corepack enable
-
-WORKDIR /openclaw
-
-# Install dependencies first (layer caching)
-COPY openclaw/package.json openclaw/pnpm-lock.yaml openclaw/pnpm-workspace.yaml openclaw/.npmrc ./
-COPY openclaw/ui/package.json ./ui/package.json
-COPY openclaw/patches ./patches
-COPY openclaw/scripts ./scripts
-
-RUN pnpm install --frozen-lockfile
-
-# Build
-COPY openclaw/ .
-RUN OPENCLAW_A2UI_SKIP_MISSING=1 pnpm build
-ENV OPENCLAW_PREFER_PNPM=1
-RUN pnpm ui:build
-
-# Remove source files to reduce copy size (keep dist + node_modules)
-# NOTE: Keep docs/reference/templates/ — OpenClaw reads AGENTS.md etc. at runtime
-RUN rm -rf src/ test/ .git/ vitest.*.ts tsconfig*.json tsdown.config.ts && \
-    find docs/ -mindepth 1 -not -path 'docs/reference/templates*' -delete 2>/dev/null || true
-
-# =====================================================================
-# Stage 2: Runtime (Python + Node.js)
-# =====================================================================
 FROM python:3.10-slim
 
-# Install Node.js 22 runtime, git, curl
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl gnupg && \
-    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
-    apt-get install -y --no-install-recommends nodejs git && \
+    apt-get install -y --no-install-recommends git curl && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -61,19 +25,11 @@ COPY pyproject.toml requirements.txt VERSION ./
 COPY trajectoryrl/ trajectoryrl/
 COPY neurons/ neurons/
 COPY scripts/ scripts/
-COPY clawbench/ clawbench/
-RUN rm -f clawbench/.git
 
-RUN pip install --no-cache-dir -e . && \
-    pip install --no-cache-dir -r clawbench/requirements.txt && \
-    pip install --no-cache-dir -r clawbench/requirements-mock.txt && \
-    pip install --no-cache-dir pyyaml
-
-# ── OpenClaw (pre-built from Stage 1) ───────────────────────────
-COPY --from=openclaw-builder /openclaw /app/openclaw
+RUN pip install --no-cache-dir -e .
 
 # ── Directories ─────────────────────────────────────────────────
-RUN mkdir -p /workspace /root/.openclaw
+RUN mkdir -p /var/lib/trajectoryrl
 
 # ── Entrypoint ──────────────────────────────────────────────────
 COPY docker/entrypoint-validator.sh /entrypoint.sh
@@ -81,20 +37,13 @@ RUN chmod +x /entrypoint.sh
 
 # ── Environment defaults ────────────────────────────────────────
 ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONPATH="/app/clawbench:/app/clawbench/clawbench"
 ENV WALLET_NAME=validator
 ENV WALLET_HOTKEY=default
 ENV NETUID=11
 ENV NETWORK=finney
 ENV EVAL_INTERVAL_BLOCKS=1200
 ENV WEIGHT_INTERVAL_BLOCKS=360
-ENV EMA_ALPHA=0.3
 ENV INACTIVITY_BLOCKS=14400
 ENV LOG_LEVEL=INFO
-# All-in-one: no Docker port mapping, use actual listen ports
-ENV OPENCLAW_URL=http://localhost:18789
-ENV MOCK_TOOLS_URL=http://localhost:3001
-ENV FIXTURES_PATH=/app/clawbench/fixtures
-ENV SCENARIO=client_escalation
 
 ENTRYPOINT ["/entrypoint.sh"]
