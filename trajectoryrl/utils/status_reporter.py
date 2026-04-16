@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 _BASE_URL = os.getenv("TRAJECTORYRL_API_BASE_URL", "https://trajrl.com")
 DEFAULT_HEARTBEAT_URL = f"{_BASE_URL}/api/v2/validators/heartbeat"
 DEFAULT_SUBMIT_URL = f"{_BASE_URL}/api/v2/scores/submit"
-DEFAULT_PRE_EVAL_URL = f"{_BASE_URL}/api/miners/pre-eval"
+DEFAULT_PRE_EVAL_URL = f"{_BASE_URL}/api/v2/miners/pre-eval"
 DEFAULT_LOGS_UPLOAD_URL = f"{_BASE_URL}/api/validators/logs/upload"
 DEFAULT_CYCLE_LOGS_URL = f"{_BASE_URL}/api/validators/logs/cycle"
 
