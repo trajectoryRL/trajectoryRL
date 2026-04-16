@@ -31,9 +31,10 @@ One install gives any agent (Claude Code, Cursor, Codex, OpenClaw, Hermes, Manus
 │  └───────────────┘                   │ verify hash       │   │
 │        │                             │                   │   │
 │        │                             │ Evaluate via      │   │
-│        │                             │ TrajRL-Bench      │   │
-│        │                             │ (SSH sandbox +    │   │
-│        │                             │  LLM judge)       │   │
+│        │                             │ TrajRL-Bench:     │   │
+│        │                             │ sandbox + testee  │   │
+│        │                             │ agent + judge     │   │
+│        │                             │ agent (all SSH)   │   │
 │        │                             └───────────────────┘   │
 │        │                                      │              │
 │        │                                      │ set_weights  │
@@ -46,7 +47,7 @@ One install gives any agent (Claude Code, Cursor, Codex, OpenClaw, Hermes, Manus
 ```
 
 - **No server required** — Miners upload packs to any HTTP endpoint and commit on-chain. No GPU, no uptime needed.
-- **Quality-based competition** — Agent SSHes into isolated sandbox with mock services. 100% LLM judge scoring across 4 episodes. Best quality wins.
+- **Quality-based competition** — Testee agent SSHes into isolated sandbox, solves the task. A judge agent SSHes in, grounds its evaluation in mock service state, scores the result. 4 episodes per miner, split-half delta for learning bonus.
 - **Content-addressed** — Packs identified by SHA256 hash, verified against on-chain commitment
 - **Winner-take-all** — Best miner gets 100% of rewards; first-mover advantage protects early innovators
 - **Anti-copy** — NCD similarity detection + first-mover threshold
@@ -77,7 +78,7 @@ See [.env.validator.example](.env.validator.example) for all config options.
 
 ### For Miners
 
-Mining means writing a **SKILL.md** -- instructions and strategies that teach an AI agent how to handle operational scenarios. The agent SSHes into an isolated sandbox with mock services, executes tasks, and gets scored by an LLM judge on quality. No GPU, no server, no uptime required.
+Mining means writing a **SKILL.md** -- instructions and strategies that teach an AI agent how to handle operational scenarios. The testee agent SSHes into an isolated sandbox (shell + mock services + scenario files), reads your SKILL.md, solves the task. A judge agent then SSHes in, grounds its evaluation in the sandbox state, and scores the work. No GPU, no server, no uptime required.
 
 #### 1. Prerequisites (one-time)
 
@@ -132,7 +133,7 @@ Source, skill catalog, and full documentation: https://github.com/trajectoryRL/t
 
 - **[Miner Guide](MINER_GUIDE_S1.md)** — SKILL.md authoring, sandbox environment, scoring, and submission
 - **[Season 1 Spec](seasons/self_learning_s1.md)** — Design doc: sandbox architecture, scoring formula, scenarios
-- **[TrajRL-Bench](https://github.com/trajectoryRL/trajrl-bench)** — Agent skills benchmark (mock services, LLM judge, Docker)
+- **[TrajRL-Bench](https://github.com/trajectoryRL/trajrl-bench)** — Agent skills benchmark (sandbox + testee + judge agent, three-container Docker)
 - **[trajrl CLI](https://github.com/trajectoryRL/trajrl)** — Install and use skills produced by the subnet
 
 ## Community

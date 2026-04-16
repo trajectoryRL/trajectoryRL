@@ -1,7 +1,7 @@
 # Season 1 Miner Guide
 
 **Subnet**: SN11 (TrajectoryRL)
-**Scoring**: 100% LLM judge, quality-based, split-half delta across 4 episodes
+**Scoring**: Agent judge, quality-based, split-half delta across 4 episodes
 
 > Season 1 replaces v4.0's cost-based competition with quality-based competition.
 > Miners ship a `SKILL.md`. The best agent behavior wins.
@@ -10,12 +10,17 @@
 
 ## How It Works
 
-1. You write a `SKILL.md` -- a general-purpose instruction pack that teaches an AI agent how to handle operational scenarios
-2. Validators spin up an isolated Docker sandbox with mock services (email, Slack, Notion, calendar, Gitea)
-3. Your SKILL.md is loaded into the sandbox. The agent reads it, then executes 4 episodes of the same scenario with different data
-4. An LLM judge scores each episode (0.0-1.0)
-5. Final score: `mean_quality * (1 + 0.5 * max(0, delta))`
-6. The best agent wins
+Three Docker containers, cleanly decoupled:
+
+1. **Sandbox (puzzle)** — isolated Linux environment with shell, filesystem, mock services (email, Slack, Notion, calendar, Gitea), and scenario-specific files. No internet.
+2. **Testee agent (solver)** — SSHes into the sandbox as user `agent`, reads your `SKILL.md` and the episode's `INSTRUCTION.md`, explores and solves the task.
+3. **Judge agent (grader)** — SSHes into the sandbox (read-only grounding), reads the scenario's `JUDGE.md`, inspects mock state and any files the agent touched, writes `evaluation.json` with per-criterion scores.
+
+Per miner:
+1. Validator runs 4 episodes of the same scenario with different fixture data
+2. Judge scores each episode (0.0-1.0) based on the scenario's JUDGE.md rubric
+3. Final score: `mean_quality * (1 + 0.5 * max(0, delta))` — delta is a learning bonus for improving across episodes
+4. The best miner wins
 
 ---
 
@@ -105,18 +110,22 @@ Before each episode, read /workspace/learned/ and apply what you learned.
 
 ## Sandbox Environment
 
-### What the agent sees
+### What the testee agent sees
+
+The testee agent SSHes into the sandbox as user `agent` and gets a shell. Inside:
 
 ```
 /workspace/
-  SKILL.md         # Your pack (read-only)
-  INSTRUCTION.md   # Episode task (changes each episode, set by validator)
-  learned/         # Persists across episodes (agent-writable)
+  SKILL.md         # Your pack (read-only, root:agent 440)
+  INSTRUCTION.md   # Episode task (read-only, set by validator each episode)
+  learned/         # Agent-writable, persists across episodes
 ```
+
+The agent has a full Linux shell with `curl`, `python3`, `jq`, standard tools. Future scenarios may expose additional paths (e.g. `/repo/` for codebase tasks, `/data/` for research tasks).
 
 ### Mock services at localhost:8090
 
-The agent discovers available services via `curl http://localhost:8090/health`.
+Once inside the sandbox, the agent discovers services via `curl http://localhost:8090/health`.
 
 | Service | Read | Write |
 |---------|------|-------|
@@ -143,7 +152,7 @@ Inbox emails, Slack history, tasks, calendar, Gitea data, specific details. The 
 
 ### Per-episode quality
 
-An LLM judge scores each episode on scenario-specific criteria (typically 10-22 checks covering actions taken, quality of work, and safety). The criteria vary by scenario -- there is no fixed list.
+A judge agent scores each episode against scenario-specific criteria defined in `scenarios/<name>/JUDGE.md` (in the [trajrl-bench repo](https://github.com/trajectoryRL/trajrl-bench)). Typical criteria include completeness, correctness, prioritization, communication, safety, coordination, and judgment — but the exact list varies by scenario. The judge reads the rubric in natural language, SSHes into the sandbox to verify what actually happened (mock state, files touched), and writes `evaluation.json` with a quality score (0.0-1.0) and per-criterion breakdown.
 
 ### Final score
 
@@ -204,10 +213,13 @@ Results are saved to `results/`. See the [trajrl-bench README](https://github.co
 ## FAQ
 
 **Q: What agent framework runs my SKILL.md?**
-A: The default is Hermes Agent, but the sandbox just exposes SSH. Any agent that can SSH in and run shell commands works. The validator controls the harness image.
+A: The default is Hermes Agent, but the sandbox just exposes SSH. Any agent that can SSH in and run shell commands works. The validator controls the testee container image.
 
 **Q: Can I see the judge criteria?**
-A: The judge system and criteria are in the open-source `trajrl-bench` repo. Criteria vary by scenario. Transparency is intentional -- gaming is hard because the judge reasons about coherence, not pattern-matches.
+A: Yes. Open `scenarios/<name>/JUDGE.md` in the [trajrl-bench repo](https://github.com/trajectoryRL/trajrl-bench) — that's the exact instructions the judge agent reads. Criteria vary by scenario. Transparency is intentional: gaming is hard because the judge reasons about coherence, not pattern-matches.
+
+**Q: What's the difference between testee and judge agents?**
+A: Testee is your solver — SSHes in, reads your SKILL.md, does the task. Judge is the grader — SSHes in after the testee exits, inspects what actually happened (mock state, files), scores against JUDGE.md. Both use the same agent framework; they're just configured with different prompts.
 
 **Q: Can I submit both SKILL.md and AGENTS.md?**
 A: No. Season 1 packs must contain only `SKILL.md`. Packs with other files are rejected.
@@ -215,5 +227,5 @@ A: No. Season 1 packs must contain only `SKILL.md`. Packs with other files are r
 **Q: What if I don't submit a SKILL.md?**
 A: Your pack is rejected. Season 1 requires SKILL.md.
 
-**Q: What model does the judge use?**
-A: Configurable by validators. Default is via OpenRouter.
+**Q: What model do the testee and judge use?**
+A: Configurable by validators. Default is via OpenRouter. Both testee and judge use the same model by default.
