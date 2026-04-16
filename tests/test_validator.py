@@ -22,7 +22,7 @@ import pytest
 # ---------------------------------------------------------------------------
 _mock_bt = MagicMock()
 
-# bt.Synapse must be a real class so PackRequest/PackResponse can inherit
+# bt.Synapse must be a real class for any module that inherits from it
 class _MockSynapse:
     pass
 
@@ -955,7 +955,7 @@ class TestPackFetcher:
             assert cache.exists()
 
     def test_verify_valid_pack(self):
-        """Valid pack URL + matching hash → verification passes."""
+        """Valid JSON pack URL + matching hash → verification passes."""
         pack = {"schema_version": 1, "files": {"AGENTS.md": "# Test"}}
         pack_json = json.dumps(pack, sort_keys=True)
         pack_hash = hashlib.sha256(pack_json.encode()).hexdigest()
@@ -976,9 +976,33 @@ class TestPackFetcher:
 
             assert result.valid is True
             assert result.pack_content == pack
+            assert result.raw_text == pack_json
+
+    def test_verify_valid_text(self):
+        """Valid plain-text submission (S1 SKILL.md) + matching hash → passes."""
+        skill_md = "# My Skill\n\nDo good work."
+        text_hash = hashlib.sha256(skill_md.encode()).hexdigest()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fetcher = PackFetcher(cache_dir=Path(tmpdir))
+
+            with patch.object(
+                fetcher, "_fetch_pack",
+                new_callable=AsyncMock, return_value=skill_md,
+            ):
+                result = asyncio.run(
+                    fetcher.verify_submission(
+                        pack_url="https://example.com/skill.md",
+                        pack_hash=text_hash,
+                    )
+                )
+
+            assert result.valid is True
+            assert result.pack_content is None
+            assert result.raw_text == skill_md
 
     def test_verify_hash_mismatch(self):
-        """Pack content doesn't match expected hash → verification fails."""
+        """Content doesn't match expected hash → verification fails."""
         pack_json = json.dumps({"schema_version": 1, "files": {"AGENTS.md": "# Test"}}, sort_keys=True)
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1016,25 +1040,6 @@ class TestPackFetcher:
 
             assert result.valid is False
             assert "fetch" in result.error.lower() or "failed" in result.error.lower()
-
-    def test_verify_invalid_json(self):
-        """Non-JSON response → verification fails."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fetcher = PackFetcher(cache_dir=Path(tmpdir))
-
-            with patch.object(
-                fetcher, "_fetch_pack",
-                new_callable=AsyncMock, return_value="not json {{{",
-            ):
-                result = asyncio.run(
-                    fetcher.verify_submission(
-                        pack_url="https://trajrl.com/samples/pack.json",
-                        pack_hash="a" * 64,
-                    )
-                )
-
-            assert result.valid is False
-            assert "json" in result.error.lower()
 
     def test_cache_hit_skips_fetch(self):
         """Cached pack with matching hash → no HTTP fetch needed."""

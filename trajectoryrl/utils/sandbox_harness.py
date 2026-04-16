@@ -269,6 +269,23 @@ def _generate_keypair() -> tuple[str, str]:
     return private_key, public_key
 
 
+_PROVIDER_PREFIXES = ("openrouter/", "chutes/")
+
+
+def _strip_provider_prefix(model: str) -> str:
+    """Remove provider routing prefixes from model identifiers.
+
+    Providers like OpenRouter and Chutes use prefixed model names
+    (e.g. ``openrouter/anthropic/claude-3``), but the sandbox calls
+    the provider API directly via LLM_BASE_URL and expects the bare
+    model name.
+    """
+    for prefix in _PROVIDER_PREFIXES:
+        if model.startswith(prefix):
+            return model[len(prefix):]
+    return model
+
+
 # ---------------------------------------------------------------------------
 # Harness
 # ---------------------------------------------------------------------------
@@ -292,10 +309,8 @@ class TrajectorySandboxHarness:
         self._harness_image = config.harness_image
         self._llm_api_key = config.judge_api_key or config.clawbench_api_key
         self._llm_api_url = config.judge_base_url or config.clawbench_base_url
-        # Strip "openrouter/" prefix — the sandbox scorer calls OpenRouter
-        # directly via LLM_BASE_URL and doesn't use the prefix convention.
         _model = config.judge_model or config.clawbench_default_model
-        self._llm_model = _model.removeprefix("openrouter/")
+        self._llm_model = _strip_provider_prefix(_model)
 
         # Sandbox version — queried at pull time, drives scoring_version
         self.sandbox_version: str = "unknown"

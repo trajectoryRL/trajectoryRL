@@ -8,6 +8,5 @@ else:
     from importlib.metadata import version
     __version__ = version("trajectoryrl")
 
-from trajectoryrl.protocol import PackRequest, PackResponse
 from trajectoryrl.utils import validate_opp_schema
-__all__ = ["PackRequest", "PackResponse", "validate_opp_schema"]
+__all__ = ["validate_opp_schema"]

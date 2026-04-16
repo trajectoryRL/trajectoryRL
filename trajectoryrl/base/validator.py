@@ -1456,11 +1456,14 @@ class TrajectoryValidator:
                 commitment.pack_url,
                 commitment.pack_hash,
             )
-            if not result.valid or result.pack_content is None:
+            if not result.valid:
                 logger.warning(
                     f"NCD prefetch: uid={uid} ({hk[:8]}…): "
                     f"{result.error or 'unknown'}"
                 )
+                continue
+            if result.pack_content is None:
+                # S1 text submission — not applicable for NCD dedup
                 continue
             pack_info[hk] = (
                 result.pack_content,
@@ -2114,7 +2117,28 @@ class TrajectoryValidator:
             )
             return None
 
+        # Season 1 path: text submissions go to trajrl-bench harness.
+        # JSON content is treated as a legacy v4.0 pack and skipped.
+        if self._evaluation_harness == "trajrl-bench" and self._sandbox_harness:
+            if verification.pack_content is not None:
+                mlog.info(
+                    "S1 mode: submission is JSON (legacy v4.0 pack), skipping"
+                )
+                self._disqualified_miners[commitment.hotkey] = "legacy_json_pack"
+                return None
+
+            return await self._evaluate_miner_s1(
+                miner_uid=miner_uid,
+                commitment=commitment,
+                skill_md=verification.raw_text,
+                epoch_seed=epoch_seed,
+                block_height=block_height,
+            )
+
         pack = verification.pack_content
+        if pack is None:
+            mlog.warning("Submission is not JSON — expected OPP v1 pack")
+            return None
 
         # Step 2: Schema validation
         lint_result = validate_opp_schema(pack)
@@ -2165,16 +2189,6 @@ class TrajectoryValidator:
 
         self._hotkey_packs[commitment.hotkey] = pack
         self._pack_by_hash[commitment.pack_hash] = pack
-
-        # Season 1 path: use trajrl-bench harness
-        if self._evaluation_harness == "trajrl-bench" and self._sandbox_harness:
-            return await self._evaluate_miner_s1(
-                miner_uid=miner_uid,
-                commitment=commitment,
-                pack=pack,
-                epoch_seed=epoch_seed,
-                block_height=block_height,
-            )
 
         # Step 4+5: Run episodes and judge trajectories
         scenario_costs: Dict[str, float] = {}
@@ -2346,7 +2360,7 @@ class TrajectoryValidator:
         self,
         miner_uid: int,
         commitment: "MinerCommitment",
-        pack: dict,
+        skill_md: str,
         epoch_seed: int,
         block_height: int = 0,
     ) -> Optional[Dict]:
@@ -2356,25 +2370,19 @@ class TrajectoryValidator:
         Hermes Agent. Uses split-half delta scoring (quality-based,
         not cost-based).
 
+        In S1, miners submit raw SKILL.md text (not JSON). The caller
+        has already verified the content hash and filtered out JSON
+        (legacy v4.0) submissions.
+
         Returns same shape as _evaluate_miner for pipeline compatibility:
             {"costs": {...}, "qualified": {...}, ...}
         """
         mlog = self._get_miner_logger(commitment.hotkey)
         harness = self._sandbox_harness
 
-        # S1 packs must contain ONLY SKILL.md (no AGENTS.md or other files)
-        files = pack.get("files", {})
-        skill_md = files.get("SKILL.md") or files.get("skill.md")
-        if not skill_md:
-            mlog.warning("No SKILL.md found in pack — not a valid S1 submission")
-            self._disqualified_miners[commitment.hotkey] = "no_skill_md"
-            return None
-
-        allowed = {"SKILL.md", "skill.md"}
-        extra = set(files.keys()) - allowed
-        if extra:
-            mlog.warning("S1 pack contains disallowed files: %s — only SKILL.md permitted", extra)
-            self._disqualified_miners[commitment.hotkey] = "extra_files"
+        if not skill_md or not skill_md.strip():
+            mlog.warning("Empty SKILL.md submission")
+            self._disqualified_miners[commitment.hotkey] = "empty_skill_md"
             return None
 
         mlog.info(
