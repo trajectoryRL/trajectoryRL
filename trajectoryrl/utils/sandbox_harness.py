@@ -157,8 +157,15 @@ def _docker_run_json(client: docker.DockerClient, image: str,
         raise RuntimeError(f"Failed to parse container output as JSON: {e}") from e
 
 
-def _put_file(container: Container, path: str, content: str | bytes) -> None:
-    """Write a file into a running container via tar archive."""
+def _put_file(
+    container: Container, path: str, content: str | bytes,
+    mode: int = 0o644,
+) -> None:
+    """Write a file into a container via tar archive.
+
+    Works on containers that are created but not yet started (no exec_run
+    required). Sets file mode via tar header.
+    """
     import posixpath
     dir_name = posixpath.dirname(path)
     file_name = posixpath.basename(path)
@@ -167,6 +174,7 @@ def _put_file(container: Container, path: str, content: str | bytes) -> None:
     with tarfile.open(fileobj=buf, mode="w") as tar:
         info = tarfile.TarInfo(name=file_name)
         info.size = len(data)
+        info.mode = mode
         tar.addfile(info, io.BytesIO(data))
     buf.seek(0)
     container.put_archive(dir_name, buf)
@@ -359,23 +367,22 @@ class TrajectorySandboxHarness:
         # -----------------------------------------------------------
         network = None
         sandbox = None
-        # Shared volume for /workspace/learned/ (persists agent notes
-        # across episodes). Other files (SKILL.md, INSTRUCTION.md) are
-        # written directly into each container via Docker API to avoid
-        # permission issues from the sandbox entrypoint.
-        learned_dir = tempfile.mkdtemp(prefix=f"eval_{session_id}_learned_")
+        # Ephemeral SSH keypair — testee agent SSHes into sandbox.
+        # The sandbox is the puzzle environment (self-contained: shell,
+        # filesystem, mock services, scenario files). Testee comes in as
+        # the "agent" user and explores/solves whatever is there.
+        private_key, public_key = _generate_keypair()
 
         try:
-            # Create internal network for sandbox ↔ harness
+            # Create internal network for sandbox ↔ harness ↔ judge
             network_name = f"eval_{session_id}"
             network = self.client.networks.create(
                 network_name, driver="bridge", internal=True,
                 labels={"trajectoryrl.role": "eval_net"},
             )
 
-            # Start sandbox container (internal network only — no internet)
-            # Alias "sandbox" lets the harness reach it via http://sandbox:8090
-            # so miners can write SKILL.md with stable hostnames, not raw IPs.
+            # Start sandbox container (internal network only — no internet).
+            # Alias "sandbox" lets SSH use "ssh agent@sandbox" stably.
             sandbox = self.client.containers.run(
                 self._sandbox_image,
                 name=f"sandbox_{session_id}",
@@ -384,6 +391,10 @@ class TrajectorySandboxHarness:
                     network.name: self.client.api.create_endpoint_config(
                         aliases=["sandbox"],
                     ),
+                },
+                environment={
+                    "SSH_PUBLIC_KEY": public_key,
+                    "SSH_USER": "agent",
                 },
                 mem_limit="2g", cpu_quota=100000,
                 labels={"trajectoryrl.role": "sandbox",
@@ -405,6 +416,14 @@ class TrajectorySandboxHarness:
             else:
                 raise RuntimeError("Sandbox mock services failed to start")
 
+            # Write SKILL.md into sandbox's /workspace (persists across episodes).
+            # This is the miner's product — read-only to the agent.
+            _put_file(sandbox, "/workspace/SKILL.md", skill_md)
+            sandbox.exec_run(["chown", "root:agent", "/workspace/SKILL.md"])
+            sandbox.exec_run(["chmod", "440", "/workspace/SKILL.md"])
+            sandbox.exec_run(["mkdir", "-p", "/workspace/learned"])
+            sandbox.exec_run(["chown", "-R", "agent:agent", "/workspace/learned"])
+
             # Run each episode
             for i, ep_data in enumerate(episodes_data):
                 episode = self._run_episode(
@@ -415,8 +434,7 @@ class TrajectorySandboxHarness:
                     scenario=scenario,
                     sandbox=sandbox,
                     network=network,
-                    skill_md=skill_md,
-                    learned_dir=learned_dir,
+                    private_key=private_key,
                 )
                 session_result.episodes.append(episode)
 
@@ -432,9 +450,6 @@ class TrajectorySandboxHarness:
                     network.remove()
                 except Exception:
                     pass
-            # Clean up shared learned directory
-            import shutil
-            shutil.rmtree(learned_dir, ignore_errors=True)
 
         # -----------------------------------------------------------
         # Step 3: Compute split-half delta (simple math, no imports)
@@ -446,68 +461,72 @@ class TrajectorySandboxHarness:
         self, session_id: str, episode_index: int, ep_data: dict,
         world_data: dict, scenario: str,
         sandbox: Container,
-        network: Network, skill_md: str, learned_dir: str,
+        network: Network, private_key: str,
     ) -> _EpisodeResult:
-        """Run a single episode: load fixtures, start harness, capture, score."""
-        import os
-        import tempfile
+        """Run a single episode: load fixtures, start testee agent, capture, score.
 
+        Testee agent SSHes into the sandbox. The sandbox is the complete
+        environment — shell, filesystem, mock services, scenario files.
+        Testee reads /workspace/SKILL.md (miner's product), INSTRUCTION.md
+        (this episode's task), and explores whatever else the scenario
+        exposes (e.g. a git repo at /repo, logs at /var/log/, a dataset
+        at /data/).
+        """
         episode = _EpisodeResult(episode_index=episode_index)
         t0 = time.time()
         logger.info("[%s] Episode %d starting", session_id, episode_index)
 
         try:
-            # Load fixtures into sandbox mock services
+            # Load fixtures into sandbox mock services + write INSTRUCTION.md
             sandbox.exec_run(["sh", "-c", "curl -s -X POST http://localhost:8090/reset"])
             fixtures_json = json.dumps(ep_data["fixtures"])
             _put_file(sandbox, "/tmp/fixtures.json", fixtures_json)
             sandbox.exec_run(["sh", "-c",
                 "curl -s -X POST http://localhost:8090/load_fixtures "
                 "-H 'Content-Type: application/json' -d @/tmp/fixtures.json"])
+            _put_file(sandbox, "/workspace/INSTRUCTION.md", ep_data["instruction_md"])
+            sandbox.exec_run(["chown", "root:agent", "/workspace/INSTRUCTION.md"])
+            sandbox.exec_run(["chmod", "440", "/workspace/INSTRUCTION.md"])
 
-            # Start harness container (INSTRUCTION.md written after start)
-            harness_name = f"harness_{session_id}_ep{episode_index}"
+            # Start testee agent. Gets SSH creds to the sandbox.
+            harness_name = f"testee_{session_id}_ep{episode_index}"
             harness_prompt = (
+                "SSH into the sandbox: `ssh -o StrictHostKeyChecking=no "
+                "-i /keys/id_ed25519 agent@sandbox`. "
+                "Everything you need is there: shell, filesystem, tools. "
                 "Read /workspace/SKILL.md for your approach. "
-                "Read /workspace/INSTRUCTION.md for the task. "
-                "Check /workspace/learned/ for notes from prior episodes. "
-                "Services are at http://sandbox:8090 - start with /health. "
+                "Read /workspace/INSTRUCTION.md for this episode's task. "
+                "Check /workspace/learned/ for notes from prior episodes (you may write there). "
+                "Explore the environment and solve the task. "
                 "Do not modify SKILL.md."
             )
 
-            # Create harness container (not started yet).
-            # We need to attach the eval network and write files BEFORE
-            # starting, so the agent can resolve "sandbox" hostname and
-            # read SKILL.md/INSTRUCTION.md from the first tool call.
             harness = self.client.containers.create(
                 self._harness_image,
                 command=["chat", "-q", harness_prompt,
                          "-m", self._llm_model,
-                         "-t", "terminal,file,web,code_execution,memory",
+                         "-t", "terminal,file,code_execution,memory",
                          "--quiet", "--yolo", "--max-turns", "30"],
                 name=harness_name,
-                working_dir="/workspace",
-                volumes={learned_dir: {"bind": "/workspace/learned", "mode": "rw"}},
                 environment={
                     "OPENROUTER_API_KEY": self._llm_api_key,
                     "LLM_API_KEY": self._llm_api_key,
                     "HERMES_BUNDLED_SKILLS": "/nonexistent",
                 },
                 mem_limit="4g", cpu_quota=200000,
-                labels={"trajectoryrl.role": "harness",
+                labels={"trajectoryrl.role": "testee",
                         "trajectoryrl.session": session_id},
                 log_config=LogConfig(type=LogConfig.types.JSON,
                                      config={"max-size": "50m"}),
             )
 
-            # Attach eval network (sandbox reachable at http://sandbox:8090)
+            # Attach eval network so testee can reach sandbox via SSH
             network.connect(harness)
 
-            # Write files into harness container before starting
-            _put_file(harness, "/workspace/SKILL.md", skill_md)
-            _put_file(harness, "/workspace/INSTRUCTION.md", ep_data["instruction_md"])
+            # Install SSH private key into testee container (mode 0600
+            # so ssh client accepts it).
+            _put_file(harness, "/keys/id_ed25519", private_key, mode=0o600)
 
-            # Now start — agent has network + files ready
             harness.start()
 
             try:
@@ -550,7 +569,7 @@ class TrajectorySandboxHarness:
                     pass
 
             # -----------------------------------------------------------
-            # Score via agent judge (Hermes explores sandbox state)
+            # Score via agent judge (explores sandbox state via SSH + HTTP)
             # -----------------------------------------------------------
             self._score_episode_agent(
                 session_id=session_id,
@@ -561,6 +580,7 @@ class TrajectorySandboxHarness:
                 scenario=scenario,
                 sandbox=sandbox,
                 network=network,
+                private_key=private_key,
             )
 
             logger.info("[%s] Episode %d quality=%.3f",
@@ -578,21 +598,20 @@ class TrajectorySandboxHarness:
         self, session_id: str, episode_index: int,
         episode: _EpisodeResult, ep_data: dict, world_data: dict,
         scenario: str, sandbox: Container, network: Network,
+        private_key: str,
     ) -> None:
-        """Score an episode using a judge agent instead of a fixed LLM call.
+        """Score an episode using a judge agent.
 
-        The judge agent connects to the sandbox, reads the transcript and
-        mock service state, and writes a structured evaluation. This allows
-        scoring logic to live in natural language (JUDGE.md) instead of
-        Python code, making it trivial to add new scenarios.
+        The judge SSHes into the sandbox (same SSH key as the testee,
+        read-only grounding) to inspect whatever the scenario exposes:
+        mock service state via http://localhost:8090/state, filesystem
+        contents (git repo, logs, output files), etc. It reads JUDGE.md
+        for scoring criteria and writes evaluation.json.
         """
-        import os
-
         judge_name = f"judge_{session_id}_ep{episode_index}"
         logger.info("[%s] Episode %d: starting agent judge...",
                     session_id, episode_index)
 
-        # Build judge workspace with all evidence
         judge_skill = self._build_judge_skill(scenario)
         judge_instruction = self._build_judge_instruction(
             episode_index, ep_data, world_data, episode.transcript,
@@ -604,12 +623,15 @@ class TrajectorySandboxHarness:
                 command=["chat", "-q",
                          "Read /workspace/JUDGE.md for your evaluation protocol. "
                          "Read /workspace/JUDGE_TASK.md for this episode's evidence. "
-                         "Services are at http://sandbox:8090 — you can query /state "
-                         "for the full mock service state. "
+                         "You can SSH into the sandbox for grounding: "
+                         "`ssh -o StrictHostKeyChecking=no -i /keys/id_ed25519 agent@sandbox`. "
+                         "Inside the sandbox, query http://localhost:8090/state for the "
+                         "full mock service state, read logs, check outputs — whatever the "
+                         "scenario exposes. "
                          "Write your evaluation to /workspace/evaluation.json. "
                          "You MUST write that file before finishing.",
                          "-m", self._llm_model,
-                         "-t", "terminal,file,web,code_execution,memory",
+                         "-t", "terminal,file,code_execution,memory",
                          "--quiet", "--yolo", "--max-turns", "15"],
                 name=judge_name,
                 working_dir="/workspace",
@@ -628,6 +650,7 @@ class TrajectorySandboxHarness:
             network.connect(judge)
             _put_file(judge, "/workspace/JUDGE.md", judge_skill)
             _put_file(judge, "/workspace/JUDGE_TASK.md", judge_instruction)
+            _put_file(judge, "/keys/id_ed25519", private_key, mode=0o600)
             judge.start()
 
             try:
@@ -738,12 +761,20 @@ You are evaluating an AI agent's performance on a workplace scenario.
 {transcript[-8000:] if len(transcript) > 8000 else transcript}
 ```
 
-## How to check what actually happened
-Run: `curl -s http://sandbox:8090/state | python3 -m json.tool`
+## How to ground your evaluation
 
-This shows the full mock service state: emails read/sent, Slack messages posted,
-tasks created, calendar events, Gitea activity. Compare this against the task
-instruction to evaluate the agent's work.
+SSH into the sandbox to inspect everything the scenario exposes:
+
+```
+ssh -o StrictHostKeyChecking=no -i /keys/id_ed25519 agent@sandbox
+```
+
+Once inside, depending on scenario:
+- Mock service state: `curl -s http://localhost:8090/state | python3 -m json.tool`
+- Filesystem changes: check /workspace/, /repo/, /data/, /output/, /var/log/
+- Agent's notes: /workspace/learned/
+
+The transcript shows what the agent tried; the sandbox state shows what it achieved.
 """
 
     def _default_salt(self) -> str:
