@@ -2467,6 +2467,9 @@ class TrajectoryValidator:
             "judge_details": scenario_judge_details,
             "session_keys": {},
             "session_files": {},
+            # S1-specific: full SandboxEvaluationResult for eval log upload.
+            # Not serialized — consumed by _fire_upload_eval_logs and dropped.
+            "_s1_sandbox_result": result,
         }
 
     def _default_validator_salt(self) -> str:
@@ -2773,6 +2776,17 @@ class TrajectoryValidator:
         """Collect and upload eval logs. Fire-and-forget."""
         session_keys = eval_result.get("session_keys", {}) if eval_result else {}
         session_files = eval_result.get("session_files", {}) if eval_result else {}
+
+        # If this was an S1 eval, write the sandbox artifacts (transcripts,
+        # evaluation.json, JUDGE.md, fixtures) into eval_dir so they're
+        # included in the tar.gz uploaded to the dashboard.
+        s1_result = eval_result.get("_s1_sandbox_result") if eval_result else None
+        if s1_result is not None:
+            try:
+                s1_result.write_artifacts(eval_dir)
+            except Exception as e:
+                logger.warning("Failed to write S1 eval artifacts: %s", e)
+
         log_archive = self._collect_eval_logs(
             commitment.hotkey, eval_scenarios, eval_dir,
             validator_log_offset, miner_log_offset, session_keys,

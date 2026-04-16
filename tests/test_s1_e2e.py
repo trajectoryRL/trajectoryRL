@@ -157,6 +157,60 @@ class TestS1UnitMath:
         harness.sandbox_version = "unknown"
         assert harness.scoring_version == 1
 
+    def test_write_artifacts(self):
+        """SandboxEvaluationResult.write_artifacts() creates correct dir layout."""
+        import tempfile
+        from pathlib import Path
+        from trajectoryrl.utils.sandbox_harness import (
+            _EpisodeResult, _SessionResult, SandboxEvaluationResult,
+        )
+
+        sr = _SessionResult(
+            scenario="incident_response",
+            pack_hash="abc123",
+            validator_salt="test_salt",
+            skill_md="# My SKILL",
+            judge_skill="# JUDGE rubric",
+            world_data={"company": "Acme Corp"},
+            episodes=[
+                _EpisodeResult(
+                    episode_index=i, quality=0.5 + 0.1 * i,
+                    transcript=f"testee output ep{i}",
+                    judge_transcript=f"judge output ep{i}",
+                    judge_result={"quality": 0.5 + 0.1 * i,
+                                  "criteria": {"completeness": 0.7}},
+                    ep_data={"instruction_md": f"task {i}", "fixtures": {}},
+                ) for i in range(4)
+            ],
+        )
+        sr.compute_scores()
+        result = SandboxEvaluationResult(sr, scenario_name=sr.scenario)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "eval_out"
+            result.write_artifacts(out)
+
+            # Session-level files
+            assert (out / "SKILL.md").read_text() == "# My SKILL"
+            assert (out / "JUDGE.md").read_text() == "# JUDGE rubric"
+            meta = json.loads((out / "metadata.json").read_text())
+            assert meta["scenario"] == "incident_response"
+            assert meta["pack_hash"] == "abc123"
+            assert len(meta["episode_qualities"]) == 4
+
+            world = json.loads((out / "world.json").read_text())
+            assert world["company"] == "Acme Corp"
+
+            # Per-episode files
+            for i in range(4):
+                ep_dir = out / "episodes" / f"episode_{i}"
+                assert (ep_dir / "testee_transcript.txt").read_text() == \
+                    f"testee output ep{i}"
+                assert (ep_dir / "judge_transcript.txt").read_text() == \
+                    f"judge output ep{i}"
+                eval_json = json.loads((ep_dir / "evaluation.json").read_text())
+                assert eval_json["quality"] == pytest.approx(0.5 + 0.1 * i)
+
     def test_split_half_delta(self):
         """Verify split-half delta math including anti-sandbagging."""
         from trajectoryrl.utils.sandbox_harness import _SessionResult, _EpisodeResult

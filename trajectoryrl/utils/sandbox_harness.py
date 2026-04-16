@@ -62,12 +62,14 @@ class _EpisodeResult:
     episode_index: int
     quality: float = 0.0
     tool_calls: int = 0
-    transcript: str = ""
+    transcript: str = ""                      # Testee agent's Hermes log
+    judge_transcript: str = ""                # Judge agent's Hermes log
     mock_state: dict = field(default_factory=dict)
     timed_out: bool = False
     error: str | None = None
     duration_s: float = 0.0
-    judge_result: dict = field(default_factory=dict)
+    judge_result: dict = field(default_factory=dict)  # Parsed evaluation.json
+    ep_data: dict = field(default_factory=dict)       # fixtures + instruction_md
 
 
 @dataclass
@@ -82,6 +84,10 @@ class _SessionResult:
     pack_hash: str = ""
     validator_salt: str = ""
     scenario: str = ""
+    # Context shared across episodes (captured for eval log uploads)
+    skill_md: str = ""
+    world_data: dict = field(default_factory=dict)
+    judge_skill: str = ""  # JUDGE.md fetched from sandbox
 
     def compute_scores(self, alpha: float = 0.5, early_floor: float = 0.3,
                        delta_threshold: float = 0.4) -> None:
@@ -136,6 +142,62 @@ class SandboxEvaluationResult:
         self.mean_quality = session_result.mean_quality
         self.learning_bonus = session_result.learning_bonus
         self.episode_qualities = [ep.quality for ep in session_result.episodes]
+
+    def write_artifacts(self, out_dir: "Path | str") -> None:
+        """Write per-episode transcripts + evaluations + session metadata.
+
+        Produces the same folder layout as the standalone e2e test, so
+        `trajrl logs --show` unpacks it into a predictable structure:
+
+            out_dir/
+              SKILL.md                    # miner's product
+              JUDGE.md                    # scoring rubric used
+              world.json                  # company context + salt
+              metadata.json               # final_score, delta, scenario, etc.
+              episodes/
+                episode_0/
+                  testee_transcript.txt
+                  judge_transcript.txt
+                  evaluation.json
+                  episode.json            # fixtures + instruction
+                episode_1/ ...
+        """
+        from pathlib import Path
+        out = Path(out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        sr = self.session_result
+
+        # Session-level artifacts
+        (out / "SKILL.md").write_text(sr.skill_md or "")
+        (out / "JUDGE.md").write_text(sr.judge_skill or "")
+        (out / "world.json").write_text(json.dumps(sr.world_data, indent=2,
+                                                    default=str))
+        (out / "metadata.json").write_text(json.dumps({
+            "scenario": sr.scenario,
+            "pack_hash": sr.pack_hash,
+            "validator_salt": sr.validator_salt,
+            "final_score": sr.final_score,
+            "mean_quality": sr.mean_quality,
+            "early_mean": sr.early_mean,
+            "late_mean": sr.late_mean,
+            "delta": sr.delta,
+            "learning_bonus": sr.learning_bonus,
+            "episode_qualities": [ep.quality for ep in sr.episodes],
+        }, indent=2, default=str))
+
+        # Per-episode artifacts
+        for ep in sr.episodes:
+            ep_dir = out / "episodes" / f"episode_{ep.episode_index}"
+            ep_dir.mkdir(parents=True, exist_ok=True)
+            (ep_dir / "testee_transcript.txt").write_text(ep.transcript or "")
+            (ep_dir / "judge_transcript.txt").write_text(
+                ep.judge_transcript or "")
+            (ep_dir / "evaluation.json").write_text(
+                json.dumps(ep.judge_result, indent=2, default=str))
+            (ep_dir / "episode.json").write_text(
+                json.dumps(ep.ep_data, indent=2, default=str))
+            if ep.error:
+                (ep_dir / "error.txt").write_text(ep.error)
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +428,8 @@ class TrajectorySandboxHarness:
         world_data = gen_data["world"]
         episodes_data = gen_data["episodes"]
         session_result.scenario = scenario
+        session_result.skill_md = skill_md
+        session_result.world_data = world_data
 
         logger.info("[%s] Scenario: %s, World: %s", session_id, scenario,
                     world_data["company"])
@@ -432,6 +496,9 @@ class TrajectorySandboxHarness:
             sandbox.exec_run(["mkdir", "-p", "/workspace/learned"])
             sandbox.exec_run(["chown", "-R", "agent:agent", "/workspace/learned"])
 
+            # Fetch JUDGE.md once per session (same for all 4 episodes)
+            session_result.judge_skill = self._build_judge_skill(scenario)
+
             # Run each episode
             for i, ep_data in enumerate(episodes_data):
                 episode = self._run_episode(
@@ -443,6 +510,7 @@ class TrajectorySandboxHarness:
                     sandbox=sandbox,
                     network=network,
                     private_key=private_key,
+                    judge_skill=session_result.judge_skill,
                 )
                 session_result.episodes.append(episode)
 
@@ -470,6 +538,7 @@ class TrajectorySandboxHarness:
         world_data: dict, scenario: str,
         sandbox: Container,
         network: Network, private_key: str,
+        judge_skill: str,
     ) -> _EpisodeResult:
         """Run a single episode: load fixtures, start testee agent, capture, score.
 
@@ -480,7 +549,7 @@ class TrajectorySandboxHarness:
         exposes (e.g. a git repo at /repo, logs at /var/log/, a dataset
         at /data/).
         """
-        episode = _EpisodeResult(episode_index=episode_index)
+        episode = _EpisodeResult(episode_index=episode_index, ep_data=ep_data)
         t0 = time.time()
         logger.info("[%s] Episode %d starting", session_id, episode_index)
 
@@ -591,6 +660,7 @@ class TrajectorySandboxHarness:
                 sandbox=sandbox,
                 network=network,
                 private_key=private_key,
+                judge_skill=judge_skill,
             )
 
             logger.info("[%s] Episode %d quality=%.3f",
@@ -608,7 +678,7 @@ class TrajectorySandboxHarness:
         self, session_id: str, episode_index: int,
         episode: _EpisodeResult, ep_data: dict, world_data: dict,
         scenario: str, sandbox: Container, network: Network,
-        private_key: str,
+        private_key: str, judge_skill: str,
     ) -> None:
         """Score an episode using a judge agent.
 
@@ -622,7 +692,6 @@ class TrajectorySandboxHarness:
         logger.info("[%s] Episode %d: starting agent judge...",
                     session_id, episode_index)
 
-        judge_skill = self._build_judge_skill(scenario)
         judge_instruction = self._build_judge_instruction(
             episode_index, ep_data, world_data, episode.transcript,
         )
@@ -674,6 +743,13 @@ class TrajectorySandboxHarness:
                     judge.kill()
                 except Exception:
                     pass
+
+            # Capture judge transcript for eval log upload
+            try:
+                episode.judge_transcript = judge.logs(
+                    stdout=True, stderr=False).decode(errors="replace")
+            except Exception:
+                pass
 
             # Read evaluation.json from the judge container via get_archive
             # (works even after the container has exited)
