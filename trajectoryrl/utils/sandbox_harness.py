@@ -1,18 +1,28 @@
 """Season 1 trajrl-bench harness for evaluating SKILL.md packs.
 
-Architecture: the validator does NOT import trajrl-bench as a Python
-dependency. Instead, it runs scenario logic inside the sandbox Docker image
-via `docker run`. This means:
+Three-container architecture:
+  - Sandbox (puzzle): shell + filesystem + mock services + scenario files
+  - Testee agent: SSHes into sandbox, reads SKILL.md + INSTRUCTION.md, solves
+  - Judge agent: SSHes into sandbox, reads JUDGE.md, grounds scoring in state
 
-  - Updating scenarios = rebuild sandbox image only (CI does this)
-  - Watchtower or `docker pull` before eval gets the latest scenarios
-  - Validator image is stable — just orchestration + bittensor
+The validator does NOT import trajrl-bench as a Python dependency. Instead,
+it pulls the sandbox image and runs CLI commands via `docker run`:
+  - `cli generate` — produce fixtures + instructions
+  - `cli judge --scenario X` — fetch JUDGE.md for a scenario
+  - (legacy) `cli score` — kept for backwards compat
+
+Updating scenarios = rebuild sandbox image, publish to GHCR. Validators
+pull on next eval. No validator code change.
 
 The flow:
   1. docker pull sandbox image (get latest scenarios)
-  2. docker run sandbox generate (fixtures + instruction + world JSON)
-  3. For each episode: start sandbox + harness containers, run agent, capture state
-  4. docker run sandbox score (transcript + state → quality via LLM judge)
+  2. docker run sandbox generate → fixtures + instruction + world JSON
+  3. Start sandbox container (SSH + mock services), write SKILL.md
+  4. For each episode:
+     - Load fixtures into mock services
+     - Start testee container with SSH key, wait for it to solve + exit
+     - Start judge container with same key, wait for evaluation.json
+     - Read evaluation.json for quality score
   5. Compute split-half delta from 4 quality scores
 
 Usage:
@@ -330,16 +340,14 @@ class TrajectorySandboxHarness:
         """Synchronous eval: generate → run episodes → score → delta.
 
         Architecture:
-        - Sandbox container: runs mock services (email, Slack, etc.)
-        - Harness container: runs the agent (Hermes) with LLM calls
-        - Shared workspace volume: host tmpdir mounted into both containers
-          at /workspace so the harness can read SKILL.md/INSTRUCTION.md
-        - Sandbox on internal network only (no internet)
-        - Harness on both default bridge (LLM egress) and internal network
-          (to reach sandbox mock services via container IP)
+        - Sandbox container: shell + mock services + SSH daemon. Hosts
+          SKILL.md and INSTRUCTION.md in /workspace (root:agent 440).
+        - Testee container: SSHes into sandbox, solves task, exits.
+        - Judge container: SSHes into sandbox, grades, writes evaluation.json.
+        - Sandbox on internal network only (no internet egress).
+        - Testee + judge on default bridge (LLM API egress) + eval network
+          (to reach sandbox via ssh agent@sandbox).
         """
-        import tempfile
-
         session_id = secrets.token_hex(6)
         session_result = _SessionResult(pack_hash=pack_hash, validator_salt=salt)
 
@@ -723,9 +731,10 @@ You are evaluating an AI agent's performance on a workplace scenario.
 
 ## Protocol
 1. Read JUDGE_TASK.md for context, instruction, and transcript
-2. Run: curl -s http://sandbox:8090/state | python3 -m json.tool
-3. Compare what the agent DID against what it SHOULD have done
-4. Write /workspace/evaluation.json
+2. SSH into sandbox: ssh -o StrictHostKeyChecking=no -i /tmp/id_ed25519 agent@sandbox
+3. Inside sandbox: curl -s http://localhost:8090/state | python3 -m json.tool
+4. Compare what the agent DID against what it SHOULD have done
+5. Write /workspace/evaluation.json
 
 ## Scoring Criteria (each 0.0 to 1.0)
 - **completeness**: Did the agent address all parts of the task?
