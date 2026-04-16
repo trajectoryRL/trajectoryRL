@@ -492,7 +492,7 @@ class TrajectorySandboxHarness:
             harness_name = f"testee_{session_id}_ep{episode_index}"
             harness_prompt = (
                 "SSH into the sandbox: `ssh -o StrictHostKeyChecking=no "
-                "-i /keys/id_ed25519 agent@sandbox`. "
+                "-i /tmp/id_ed25519 agent@sandbox`. "
                 "Everything you need is there: shell, filesystem, tools. "
                 "Read /workspace/SKILL.md for your approach. "
                 "Read /workspace/INSTRUCTION.md for this episode's task. "
@@ -525,7 +525,7 @@ class TrajectorySandboxHarness:
 
             # Install SSH private key into testee container (mode 0600
             # so ssh client accepts it).
-            _put_file(harness, "/keys/id_ed25519", private_key, mode=0o600)
+            _put_file(harness, "/tmp/id_ed25519", private_key, mode=0o600)
 
             harness.start()
 
@@ -624,7 +624,7 @@ class TrajectorySandboxHarness:
                          "Read /workspace/JUDGE.md for your evaluation protocol. "
                          "Read /workspace/JUDGE_TASK.md for this episode's evidence. "
                          "You can SSH into the sandbox for grounding: "
-                         "`ssh -o StrictHostKeyChecking=no -i /keys/id_ed25519 agent@sandbox`. "
+                         "`ssh -o StrictHostKeyChecking=no -i /tmp/id_ed25519 agent@sandbox`. "
                          "Inside the sandbox, query http://localhost:8090/state for the "
                          "full mock service state, read logs, check outputs — whatever the "
                          "scenario exposes. "
@@ -650,7 +650,7 @@ class TrajectorySandboxHarness:
             network.connect(judge)
             _put_file(judge, "/workspace/JUDGE.md", judge_skill)
             _put_file(judge, "/workspace/JUDGE_TASK.md", judge_instruction)
-            _put_file(judge, "/keys/id_ed25519", private_key, mode=0o600)
+            _put_file(judge, "/tmp/id_ed25519", private_key, mode=0o600)
             judge.start()
 
             try:
@@ -766,7 +766,7 @@ You are evaluating an AI agent's performance on a workplace scenario.
 SSH into the sandbox to inspect everything the scenario exposes:
 
 ```
-ssh -o StrictHostKeyChecking=no -i /keys/id_ed25519 agent@sandbox
+ssh -o StrictHostKeyChecking=no -i /tmp/id_ed25519 agent@sandbox
 ```
 
 Once inside, depending on scenario:
