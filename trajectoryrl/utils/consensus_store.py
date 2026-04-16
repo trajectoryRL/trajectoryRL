@@ -139,7 +139,7 @@ class IPFSBackend(CASBackend):
 class TrajRLAPIBackend(CASBackend):
     """GCS proxy via trajrl.com API.
 
-    Upload:   POST /api/v1/consensus/payload → stores to GCS, returns public URL
+    Upload:   POST /api/v2/consensus/payload → stores to GCS, returns public URL
     Download: GET {url} — direct download from the public GCS URL
     """
 
@@ -170,7 +170,7 @@ class TrajRLAPIBackend(CASBackend):
                 msg = f"trajectoryrl-consensus:{self._validator_hotkey}:{ts}"
                 body["signature"] = self._sign_fn(msg)
 
-            url = f"{self.base_url}/api/v1/consensus/payload"
+            url = f"{self.base_url}/api/v2/consensus/payload"
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     url, json=body,

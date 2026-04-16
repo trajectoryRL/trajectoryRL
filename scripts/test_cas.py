@@ -185,7 +185,7 @@ async def test_api_upload(api_url: str, data: bytes) -> str | None:
             "signature": "",
             "payload": payload_dict,
         }
-        url = f"{api_url.rstrip('/')}/api/v1/consensus/payload"
+        url = f"{api_url.rstrip('/')}/api/v2/consensus/payload"
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=body, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 resp_body = await resp.text()
