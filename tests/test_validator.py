@@ -1704,6 +1704,7 @@ class TestInactivityBlocks:
             config.scenarios = ["client_escalation"]
             config.scenarios_path = Path("/tmp/test_scenarios")
             config.inactivity_blocks = 14400
+            config.coldkey_blacklist = []
             config.eval_interval_blocks = 7200
             config.similarity_threshold = 0.80
             config.weight_interval_blocks = 360
@@ -1717,6 +1718,7 @@ class TestInactivityBlocks:
 
             mock_metagraph = MagicMock()
             mock_metagraph.hotkeys = ["hk_0", "hk_1", "hk_2"]
+            mock_metagraph.coldkeys = ["ck_0", "ck_1", "ck_2"]
             mock_metagraph.validator_permit = [False, False, False]
             mock_metagraph.S = [100.0, 100.0, 100.0]
             mock_metagraph.stake = [100.0, 100.0, 100.0]
@@ -1748,40 +1750,39 @@ class TestInactivityBlocks:
             return validator
 
     def test_active_miner_within_inactivity_window(self):
-        """Miner evaluated recently is still active."""
+        """Miner whose commitment is fresh (within inactivity_blocks) is active."""
         v = self._make_validator()
-        v.last_eval_block["hk_0"] = 90000  # 10000 blocks ago < 14400
 
         from trajectoryrl.utils.commitments import MinerCommitment
         commitments = {
             0: MinerCommitment(
                 uid=0, hotkey="hk_0", pack_hash="a" * 64,
                 pack_url="https://trajrl.com/samples/pack.json",
-                block_number=1000, raw="raw",
+                block_number=90000, raw="raw",
             ),
         }
-        active = v._get_active_miners_from_commitments(commitments, 100000)
+        # 100000 - 90000 = 10000 < 14400 → active
+        active = v._filter_active_commitments(commitments, 100000)
         assert 0 in active
 
     def test_inactive_miner_removed_from_active(self):
-        """Miner inactive > inactivity_blocks is removed from active set."""
+        """Miner whose commitment is stale (> inactivity_blocks old) is removed."""
         v = self._make_validator()
-        v.last_eval_block["hk_1"] = 80000  # 20000 blocks ago > 14400
 
         from trajectoryrl.utils.commitments import MinerCommitment
         commitments = {
             1: MinerCommitment(
                 uid=1, hotkey="hk_1", pack_hash="a" * 64,
                 pack_url="https://trajrl.com/samples/pack.json",
-                block_number=1000, raw="raw",
+                block_number=80000, raw="raw",
             ),
         }
-        active = v._get_active_miners_from_commitments(commitments, 100000)
+        # 100000 - 80000 = 20000 > 14400 → stale
+        active = v._filter_active_commitments(commitments, 100000)
         assert 1 not in active
 
-    def test_never_evaluated_miner_is_active(self):
-        """Miner never evaluated (no last_eval_block) is treated as active
-        so it can be evaluated this cycle."""
+    def test_fresh_commitment_is_active(self):
+        """A brand-new commitment (block_number close to current) is active."""
         v = self._make_validator()
 
         from trajectoryrl.utils.commitments import MinerCommitment
@@ -1789,52 +1790,44 @@ class TestInactivityBlocks:
             0: MinerCommitment(
                 uid=0, hotkey="hk_0", pack_hash="a" * 64,
                 pack_url="https://trajrl.com/samples/pack.json",
-                block_number=1000, raw="raw",
+                block_number=99999, raw="raw",
             ),
         }
-        active = v._get_active_miners_from_commitments(commitments, 100000)
+        # 100000 - 99999 = 1 < 14400 → active
+        active = v._filter_active_commitments(commitments, 100000)
         assert 0 in active
 
-    def test_reactivation_after_inactivity(self):
-        """Miner returning after inactivity (new eval updates last_eval_block)."""
+    def test_resubmission_reactivates_miner(self):
+        """Miner re-submitting (new block_number) becomes active again."""
         v = self._make_validator()
-        v.last_eval_block["hk_0"] = 80000  # Was inactive
-
-        # After a successful evaluation, last_eval_block is updated
-        v.last_eval_block["hk_0"] = 100000
 
         from trajectoryrl.utils.commitments import MinerCommitment
         commitments = {
             0: MinerCommitment(
                 uid=0, hotkey="hk_0", pack_hash="a" * 64,
                 pack_url="https://trajrl.com/samples/pack.json",
-                block_number=9000, raw="raw",
+                block_number=95000, raw="raw",
             ),
         }
-        active = v._get_active_miners_from_commitments(commitments, 100000)
+        # 100000 - 95000 = 5000 < 14400 → active
+        active = v._filter_active_commitments(commitments, 100000)
         assert 0 in active
 
-    def test_validators_filtered_out(self):
-        """UIDs with validator_permit=True are filtered out."""
+    def test_boundary_exactly_at_limit(self):
+        """Commitment age exactly at inactivity_blocks is not stale."""
         v = self._make_validator()
-        v.metagraph.validator_permit = [True, False, False]
 
         from trajectoryrl.utils.commitments import MinerCommitment
         commitments = {
             0: MinerCommitment(
                 uid=0, hotkey="hk_0", pack_hash="a" * 64,
                 pack_url="https://trajrl.com/samples/pack.json",
-                block_number=1000, raw="raw",
-            ),
-            1: MinerCommitment(
-                uid=1, hotkey="hk_1", pack_hash="b" * 64,
-                pack_url="https://trajrl.com/samples/pack.json",
-                block_number=2000, raw="raw",
+                block_number=100000 - 14400, raw="raw",
             ),
         }
-        active = v._get_active_miners_from_commitments(commitments, 100000)
-        assert 0 not in active  # Validator
-        assert 1 in active      # Miner
+        # age == inactivity_blocks → not stale (> required, not >=)
+        active = v._filter_active_commitments(commitments, 100000)
+        assert 0 in active
 
 
 # ===================================================================

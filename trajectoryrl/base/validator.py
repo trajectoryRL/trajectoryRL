@@ -1588,8 +1588,10 @@ class TrajectoryValidator:
             self.subtensor, self.config.netuid, self.metagraph
         )
 
-        # 4. Filter to non-validator miners
-        active_commitments = self._filter_active_commitments(commitments)
+        # 4. Filter to active non-validator miners (drops stale submissions)
+        active_commitments = self._filter_active_commitments(
+            commitments, current_block,
+        )
         logger.info(
             f"Commitments: {len(commitments)} total, "
             f"{len(active_commitments)} active miners"
@@ -1939,9 +1941,17 @@ class TrajectoryValidator:
     def _filter_active_commitments(
         self,
         commitments: Dict[int, MinerCommitment],
+        current_block: int,
     ) -> Dict[int, MinerCommitment]:
-        """Filter commitments to non-validator miners, excluding blacklisted coldkeys."""
+        """Filter commitments to active, non-validator miners.
+
+        Excludes:
+        - UIDs with validator_permit
+        - Blacklisted coldkeys
+        - Stale submissions (commitment older than ``inactivity_blocks``)
+        """
         blacklist = set(self.config.coldkey_blacklist)
+        max_age = self.config.inactivity_blocks
         active: Dict[int, MinerCommitment] = {}
         for uid, commitment in commitments.items():
             if uid < len(self.metagraph.validator_permit) and self.metagraph.validator_permit[uid]:
@@ -1953,42 +1963,14 @@ class TrajectoryValidator:
                         f"Skipping eval (coldkey {coldkey} is blacklisted)"
                     )
                     continue
-            active[uid] = commitment
-        return active
-
-    def _get_active_miners_from_commitments(
-        self,
-        commitments: Dict[int, MinerCommitment],
-        current_block: int,
-    ) -> Dict[int, MinerCommitment]:
-        """Filter commitments to active miners considering inactivity.
-
-        A miner is active if:
-        1. Has a parseable on-chain commitment
-        2. Is not a validator
-        3. Has been evaluated within inactivity_blocks
-        """
-        active: Dict[int, MinerCommitment] = {}
-        for uid, commitment in commitments.items():
-            if uid < len(self.metagraph.validator_permit) and self.metagraph.validator_permit[uid]:
+            age = current_block - commitment.block_number
+            if age > max_age:
+                self._get_miner_logger(commitment.hotkey).info(
+                    f"Stale submission: {age} blocks old > "
+                    f"{max_age} block limit (~48h), skipping"
+                )
                 continue
-
-            hotkey = commitment.hotkey
-            last_block = self.last_eval_block.get(hotkey)
-
-            if last_block is not None:
-                blocks_since = current_block - last_block
-                if blocks_since > self.config.inactivity_blocks:
-                    self._get_miner_logger(hotkey).info(
-                        f"Inactive for {blocks_since} blocks > "
-                        f"{self.config.inactivity_blocks}, "
-                        f"removing from active set"
-                    )
-                    self._hotkey_uid_map.pop(hotkey, None)
-                    continue
-
             active[uid] = commitment
-
         return active
 
     # ------------------------------------------------------------------
