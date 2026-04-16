@@ -519,6 +519,8 @@ class TrajectorySandboxHarness:
                 environment={
                     "OPENROUTER_API_KEY": self._llm_api_key,
                     "LLM_API_KEY": self._llm_api_key,
+                    "LLM_BASE_URL": self._llm_api_url,
+                    "LLM_MODEL": self._llm_model,
                     "HERMES_BUNDLED_SKILLS": "/nonexistent",
                 },
                 mem_limit="4g", cpu_quota=200000,
@@ -646,6 +648,8 @@ class TrajectorySandboxHarness:
                 environment={
                     "OPENROUTER_API_KEY": self._llm_api_key,
                     "LLM_API_KEY": self._llm_api_key,
+                    "LLM_BASE_URL": self._llm_api_url,
+                    "LLM_MODEL": self._llm_model,
                     "HERMES_BUNDLED_SKILLS": "/nonexistent",
                 },
                 mem_limit="4g", cpu_quota=200000,
