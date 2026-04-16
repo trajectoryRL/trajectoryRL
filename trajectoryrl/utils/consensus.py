@@ -10,13 +10,14 @@ from dataclasses import dataclass, field
 from typing import Dict
 
 
-CONSENSUS_PROTOCOL_VERSION = 1
+CONSENSUS_PROTOCOL_VERSION = 2
 
-# Scoring version tracks evaluation criteria (scenario set, rubric, judge logic).
-# Bump this whenever scenarios are added/removed or scoring semantics change
-# so that results from different versions are never mixed during aggregation,
+# Scoring version = major version of trajrl-bench (e.g. v3.0.1 → 3).
+# Overwritten at runtime by TrajectorySandboxHarness.scoring_version after
+# pulling the sandbox image.  This default is only used before the first pull.
+# Results from different scoring versions are never mixed during aggregation,
 # cached-result lookup, or winner selection.
-SCORING_VERSION = 2
+SCORING_VERSION = 1
 
 
 @dataclass
@@ -25,32 +26,32 @@ class ConsensusPayload:
 
     Content-addressed: the canonical JSON serialization determines the
     content hash used for CAS storage and integrity verification.
+
+    Protocol v2 fields:
+      - scores: miner hotkey -> quality score (0.0–1.0)
+      - bench_version: trajrl-bench version string
+      - disqualified: miner hotkey -> reason
     """
     protocol_version: int
     window_number: int
     validator_hotkey: str
-    clawbench_version: str
-    costs: Dict[str, float]         # miner hotkey -> EMA cost (USD)
-    qualified: Dict[str, bool]      # miner hotkey -> qualification gate (all known miners)
-    timestamp: int                  # unix seconds when payload was built
-    scoring_version: int = 1        # evaluation criteria version (scenario set + rubric)
+    bench_version: str
+    scores: Dict[str, float]        # miner hotkey -> quality score (0.0–1.0)
+    timestamp: int                   # unix seconds when payload was built
+    scoring_version: int = 1         # major version of trajrl-bench
     disqualified: Dict[str, str] = field(default_factory=dict)
-    # miner hotkey -> reason (e.g. "pre_eval_rejected", "integrity_failed")
-    # miners in disqualified also appear in qualified with value=False
 
     def to_dict(self) -> dict:
-        d = {
-            "clawbench_version": self.clawbench_version,
-            "costs": self.costs,
+        return {
+            "bench_version": self.bench_version,
             "disqualified": self.disqualified,
             "protocol_version": self.protocol_version,
-            "qualified": self.qualified,
+            "scores": self.scores,
             "scoring_version": self.scoring_version,
             "timestamp": self.timestamp,
             "validator_hotkey": self.validator_hotkey,
             "window_number": self.window_number,
         }
-        return d
 
     def serialize(self) -> bytes:
         """Canonical JSON serialization (sorted keys, no extra whitespace)."""
@@ -67,9 +68,8 @@ class ConsensusPayload:
             protocol_version=d["protocol_version"],
             window_number=d["window_number"],
             validator_hotkey=d["validator_hotkey"],
-            clawbench_version=d.get("clawbench_version", d.get("software_version", "")),
-            costs=d["costs"],
-            qualified=d["qualified"],
+            bench_version=d.get("bench_version", ""),
+            scores=d.get("scores", {}),
             timestamp=d["timestamp"],
             scoring_version=d.get("scoring_version", 1),
             disqualified=d.get("disqualified", {}),
@@ -81,9 +81,8 @@ class ConsensusPayload:
             protocol_version=d["protocol_version"],
             window_number=d["window_number"],
             validator_hotkey=d["validator_hotkey"],
-            clawbench_version=d.get("clawbench_version", d.get("software_version", "")),
-            costs=d["costs"],
-            qualified=d["qualified"],
+            bench_version=d.get("bench_version", ""),
+            scores=d.get("scores", {}),
             timestamp=d["timestamp"],
             scoring_version=d.get("scoring_version", 1),
             disqualified=d.get("disqualified", {}),

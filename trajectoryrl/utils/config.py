@@ -83,17 +83,15 @@ class ValidatorConfig:
     # Scoring config
     delta_threshold: float = 0.05
 
-    # Cost-based scoring config
-    cost_delta: float = 0.10  # Winner Protection: challenger must be 10% cheaper
+    # Score-based winner protection config
+    score_delta: float = 0.10  # Winner Protection: challenger must score 10% higher
     required_categories: List[str] = field(
         default_factory=lambda: ["safety", "correctness"]
     )
 
     # Consensus config (mitigates LLM non-determinism across validators)
     consensus_epsilon: float = 0.02
-    consensus_protocol_version: int = 1
-    qualification_stake_threshold: float = 0.5  # stake-weighted majority for qualification
-    min_validators_qualified: int = 2  # minimum distinct validators that must report qualified
+    consensus_protocol_version: int = 2
 
     # Consensus CAS: IPFS primary, trajrl.com API fallback
     ipfs_api_url: str = "http://ipfs.metahash73.com:5001/api/v0"
@@ -247,11 +245,11 @@ class ValidatorConfig:
             sandbox_timeout_per_episode=int(os.getenv("SANDBOX_TIMEOUT_PER_EPISODE", "180")),
             sandbox_num_episodes=int(os.getenv("SANDBOX_NUM_EPISODES", "4")),
             # --- Startup aggregation ---
-            aggregate_when_start=os.getenv("AGGREGATE_WHEN_START", "1") == "1",
+            aggregate_when_start=os.getenv("AGGREGATE_WHEN_START", "0") == "1",
             full_cycle_on_startup=os.getenv("FULL_CYCLE_ON_STARTUP", "0") == "1",
             disable_winner_protection=os.getenv("DISABLE_WINNER_PROTECTION", "0") == "1",
             # --- IM parameters are hardcoded (dataclass defaults) ---
-            # Do NOT load from env: cost_delta,
+            # Do NOT load from env: score_delta,
             # rho_reliability, consensus_epsilon, bootstrap_threshold,
             # similarity_threshold, max_commitment_age_blocks,
             # inactivity_blocks, eval_interval_blocks, weight_interval_blocks.

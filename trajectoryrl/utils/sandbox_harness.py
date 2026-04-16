@@ -301,12 +301,16 @@ class TrajectorySandboxHarness:
         self.sandbox_version: str = "unknown"
         self.sandbox_scenarios: list[str] = []
 
+        # Image digests — populated after pull_latest
+        self.bench_image_hash: str = "unknown"
+        self.harness_image_hash: str = "unknown"
+
     @property
     def scoring_version(self) -> int:
-        """Derive scoring version from sandbox major version.
+        """Major version of bench_version (trajrl-bench version).
 
-        v1.0.0 → 1, v2.0.0 → 2, etc. Falls back to 1 if unparseable.
-        Validators with different sandbox major versions will not mix
+        v3.0.1 → 3, v1.0.0 → 1, etc. Falls back to 1 if unparseable.
+        Validators with different bench major versions will not mix
         results during consensus aggregation.
         """
         try:
@@ -337,6 +341,22 @@ class TrajectorySandboxHarness:
                 self.client.images.pull(image)
             except Exception as e:
                 logger.warning("Failed to pull %s: %s (using cached)", image, e)
+
+        # Capture image digests (sha256 from RepoDigests)
+        for image_ref, attr in [
+            (self._sandbox_image, "bench_image_hash"),
+            (self._harness_image, "harness_image_hash"),
+        ]:
+            try:
+                img = self.client.images.get(image_ref)
+                digests = img.attrs.get("RepoDigests", [])
+                if digests:
+                    # RepoDigests format: "repo@sha256:abc123..."
+                    setattr(self, attr, digests[0].split("@", 1)[-1])
+                else:
+                    setattr(self, attr, img.id)
+            except Exception as e:
+                logger.warning("Failed to get digest for %s: %s", image_ref, e)
 
         # Query sandbox version and available scenarios
         try:

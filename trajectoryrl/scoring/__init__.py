@@ -524,114 +524,98 @@ class TrajectoryScorer:
         return weights
 
 
-def compute_consensus_costs(
+def compute_consensus_scores(
     validated_submissions: List[ValidatedSubmission],
-    qualification_stake_threshold: float = 0.5,
-    min_validators_qualified: int = 2,
-) -> Tuple[Dict[str, float], Dict[str, bool]]:
-    """Compute stake-weighted consensus costs and qualification across validators.
+    disqualify_stake_threshold: float = 0.5,
+) -> Tuple[Dict[str, float], Dict[str, str]]:
+    """Compute stake-weighted consensus scores and disqualification across validators.
 
-    Qualification uses stake-weighted majority across ALL reporting validators:
-        qual_ratio = qualified_stake / total_reporting_stake > threshold
+    Scores: for each miner, the consensus score is the stake-weighted average
+    of quality scores reported by validators that did NOT disqualify the miner:
 
-    Additionally, a miner must be reported as qualified by at least
-    ``min_validators_qualified`` distinct validators.  This prevents gaming
-    where a miner passes only a single dominant-stake validator.
+        consensus_score[miner] = Σ(stake_i × score_i) / Σ(stake_i)
+                                  (where i ∈ {validators that did not disqualify miner})
 
-    Consensus cost uses ONLY votes where the validator reported qualified=True:
-        consensus_cost[miner] = Σ(stake_i × cost_i) / Σ(stake_i)
-                                 (where i ∈ {validators reporting qualified=True})
-
-    Costs from not-qualified votes are excluded because fail-fast evaluation
-    may produce artificially low costs from incomplete scenario runs.
+    Disqualification uses stake-weighted majority: a miner is consensus-
+    disqualified only when the fraction of reporting stake that flagged it
+    exceeds ``disqualify_stake_threshold`` (default 0.5).
 
     Args:
         validated_submissions: Submissions that passed the filter pipeline,
             each with an attached validator_stake.
-        qualification_stake_threshold: Fraction of reporting stake that must
-            vote qualified=True for a miner to be considered qualified.
-            Default 0.5 (simple majority by stake weight).
-        min_validators_qualified: Minimum number of distinct validators that
-            must report qualified=True for a miner to qualify.  Default 2.
-            When fewer than ``min_validators_qualified`` validators submitted
-            results overall, this gate is relaxed to the total validator count
-            so that small networks are not deadlocked.
+        disqualify_stake_threshold: Fraction of reporting stake that must
+            vote to disqualify a miner for it to be consensus-disqualified.
 
     Returns:
-        Tuple of (consensus_costs, consensus_qualified):
-          - consensus_costs: Dict[miner_hotkey -> weighted avg cost]
-          - consensus_qualified: Dict[miner_hotkey -> bool]
+        Tuple of (consensus_scores, consensus_disqualified):
+          - consensus_scores: Dict[miner_hotkey -> stake-weighted score (0.0–1.0)]
+          - consensus_disqualified: Dict[miner_hotkey -> reason] for miners
+            where disqualification stake exceeds the threshold
     """
     if not validated_submissions:
         return {}, {}
 
+    miner_weighted_score: Dict[str, float] = {}
     miner_total_stake: Dict[str, float] = {}
-    miner_qualified_stake: Dict[str, float] = {}
-    miner_qual_weighted_cost: Dict[str, float] = {}
-    miner_qual_cost_stake: Dict[str, float] = {}
-    miner_qual_validator_count: Dict[str, int] = {}
+
+    # Track disqualification votes by stake
+    miner_disq_stake: Dict[str, float] = {}
+    miner_reporting_stake: Dict[str, float] = {}
+    miner_disq_reasons: Dict[str, str] = {}
 
     for sub in validated_submissions:
         stake = sub.validator_stake
         if stake <= 0:
             continue
 
-        # Include miners that appear only in `qualified`/`disqualified` (no cost
-        # entry) so that validators who flagged a miner as integrity_failed still
-        # contribute their stake to the denominator even when they recorded no cost.
-        all_miners = set(sub.payload.costs.keys()) | set(sub.payload.qualified.keys())
+        disqualified = sub.payload.disqualified
 
+        all_miners = set(sub.payload.scores.keys()) | set(disqualified.keys())
         for miner_hk in all_miners:
+            if miner_hk not in miner_reporting_stake:
+                miner_reporting_stake[miner_hk] = 0.0
+                miner_disq_stake[miner_hk] = 0.0
+            miner_reporting_stake[miner_hk] += stake
+
+            if miner_hk in disqualified:
+                miner_disq_stake[miner_hk] += stake
+                miner_disq_reasons[miner_hk] = disqualified[miner_hk]
+
+        for miner_hk, score in sub.payload.scores.items():
+            if miner_hk in disqualified:
+                continue
+
             if miner_hk not in miner_total_stake:
                 miner_total_stake[miner_hk] = 0.0
-                miner_qualified_stake[miner_hk] = 0.0
-                miner_qual_weighted_cost[miner_hk] = 0.0
-                miner_qual_cost_stake[miner_hk] = 0.0
-                miner_qual_validator_count[miner_hk] = 0
+                miner_weighted_score[miner_hk] = 0.0
 
             miner_total_stake[miner_hk] += stake
+            miner_weighted_score[miner_hk] += stake * score
 
-            if sub.payload.qualified.get(miner_hk, False) and miner_hk in sub.payload.costs:
-                cost = sub.payload.costs[miner_hk]
-                miner_qualified_stake[miner_hk] += stake
-                miner_qual_weighted_cost[miner_hk] += stake * cost
-                miner_qual_cost_stake[miner_hk] += stake
-                miner_qual_validator_count[miner_hk] += 1
+    # Compute consensus disqualification via stake-weighted majority
+    consensus_disqualified: Dict[str, str] = {}
+    for miner_hk in miner_reporting_stake:
+        reporting = miner_reporting_stake[miner_hk]
+        if reporting > 0:
+            disq_ratio = miner_disq_stake[miner_hk] / reporting
+            if disq_ratio > disqualify_stake_threshold:
+                consensus_disqualified[miner_hk] = miner_disq_reasons.get(
+                    miner_hk, "consensus_disqualified"
+                )
 
-    # When the network has fewer validators than the minimum, relax the gate
-    # to the actual validator count so small networks are not deadlocked.
-    total_validators = len({s.payload.validator_hotkey for s in validated_submissions if s.validator_stake > 0})
-    effective_min_validators = min(min_validators_qualified, total_validators)
-
-    consensus_costs: Dict[str, float] = {}
-    miner_qualified: Dict[str, bool] = {}
+    consensus_scores: Dict[str, float] = {}
     for miner_hk in miner_total_stake:
         total_stake = miner_total_stake[miner_hk]
         if total_stake > 0:
-            qual_ratio = miner_qualified_stake[miner_hk] / total_stake
-            stake_ok = qual_ratio > qualification_stake_threshold
+            consensus_scores[miner_hk] = miner_weighted_score[miner_hk] / total_stake
         else:
-            stake_ok = False
-
-        validator_count_ok = (
-            miner_qual_validator_count.get(miner_hk, 0) >= effective_min_validators
-        )
-        miner_qualified[miner_hk] = stake_ok and validator_count_ok
-
-        qual_cost_stake = miner_qual_cost_stake[miner_hk]
-        if qual_cost_stake > 0:
-            consensus_costs[miner_hk] = (
-                miner_qual_weighted_cost[miner_hk] / qual_cost_stake
-            )
-        else:
-            consensus_costs[miner_hk] = 0.0
+            consensus_scores[miner_hk] = 0.0
 
     logger.info(
-        "Consensus computed: %d miners, %d validators, qual_threshold=%.2f, "
-        "min_validators=%d (effective=%d)",
-        len(consensus_costs), len(validated_submissions),
-        qualification_stake_threshold, min_validators_qualified,
-        effective_min_validators,
+        "Consensus computed: %d miners (%d disqualified by stake majority), "
+        "%d validators",
+        len(consensus_scores), len(consensus_disqualified),
+        len(validated_submissions),
     )
 
-    return consensus_costs, miner_qualified
+    return consensus_scores, consensus_disqualified

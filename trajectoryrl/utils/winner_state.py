@@ -1,9 +1,11 @@
 """Winner Protection for consensus-based winner selection.
 
 Each validator maintains a local WinnerState that tracks the current winner's
-hotkey, pack hash, and the consensus cost at the time they won.  Challengers
-must beat winner_cost × (1 - cost_delta) to dethrone the winner.  The winner
+hotkey, pack hash, and the consensus score at the time they won.  Challengers
+must beat winner_score × (1 + score_delta) to dethrone the winner.  The winner
 can also self-update by the same rule.
+
+Higher score wins — the best-performing miner takes emission.
 """
 
 import json
@@ -12,9 +14,14 @@ import os
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
-from .consensus import SCORING_VERSION
+from . import consensus as _consensus_mod
 
 logger = logging.getLogger(__name__)
+
+
+def _scoring_version() -> int:
+    """Read the current SCORING_VERSION dynamically from the consensus module."""
+    return _consensus_mod.SCORING_VERSION
 
 
 @dataclass
@@ -23,32 +30,30 @@ class WinnerState:
 
     winner_hotkey: Optional[str] = None
     winner_pack_hash: Optional[str] = None
-    winner_cost: Optional[float] = None
+    winner_score: Optional[float] = None
     winner_uid: Optional[int] = None
-    scoring_version: int = SCORING_VERSION
+    scoring_version: int = 1
 
 
 def select_winner_with_protection(
-    consensus_costs: Dict[str, float],
-    consensus_qualified: Dict[str, bool],
+    consensus_scores: Dict[str, float],
     state: WinnerState,
-    cost_delta: float = 0.10,
+    score_delta: float = 0.10,
     pack_hashes: Optional[Dict[str, str]] = None,
     hk_to_uid: Optional[Dict[str, int]] = None,
     disable_winner_protection: bool = False,
 ) -> Tuple[Optional[str], WinnerState]:
-    """Select winner using Winner Protection.
+    """Select winner using Winner Protection (highest score wins).
 
-    The current winner defends with their winning cost (frozen at time of
-    winning).  A new winner is elected only if the lowest-cost qualified
-    miner's cost is below winner_cost × (1 - cost_delta).
+    The current winner defends with their winning score (frozen at time of
+    winning).  A new winner is elected only if the highest-scoring miner's
+    score exceeds winner_score × (1 + score_delta).
 
     Args:
-        consensus_costs: miner_hotkey -> stake-weighted consensus cost
-        consensus_qualified: miner_hotkey -> consensus qualification
+        consensus_scores: miner_hotkey -> stake-weighted consensus score
         state: persisted winner state from previous window
-        cost_delta: fraction by which a miner must beat the winner's
-            winning cost to take over (default 0.10 = 10%)
+        score_delta: fraction by which a challenger must beat the winner's
+            score to take over (default 0.10 = 10%)
         pack_hashes: optional miner_hotkey -> pack_hash mapping for
             recording the winner's pack hash
         hk_to_uid: optional miner_hotkey -> on-chain UID mapping,
@@ -56,85 +61,74 @@ def select_winner_with_protection(
 
     Returns:
         (winner_hotkey, updated_state)
-        winner_hotkey is None if no qualified miners exist.
+        winner_hotkey is None if no miners have scores.
     """
     pack_hashes = pack_hashes or {}
     hk_to_uid = hk_to_uid or {}
 
-    qualified_miners = {
-        hk: cost for hk, cost in consensus_costs.items()
-        if consensus_qualified.get(hk, False)
-    }
-
-    if not qualified_miners:
-        logger.warning("No qualified miners in consensus — no winner")
+    if not consensus_scores:
+        logger.warning("No miners with scores in consensus — no winner")
         return None, state
 
-    sorted_miners = sorted(qualified_miners.items(), key=lambda x: x[1])
-    lowest_hk, lowest_cost = sorted_miners[0]
+    sorted_miners = sorted(consensus_scores.items(), key=lambda x: x[1], reverse=True)
+    best_hk, best_score = sorted_miners[0]
 
-    # No current winner or winner disqualified → lowest cost takes over
     if (
         disable_winner_protection
         or state.winner_hotkey is None
-        or state.winner_hotkey not in qualified_miners
+        or state.winner_hotkey not in consensus_scores
     ):
         reason = "no previous winner" if state.winner_hotkey is None else (
-            f"previous winner {state.winner_hotkey[:8]} disqualified"
+            f"previous winner {state.winner_hotkey[:8]} absent from scores"
         )
         new_state = WinnerState(
-            winner_hotkey=lowest_hk,
-            winner_pack_hash=pack_hashes.get(lowest_hk),
-            winner_cost=lowest_cost,
-            winner_uid=hk_to_uid.get(lowest_hk),
+            winner_hotkey=best_hk,
+            winner_pack_hash=pack_hashes.get(best_hk),
+            winner_score=best_score,
+            winner_uid=hk_to_uid.get(best_hk),
         )
         logger.info(
-            "Winner elected (%s): %s UID %s (consensus cost $%.4f)",
-            reason, lowest_hk[:8], hk_to_uid.get(lowest_hk, "?"), lowest_cost,
+            "Winner elected (%s): %s UID %s (consensus score %.4f)",
+            reason, best_hk[:8], hk_to_uid.get(best_hk, "?"), best_score,
         )
-        return lowest_hk, new_state
+        return best_hk, new_state
 
-    # Winner is qualified — check if anyone beats the protection threshold
-    threshold = state.winner_cost * (1 - cost_delta)
+    threshold = state.winner_score * (1 + score_delta)
 
-    if lowest_cost < threshold:
-        if lowest_hk == state.winner_hotkey:
-            # Winner self-update
+    if best_score > threshold:
+        if best_hk == state.winner_hotkey:
             new_state = WinnerState(
-                winner_hotkey=lowest_hk,
-                winner_pack_hash=pack_hashes.get(lowest_hk, state.winner_pack_hash),
-                winner_cost=lowest_cost,
-                winner_uid=hk_to_uid.get(lowest_hk, state.winner_uid),
+                winner_hotkey=best_hk,
+                winner_pack_hash=pack_hashes.get(best_hk, state.winner_pack_hash),
+                winner_score=best_score,
+                winner_uid=hk_to_uid.get(best_hk, state.winner_uid),
             )
             logger.info(
-                "Winner %s self-updated: $%.4f → $%.4f (cleared δ threshold $%.4f)",
-                lowest_hk[:8], state.winner_cost, lowest_cost, threshold,
+                "Winner %s self-updated: %.4f → %.4f (cleared δ threshold %.4f)",
+                best_hk[:8], state.winner_score, best_score, threshold,
             )
         else:
-            # Challenger dethrones winner
             new_state = WinnerState(
-                winner_hotkey=lowest_hk,
-                winner_pack_hash=pack_hashes.get(lowest_hk),
-                winner_cost=lowest_cost,
-                winner_uid=hk_to_uid.get(lowest_hk),
+                winner_hotkey=best_hk,
+                winner_pack_hash=pack_hashes.get(best_hk),
+                winner_score=best_score,
+                winner_uid=hk_to_uid.get(best_hk),
             )
             logger.info(
-                "Winner overtake: %s UID %s ($%.4f) dethrones %s "
-                "(winner_cost $%.4f, δ threshold $%.4f)",
-                lowest_hk[:8], hk_to_uid.get(lowest_hk, "?"), lowest_cost,
-                state.winner_hotkey[:8], state.winner_cost, threshold,
+                "Winner overtake: %s UID %s (%.4f) dethrones %s "
+                "(winner_score %.4f, δ threshold %.4f)",
+                best_hk[:8], hk_to_uid.get(best_hk, "?"), best_score,
+                state.winner_hotkey[:8], state.winner_score, threshold,
             )
-        return lowest_hk, new_state
+        return best_hk, new_state
 
-    # No one beats the threshold → winner retains;
-    # refresh UID in case it changed due to re-registration
     if state.winner_hotkey in hk_to_uid:
         state.winner_uid = hk_to_uid[state.winner_hotkey]
     logger.info(
-        "Winner %s retains (winner_cost $%.4f): best challenger %s ($%.4f) "
-        "does not clear δ threshold ($%.4f)",
-        state.winner_hotkey[:8], state.winner_cost,
-        lowest_hk[:8], lowest_cost, threshold,
+        "Winner %s retains (winner_score %.4f): best challenger %s (%.4f) "
+        "does not clear δ threshold (%.4f)",
+        state.winner_hotkey[:8], state.winner_score,
+        best_hk[:8], best_score, threshold,
     )
     return state.winner_hotkey, state
 
@@ -145,7 +139,7 @@ def save_winner_state(state: WinnerState, path: str):
         "scoring_version": state.scoring_version,
         "winner_hotkey": state.winner_hotkey,
         "winner_pack_hash": state.winner_pack_hash,
-        "winner_cost": state.winner_cost,
+        "winner_score": state.winner_score,
         "winner_uid": state.winner_uid,
     }
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -167,18 +161,19 @@ def load_winner_state(path: str) -> WinnerState:
             data = json.load(f)
 
         file_sv = data.get("scoring_version", 1)
-        if file_sv != SCORING_VERSION:
+        current_sv = _scoring_version()
+        if file_sv != current_sv:
             logger.warning(
                 "Winner state scoring_version mismatch (%d != %d), "
                 "resetting winner protection",
-                file_sv, SCORING_VERSION,
+                file_sv, current_sv,
             )
             return WinnerState()
 
         return WinnerState(
             winner_hotkey=data.get("winner_hotkey"),
             winner_pack_hash=data.get("winner_pack_hash"),
-            winner_cost=data.get("winner_cost"),
+            winner_score=data.get("winner_score", data.get("winner_cost")),
             winner_uid=data.get("winner_uid"),
             scoring_version=file_sv,
         )
