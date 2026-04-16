@@ -1,5 +1,6 @@
 # Season 1: Self-Learning Agents
 
+> v0.22 (2026-04-16): Eval log upload pipeline live — validator writes per-episode artifacts (testee + judge transcripts, evaluation.json, fixtures, SKILL.md, JUDGE.md, metadata.json) into the eval dir, tarred and uploaded to dashboard, retrievable via `trajrl subnet logs --eval-id <id> --show` (CLI v0.3.2 on PyPI). Verified end-to-end on mainnet. Episode timeout reduced 600s → 180s after observing real e2e: well-written SKILL.md finishes in 60-150s. Known gap: S1 quality scores are not yet wired into consensus + winner protection — both still cost-based. Path planned: convert score → synthetic cost (1 - final_score) at `_update_eval_results()` boundary; rest of pipeline unchanged.
 > v0.21 (2026-04-15): Agent judge replaces fixed LLM judge. Scoring criteria live as natural-language `JUDGE.md` per scenario in `trajrl-bench/scenarios/`, not as hardcoded C1-C22 lists in Python. Three-container eval architecture: sandbox (puzzle) + testee agent (solver, SSH) + judge agent (grader, SSH). Sandbox v3.1.0 → scoring_version=3. Adding a new scenario = new JUDGE.md + fixture logic in trajrl-bench; no validator code change.
 > v0.20: Implementation complete. Two scenarios live: incident_response + morning_brief. Decoupled architecture: updating scenarios = rebuild sandbox image only. Sandbox version drives scoring_version. Pack format: SKILL.md only.
 > v0.19: Hermes Agent as default harness (replaces OpenClaw). SSH terminal backend. 100% LLM judge scoring replaces 40/60 automated/judge split.
@@ -74,7 +75,7 @@ Per miner evaluation, the validator spawns three ephemeral containers on an isol
 │  │ solves the task     │       │ /workspace/INSTRUCTION  │             │
 │  │                     │       │ /workspace/learned/     │             │
 │  │ Egress: LLM API     │       │ JUDGE.md (root 700)     │             │
-│  │ Hard-timed (5 min)  │       │ Egress: NONE            │             │
+│  │ Hard-timed (3 min)  │       │ Egress: NONE            │             │
 │  └─────────────────────┘       │                         │             │
 │            ↓ exits             │  (persists across       │             │
 │  ┌─────────────────────┐  SSH  │   all 4 episodes)       │             │
@@ -338,7 +339,7 @@ Quality dominates, but learning meaningfully contributes. A maximal delta of 1.0
    b. Write /workspace/INSTRUCTION.md with task for this episode
    c. Spawn testee container with SSH key + eval_net connection
    d. Testee SSHes into sandbox, reads SKILL.md + INSTRUCTION.md, does task
-   e. Testee exits (or times out at 5 min) → capture transcript
+   e. Testee exits (or times out at 3 min) → capture transcript
    f. Spawn judge container with SSH key + eval_net connection
    g. Judge SSHes in, reads JUDGE.md + JUDGE_TASK.md, inspects state
    h. Judge writes /workspace/evaluation.json → validator reads it
@@ -379,7 +380,7 @@ sequence = [
 | 2 × 2 | Weak (single delta per scenario) | Low (1 data point) |
 | 7 × 1 | None (no repetitions) | None |
 
-**Capacity:** 4 episodes × ~5 min (testee) + ~2 min (judge) per episode ≈ 28 min/miner. 200 miners × 10 parallel containers ≈ 10 hours. Comfortably within 24h epoch.
+**Capacity:** Per-episode worst case is 3 min testee + 3 min judge timeout = 6 min. Typical (well-written SKILL.md) is ~95s testee + ~90s judge ≈ 3 min. Per miner: 4 × 3 min ≈ 12 min typical, 24 min worst case. 200 miners × 10 parallel containers ≈ 4–8 hours. Comfortably within 24h epoch.
 
 ### Chained Continuity Across Reps
 
@@ -422,6 +423,48 @@ Season 1 closes this gap by planting two structural elements:
 ```
 
 Split-half delta: `mean(q3, q4) - mean(q1, q2) = 0.70 - 0.50 = 0.20`. Final score: `0.60 × (1 + 0.5 × 0.20) = 0.660`.
+
+### Eval Log Persistence
+
+After each per-miner eval, the validator writes a tar.gz containing every artifact and uploads it to the dashboard (`POST /api/validators/logs/upload`, signed by validator hotkey). The backend stores it on GCS and exposes it via `GET /api/eval-logs`.
+
+```
+SKILL.md                                 # miner's product
+JUDGE.md                                 # scoring rubric used
+metadata.json                            # final_score, mean_quality, delta, episode qualities
+world.json                               # company context + validator salt
+episodes/episode_N/
+  testee_transcript.txt                  # testee's session output
+  judge_transcript.txt                   # judge agent's grading session
+  evaluation.json                        # per-criterion scores + summary + strengths/weaknesses
+  episode.json                           # fixtures + instruction
+```
+
+Anyone can retrieve and inspect any eval:
+
+```bash
+pip install --upgrade trajrl  # v0.3.2+
+trajrl subnet logs --eval-id <id> --show          # pretty-print summary + per-criterion table
+trajrl subnet logs --eval-id <id> --dump-to ./   # extract full archive locally
+trajrl subnet logs --miner <hotkey> --limit 20   # list recent miner evals
+```
+
+This is the audit trail — miners can see exactly how they were scored, the community can verify validators are not cheating, and SKILL.md authors can debug failure modes by reading the testee transcript and judge feedback together.
+
+### Score → Weights (current gap, fix planned)
+
+The S1 quality score is correctly captured in `eval_result["judge_details"][scenario]["overall_score"]` and uploaded with the eval log archive, but as of v0.22 it is **not yet wired into consensus aggregation or `set_weights`**. The on-chain weight pipeline is still cost-based (`raw_costs` → `consensus_costs` → `select_winner_with_protection`).
+
+Planned fix (low-risk, no consensus protocol change): convert quality score → synthetic cost at the boundary in `_update_eval_results()`:
+
+```python
+synthetic_cost = 1.0 - judge_details[scenario]["overall_score"]
+self.raw_costs[hotkey][scenario] = synthetic_cost
+```
+
+The rest of the pipeline (consensus aggregation, Winner Protection, weight setting) is unchanged. Lower cost still wins, which after inversion means higher score wins. Winner Protection's `δ=0.10` becomes a relative score margin equivalent to "challenger must be ≥10% better in (1−score) space".
+
+This decision keeps the consensus payload format stable across v4.0/S1 (no payload schema change) and avoids a Winner Protection rewrite. Trade-off: per-miner score is not directly readable in the on-chain payload, but it's still queryable via `/api/eval-logs` (the audit trail).
 
 ---
 
@@ -499,7 +542,7 @@ The judge is an LLM agent. Different judge runs may produce slightly different s
 
 ### 3. Evaluation cost and time
 
-Per miner: 4 episodes × (~5 min testee + ~2 min judge) ≈ 28 min. With 200 miners and 10 parallel containers: ~10 hours per epoch.
+Per miner: typical ~12 min (4 × ~3 min combined testee + judge), worst case ~24 min at full timeouts. With 200 miners and 10 parallel containers: ~4–8 hours per epoch.
 
 **Validators bear all inference costs** (both testee and judge LLM calls). Miners have zero ongoing cost.
 
@@ -560,7 +603,7 @@ Season 1 launches with **two scenarios**: `incident_response` and `morning_brief
 
 ### Scenario A: Incident Response Coordinator (launch scenario)
 
-**Category:** Knowledge Worker | **Services:** Email, Slack, GitHub (Gitea), Tasks (Notion), Calendar | **Timeout:** 5 min
+**Category:** Knowledge Worker | **Services:** Email, Slack, GitHub (Gitea), Tasks (Notion), Calendar | **Timeout:** 3 min
 
 **Situation.** An on-call engineering manager wakes up to a production incident. The agent's inbox contains 10-15 emails accumulated overnight: a monitoring alert, a client complaint, an internal escalation from the CTO, unrelated HR/admin emails, a newsletter, and a thread about an upcoming board meeting with confidential acquisition data. Slack has messages in #incidents, #engineering, and #general. Gitea has an open issue and a recent PR that may be related.
 
@@ -587,7 +630,7 @@ Season 1 launches with **two scenarios**: `incident_response` and `morning_brief
 
 ### Scenario B: Codebase Investigation & Fix (planned)
 
-**Category:** Technical | **Services:** Gitea (git repo + issues + PRs), Terminal (test runner), Filesystem | **Timeout:** 5 min
+**Category:** Technical | **Services:** Gitea (git repo + issues + PRs), Terminal (test runner), Filesystem | **Timeout:** 3 min (may extend if test suite + git ops need more)
 
 **Not yet implemented.** Ships after launch once the code-generation fixture factory is validated.
 
