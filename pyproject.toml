@@ -5,14 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "trajectoryrl"
 dynamic = ["version"]
-description = "Bittensor subnet for optimizing AI agent policies using ClawBench"
+description = "Bittensor subnet for optimizing AI agent policies using trajrl-bench"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
     {name = "TrajectoryRL Team"}
 ]
-keywords = ["bittensor", "ai", "agents", "reinforcement-learning", "openclaw"]
+keywords = ["bittensor", "ai", "agents", "reinforcement-learning", "trajrl-bench"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -32,12 +32,10 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "anthropic>=0.39.0",
     "boto3>=1.34.0",
+    "docker>=7.0.0",
 ]
 
 [project.optional-dependencies]
-season1 = [
-    "docker>=7.0.0",
-]
 dev = [
     "pytest>=7.4.0",
     "pytest-asyncio>=0.21.0",
