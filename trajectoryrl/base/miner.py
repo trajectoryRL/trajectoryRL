@@ -1,6 +1,13 @@
 """TrajectoryRL Miner — Pack building and on-chain submission.
 
 Miners don't run a server. The workflow is:
+
+Season 1 (SKILL.md — plain text):
+    1. Write SKILL.md
+    2. Upload SKILL.md to a public HTTP endpoint
+    3. Submit on-chain commitment via set_commitment
+
+v4.0 (OPP JSON — legacy):
     1. Write AGENTS.md (policy document)
     2. Build a pack.json (OPP v1 format)
     3. Upload pack.json to a public HTTP endpoint
@@ -8,8 +15,6 @@ Miners don't run a server. The workflow is:
 
 The on-chain commitment is block-timestamped, establishing first-mover
 precedence. Validators read commitments and fetch packs via HTTP.
-
-Reference: INCENTIVE_MECHANISM.md § Submission Protocol
 """
 
 import hashlib
@@ -32,18 +37,17 @@ MAX_COMMITMENT_BYTES = 128
 class TrajectoryMiner:
     """TrajectoryRL miner for building and submitting policy packs.
 
-    Example (submit existing pack)::
+    Example (S1 — submit SKILL.md)::
+
+        miner = TrajectoryMiner(wallet_name="miner", wallet_hotkey="default")
+        skill_hash = TrajectoryMiner.compute_text_hash("path/to/SKILL.md")
+        miner.submit_commitment(skill_hash, "https://example.com/SKILL.md")
+
+    Example (v4.0 — submit JSON pack)::
 
         miner = TrajectoryMiner(wallet_name="miner", wallet_hotkey="default")
         pack = miner.build_pack(agents_md="path/to/AGENTS.md")
         miner.submit(pack, pack_url="https://trajrl.com/samples/pack.json")
-
-    Example (validate locally)::
-
-        miner = TrajectoryMiner(wallet_name="miner", wallet_hotkey="default")
-        pack = miner.load_pack("pack.json")
-        result = miner.validate(pack)
-        print(result)
     """
 
     def __init__(
@@ -185,7 +189,7 @@ class TrajectoryMiner:
 
     @staticmethod
     def compute_pack_hash(pack: dict) -> str:
-        """Compute content-addressed SHA256 hash of a pack.
+        """Compute content-addressed SHA256 hash of a JSON pack (v4.0).
 
         Uses ``json.dumps(pack, sort_keys=True)`` for deterministic
         serialization, matching the validator's hash computation.
@@ -198,6 +202,42 @@ class TrajectoryMiner:
         """
         canonical = json.dumps(pack, sort_keys=True)
         return hashlib.sha256(canonical.encode()).hexdigest()
+
+    # ------------------------------------------------------------------
+    # S1: plain-text SKILL.md helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def compute_text_hash(text_or_path: str) -> str:
+        """Compute SHA256 hash of raw text content (S1 SKILL.md).
+
+        If ``text_or_path`` is a path to an existing file, reads the file
+        first.  Otherwise treats the string as content directly.
+
+        Args:
+            text_or_path: SKILL.md content string, or path to a file.
+
+        Returns:
+            64-char lowercase hex SHA256 digest.
+        """
+        content = _read_or_use(text_or_path)
+        return hashlib.sha256(content.encode()).hexdigest()
+
+    @staticmethod
+    def save_text(text_or_path: str, output: str) -> str:
+        """Save SKILL.md text to disk and return its SHA256 hash.
+
+        Args:
+            text_or_path: SKILL.md content string, or path to a source file.
+            output: Output file path.
+
+        Returns:
+            64-char lowercase hex SHA256 digest.
+        """
+        content = _read_or_use(text_or_path)
+        Path(output).parent.mkdir(parents=True, exist_ok=True)
+        Path(output).write_text(content)
+        return hashlib.sha256(content.encode()).hexdigest()
 
     @staticmethod
     def validate(pack: dict) -> "ValidationResult":
@@ -223,8 +263,8 @@ class TrajectoryMiner:
         """Format a commitment string for on-chain submission.
 
         Args:
-            pack_hash: SHA256 hex of pack JSON (64 chars).
-            pack_url: HTTP(S) URL where the pack.json is hosted.
+            pack_hash: SHA256 hex of submission content (64 chars).
+            pack_url: HTTP(S) URL where the submission is hosted.
 
         Returns:
             Pipe-delimited commitment string (≤256 bytes).
@@ -258,8 +298,8 @@ class TrajectoryMiner:
         """Submit on-chain commitment via set_commitment.
 
         Args:
-            pack_hash: SHA256 hex of pack JSON.
-            pack_url: HTTP(S) URL where pack.json is publicly accessible.
+            pack_hash: SHA256 hex of submission content.
+            pack_url: HTTP(S) URL where the submission is publicly accessible.
 
         Returns:
             True if commitment was submitted successfully.
