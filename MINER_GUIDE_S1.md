@@ -62,35 +62,38 @@ In v4.0, the agent called specific tools through an API, so you could allow/deny
 
 ## Writing SKILL.md
 
-Your SKILL.md teaches the agent **how to work**, not what specific commands to run. Think of it as onboarding a new hire.
+Your SKILL.md is a **self-learning system**. The agent runs 4 episodes of the same scenario with different data. Between episodes, `/workspace/learned/` persists. The competition rewards agents that capture learnings, detect patterns, and improve across episodes.
 
-### What to include
+See [pskoett/self-improving-agent](https://clawhub.ai/pskoett/self-improving-agent) on ClawHub for a strong reference implementation.
 
-**1. Role and approach**
+### What a winning SKILL.md looks like
 
-```markdown
-# Operations Agent
-
-You handle operational tasks. Before acting, always:
-1. Read all available information (inbox, Slack, Gitea, calendar)
-2. Assess what's urgent vs routine vs noise
-3. Look for connections between signals
-4. Act on high-priority items first
-5. Protect confidential information
-```
-
-**2. Self-improvement strategy**
-
-The agent runs 4 episodes. Between episodes, `/workspace/learned/` persists:
+**1. Structured learning logs.** Don't just say "write notes." Define a logging system with categorized entries, metadata (priority, status, area), and a consistent naming scheme so the agent can retrieve what matters.
 
 ```markdown
-## Learning
+## Learning System
 
-After each episode, write observations to /workspace/learned/notes.md.
-Before each episode, read /workspace/learned/ and apply what you learned.
+After each episode, log what worked and what failed:
+- /workspace/learned/LEARNINGS.md — corrections, insights, patterns discovered
+- /workspace/learned/ERRORS.md — command failures, wrong assumptions, dead ends
+- /workspace/learned/PATTERNS.md — recurring structures across episodes
+
+Each entry: `[YYYY-MM-DD] area | priority | observation | action taken`
+Before starting, read all of /workspace/learned/ and apply prior knowledge.
 ```
 
-**3. Safety rules**
+**2. Pattern recognition and promotion.** The agent sees the same scenario 4 times. Rep 3 reuses a structural pattern from rep 1. Rep 4 evolves a fact from earlier. Teach the agent to detect recurring patterns and flag stale information.
+
+```markdown
+## Pattern Detection
+
+- Track recurrence: if you see the same type of issue twice, extract the pattern
+- Timestamp everything — later episodes may contradict earlier facts
+- When a fact changes (e.g. on-call rotation, meeting time), mark old entries superseded
+- Promote high-confidence patterns to a summary section for quick retrieval
+```
+
+**3. Safety rules.**
 
 ```markdown
 ## Safety
@@ -105,6 +108,7 @@ Before each episode, read /workspace/learned/ and apply what you learned.
 - Hardcoded curl commands or API endpoints (the agent should discover them via `/health`)
 - Scenario-specific workflows (your SKILL.md should work across different scenarios)
 - References to specific criteria IDs (the judge criteria may change between scenarios)
+- Static task checklists — the value is in the learning loop, not a fixed playbook
 
 ---
 
@@ -171,15 +175,19 @@ Quality dominates. A consistently good agent (0.90) beats an improving-but-medio
 
 ## Submission
 
-Pack your SKILL.md, host at a public URL, submit on-chain:
+1. **Write your SKILL.md** and host it at a public URL (raw GitHub file, S3, any HTTP endpoint).
 
-```bash
-pip install trajrl
-trajrl pack build --skill-md ./SKILL.md
-trajrl pack submit --url https://your-host.com/pack.json
+2. **Submit on-chain** via the Python SDK:
+
+```python
+from trajectoryrl.base.miner import TrajectoryMiner
+
+miner = TrajectoryMiner(wallet_name="miner", wallet_hotkey="default")
+skill_hash = TrajectoryMiner.compute_text_hash("path/to/SKILL.md")
+miner.submit_commitment(skill_hash, "https://your-host.com/SKILL.md")
 ```
 
-The on-chain commitment format is the same as v4.0: `{pack_hash}|{pack_url}`.
+The on-chain commitment is `{hash}|{url}`. Validators fetch your SKILL.md from the URL and verify it against the hash.
 
 ---
 
@@ -200,12 +208,12 @@ Results are saved to `results/`. See the [trajrl-bench README](https://github.co
 
 ## Tips
 
-1. **Write general instructions**, not scenario-specific scripts. Your SKILL.md should work across different scenarios.
-2. **Teach the agent to discover** -- `curl localhost:8090/health` shows available services.
-3. **Use /workspace/learned/** -- the delta bonus rewards agents that improve across episodes.
-4. **Protect sensitive info** -- multiple criteria check for confidentiality leaks.
-5. **Be structured in communications** -- the judge evaluates quality of Slack posts, emails, and tasks.
-6. **Read before acting** -- investigating sources before taking action is scored.
+1. **Design a learning loop**, not a static playbook. The delta bonus rewards agents that genuinely improve across 4 episodes.
+2. **Structure your logs** -- categorized entries with timestamps beat freeform notes. The agent needs to retrieve, not just record.
+3. **Handle stale knowledge** -- rep 4 may contradict rep 1. Teach the agent to timestamp, supersede, and prefer recent observations.
+4. **Detect recurring patterns** -- rep 3 reuses rep 1's structure. An agent that extracted the pattern short-circuits discovery.
+5. **Protect sensitive info** -- multiple criteria check for confidentiality leaks. Safety matters.
+6. **Keep it general** -- your SKILL.md should work across different scenarios, not script a specific workflow.
 7. **Don't sandbag** -- anti-sandbagging guard zeros delta if early episodes are deliberately bad.
 
 ---
