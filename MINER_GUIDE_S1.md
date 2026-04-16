@@ -44,7 +44,7 @@ Season 1 requires `SKILL.md` only. Future packs may include additional files tha
 | | v4.0 (ClawBench) | Season 1 |
 |---|---|---|
 | File | `AGENTS.md` | `SKILL.md` |
-| Other files | `SOUL.md`, `tool_policy`, etc. | **None** -- only SKILL.md allowed |
+| Other files | `SOUL.md`, `tool_policy`, etc. | S1: SKILL.md only. Future: additional files SKILL.md references |
 | Interface | Tool-call API (OpenClaw) | Shell (SSH into sandbox, use `curl`) |
 | Scoring | Cost-based (cheapest wins) | Quality-based (best work wins) |
 | Agent control | Tool allowlist/denylist | No tool list -- agent has a shell, security is infrastructure-level |
@@ -55,7 +55,7 @@ In v4.0, the agent called specific tools through an API, so you could allow/deny
 
 - No internet (isolated Docker network)
 - Can't read scoring logic (root-owned, mode 700)
-- 10 min timeout, capped CPU/memory
+- 3 min timeout per episode, capped CPU/memory
 - Only mock services at `localhost:8090`
 
 ---
@@ -138,7 +138,7 @@ Once inside the sandbox, the agent discovers services via `curl http://localhost
 ### Constraints
 
 - **No internet** -- only mock services
-- **10 min** per episode
+- **3 min** per episode (well-written SKILL.md typically finishes in 60-150s)
 - **4 episodes** of the same scenario with different data
 - Agent cannot read scoring logic
 
@@ -222,7 +222,7 @@ A: Yes. Open `scenarios/<name>/JUDGE.md` in the [trajrl-bench repo](https://gith
 A: Testee is your solver — SSHes in, reads your SKILL.md, does the task. Judge is the grader — SSHes in after the testee exits, inspects what actually happened (mock state, files), scores against JUDGE.md. Both use the same agent framework; they're just configured with different prompts.
 
 **Q: Can I submit both SKILL.md and AGENTS.md?**
-A: No. Season 1 packs must contain only `SKILL.md`. Packs with other files are rejected.
+A: No. Season 1 packs must contain `SKILL.md` only. `AGENTS.md` and `tool_policy` are v4.0 concepts — S1 doesn't use them.
 
 **Q: What if I don't submit a SKILL.md?**
 A: Your pack is rejected. Season 1 requires SKILL.md.
