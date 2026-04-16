@@ -146,7 +146,7 @@ class ValidatorConfig:
     evaluation_harness: str = "trajrl-bench"
     sandbox_image: str = "ghcr.io/trajectoryrl/trajrl-bench:latest"
     harness_image: str = "ghcr.io/trajectoryrl/hermes-agent:latest"
-    sandbox_timeout_per_episode: int = 600  # 10 min per episode
+    sandbox_timeout_per_episode: int = 180  # 3 min per episode
     sandbox_num_episodes: int = 4
 
     # EMA state persistence
@@ -244,7 +244,7 @@ class ValidatorConfig:
             evaluation_harness=os.getenv("EVALUATION_HARNESS", "trajrl-bench"),
             sandbox_image=os.getenv("SANDBOX_IMAGE", "ghcr.io/trajectoryrl/trajrl-bench:latest"),
             harness_image=os.getenv("HARNESS_IMAGE", "ghcr.io/trajectoryrl/hermes-agent:latest"),
-            sandbox_timeout_per_episode=int(os.getenv("SANDBOX_TIMEOUT_PER_EPISODE", "600")),
+            sandbox_timeout_per_episode=int(os.getenv("SANDBOX_TIMEOUT_PER_EPISODE", "180")),
             sandbox_num_episodes=int(os.getenv("SANDBOX_NUM_EPISODES", "4")),
             # --- Startup aggregation ---
             aggregate_when_start=os.getenv("AGGREGATE_WHEN_START", "1") == "1",

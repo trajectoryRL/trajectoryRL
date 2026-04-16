@@ -128,7 +128,7 @@ class TestConfigWiring:
 
     def test_season1_defaults(self):
         assert ValidatorConfig.sandbox_num_episodes == 4
-        assert ValidatorConfig.sandbox_timeout_per_episode == 600
+        assert ValidatorConfig.sandbox_timeout_per_episode == 180
 
 
 # ---------------------------------------------------------------------------
