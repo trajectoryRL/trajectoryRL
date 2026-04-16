@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import bittensor as bt
+import docker.errors
 
 from ..utils.config import ValidatorConfig
 from ..utils.sandbox_harness import TrajectorySandboxHarness, SandboxEvaluationResult
@@ -1475,7 +1476,18 @@ class TrajectoryValidator:
         self._disqualified_miners = {}
 
         # Pull latest sandbox image before eval (gets new scenarios + version)
-        await self._sandbox_harness.pull_latest()
+        try:
+            await self._sandbox_harness.pull_latest()
+        except docker.errors.DockerException as e:
+            logger.error(
+                "Docker is not available — cannot run sandbox evaluations. "
+                "If running inside Docker, ensure docker.sock is mounted. "
+                "Run:\n"
+                "  docker compose -f docker/docker-compose.validator.yml "
+                "--env-file .env.validator up -d\n"
+                "Skipping this eval cycle. Error: %s", e,
+            )
+            return
         # scoring_version = trajrl-bench major version (v3.0.1 → 3)
         import trajectoryrl.utils.consensus as _consensus
         _consensus_mod.SCORING_VERSION = self._sandbox_harness.scoring_version

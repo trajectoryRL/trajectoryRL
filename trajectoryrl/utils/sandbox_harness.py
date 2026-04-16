@@ -302,7 +302,7 @@ class TrajectorySandboxHarness:
 
     def __init__(self, config: ValidatorConfig):
         self.config = config
-        self.client = docker.from_env()
+        self._docker_client: docker.DockerClient | None = None
 
         self._sandbox_image = config.sandbox_image
         self._harness_image = config.harness_image
@@ -318,6 +318,17 @@ class TrajectorySandboxHarness:
         # Image digests — populated after pull_latest
         self.bench_image_hash: str = "unknown"
         self.harness_image_hash: str = "unknown"
+
+    @property
+    def client(self) -> docker.DockerClient:
+        """Lazy Docker client — connects on first access, not at init time.
+
+        Allows the validator to start and run non-eval functions (weights,
+        consensus, metagraph sync) even when docker.sock is not mounted.
+        """
+        if self._docker_client is None:
+            self._docker_client = docker.from_env()
+        return self._docker_client
 
     @property
     def scoring_version(self) -> int:
