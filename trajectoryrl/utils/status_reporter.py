@@ -12,9 +12,9 @@ from trajectoryrl import __version__
 logger = logging.getLogger(__name__)
 
 _BASE_URL = os.getenv("TRAJECTORYRL_API_BASE_URL", "https://trajrl.com")
-DEFAULT_HEARTBEAT_URL = f"{_BASE_URL}/api/validators/heartbeat"
-DEFAULT_SUBMIT_URL = f"{_BASE_URL}/api/scores/submit"
-DEFAULT_PRE_EVAL_URL = f"{_BASE_URL}/api/miners/pre-eval"
+DEFAULT_HEARTBEAT_URL = f"{_BASE_URL}/api/v2/validators/heartbeat"
+DEFAULT_SUBMIT_URL = f"{_BASE_URL}/api/v2/scores/submit"
+DEFAULT_PRE_EVAL_URL = f"{_BASE_URL}/api/v2/miners/pre-eval"
 DEFAULT_LOGS_UPLOAD_URL = f"{_BASE_URL}/api/validators/logs/upload"
 DEFAULT_CYCLE_LOGS_URL = f"{_BASE_URL}/api/validators/logs/cycle"
 
@@ -25,14 +25,20 @@ async def heartbeat(
     heartbeat_url: str = DEFAULT_HEARTBEAT_URL,
     last_set_weights_at: Optional[int] = None,
     last_eval_at: Optional[int] = None,
+    bench_image_hash: Optional[str] = None,
+    harness_image_hash: Optional[str] = None,
+    bench_version: Optional[str] = None,
 ) -> bool:
-    """Send a validator heartbeat to the dashboard API.
+    """Send a validator heartbeat to the dashboard API (v2).
 
     Args:
         wallet: bt.Wallet with accessible hotkey for signing.
         heartbeat_url: Dashboard heartbeat endpoint.
         last_set_weights_at: Unix timestamp of most recent set_weights call.
         last_eval_at: Unix timestamp of most recent completed full eval cycle.
+        bench_image_hash: Docker image digest of the trajrl-bench sandbox.
+        harness_image_hash: Docker image digest of the hermes-agent harness.
+        bench_version: Version string reported by the trajrl-bench CLI.
 
     Returns:
         True on success (HTTP 200), False otherwise.
@@ -59,6 +65,12 @@ async def heartbeat(
         payload["last_set_weights_at"] = last_set_weights_at
     if last_eval_at is not None:
         payload["last_eval_at"] = last_eval_at
+    if bench_image_hash is not None:
+        payload["bench_image_hash"] = bench_image_hash
+    if harness_image_hash is not None:
+        payload["harness_image_hash"] = harness_image_hash
+    if bench_version is not None:
+        payload["bench_version"] = bench_version
 
     try:
         async with httpx.AsyncClient() as client:
@@ -339,15 +351,11 @@ async def submit_eval(
     miner_uid: int,
     block_height: int,
     score: float,
-    ema_score: float,
-    cost: float,
-    ema_cost: float,
     weight: float,
     qualified: bool,
     pack_url: Optional[str] = None,
     pack_hash: Optional[str] = None,
     eval_count: Optional[int] = None,
-    ema_reset: Optional[bool] = None,
     scenario_results: Optional[Dict[str, Any]] = None,
     llm_base_url: Optional[str] = None,
     llm_model: Optional[str] = None,
@@ -355,6 +363,9 @@ async def submit_eval(
     rejection_stage: Optional[str] = None,
     rejection_detail: Optional[str] = None,
     scoring_version: Optional[int] = None,
+    bench_image_hash: Optional[str] = None,
+    harness_image_hash: Optional[str] = None,
+    bench_version: Optional[str] = None,
     submit_url: str = DEFAULT_SUBMIT_URL,
 ) -> bool:
     """Submit a single miner eval result to the dashboard API.
@@ -386,9 +397,6 @@ async def submit_eval(
         "signature": signature,
         "version": __version__,
         "score": score,
-        "ema_score": ema_score,
-        "cost": cost,
-        "ema_cost": ema_cost,
         "weight": weight,
         "qualified": qualified,
     }
@@ -398,8 +406,6 @@ async def submit_eval(
         payload["pack_hash"] = pack_hash
     if eval_count is not None:
         payload["eval_count"] = eval_count
-    if ema_reset is not None:
-        payload["ema_reset"] = ema_reset
     if scenario_results is not None:
         payload["scenario_results"] = scenario_results
     if llm_base_url is not None:
@@ -414,6 +420,12 @@ async def submit_eval(
         payload["rejection_detail"] = rejection_detail
     if scoring_version is not None:
         payload["scoring_version"] = scoring_version
+    if bench_image_hash is not None:
+        payload["bench_image_hash"] = bench_image_hash
+    if harness_image_hash is not None:
+        payload["harness_image_hash"] = harness_image_hash
+    if bench_version is not None:
+        payload["bench_version"] = bench_version
 
     try:
         async with httpx.AsyncClient() as client:

@@ -128,6 +128,13 @@ async def evaluate_single_miner(
         return None
 
     pack = verification.pack_content
+    if pack is None:
+        logger.info(
+            "Submission is plain text, not a JSON pack — "
+            "skipping ClawBench evaluation"
+        )
+        return None
+
     logger.info(f"Pack verified: {len(pack.get('files', {}))} files")
     for fname in pack.get("files", {}):
         logger.info(f"  - {fname}")

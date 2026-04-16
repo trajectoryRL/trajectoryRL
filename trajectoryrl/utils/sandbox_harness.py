@@ -269,6 +269,23 @@ def _generate_keypair() -> tuple[str, str]:
     return private_key, public_key
 
 
+_PROVIDER_PREFIXES = ("openrouter/", "chutes/")
+
+
+def _strip_provider_prefix(model: str) -> str:
+    """Remove provider routing prefixes from model identifiers.
+
+    Providers like OpenRouter and Chutes use prefixed model names
+    (e.g. ``openrouter/anthropic/claude-3``), but the sandbox calls
+    the provider API directly via LLM_BASE_URL and expects the bare
+    model name.
+    """
+    for prefix in _PROVIDER_PREFIXES:
+        if model.startswith(prefix):
+            return model[len(prefix):]
+    return model
+
+
 # ---------------------------------------------------------------------------
 # Harness
 # ---------------------------------------------------------------------------
@@ -292,21 +309,23 @@ class TrajectorySandboxHarness:
         self._harness_image = config.harness_image
         self._llm_api_key = config.judge_api_key or config.clawbench_api_key
         self._llm_api_url = config.judge_base_url or config.clawbench_base_url
-        # Strip "openrouter/" prefix — the sandbox scorer calls OpenRouter
-        # directly via LLM_BASE_URL and doesn't use the prefix convention.
         _model = config.judge_model or config.clawbench_default_model
-        self._llm_model = _model.removeprefix("openrouter/")
+        self._llm_model = _strip_provider_prefix(_model)
 
         # Sandbox version — queried at pull time, drives scoring_version
         self.sandbox_version: str = "unknown"
         self.sandbox_scenarios: list[str] = []
 
+        # Image digests — populated after pull_latest
+        self.bench_image_hash: str = "unknown"
+        self.harness_image_hash: str = "unknown"
+
     @property
     def scoring_version(self) -> int:
-        """Derive scoring version from sandbox major version.
+        """Major version of bench_version (trajrl-bench version).
 
-        v1.0.0 → 1, v2.0.0 → 2, etc. Falls back to 1 if unparseable.
-        Validators with different sandbox major versions will not mix
+        v3.0.1 → 3, v1.0.0 → 1, etc. Falls back to 1 if unparseable.
+        Validators with different bench major versions will not mix
         results during consensus aggregation.
         """
         try:
@@ -337,6 +356,22 @@ class TrajectorySandboxHarness:
                 self.client.images.pull(image)
             except Exception as e:
                 logger.warning("Failed to pull %s: %s (using cached)", image, e)
+
+        # Capture image digests (sha256 from RepoDigests)
+        for image_ref, attr in [
+            (self._sandbox_image, "bench_image_hash"),
+            (self._harness_image, "harness_image_hash"),
+        ]:
+            try:
+                img = self.client.images.get(image_ref)
+                digests = img.attrs.get("RepoDigests", [])
+                if digests:
+                    # RepoDigests format: "repo@sha256:abc123..."
+                    setattr(self, attr, digests[0].split("@", 1)[-1])
+                else:
+                    setattr(self, attr, img.id)
+            except Exception as e:
+                logger.warning("Failed to get digest for %s: %s", image_ref, e)
 
         # Query sandbox version and available scenarios
         try:

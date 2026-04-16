@@ -9,18 +9,19 @@ Pipeline order:
   2. Window number     — discard submissions from wrong window
   3. Trust threshold   — discard validators below min stake
   4. Data integrity    — discard payloads that fail hash verification
-  5. ClawBench version — discard incompatible major versions
+  5. Bench version     — discard incompatible trajrl-bench major versions
   6. Scoring version   — discard mismatched evaluation criteria versions
-  7. Zero-signal       — discard all-zero cost submissions (free-riders)
+  7. Zero-signal       — discard all-zero score submissions (free-riders)
 """
 
 import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from . import consensus as _consensus_mod
 from .consensus import (
     ConsensusPayload, ConsensusPointer,
-    CONSENSUS_PROTOCOL_VERSION, SCORING_VERSION,
+    CONSENSUS_PROTOCOL_VERSION,
 )
 
 logger = logging.getLogger(__name__)
@@ -60,7 +61,7 @@ class ValidatedSubmission:
 def _parse_major_version(version_str: str) -> Optional[int]:
     """Extract major version number from semver string."""
     try:
-        return int(version_str.split(".")[0])
+        return int(version_str.lstrip("v").split(".")[0])
     except (ValueError, IndexError):
         return None
 
@@ -135,7 +136,6 @@ def filter_data_integrity(
     skipped = 0
     for ptr, payload in submissions:
         computed_hash = payload.content_hash()
-        # For sha256-addressed pointers, verify hash matches
         if ptr.content_address.startswith("sha256:"):
             if computed_hash != ptr.content_address:
                 logger.warning(
@@ -148,11 +148,11 @@ def filter_data_integrity(
     return passed, skipped
 
 
-def filter_clawbench_version(
+def filter_bench_version(
     submissions: List[Tuple[ConsensusPointer, ConsensusPayload]],
     local_version: str,
 ) -> Tuple[List[Tuple[ConsensusPointer, ConsensusPayload]], int]:
-    """Layer 5: discard submissions from incompatible ClawBench major versions.
+    """Layer 5: discard submissions from incompatible trajrl-bench major versions.
 
     Different major versions use different scenarios/criteria/judge logic,
     producing incomparable scores.
@@ -164,11 +164,11 @@ def filter_clawbench_version(
     passed = []
     skipped = 0
     for ptr, payload in submissions:
-        remote_major = _parse_major_version(payload.clawbench_version)
+        remote_major = _parse_major_version(payload.bench_version)
         if remote_major is None or remote_major != local_major:
             logger.debug(
-                "Filter[clawbench_version]: skip %s (v%s, local major=%d)",
-                ptr.validator_hotkey[:8], payload.clawbench_version, local_major,
+                "Filter[bench_version]: skip %s (v%s, local major=%d)",
+                ptr.validator_hotkey[:8], payload.bench_version, local_major,
             )
             skipped += 1
         else:
@@ -178,13 +178,11 @@ def filter_clawbench_version(
 
 def filter_scoring_version(
     submissions: List[Tuple[ConsensusPointer, ConsensusPayload]],
-    expected_version: int = SCORING_VERSION,
+    expected_version: Optional[int] = None,
 ) -> Tuple[List[Tuple[ConsensusPointer, ConsensusPayload]], int]:
-    """Layer 6: discard submissions with mismatched scoring version.
-
-    Different scoring versions use different scenario sets or rubrics,
-    producing incomparable costs and qualification verdicts.
-    """
+    """Layer 6: discard submissions with mismatched scoring version."""
+    if expected_version is None:
+        expected_version = _consensus_mod.SCORING_VERSION
     passed = []
     skipped = 0
     for ptr, payload in submissions:
@@ -202,13 +200,13 @@ def filter_scoring_version(
 def filter_zero_signal(
     submissions: List[Tuple[ConsensusPointer, ConsensusPayload]],
 ) -> Tuple[List[Tuple[ConsensusPointer, ConsensusPayload]], int]:
-    """Layer 7: discard all-zero cost submissions when non-zero signals exist.
+    """Layer 7: discard all-zero score submissions when non-zero signals exist.
 
     Prevents free-riding validators from diluting legitimate signals.
     If ALL submissions are zero, they all pass (bootstrap scenario).
     """
     has_nonzero = any(
-        any(c != 0.0 for c in payload.costs.values())
+        any(s != 0.0 for s in payload.scores.values())
         for _, payload in submissions
     )
 
@@ -218,9 +216,9 @@ def filter_zero_signal(
     passed = []
     skipped = 0
     for ptr, payload in submissions:
-        if all(c == 0.0 for c in payload.costs.values()):
+        if not payload.scores or all(s == 0.0 for s in payload.scores.values()):
             logger.debug(
-                "Filter[zero-signal]: skip %s (all-zero costs)",
+                "Filter[zero-signal]: skip %s (all-zero scores)",
                 ptr.validator_hotkey[:8],
             )
             skipped += 1
@@ -236,7 +234,7 @@ def run_filter_pipeline(
     min_stake: float,
     local_version: str,
     expected_protocol: int = CONSENSUS_PROTOCOL_VERSION,
-    expected_scoring_version: int = SCORING_VERSION,
+    expected_scoring_version: Optional[int] = None,
 ) -> Tuple[List[ValidatedSubmission], FilterStats]:
     """Run the full 7-layer filter pipeline.
 
@@ -260,7 +258,7 @@ def run_filter_pipeline(
     current, n = filter_data_integrity(current)
     stats.skipped_integrity = n
 
-    current, n = filter_clawbench_version(current, local_version)
+    current, n = filter_bench_version(current, local_version)
     stats.skipped_version = n
 
     current, n = filter_scoring_version(current, expected_scoring_version)

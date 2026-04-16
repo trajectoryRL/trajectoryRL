@@ -89,8 +89,7 @@ Be direct. No exploration. Exit the SSH session when done.
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _strip_openrouter_prefix(model: str) -> str:
-    return model.removeprefix("openrouter/") if model else model
+from trajectoryrl.utils.sandbox_harness import _strip_provider_prefix
 
 
 def _make_config():
@@ -105,7 +104,7 @@ def _make_config():
     api_key = os.environ["CLAWBENCH_LLM_API_KEY"]
     base_url = os.environ.get("CLAWBENCH_LLM_BASE_URL",
                               "https://openrouter.ai/api/v1")
-    model = _strip_openrouter_prefix(os.environ.get(
+    model = _strip_provider_prefix(os.environ.get(
         "CLAWBENCH_DEFAULT_MODEL", "z-ai/glm-5.1"))
 
     return ValidatorConfig(

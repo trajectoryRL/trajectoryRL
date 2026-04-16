@@ -34,8 +34,9 @@ docker = pytest.importorskip("docker")
 
 LLM_API_KEY = os.environ.get("CLAWBENCH_LLM_API_KEY", "")
 LLM_BASE_URL = os.environ.get("CLAWBENCH_LLM_BASE_URL", "https://openrouter.ai/api/v1")
+from trajectoryrl.utils.sandbox_harness import _strip_provider_prefix
 _raw_model = os.environ.get("CLAWBENCH_DEFAULT_MODEL", "z-ai/glm-5.1")
-LLM_MODEL = _raw_model.removeprefix("openrouter/")
+LLM_MODEL = _strip_provider_prefix(_raw_model)
 
 SANDBOX_IMAGE = os.environ.get("SANDBOX_IMAGE", "ghcr.io/trajectoryrl/trajrl-bench:latest")
 HARNESS_IMAGE = os.environ.get("HARNESS_IMAGE", "ghcr.io/trajectoryrl/hermes-agent:latest")

@@ -51,8 +51,8 @@ from ..utils.consensus import (
 )
 
 def _scoring_version() -> int:
-    """Get current scoring version. In S1 mode this is set dynamically
-    from the sandbox image major version at the start of each eval cycle."""
+    """Current scoring version — major version of trajrl-bench (e.g. v3.0.1 → 3).
+    Set dynamically after pulling the sandbox image at each eval cycle."""
     return _consensus_mod.SCORING_VERSION
 from ..utils.consensus_store import (
     ConsensusStore, IPFSBackend, TrajRLAPIBackend,
@@ -60,7 +60,7 @@ from ..utils.consensus_store import (
 from ..utils.consensus_filter import (
     run_filter_pipeline, ValidatedSubmission,
 )
-from ..scoring import compute_consensus_costs
+from ..scoring import compute_consensus_scores
 from ..utils.winner_state import (
     WinnerState, select_winner_with_protection,
     save_winner_state, load_winner_state,
@@ -712,10 +712,14 @@ class TrajectoryValidator:
         """Send validator heartbeat every 10 minutes, independent of eval cycle."""
         while True:
             try:
+                harness = self._sandbox_harness
                 await heartbeat(
                     self.wallet,
                     last_set_weights_at=self._last_set_weights_at,
                     last_eval_at=self._last_eval_at,
+                    bench_image_hash=harness.bench_image_hash if harness else None,
+                    harness_image_hash=harness.harness_image_hash if harness else None,
+                    bench_version=harness.sandbox_version if harness else None,
                 )
             except Exception as e:
                 logger.warning("Heartbeat error: %s", e)
@@ -823,36 +827,29 @@ class TrajectoryValidator:
         Used as a fallback when this validator's submission is absent from
         CAS/chain during aggregation.  Returns None if no eval data exists.
         """
-        from clawbench import __version__ as clawbench_version
-
-        costs_by_hotkey: Dict[str, float] = {}
-        qualified_by_hotkey: Dict[str, bool] = {}
+        scores_by_hotkey: Dict[str, float] = {}
         disqualified_by_hotkey: Dict[str, str] = {}
 
-        for hotkey, scenario_costs in self.raw_costs.items():
-            if scenario_costs:
-                total_cost = sum(scenario_costs.values()) / len(scenario_costs)
-                costs_by_hotkey[hotkey] = total_cost
-                scenario_q = self.scenario_qualified.get(hotkey, {})
-                qualified_by_hotkey[hotkey] = (
-                    bool(scenario_q) and all(scenario_q.values())
-                )
+        for hotkey, scenario_q in self.scenario_qualified.items():
+            if scenario_q:
+                score = sum(1.0 if q else 0.0 for q in scenario_q.values()) / len(scenario_q)
+                scores_by_hotkey[hotkey] = round(score, 4)
 
         for hotkey, reason in getattr(self, "_disqualified_miners", {}).items():
-            if hotkey not in qualified_by_hotkey:
-                qualified_by_hotkey[hotkey] = False
             disqualified_by_hotkey[hotkey] = reason
 
-        if not costs_by_hotkey and not disqualified_by_hotkey:
+        if not scores_by_hotkey and not disqualified_by_hotkey:
             return None
+
+        harness = self._sandbox_harness
+        bench_ver = harness.sandbox_version if harness else "unknown"
 
         return ConsensusPayload(
             protocol_version=self.config.consensus_protocol_version,
             window_number=window.window_number,
             validator_hotkey=self.wallet.hotkey.ss58_address,
-            clawbench_version=clawbench_version,
-            costs=costs_by_hotkey,
-            qualified=qualified_by_hotkey,
+            bench_version=bench_ver,
+            scores=scores_by_hotkey,
             timestamp=int(time.time()),
             scoring_version=_scoring_version(),
             disqualified=disqualified_by_hotkey,
@@ -941,14 +938,15 @@ class TrajectoryValidator:
             if stake > 0:
                 validator_stakes[hotkey] = stake
 
-        from clawbench import __version__ as clawbench_version
+        harness = self._sandbox_harness
+        bench_ver = harness.sandbox_version if harness else "unknown"
         min_stake = getattr(self.config, "min_validator_stake", 0.0)
         validated, stats = run_filter_pipeline(
             submissions=submissions,
             expected_window=window.window_number,
             validator_stakes=validator_stakes,
             min_stake=min_stake,
-            local_version=clawbench_version,
+            local_version=bench_ver,
             expected_protocol=self.config.consensus_protocol_version,
             expected_scoring_version=_scoring_version(),
         )
@@ -960,11 +958,7 @@ class TrajectoryValidator:
             )
             return
 
-        consensus_costs, consensus_qualified = compute_consensus_costs(
-            validated,
-            qualification_stake_threshold=self.config.qualification_stake_threshold,
-            min_validators_qualified=self.config.min_validators_qualified,
-        )
+        consensus_scores, disqualified = compute_consensus_scores(validated)
 
         # Build hotkey → UID mapping (used by pre-eval reporting, winner
         # selection, and logging)
@@ -984,14 +978,12 @@ class TrajectoryValidator:
             }
             current_block = self.subtensor.get_current_block()
 
-            # Build list of miners to check (must have a commitment on chain)
             miners_to_check = [
                 (miner_hk, hk_to_commitment[miner_hk])
-                for miner_hk in consensus_qualified
+                for miner_hk in consensus_scores
                 if miner_hk in hk_to_commitment
             ]
 
-            # Batch pre-eval calls with bounded concurrency
             if miners_to_check:
                 sem = asyncio.Semaphore(8)
 
@@ -1010,7 +1002,7 @@ class TrajectoryValidator:
                 for (miner_hk, commitment), pre_eval_result in zip(miners_to_check, results):
                     if pre_eval_result is not None and not pre_eval_result.get("allowed", True):
                         reason = pre_eval_result.get("reason", "unknown")
-                        consensus_qualified[miner_hk] = False
+                        disqualified[miner_hk] = f"pre_eval:{reason}"
                         pre_eval_disqualified += 1
                         _stage = "integrity_check" if reason == "hardcoded" else "pack_fetch"
                         _detail = (
@@ -1033,9 +1025,6 @@ class TrajectoryValidator:
                                 miner_uid=hk_to_uid.get(miner_hk, -1),
                                 block_height=current_block,
                                 score=0.0,
-                                ema_score=0.0,
-                                cost=0.0,
-                                ema_cost=0.0,
                                 weight=0.0,
                                 qualified=False,
                                 pack_url=commitment.pack_url,
@@ -1045,7 +1034,8 @@ class TrajectoryValidator:
                                 rejected=True,
                                 rejection_stage=_stage,
                                 rejection_detail=_detail,
-                                scoring_version=SCORING_VERSION,
+                                scoring_version=_scoring_version(),
+                                **self._harness_metadata(),
                             )
                         )
                 if pre_eval_disqualified:
@@ -1057,46 +1047,50 @@ class TrajectoryValidator:
 
         self._consensus_window = window.window_number
 
+        # Filter disqualified miners from consensus scores before winner selection
+        eligible_scores = {
+            hk: s for hk, s in consensus_scores.items() if hk not in disqualified
+        }
+
         # Apply Winner Protection (stores winner_uid so set_weights
         # can skip the metagraph lookup later)
         winner_hk, updated_state = select_winner_with_protection(
-            consensus_costs=consensus_costs,
-            consensus_qualified=consensus_qualified,
+            consensus_scores=eligible_scores,
             state=self._winner_state,
-            cost_delta=self.config.cost_delta,
+            score_delta=self.config.score_delta,
             hk_to_uid=hk_to_uid,
             disable_winner_protection=self.config.disable_winner_protection,
         )
         self._winner_state = updated_state
         save_winner_state(updated_state, self._winner_state_path)
 
-        n_qualified = sum(1 for q in consensus_qualified.values() if q)
         logger.info("=" * 60)
         logger.info(
-            "Window %d: CONSENSUS RESULTS — %d miners (%d qualified), "
+            "Window %d: CONSENSUS RESULTS — %d miners (%d eligible, %d disqualified), "
             "%d validators (%s)",
-            window.window_number, len(consensus_costs), n_qualified,
+            window.window_number, len(consensus_scores),
+            len(eligible_scores), len(disqualified),
             stats.passed, stats.summary(),
         )
         logger.info(f"Burn fraction: {BURN_FRACTION:.0%} to owner UID {OWNER_UID}")
         if winner_hk:
             winner_uid = hk_to_uid.get(winner_hk, -1)
             logger.info(
-                "Winner: %s (UID %d, cost=$%.4f, weight=%.4f)",
+                "Winner: %s (UID %d, score=%.4f, weight=%.4f)",
                 winner_hk[:8], winner_uid,
-                consensus_costs.get(winner_hk, 0),
+                consensus_scores.get(winner_hk, 0),
                 1.0 - BURN_FRACTION,
             )
         else:
-            logger.info("No winner — all miners disqualified")
+            logger.info("No winner — all miners disqualified or no scores")
         logger.info("=" * 60)
-        for hk, cost in sorted(consensus_costs.items(), key=lambda x: x[1]):
+        for hk, score in sorted(consensus_scores.items(), key=lambda x: x[1], reverse=True):
             uid = hk_to_uid.get(hk, -1)
-            gate = "PASS" if consensus_qualified.get(hk, False) else "FAIL"
+            status = "DISQ" if hk in disqualified else "OK"
             marker = " <- WINNER" if hk == winner_hk else ""
             logger.info(
-                "  Miner %d (%s): cost=$%.4f, gate=%s%s",
-                uid, hk[:8], cost, gate, marker,
+                "  Miner %d (%s): score=%.4f, status=%s%s",
+                uid, hk[:8], score, status, marker,
             )
 
         self._save_ema_state()
@@ -1462,11 +1456,14 @@ class TrajectoryValidator:
                 commitment.pack_url,
                 commitment.pack_hash,
             )
-            if not result.valid or result.pack_content is None:
+            if not result.valid:
                 logger.warning(
                     f"NCD prefetch: uid={uid} ({hk[:8]}…): "
                     f"{result.error or 'unknown'}"
                 )
+                continue
+            if result.pack_content is None:
+                # S1 text submission — not applicable for NCD dedup
                 continue
             pack_info[hk] = (
                 result.pack_content,
@@ -1547,12 +1544,10 @@ class TrajectoryValidator:
         # Pull latest sandbox image before eval (gets new scenarios + version)
         if self._sandbox_harness:
             await self._sandbox_harness.pull_latest()
-            # S1: scoring version = sandbox image major version (v1.0.0 → 1)
-            # Update the module-level constant so all consensus/cache/filter
-            # code in this process uses the sandbox-derived version.
+            # scoring_version = trajrl-bench major version (v3.0.1 → 3)
             import trajectoryrl.utils.consensus as _consensus
             _consensus_mod.SCORING_VERSION = self._sandbox_harness.scoring_version
-            logger.info("S1 scoring_version=%d (sandbox %s)",
+            logger.info("scoring_version=%d (bench_version=%s)",
                         self._sandbox_harness.scoring_version,
                         self._sandbox_harness.sandbox_version)
 
@@ -1596,8 +1591,10 @@ class TrajectoryValidator:
             self.subtensor, self.config.netuid, self.metagraph
         )
 
-        # 4. Filter to non-validator miners
-        active_commitments = self._filter_active_commitments(commitments)
+        # 4. Filter to active non-validator miners (drops stale submissions)
+        active_commitments = self._filter_active_commitments(
+            commitments, current_block,
+        )
         logger.info(
             f"Commitments: {len(commitments)} total, "
             f"{len(active_commitments)} active miners"
@@ -1693,9 +1690,6 @@ class TrajectoryValidator:
                         miner_uid=uid,
                         block_height=current_block,
                         score=0.0,
-                        ema_score=0.0,
-                        cost=0.0,
-                        ema_cost=0.0,
                         weight=0.0,
                         qualified=False,
                         pack_url=commitment.pack_url,
@@ -1706,6 +1700,7 @@ class TrajectoryValidator:
                         rejection_stage="integrity_check",
                         rejection_detail=detail,
                         scoring_version=_scoring_version(),
+                        **self._harness_metadata(),
                     )
                 )
                 self.raw_costs.pop(hotkey, None)
@@ -1747,9 +1742,6 @@ class TrajectoryValidator:
                             miner_uid=uid,
                             block_height=current_block,
                             score=0.0,
-                            ema_score=0.0,
-                            cost=0.0,
-                            ema_cost=0.0,
                             weight=0.0,
                             qualified=False,
                             pack_url=commitment.pack_url,
@@ -1760,6 +1752,7 @@ class TrajectoryValidator:
                             rejection_stage=_stage,
                             rejection_detail=_detail,
                             scoring_version=_scoring_version(),
+                            **self._harness_metadata(),
                         )
                     )
                     self._disqualified_miners[hotkey] = f"pre_eval_rejected:{reason}"
@@ -1951,9 +1944,17 @@ class TrajectoryValidator:
     def _filter_active_commitments(
         self,
         commitments: Dict[int, MinerCommitment],
+        current_block: int,
     ) -> Dict[int, MinerCommitment]:
-        """Filter commitments to non-validator miners, excluding blacklisted coldkeys."""
+        """Filter commitments to active, non-validator miners.
+
+        Excludes:
+        - UIDs with validator_permit
+        - Blacklisted coldkeys
+        - Stale submissions (commitment older than ``inactivity_blocks``)
+        """
         blacklist = set(self.config.coldkey_blacklist)
+        max_age = self.config.inactivity_blocks
         active: Dict[int, MinerCommitment] = {}
         for uid, commitment in commitments.items():
             if uid < len(self.metagraph.validator_permit) and self.metagraph.validator_permit[uid]:
@@ -1965,42 +1966,14 @@ class TrajectoryValidator:
                         f"Skipping eval (coldkey {coldkey} is blacklisted)"
                     )
                     continue
-            active[uid] = commitment
-        return active
-
-    def _get_active_miners_from_commitments(
-        self,
-        commitments: Dict[int, MinerCommitment],
-        current_block: int,
-    ) -> Dict[int, MinerCommitment]:
-        """Filter commitments to active miners considering inactivity.
-
-        A miner is active if:
-        1. Has a parseable on-chain commitment
-        2. Is not a validator
-        3. Has been evaluated within inactivity_blocks
-        """
-        active: Dict[int, MinerCommitment] = {}
-        for uid, commitment in commitments.items():
-            if uid < len(self.metagraph.validator_permit) and self.metagraph.validator_permit[uid]:
+            age = current_block - commitment.block_number
+            if age > max_age:
+                self._get_miner_logger(commitment.hotkey).info(
+                    f"Stale submission: {age} blocks old > "
+                    f"{max_age} block limit (~48h), skipping"
+                )
                 continue
-
-            hotkey = commitment.hotkey
-            last_block = self.last_eval_block.get(hotkey)
-
-            if last_block is not None:
-                blocks_since = current_block - last_block
-                if blocks_since > self.config.inactivity_blocks:
-                    self._get_miner_logger(hotkey).info(
-                        f"Inactive for {blocks_since} blocks > "
-                        f"{self.config.inactivity_blocks}, "
-                        f"removing from active set"
-                    )
-                    self._hotkey_uid_map.pop(hotkey, None)
-                    continue
-
             active[uid] = commitment
-
         return active
 
     # ------------------------------------------------------------------
@@ -2144,7 +2117,28 @@ class TrajectoryValidator:
             )
             return None
 
+        # Season 1 path: text submissions go to trajrl-bench harness.
+        # JSON content is treated as a legacy v4.0 pack and skipped.
+        if self._evaluation_harness == "trajrl-bench" and self._sandbox_harness:
+            if verification.pack_content is not None:
+                mlog.info(
+                    "S1 mode: submission is JSON (legacy v4.0 pack), skipping"
+                )
+                self._disqualified_miners[commitment.hotkey] = "legacy_json_pack"
+                return None
+
+            return await self._evaluate_miner_s1(
+                miner_uid=miner_uid,
+                commitment=commitment,
+                skill_md=verification.raw_text,
+                epoch_seed=epoch_seed,
+                block_height=block_height,
+            )
+
         pack = verification.pack_content
+        if pack is None:
+            mlog.warning("Submission is not JSON — expected OPP v1 pack")
+            return None
 
         # Step 2: Schema validation
         lint_result = validate_opp_schema(pack)
@@ -2169,9 +2163,6 @@ class TrajectoryValidator:
                     miner_uid=miner_uid,
                     block_height=block_height,
                     score=0.0,
-                    ema_score=0.0,
-                    cost=0.0,
-                    ema_cost=0.0,
                     weight=0.0,
                     qualified=False,
                     pack_url=commitment.pack_url,
@@ -2182,6 +2173,7 @@ class TrajectoryValidator:
                     rejection_stage="integrity_check",
                     rejection_detail=integrity.summary,
                     scoring_version=_scoring_version(),
+                    **self._harness_metadata(),
                 )
             )
             self._disqualified_miners[commitment.hotkey] = "integrity_failed"
@@ -2197,16 +2189,6 @@ class TrajectoryValidator:
 
         self._hotkey_packs[commitment.hotkey] = pack
         self._pack_by_hash[commitment.pack_hash] = pack
-
-        # Season 1 path: use trajrl-bench harness
-        if self._evaluation_harness == "trajrl-bench" and self._sandbox_harness:
-            return await self._evaluate_miner_s1(
-                miner_uid=miner_uid,
-                commitment=commitment,
-                pack=pack,
-                epoch_seed=epoch_seed,
-                block_height=block_height,
-            )
 
         # Step 4+5: Run episodes and judge trajectories
         scenario_costs: Dict[str, float] = {}
@@ -2378,7 +2360,7 @@ class TrajectoryValidator:
         self,
         miner_uid: int,
         commitment: "MinerCommitment",
-        pack: dict,
+        skill_md: str,
         epoch_seed: int,
         block_height: int = 0,
     ) -> Optional[Dict]:
@@ -2388,25 +2370,19 @@ class TrajectoryValidator:
         Hermes Agent. Uses split-half delta scoring (quality-based,
         not cost-based).
 
+        In S1, miners submit raw SKILL.md text (not JSON). The caller
+        has already verified the content hash and filtered out JSON
+        (legacy v4.0) submissions.
+
         Returns same shape as _evaluate_miner for pipeline compatibility:
             {"costs": {...}, "qualified": {...}, ...}
         """
         mlog = self._get_miner_logger(commitment.hotkey)
         harness = self._sandbox_harness
 
-        # S1 packs must contain ONLY SKILL.md (no AGENTS.md or other files)
-        files = pack.get("files", {})
-        skill_md = files.get("SKILL.md") or files.get("skill.md")
-        if not skill_md:
-            mlog.warning("No SKILL.md found in pack — not a valid S1 submission")
-            self._disqualified_miners[commitment.hotkey] = "no_skill_md"
-            return None
-
-        allowed = {"SKILL.md", "skill.md"}
-        extra = set(files.keys()) - allowed
-        if extra:
-            mlog.warning("S1 pack contains disallowed files: %s — only SKILL.md permitted", extra)
-            self._disqualified_miners[commitment.hotkey] = "extra_files"
+        if not skill_md or not skill_md.strip():
+            mlog.warning("Empty SKILL.md submission")
+            self._disqualified_miners[commitment.hotkey] = "empty_skill_md"
             return None
 
         mlog.info(
@@ -2481,6 +2457,20 @@ class TrajectoryValidator:
     # ------------------------------------------------------------------
     # Eval submission
     # ------------------------------------------------------------------
+
+    def _harness_metadata(self) -> Dict[str, str]:
+        """Return bench/harness image hashes and bench version for submit payloads."""
+        h = self._sandbox_harness
+        if h is None:
+            return {}
+        meta: Dict[str, str] = {}
+        if h.bench_image_hash != "unknown":
+            meta["bench_image_hash"] = h.bench_image_hash
+        if h.harness_image_hash != "unknown":
+            meta["harness_image_hash"] = h.harness_image_hash
+        if h.sandbox_version != "unknown":
+            meta["bench_version"] = h.sandbox_version
+        return meta
 
     async def _fire_submit_eval(
         self,
@@ -2595,19 +2585,16 @@ class TrajectoryValidator:
             miner_uid=uid,
             block_height=block_height,
             score=round(raw_score, 4),
-            ema_score=round(raw_score, 4),
-            cost=round(raw_cost, 4),
-            ema_cost=round(total_raw_cost, 4),
             weight=0.0,
             qualified=fully_qualified,
             pack_url=commitment.pack_url,
             pack_hash=commitment.pack_hash,
             eval_count=eval_count,
-            ema_reset=ema_reset,
             scenario_results=scenario_results,
             llm_base_url=self._judge_base_url,
             llm_model=self._judge_model,
             scoring_version=_scoring_version(),
+            **self._harness_metadata(),
         )
 
     # ------------------------------------------------------------------

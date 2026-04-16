@@ -1,3 +1,1 @@
-"""Protocol package."""
-from trajectoryrl.protocol.synapse import PackRequest, PackResponse
-__all__ = ["PackRequest", "PackResponse"]
+"""Protocol package — synapse definitions removed in S1."""
