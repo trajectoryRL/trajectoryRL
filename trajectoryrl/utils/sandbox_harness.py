@@ -392,30 +392,18 @@ class TrajectorySandboxHarness:
                                      config={"max-size": "50m"}),
             )
 
-            # Wait for sandbox healthy
-            for _ in range(60):
-                time.sleep(1)
+            # Wait for sandbox + mock services healthy (single check)
+            for attempt in range(30):
                 try:
-                    code, _ = sandbox.exec_run("echo ok")
-                    if code == 0:
+                    code, out = sandbox.exec_run(
+                        ["sh", "-c", "curl -s http://localhost:8090/health"])
+                    if code == 0 and out and b'"ok"' in out:
                         break
                 except Exception:
                     pass
+                time.sleep(0.5 + min(attempt * 0.2, 1.5))
             else:
-                raise RuntimeError("Sandbox failed to start")
-
-            # Wait for mock services
-            for _ in range(30):
-                code, out = sandbox.exec_run(
-                    ["sh", "-c", "curl -s http://localhost:8090/health"])
-                if code == 0 and out:
-                    try:
-                        health = json.loads(out.decode())
-                        if health.get("status") == "ok":
-                            break
-                    except Exception:
-                        pass
-                time.sleep(1)
+                raise RuntimeError("Sandbox mock services failed to start")
 
             # Run each episode
             for i, ep_data in enumerate(episodes_data):
