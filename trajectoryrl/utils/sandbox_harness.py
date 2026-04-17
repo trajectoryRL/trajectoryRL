@@ -735,6 +735,13 @@ class TrajectorySandboxHarness:
                 except Exception:
                     pass
 
+                logger.info(
+                    "[%s] Episode %d testee transcript tail (%d chars):\n%s",
+                    session_id, episode_index,
+                    len(episode.transcript or ""),
+                    (episode.transcript or "")[-3000:],
+                )
+
             finally:
                 try:
                     harness.stop(timeout=3)
@@ -865,6 +872,13 @@ class TrajectorySandboxHarness:
                     stdout=True, stderr=False).decode(errors="replace")
             except Exception:
                 pass
+
+            logger.info(
+                "[%s] Episode %d judge transcript tail (%d chars):\n%s",
+                session_id, episode_index,
+                len(episode.judge_transcript or ""),
+                (episode.judge_transcript or "")[-3000:],
+            )
 
             # Read evaluation.json from the judge container via get_archive
             # (works even after the container has exited)
