@@ -445,17 +445,22 @@ class TrajectorySandboxHarness:
         epoch_seed: int,
         pack_hash: str = "",
         validator_salt: str = "",
+        miner_logger: Optional[logging.Logger] = None,
     ) -> SandboxEvaluationResult:
         """Run a full Season 1 evaluation.
 
         All scenario logic (fixture generation, LLM judge scoring) runs
         inside the sandbox Docker image. The validator only orchestrates
         containers and computes the final split-half delta.
+
+        If *miner_logger* is provided, per-eval logs go to that logger
+        instead of the module-level logger (keeps docker logs quiet).
         """
+        log = miner_logger or logger
         num_episodes = self.config.sandbox_num_episodes
         salt = validator_salt or self._default_salt()
 
-        logger.info(
+        log.info(
             "S1 evaluation starting: pack_hash=%s, seed=%d, episodes=%d",
             pack_hash[:12] if pack_hash else "?", epoch_seed, num_episodes,
         )
@@ -465,17 +470,18 @@ class TrajectorySandboxHarness:
             session_result = await loop.run_in_executor(
                 None, lambda: self._run_eval_sync(
                     skill_md, epoch_seed, salt, num_episodes, pack_hash,
+                    log=log,
                 ),
             )
         except Exception as e:
-            logger.error("S1 evaluation failed: %s", e, exc_info=True)
+            log.error("S1 evaluation failed: %s", e, exc_info=True)
             session_result = _SessionResult()
             result = SandboxEvaluationResult(session_result)
             result.error = str(e)
             return result
 
         result = SandboxEvaluationResult(session_result, scenario_name=session_result.scenario)
-        logger.info(
+        log.info(
             "S1 evaluation complete: final_score=%.3f "
             "(mean_q=%.3f, delta=%.3f, episodes=%s)",
             result.score, result.mean_quality, result.delta,
@@ -486,6 +492,7 @@ class TrajectorySandboxHarness:
     def _run_eval_sync(
         self, skill_md: str, epoch_seed: int, salt: str,
         num_episodes: int, pack_hash: str,
+        log: Optional[logging.Logger] = None,
     ) -> _SessionResult:
         """Synchronous eval: generate → run episodes → score → delta.
 
@@ -498,13 +505,14 @@ class TrajectorySandboxHarness:
         - Testee + judge on default bridge (LLM API egress) + eval network
           (to reach sandbox via ssh agent@sandbox).
         """
+        log = log or logger
         session_id = secrets.token_hex(6)
         session_result = _SessionResult(pack_hash=pack_hash, validator_salt=salt)
 
         # -----------------------------------------------------------
         # Step 1: Generate fixtures via docker run
         # -----------------------------------------------------------
-        logger.info("[%s] Generating fixtures via sandbox image...", session_id)
+        log.info("[%s] Generating fixtures via sandbox image...", session_id)
         gen_data = _docker_run_json(
             self.client, self._sandbox_image,
             command=["python", "-m", "trajrl_bench.cli", "generate",
@@ -519,8 +527,8 @@ class TrajectorySandboxHarness:
         session_result.skill_md = skill_md
         session_result.world_data = world_data
 
-        logger.info("[%s] Scenario: %s, World: %s", session_id, scenario,
-                    world_data["company"])
+        log.info("[%s] Scenario: %s, World: %s", session_id, scenario,
+                 world_data["company"])
 
         # -----------------------------------------------------------
         # Step 2: Run episodes (sandbox + harness containers)
@@ -599,6 +607,7 @@ class TrajectorySandboxHarness:
                     network=network,
                     private_key=private_key,
                     judge_skill=session_result.judge_skill,
+                    log=log,
                 )
                 session_result.episodes.append(episode)
 
@@ -627,6 +636,7 @@ class TrajectorySandboxHarness:
         sandbox: Container,
         network: Network, private_key: str,
         judge_skill: str,
+        log: Optional[logging.Logger] = None,
     ) -> _EpisodeResult:
         """Run a single episode: load fixtures, start testee agent, capture, score.
 
@@ -637,9 +647,10 @@ class TrajectorySandboxHarness:
         exposes (e.g. a git repo at /repo, logs at /var/log/, a dataset
         at /data/).
         """
+        log = log or logger
         episode = _EpisodeResult(episode_index=episode_index, ep_data=ep_data)
         t0 = time.time()
-        logger.info("[%s] Episode %d starting", session_id, episode_index)
+        log.info("[%s] Episode %d starting", session_id, episode_index)
 
         try:
             # Load fixtures into sandbox mock services + write INSTRUCTION.md
@@ -719,8 +730,8 @@ class TrajectorySandboxHarness:
                     result = harness.wait(timeout=timeout)
                     exit_code = result.get("StatusCode", -1)
                 except Exception:
-                    logger.warning("[%s] Episode %d timed out after %ds",
-                                   session_id, episode_index, timeout)
+                    log.warning("[%s] Episode %d timed out after %ds",
+                               session_id, episode_index, timeout)
                     try:
                         harness.kill()
                     except Exception:
@@ -735,7 +746,7 @@ class TrajectorySandboxHarness:
                 except Exception:
                     pass
 
-                logger.info(
+                log.info(
                     "[%s] Episode %d testee transcript tail (%d chars):\n%s",
                     session_id, episode_index,
                     len(episode.transcript or ""),
@@ -772,15 +783,16 @@ class TrajectorySandboxHarness:
                 network=network,
                 private_key=private_key,
                 judge_skill=judge_skill,
+                log=log,
             )
 
-            logger.info("[%s] Episode %d quality=%.3f",
-                        session_id, episode_index, episode.quality)
+            log.info("[%s] Episode %d quality=%.3f",
+                     session_id, episode_index, episode.quality)
 
         except Exception as e:
             episode.error = str(e)
-            logger.error("[%s] Episode %d failed: %s",
-                         session_id, episode_index, e, exc_info=True)
+            log.error("[%s] Episode %d failed: %s",
+                      session_id, episode_index, e, exc_info=True)
 
         episode.duration_s = time.time() - t0
         return episode
@@ -790,6 +802,7 @@ class TrajectorySandboxHarness:
         episode: _EpisodeResult, ep_data: dict, world_data: dict,
         scenario: str, sandbox: Container, network: Network,
         private_key: str, judge_skill: str,
+        log: Optional[logging.Logger] = None,
     ) -> None:
         """Score an episode using a judge agent.
 
@@ -799,9 +812,10 @@ class TrajectorySandboxHarness:
         contents (git repo, logs, output files), etc. It reads JUDGE.md
         for scoring criteria and writes evaluation.json.
         """
+        log = log or logger
         judge_name = f"judge_{session_id}_ep{episode_index}"
-        logger.info("[%s] Episode %d: starting agent judge...",
-                    session_id, episode_index)
+        log.info("[%s] Episode %d: starting agent judge...",
+                 session_id, episode_index)
 
         judge_instruction = self._build_judge_instruction(
             episode_index, ep_data, world_data, episode.transcript,
@@ -859,8 +873,8 @@ class TrajectorySandboxHarness:
             try:
                 judge.wait(timeout=180)  # 3 min max for judging
             except Exception:
-                logger.warning("[%s] Episode %d judge agent timed out",
-                               session_id, episode_index)
+                log.warning("[%s] Episode %d judge agent timed out",
+                            session_id, episode_index)
                 try:
                     judge.kill()
                 except Exception:
@@ -873,7 +887,7 @@ class TrajectorySandboxHarness:
             except Exception:
                 pass
 
-            logger.info(
+            log.info(
                 "[%s] Episode %d judge transcript tail (%d chars):\n%s",
                 session_id, episode_index,
                 len(episode.judge_transcript or ""),
@@ -894,14 +908,14 @@ class TrajectorySandboxHarness:
                 eval_data = json.loads(content)
                 episode.quality = float(eval_data.get("quality", 0.0))
                 episode.judge_result = eval_data
-                logger.info("[%s] Episode %d agent judge: quality=%.3f",
-                            session_id, episode_index, episode.quality)
+                log.info("[%s] Episode %d agent judge: quality=%.3f",
+                         session_id, episode_index, episode.quality)
             except docker.errors.NotFound:
-                logger.warning("[%s] Episode %d: judge did not write evaluation.json",
-                               session_id, episode_index)
+                log.warning("[%s] Episode %d: judge did not write evaluation.json",
+                            session_id, episode_index)
             except (json.JSONDecodeError, ValueError) as e:
-                logger.warning("[%s] Episode %d: failed to parse judge output: %s",
-                               session_id, episode_index, e)
+                log.warning("[%s] Episode %d: failed to parse judge output: %s",
+                            session_id, episode_index, e)
 
         finally:
             try:

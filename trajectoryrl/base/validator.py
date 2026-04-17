@@ -1846,6 +1846,7 @@ class TrajectoryValidator:
                 epoch_seed=epoch_seed,
                 pack_hash=commitment.pack_hash,
                 validator_salt=self._default_validator_salt(),
+                miner_logger=mlog,
             )
         except Exception as e:
             mlog.error("S1 evaluation failed: %s", e, exc_info=True)
