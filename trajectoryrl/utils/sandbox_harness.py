@@ -667,12 +667,16 @@ class TrajectorySandboxHarness:
             # Pin hermes to the configured OpenAI-compatible endpoint.
             # Without this, hermes' --provider auto routes by model name
             # (e.g. zai-org/* → openrouter) and ignores LLM_BASE_URL env.
+            # mode 0644 (not 0600) — put_archive writes as root:root, but the
+            # container runs as the hermes user. Image's entrypoint only
+            # chowns $HERMES_HOME when its own owner is wrong, and /opt/data
+            # is already hermes:hermes, so files we drop in stay root-owned.
             _put_file(
                 harness, "/opt/data/config.yaml",
                 _hermes_custom_config(
                     self._llm_model, self._llm_api_url, self._llm_api_key,
                 ),
-                mode=0o600,
+                mode=0o644,
             )
 
             harness.start()
