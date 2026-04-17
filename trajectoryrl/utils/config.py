@@ -114,7 +114,21 @@ class ValidatorConfig:
 
     # trajrl-bench sandbox evaluation
     sandbox_image: str = "ghcr.io/trajectoryrl/trajrl-bench:latest"
-    harness_image: str = "ghcr.io/trajectoryrl/hermes-agent:latest"
+    # Pinned to Hermes v0.9.0 (tag cf81c17143b4e7c5379c6770a972459f7716f1b8).
+    # The v0.10.0 :latest tag (2026-04-17) introduced context-compressor
+    # changes (see agent/context_compressor.py: _ensure_last_user_message_in_tail
+    # + expanded `## Active Task` summary template) that retain more
+    # uncompressed context after compaction. In S1 evaluations — where
+    # tool calls return multi-KB JSON and compaction fires mid-episode —
+    # this adds +40–120 s of wall-clock per run, which routinely exceeds
+    # both the 180 s testee cap and the hardcoded 180 s judge cap in
+    # sandbox_harness.py. Net effect: silent 0.0 episode scores across
+    # many miners. Unpin (back to :latest) when upstream exposes a knob
+    # to revert compaction aggressiveness or the S1 timeouts are raised.
+    harness_image: str = (
+        "ghcr.io/trajectoryrl/hermes-agent:"
+        "cf81c17143b4e7c5379c6770a972459f7716f1b8"
+    )
     sandbox_timeout_per_episode: int = 180  # 3 min per episode
     sandbox_num_episodes: int = 4
 
@@ -194,7 +208,11 @@ class ValidatorConfig:
             consensus_api_url=os.getenv("CONSENSUS_API_URL", "https://trajrl.com"),
             # --- trajrl-bench ---
             sandbox_image=os.getenv("SANDBOX_IMAGE", "ghcr.io/trajectoryrl/trajrl-bench:latest"),
-            harness_image=os.getenv("HARNESS_IMAGE", "ghcr.io/trajectoryrl/hermes-agent:latest"),
+            harness_image=os.getenv(
+                "HARNESS_IMAGE",
+                "ghcr.io/trajectoryrl/hermes-agent:"
+                "cf81c17143b4e7c5379c6770a972459f7716f1b8",
+            ),
             sandbox_timeout_per_episode=int(os.getenv("SANDBOX_TIMEOUT_PER_EPISODE", "180")),
             sandbox_num_episodes=int(os.getenv("SANDBOX_NUM_EPISODES", "4")),
             # --- Startup aggregation ---
