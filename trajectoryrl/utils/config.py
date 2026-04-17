@@ -52,6 +52,7 @@ class ValidatorConfig:
     global_anchor_block: int = 0     # anchor block for window alignment
     window_publish_pct: float = 0.80  # T_publish: 80% of window for evaluation
     window_aggregate_pct: float = 0.90  # T_aggregate: 90% (10% propagation interval)
+    window_shift: int = 0             # additive offset applied to window start (env: WINDOW_SHIFT)
 
     # Scoring config
     delta_threshold: float = 0.05
@@ -201,6 +202,8 @@ class ValidatorConfig:
             aggregate_when_start=os.getenv("AGGREGATE_WHEN_START", "0") == "1",
             full_cycle_on_startup=os.getenv("FULL_CYCLE_ON_STARTUP", "0") == "1",
             disable_winner_protection=os.getenv("DISABLE_WINNER_PROTECTION", "0") == "1",
+            # --- Window shift (operational knob; must match across validators) ---
+            window_shift=int(os.getenv("WINDOW_SHIFT", "0")),
             # --- IM parameters are hardcoded (dataclass defaults) ---
             # Do NOT load from env: score_delta,
             # rho_reliability, consensus_epsilon, bootstrap_threshold,
