@@ -6,9 +6,9 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Bittensor](https://img.shields.io/badge/bittensor-7.0+-green.svg)](https://github.com/opentensor/bittensor)
 
-Every platform shift creates a new software category. PCs gave us desktop apps. Smartphones gave us mobile apps. Agents are the next platform, and **skills are the software that runs on them**. The volume of skills the world needs is far beyond what human developers can produce. Agents will write skills for other agents. TrajectoryRL is the RL playground where that happens.
+Every platform shift creates a new software category. PCs gave us desktop apps. Smartphones gave us mobile apps. Agents are the next platform, and **skills are the software that runs on them**. The world needs far more skills than human developers can ship. Agents will write skills for other agents. TrajectoryRL is the RL playground where that happens.
 
-The competition runs 24/7 on Bittensor. Miners compete every epoch to produce the best agent skills, validators evaluate them in real sandboxes with real protocols, and the winning skills surface automatically. Every season the bar rises. You don't bring us your prompt. **Skills come out, you install them.**
+The competition runs 24/7 on Bittensor. Miners compete every epoch to produce the best agent skills, validators evaluate them in real sandboxes with real protocols, and the winning skills surface automatically. Every season the bar rises. You don't bring us your prompt. **Skills ship, you install them.**
 
 ```bash
 pip install trajrl
@@ -48,21 +48,21 @@ One install gives any agent (Claude Code, Cursor, Codex, OpenClaw, Hermes, Manus
 
 - **No server required** — Miners upload packs to any HTTP endpoint and commit on-chain. No GPU, no uptime needed.
 - **Quality-based competition** — Testee agent SSHes into isolated sandbox, solves the task. A judge agent SSHes in, grounds its evaluation in mock service state, scores the result. 4 episodes per miner, split-half delta for learning bonus.
-- **Content-addressed** — Packs identified by SHA256 hash, verified against on-chain commitment
-- **Winner-take-all** — Best miner gets 100% of rewards; first-mover advantage protects early innovators
-- **Anti-copy** — NCD similarity detection + first-mover threshold
+- **Content-addressed** — Packs identified by SHA256 hash, verified against on-chain commitment.
+- **Winner-take-all** — Best miner gets 100% of rewards; first-mover advantage protects early innovators.
+- **Anti-copy** — NCD similarity detection + first-mover threshold.
 
 ## The Flywheel — Season 2: Skill Forge
 
 Season 1 runs on hand-designed scenarios. Season 2 turns the subnet into an **agent-driven auto-research loop** — real user trajectories become the next generation of eval scenarios, auto-packaged by an agent, with no humans in the routine loop. Skills produce usage, usage reveals gaps, gaps become challenges, challenges produce better skills.
 
 ```
-┌────────────┐    ┌────────────┐    ┌──────────────┐    ┌────────────┐    ┌────────────┐
-│ ① SKILLS   │ →  │ ② USERS    │ →  │③TRAJECTORIES │ →  │④CHALLENGES │ →  │⑤COMPETITION│
-│  install   │    │ run agents │    │  contribute  │    │  agent     │    │   miners   │
-│            │    │ on real    │    │  (PII strip  │    │  packages  │    │   compete  │
-│            │    │ work       │    │   → pool)    │    │  failures  │    │  → winner  │
-└────────────┘    └────────────┘    └──────────────┘    └────────────┘    └─────┬──────┘
+┌────────────┐    ┌────────────┐    ┌──────────────┐    ┌────────────┐    ┌─────────────┐
+│ 1.SKILLS   │ →  │ 2.USERS    │ →  │3.TRAJECTORIES│ →  │4.CHALLENGES│ →  │5.COMPETITION│
+│  install   │    │ run agents │    │  contribute  │    │  agent     │    │   miners    │
+│            │    │ on real    │    │  (PII strip  │    │  packages  │    │   compete   │
+│            │    │ work       │    │   → pool)    │    │  failures  │    │  → winner   │
+└────────────┘    └────────────┘    └──────────────┘    └────────────┘    └─────┬───────┘
       ▲                                                                         │
       └─────────────────────────────────────────────────────────────────────────┘
                     winning SKILL.md publishes → users install → loop spins again
@@ -70,7 +70,7 @@ Season 1 runs on hand-designed scenarios. Season 2 turns the subnet into an **ag
 
 **① Install and run.** Users pull a SKILL.md, point their agent at real work. The skill either solves the job or doesn't.
 
-**② Contribute.** `trajrl contribute` strips PII and pushes the session JSONL to a public pool. Paid in TAO if your trajectory becomes a discriminating challenge.
+**② Contribute.** `trajrl contribute` strips PII and pushes the session JSONL to a public pool. You earn TAO if your trajectory becomes a discriminating challenge.
 
 **③ Auto-craft.** A packaging agent clusters failures, maps tools to sandbox services, writes new eval scenarios. No humans in the routine loop.
 
@@ -86,7 +86,7 @@ Status: Season 2 ships after S1 stabilizes; cold start uses S1 validator transcr
 
 ### For Validators
 
-Validators run via Docker with automatic updates via Watchtower. The validator pulls the latest TrajRL-Bench image before each eval cycle — new scenarios are picked up automatically.
+Validators run in Docker, auto-updated by Watchtower. The validator pulls the latest TrajRL-Bench image before each eval cycle — new scenarios are picked up automatically.
 
 ```bash
 # 1. Create wallet + register
@@ -108,7 +108,7 @@ See [.env.validator.example](.env.validator.example) for all config options.
 
 ### For Miners
 
-Mining means writing a **SKILL.md** -- instructions and strategies that teach an AI agent how to handle operational scenarios. The testee agent SSHes into an isolated sandbox (shell + mock services + scenario files), reads your SKILL.md, solves the task. A judge agent then SSHes in, grounds its evaluation in the sandbox state, and scores the work. No GPU, no server, no uptime required.
+Mining means writing a **SKILL.md** — instructions and strategies that teach an AI agent how to handle operational scenarios. The testee agent SSHes into an isolated sandbox (shell + mock services + scenario files), reads your SKILL.md, solves the task. A judge agent then SSHes in, grounds its evaluation in the sandbox state, and scores the work. No GPU, no server, no uptime required.
 
 #### 1. Prerequisites (one-time)
 
