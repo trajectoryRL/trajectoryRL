@@ -271,6 +271,23 @@ def _generate_keypair() -> tuple[str, str]:
 _PROVIDER_PREFIXES = ("openrouter/", "chutes/")
 
 
+def _hermes_custom_config(model: str, base_url: str, api_key: str) -> str:
+    """Build a hermes config.yaml pinning an OpenAI-compatible endpoint.
+
+    Hermes CLI's --provider choices list is hard-coded and rejects "custom";
+    HERMES_INFERENCE_PROVIDER env is also ignored. The only way to pin a
+    generic OpenAI-compatible endpoint (chutes, openrouter, ollama, …) is to
+    write $HERMES_HOME/config.yaml before startup.
+    """
+    return (
+        "model:\n"
+        '  provider: "custom"\n'
+        f"  default: {json.dumps(model)}\n"
+        f"  base_url: {json.dumps(base_url)}\n"
+        f"  api_key: {json.dumps(api_key)}\n"
+    )
+
+
 def _strip_provider_prefix(model: str) -> str:
     """Remove provider routing prefixes from model identifiers.
 
@@ -631,10 +648,6 @@ class TrajectorySandboxHarness:
                          "--quiet", "--yolo", "--max-turns", "30"],
                 name=harness_name,
                 environment={
-                    "OPENROUTER_API_KEY": self._llm_api_key,
-                    "LLM_API_KEY": self._llm_api_key,
-                    "LLM_BASE_URL": self._llm_api_url,
-                    "LLM_MODEL": self._llm_model,
                     "HERMES_BUNDLED_SKILLS": "/nonexistent",
                 },
                 mem_limit="4g", cpu_quota=200000,
@@ -650,6 +663,17 @@ class TrajectorySandboxHarness:
             # Install SSH private key into testee container (mode 0600
             # so ssh client accepts it).
             _put_file(harness, "/tmp/id_ed25519", private_key, mode=0o600)
+
+            # Pin hermes to the configured OpenAI-compatible endpoint.
+            # Without this, hermes' --provider auto routes by model name
+            # (e.g. zai-org/* → openrouter) and ignores LLM_BASE_URL env.
+            _put_file(
+                harness, "/opt/data/config.yaml",
+                _hermes_custom_config(
+                    self._llm_model, self._llm_api_url, self._llm_api_key,
+                ),
+                mode=0o600,
+            )
 
             harness.start()
 
@@ -760,10 +784,6 @@ class TrajectorySandboxHarness:
                 name=judge_name,
                 working_dir="/workspace",
                 environment={
-                    "OPENROUTER_API_KEY": self._llm_api_key,
-                    "LLM_API_KEY": self._llm_api_key,
-                    "LLM_BASE_URL": self._llm_api_url,
-                    "LLM_MODEL": self._llm_model,
                     "HERMES_BUNDLED_SKILLS": "/nonexistent",
                 },
                 mem_limit="4g", cpu_quota=200000,
@@ -777,6 +797,13 @@ class TrajectorySandboxHarness:
             _put_file(judge, "/workspace/JUDGE.md", judge_skill)
             _put_file(judge, "/workspace/JUDGE_TASK.md", judge_instruction)
             _put_file(judge, "/tmp/id_ed25519", private_key, mode=0o600)
+            _put_file(
+                judge, "/opt/data/config.yaml",
+                _hermes_custom_config(
+                    self._llm_model, self._llm_api_url, self._llm_api_key,
+                ),
+                mode=0o600,
+            )
             judge.start()
 
             try:
