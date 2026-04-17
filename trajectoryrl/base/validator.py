@@ -78,9 +78,6 @@ OWNER_UID = 74
 BURN_FRACTION = 0.50  # 50% of miner emissions burned via owner UID
 EVAL_START_BLOCK = 0
 
-_EVAL_CACHE_ENABLED = os.getenv("TRAJECTORYRL_EVAL_CACHE_ENABLED", "1") != "0"
-_EVAL_CACHE_TTL_DAYS = int(os.getenv("TRAJECTORYRL_CACHE_TTL_DAYS", "7"))
-
 _METAGRAPH_SYNC_RETRIES = 3
 _METAGRAPH_SYNC_DELAY = 10  # seconds between retries
 _METAGRAPH_MIN_NEURONS = 1  # minimum expected neurons for a healthy metagraph
@@ -260,11 +257,6 @@ class TrajectoryValidator:
         # Load persisted evaluation state
         self._load_eval_state()
 
-        # Eval result cache: pack_hash -> {result, last_eval_at}
-        self._eval_cache: Dict[str, dict] = {}
-        self._load_eval_cache()
-        self._validator_healthy: bool = True
-
         logger.info("Validator initialization complete!")
 
     # ------------------------------------------------------------------
@@ -429,118 +421,6 @@ class TrajectoryValidator:
             )
         except Exception as e:
             logger.warning(f"Failed to save eval state: {e}")
-
-    # ------------------------------------------------------------------
-    # Eval result cache
-    #
-    # Caches all eval results (success + failure) keyed by pack_hash.
-    # When _validator_healthy is False the cache is bypassed so every
-    # pack is re-evaluated from scratch.
-    # ------------------------------------------------------------------
-
-    @property
-    def _eval_cache_path(self) -> Path:
-        return self.config.eval_state_path.parent / "eval_cache.json"
-
-    def _load_eval_cache(self):
-        """Load eval result cache from disk, pruning entries older than TTL.
-
-        The cache file carries a ``scoring_version`` header.  When the
-        version does not match the running scoring version, the entire
-        cache is discarded because evaluation criteria have changed and
-        all prior results are invalid.
-        """
-        if not _EVAL_CACHE_ENABLED:
-            return
-        path = self._eval_cache_path
-        if not path.exists():
-            logger.debug("No eval cache found, starting fresh")
-            return
-        try:
-            raw = json.loads(path.read_text())
-
-            if isinstance(raw, dict) and "entries" in raw:
-                file_sv = raw.get("scoring_version", 1)
-                entries = raw["entries"]
-            else:
-                file_sv = 1
-                entries = raw
-
-            if file_sv != _scoring_version():
-                logger.info(
-                    "Eval cache scoring_version mismatch (%d != %d), "
-                    "discarding %d cached entries",
-                    file_sv, _scoring_version(), len(entries),
-                )
-                return
-
-            cutoff = time.time() - _EVAL_CACHE_TTL_DAYS * 86400
-            self._eval_cache = {
-                k: v for k, v in entries.items()
-                if v.get("last_eval_at", 0) > cutoff
-            }
-            pruned = len(entries) - len(self._eval_cache)
-            logger.debug(
-                f"Loaded eval cache: {len(self._eval_cache)} entries"
-                + (f" (pruned {pruned} expired)" if pruned else "")
-            )
-        except Exception as e:
-            logger.warning(f"Failed to load eval cache: {e}")
-
-    def _save_eval_cache(self):
-        """Persist eval result cache to disk."""
-        if not _EVAL_CACHE_ENABLED:
-            return
-        try:
-            self._eval_cache_path.parent.mkdir(parents=True, exist_ok=True)
-            wrapper = {
-                "scoring_version": _scoring_version(),
-                "entries": self._eval_cache,
-            }
-            self._eval_cache_path.write_text(
-                json.dumps(wrapper, indent=2, sort_keys=True)
-            )
-        except Exception as e:
-            logger.warning(f"Failed to save eval cache: {e}")
-
-    def _check_eval_cache(self, pack_hash: str) -> Tuple[bool, Optional[Dict]]:
-        """Return a cached result for *pack_hash*, if fresh.
-
-        Bypassed entirely when _validator_healthy is False so that every
-        pack is re-evaluated after a suspected validator-side failure.
-
-        Returns:
-            (True, result_or_None) — cache hit (result may be None for
-                                     a cached failure)
-            (False, None)          — cache miss, run full evaluation
-        """
-        if not _EVAL_CACHE_ENABLED or not self._validator_healthy:
-            return False, None
-
-        entry = self._eval_cache.get(pack_hash)
-        if entry is None:
-            return False, None
-
-        age_days = (time.time() - entry.get("last_eval_at", 0)) / 86400
-        if age_days > _EVAL_CACHE_TTL_DAYS:
-            del self._eval_cache[pack_hash]
-            logger.debug(
-                f"[EVAL_CACHE] EXPIRED pack_hash={pack_hash[:12]} "
-                f"age={age_days:.1f}d"
-            )
-            return False, None
-
-        logger.info(f"[EVAL_CACHE] HIT pack_hash={pack_hash[:12]}")
-        return True, entry["result"]
-
-    def _update_eval_cache(self, pack_hash: str, eval_result: Optional[Dict]):
-        """Cache an eval result (success or failure)."""
-        if not _EVAL_CACHE_ENABLED:
-            return
-        self._eval_cache[pack_hash] = {
-            "result": eval_result,
-            "last_eval_at": time.time(),
-        }
 
     # ------------------------------------------------------------------
     # Eval state update
@@ -1136,7 +1016,6 @@ class TrajectoryValidator:
         self._last_eval_date = datetime.datetime.utcnow().date()
         self.last_weight_block = self.subtensor.get_current_block()
         self._save_eval_state()
-        self._save_eval_cache()
 
         # --- Phase 2: Propagation ---
         logger.info(
@@ -1277,7 +1156,6 @@ class TrajectoryValidator:
                         self.config.pack_cache_max_size
                     )
                     self._save_eval_state()
-                    self._save_eval_cache()
 
                     if self._cycle_eval_id is not None:
                         asyncio.ensure_future(
@@ -1352,7 +1230,6 @@ class TrajectoryValidator:
             except KeyboardInterrupt:
                 logger.info("Received interrupt, shutting down...")
                 self._save_eval_state()
-                self._save_eval_cache()
                 if self._cycle_eval_id is not None:
                     await self._fire_upload_cycle_logs(
                         self._cycle_eval_id,
@@ -1578,7 +1455,6 @@ class TrajectoryValidator:
         skipped_interval_count = 0
         rejected_pre_eval_count = 0
         ncd_rejected_count = 0
-        cached_count = 0
         total_eligible = len(active_commitments) - len(skip_uids)
         logger.info(
             f"=== Eval cycle: {total_eligible} eligible miners ==="
@@ -1696,38 +1572,26 @@ class TrajectoryValidator:
                 )
                 continue
 
-            # Check eval cache before spending LLM tokens.
-            eval_elapsed = 0.0
-            cache_hit, cache_result = self._check_eval_cache(commitment.pack_hash)
-            if cache_hit:
-                cached_count += 1
-                eval_result = cache_result
-                logger.info(
-                    f"[{miner_idx}/{total_eligible}] Miner {uid} ({hotkey[:8]}): "
-                    f"using cached eval result (pack_hash={commitment.pack_hash[:12]})"
-                )
-            else:
-                attempted_count += 1
-                logger.info(
-                    f"[{miner_idx}/{total_eligible}] Evaluating miner {uid} "
-                    f"({hotkey[:8]}) ..."
-                )
-                eval_dir, vlog_offset, mlog_offset = self._prepare_eval_log_capture(cycle_eval_id, hotkey)
-                eval_start = time.time()
-                eval_result = await self._evaluate_miner(
-                    uid, commitment, epoch_seed,
-                    block_height=current_block,
-                )
-                eval_elapsed = time.time() - eval_start
-                self._update_eval_cache(commitment.pack_hash, eval_result)
+            attempted_count += 1
+            logger.info(
+                f"[{miner_idx}/{total_eligible}] Evaluating miner {uid} "
+                f"({hotkey[:8]}) ..."
+            )
+            eval_dir, vlog_offset, mlog_offset = self._prepare_eval_log_capture(cycle_eval_id, hotkey)
+            eval_start = time.time()
+            eval_result = await self._evaluate_miner(
+                uid, commitment, epoch_seed,
+                block_height=current_block,
+            )
+            eval_elapsed = time.time() - eval_start
 
-                # Upload eval logs to dashboard (fire-and-forget)
-                asyncio.ensure_future(
-                    self._fire_upload_eval_logs(
-                        cycle_eval_id, uid, commitment, eval_scenarios, eval_result,
-                        eval_dir, vlog_offset, mlog_offset, current_block,
-                    )
+            # Upload eval logs to dashboard (fire-and-forget)
+            asyncio.ensure_future(
+                self._fire_upload_eval_logs(
+                    cycle_eval_id, uid, commitment, eval_scenarios, eval_result,
+                    eval_dir, vlog_offset, mlog_offset, current_block,
                 )
+            )
 
             if eval_result is not None:
                 pack_changed = self._eval_pack_hash.get(hotkey) != commitment.pack_hash
@@ -1788,8 +1652,6 @@ class TrajectoryValidator:
                 self.last_weight_block = mid_block
 
         parts = [f"{evaluated_count} evaluated"]
-        if cached_count:
-            parts.append(f"{cached_count} cached")
         if rejected_pre_eval_count:
             parts.append(f"{rejected_pre_eval_count} pre-eval rejected")
         if ncd_rejected_count:
@@ -1828,13 +1690,10 @@ class TrajectoryValidator:
                 "Possible LLM API key issue or service outage. "
                 "Setting fallback weights to owner UID."
             )
-            self._validator_healthy = False
             await self._set_fallback_weights(
                 reason="All evaluations failed (LLM error)"
             )
             return
-
-        self._validator_healthy = True
 
         # 5. Re-assert winner weights after eval completes
         await self._set_winner_weights()
