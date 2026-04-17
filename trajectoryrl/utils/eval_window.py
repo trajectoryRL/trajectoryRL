@@ -34,6 +34,7 @@ class WindowConfig:
     global_anchor: int = 0          # anchor block for window alignment
     publish_pct: float = 0.80       # T_publish as fraction of window
     aggregate_pct: float = 0.90     # T_aggregate as fraction of window
+    window_shift: int = 0           # additive offset applied to window start
 
     @property
     def publish_block(self) -> int:
@@ -42,6 +43,10 @@ class WindowConfig:
     @property
     def aggregate_block(self) -> int:
         return int(self.window_length * self.aggregate_pct)
+
+    @property
+    def effective_anchor(self) -> int:
+        return self.global_anchor + self.window_shift
 
 
 @dataclass(frozen=True)
@@ -73,14 +78,15 @@ def compute_window(current_block: int, config: WindowConfig) -> EvaluationWindow
     Pure function -- deterministic for any given (current_block, config) pair.
     Every validator calling this with the same inputs gets the same result.
     """
-    if current_block < config.global_anchor:
-        effective_block = config.global_anchor
+    anchor = config.effective_anchor
+    if current_block < anchor:
+        effective_block = anchor
     else:
         effective_block = current_block
 
-    blocks_since_anchor = effective_block - config.global_anchor
+    blocks_since_anchor = effective_block - anchor
     window_number = blocks_since_anchor // config.window_length
-    window_start = config.global_anchor + window_number * config.window_length
+    window_start = anchor + window_number * config.window_length
     block_offset = effective_block - window_start
 
     publish_block = config.publish_block

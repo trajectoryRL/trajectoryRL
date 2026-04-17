@@ -212,6 +212,7 @@ class TrajectoryValidator:
             global_anchor=config.global_anchor_block,
             publish_pct=config.window_publish_pct,
             aggregate_pct=config.window_aggregate_pct,
+            window_shift=config.window_shift,
         )
         # Which window's aggregation has completed (persisted in eval state).
         # Guards one-shot aggregation per window — survives restarts.
@@ -927,7 +928,7 @@ class TrajectoryValidator:
 
         synthetic_window = EvaluationWindow(
             window_number=target_window,
-            window_start=self._window_config.global_anchor
+            window_start=self._window_config.effective_anchor
             + target_window * self._window_config.window_length,
             block_offset=self._window_config.window_length - 1,
             phase=WindowPhase.AGGREGATION,
@@ -1059,6 +1060,7 @@ class TrajectoryValidator:
             f"Eval window: {self._window_config.window_length} blocks "
             f"(~{self._window_config.window_length * 12 // 3600:.0f}h), "
             f"anchor={self._window_config.global_anchor}, "
+            f"shift={self._window_config.window_shift}, "
             f"publish={self._window_config.publish_pct:.0%}, "
             f"aggregate={self._window_config.aggregate_pct:.0%}"
         )
