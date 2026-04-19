@@ -733,14 +733,12 @@ class TrajectoryValidator:
             if stake > 0:
                 validator_stakes[hotkey] = stake
 
-        bench_ver = self._sandbox_harness.sandbox_version
         min_stake = getattr(self.config, "min_validator_stake", 0.0)
         validated, stats = run_filter_pipeline(
             submissions=submissions,
             expected_window=window.window_number,
             validator_stakes=validator_stakes,
             min_stake=min_stake,
-            local_version=bench_ver,
             expected_protocol=self.config.consensus_protocol_version,
             expected_scoring_version=_scoring_version(),
         )
@@ -761,39 +759,30 @@ class TrajectoryValidator:
             hk_to_uid[self.metagraph.hotkeys[uid]] = uid
 
         # Pre-eval gate during aggregation: disqualify miners rejected by the
-        # platform before selecting a winner.  Mirrors the per-miner pre-eval
-        # check in the evaluation loop.
+        # platform before selecting a winner.  Uses epoch_number so the server
+        # resolves the pack that was active during this window (prevents
+        # pack-switch escapes).
         if os.getenv("TRAJECTORYRL_PRE_EVAL_ENABLED", "1") != "0":
-            miner_commitments = fetch_all_commitments(
-                self.subtensor, self.config.netuid, self.metagraph,
-            )
-            hk_to_commitment: Dict[str, MinerCommitment] = {
-                c.hotkey: c for c in miner_commitments.values()
-            }
             current_block = self.subtensor.get_current_block()
-
-            miners_to_check = [
-                (miner_hk, hk_to_commitment[miner_hk])
-                for miner_hk in consensus_scores
-                if miner_hk in hk_to_commitment
-            ]
+            miners_to_check = list(consensus_scores.keys())
 
             if miners_to_check:
                 sem = asyncio.Semaphore(8)
 
-                async def _limited_pre_eval(hk: str, c: MinerCommitment):
+                async def _limited_pre_eval(hk: str):
                     async with sem:
                         return await pre_eval(
-                            hk, c.pack_hash, c.pack_url, wallet=self.wallet,
+                            hk, epoch_number=window.window_number,
+                            wallet=self.wallet,
                         )
 
                 results = await asyncio.gather(*(
-                    _limited_pre_eval(miner_hk, commitment)
-                    for miner_hk, commitment in miners_to_check
+                    _limited_pre_eval(miner_hk)
+                    for miner_hk in miners_to_check
                 ))
 
                 pre_eval_disqualified = 0
-                for (miner_hk, commitment), pre_eval_result in zip(miners_to_check, results):
+                for miner_hk, pre_eval_result in zip(miners_to_check, results):
                     if pre_eval_result is not None and not pre_eval_result.get("allowed", True):
                         reason = pre_eval_result.get("reason", "unknown")
                         disqualified[miner_hk] = f"pre_eval:{reason}"
@@ -821,8 +810,8 @@ class TrajectoryValidator:
                                 score=0.0,
                                 weight=0.0,
                                 qualified=False,
-                                pack_url=commitment.pack_url,
-                                pack_hash=commitment.pack_hash,
+                                pack_url=pre_eval_result.get("pack_url", ""),
+                                pack_hash=pre_eval_result.get("pack_hash", ""),
                                 llm_base_url=self._judge_base_url,
                                 llm_model=self._judge_model,
                                 rejected=True,

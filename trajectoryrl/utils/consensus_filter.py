@@ -1,6 +1,6 @@
 """Submission filter pipeline for consensus aggregation.
 
-7-layer pipeline that filters incoming consensus submissions before
+5-layer pipeline that filters incoming consensus submissions before
 stake-weighted aggregation.  Each layer logs skip counts for diagnosing
 low participation.
 
@@ -8,10 +8,8 @@ Pipeline order:
   1. Protocol version  — discard mismatched protocol versions
   2. Window number     — discard submissions from wrong window
   3. Trust threshold   — discard validators below min stake
-  4. Data integrity    — discard payloads that fail hash verification
-  5. Bench version     — discard incompatible trajrl-bench major versions
-  6. Scoring version   — discard mismatched evaluation criteria versions
-  7. Zero-signal       — discard all-zero score submissions (free-riders)
+  4. Scoring version   — discard mismatched evaluation criteria versions
+  5. Zero-signal       — discard all-zero score submissions (free-riders)
 """
 
 import logging
@@ -34,8 +32,6 @@ class FilterStats:
     skipped_protocol: int = 0
     skipped_window: int = 0
     skipped_stake: int = 0
-    skipped_integrity: int = 0
-    skipped_version: int = 0
     skipped_scoring_version: int = 0
     skipped_zero_signal: int = 0
     passed: int = 0
@@ -44,8 +40,8 @@ class FilterStats:
         return (
             f"Filter: {self.total_input} in → {self.passed} passed | "
             f"protocol={self.skipped_protocol} window={self.skipped_window} "
-            f"stake={self.skipped_stake} integrity={self.skipped_integrity} "
-            f"version={self.skipped_version} scoring={self.skipped_scoring_version} "
+            f"stake={self.skipped_stake} "
+            f"scoring={self.skipped_scoring_version} "
             f"zero={self.skipped_zero_signal}"
         )
 
@@ -56,14 +52,6 @@ class ValidatedSubmission:
     pointer: ConsensusPointer
     payload: ConsensusPayload
     validator_stake: float
-
-
-def _parse_major_version(version_str: str) -> Optional[int]:
-    """Extract major version number from semver string."""
-    try:
-        return int(version_str.lstrip("v").split(".")[0])
-    except (ValueError, IndexError):
-        return None
 
 
 def filter_protocol_version(
@@ -118,57 +106,6 @@ def filter_trust_threshold(
             logger.debug(
                 "Filter[stake]: skip %s (stake %.2f < min %.2f)",
                 ptr.validator_hotkey[:8], stake, min_stake,
-            )
-            skipped += 1
-        else:
-            passed.append((ptr, payload))
-    return passed, skipped
-
-
-def filter_data_integrity(
-    submissions: List[Tuple[ConsensusPointer, ConsensusPayload]],
-) -> Tuple[List[Tuple[ConsensusPointer, ConsensusPayload]], int]:
-    """Layer 4: discard payloads whose content hash doesn't match.
-
-    Re-serializes the payload and checks that the sha256 matches.
-    """
-    passed = []
-    skipped = 0
-    for ptr, payload in submissions:
-        computed_hash = payload.content_hash()
-        if ptr.content_address.startswith("sha256:"):
-            if computed_hash != ptr.content_address:
-                logger.warning(
-                    "Filter[integrity]: skip %s (hash mismatch: pointer=%s, computed=%s)",
-                    ptr.validator_hotkey[:8], ptr.content_address[:24], computed_hash[:24],
-                )
-                skipped += 1
-                continue
-        passed.append((ptr, payload))
-    return passed, skipped
-
-
-def filter_bench_version(
-    submissions: List[Tuple[ConsensusPointer, ConsensusPayload]],
-    local_version: str,
-) -> Tuple[List[Tuple[ConsensusPointer, ConsensusPayload]], int]:
-    """Layer 5: discard submissions from incompatible trajrl-bench major versions.
-
-    Different major versions use different scenarios/criteria/judge logic,
-    producing incomparable scores.
-    """
-    local_major = _parse_major_version(local_version)
-    if local_major is None:
-        return submissions, 0
-
-    passed = []
-    skipped = 0
-    for ptr, payload in submissions:
-        remote_major = _parse_major_version(payload.bench_version)
-        if remote_major is None or remote_major != local_major:
-            logger.debug(
-                "Filter[bench_version]: skip %s (v%s, local major=%d)",
-                ptr.validator_hotkey[:8], payload.bench_version, local_major,
             )
             skipped += 1
         else:
@@ -232,11 +169,10 @@ def run_filter_pipeline(
     expected_window: int,
     validator_stakes: Dict[str, float],
     min_stake: float,
-    local_version: str,
     expected_protocol: int = CONSENSUS_PROTOCOL_VERSION,
     expected_scoring_version: Optional[int] = None,
 ) -> Tuple[List[ValidatedSubmission], FilterStats]:
-    """Run the full 7-layer filter pipeline.
+    """Run the full 5-layer filter pipeline.
 
     Returns:
         - List of ValidatedSubmission that passed all layers
@@ -254,12 +190,6 @@ def run_filter_pipeline(
 
     current, n = filter_trust_threshold(current, validator_stakes, min_stake)
     stats.skipped_stake = n
-
-    current, n = filter_data_integrity(current)
-    stats.skipped_integrity = n
-
-    current, n = filter_bench_version(current, local_version)
-    stats.skipped_version = n
 
     current, n = filter_scoring_version(current, expected_scoring_version)
     stats.skipped_scoring_version = n

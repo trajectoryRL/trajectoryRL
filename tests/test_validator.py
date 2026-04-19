@@ -50,8 +50,7 @@ from trajectoryrl.utils.consensus import (
 from trajectoryrl.utils.consensus_filter import (
     run_filter_pipeline, FilterStats, ValidatedSubmission,
     filter_protocol_version, filter_window_number,
-    filter_trust_threshold, filter_data_integrity,
-    filter_bench_version, filter_zero_signal,
+    filter_trust_threshold, filter_zero_signal,
 )
 from trajectoryrl.scoring import compute_consensus_scores
 from trajectoryrl.utils.winner_state import (
@@ -1757,13 +1756,12 @@ class TestConsensusFilter:
         stakes = {"val_a": 100.0, "val_b": 200.0}
         validated, stats = run_filter_pipeline(
             subs, expected_window=42, validator_stakes=stakes,
-            min_stake=10.0, local_version="0.1.0",
+            min_stake=10.0,
         )
         assert stats.passed == 2
         assert stats.total_input == 2
         assert len(validated) == 2
         assert validated[0].validator_stake == 100.0
-        assert validated[1].validator_stake == 200.0
 
     def test_filter_protocol_version(self):
         subs = [
@@ -1801,49 +1799,6 @@ class TestConsensusFilter:
         assert len(passed) == 0
         assert skipped == 1
 
-    def test_filter_data_integrity(self):
-        ptr, payload = self._make_submission(hotkey="val_a")
-        bad_ptr = ConsensusPointer(
-            protocol_version=1, window_number=42,
-            content_address="sha256:0000000000000000000000000000000000000000000000000000000000000000",
-            validator_hotkey="val_a",
-        )
-        subs = [(ptr, payload), (bad_ptr, payload)]
-        passed, skipped = filter_data_integrity(subs)
-        assert len(passed) == 1
-        assert skipped == 1
-
-    def test_filter_data_integrity_ipfs_cid_skips_check(self):
-        ptr, payload = self._make_submission(hotkey="val_a")
-        ipfs_ptr = ConsensusPointer(
-            protocol_version=1, window_number=42,
-            content_address="QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG",
-            validator_hotkey="val_a",
-        )
-        subs = [(ipfs_ptr, payload)]
-        passed, skipped = filter_data_integrity(subs)
-        assert len(passed) == 1
-        assert skipped == 0
-
-    def test_filter_bench_version_major_mismatch(self):
-        subs = [
-            self._make_submission(hotkey="val_a", version="0.1.0"),
-            self._make_submission(hotkey="val_b", version="1.0.0"),
-        ]
-        passed, skipped = filter_bench_version(subs, local_version="0.2.0")
-        assert len(passed) == 1
-        assert skipped == 1
-        assert passed[0][0].validator_hotkey == "val_a"
-
-    def test_filter_bench_version_same_major(self):
-        subs = [
-            self._make_submission(hotkey="val_a", version="0.1.0"),
-            self._make_submission(hotkey="val_b", version="0.9.9"),
-        ]
-        passed, skipped = filter_bench_version(subs, local_version="0.2.0")
-        assert len(passed) == 2
-        assert skipped == 0
-
     def test_filter_zero_signal_with_nonzero(self):
         subs = [
             self._make_submission(hotkey="val_a", scores={"m": 0.85}),
@@ -1869,27 +1824,25 @@ class TestConsensusFilter:
             self._make_submission(hotkey="bad_proto", window=42, protocol=2, version="0.1.0"),
             self._make_submission(hotkey="bad_window", window=41, protocol=1, version="0.1.0"),
             self._make_submission(hotkey="low_stake", window=42, protocol=1, version="0.1.0"),
-            self._make_submission(hotkey="bad_version", window=42, protocol=1, version="1.0.0"),
             self._make_submission(hotkey="zero_score", window=42, protocol=1, version="0.1.0", scores={"m": 0.0}),
         ]
         stakes = {"good": 100.0, "bad_proto": 100.0, "bad_window": 100.0,
-                  "low_stake": 1.0, "bad_version": 100.0, "zero_score": 100.0}
+                  "low_stake": 1.0, "zero_score": 100.0}
         validated, stats = run_filter_pipeline(
             subs, expected_window=42, validator_stakes=stakes,
-            min_stake=10.0, local_version="0.1.0",
+            min_stake=10.0,
         )
         assert stats.passed == 1
         assert stats.skipped_protocol == 1
         assert stats.skipped_window == 1
         assert stats.skipped_stake == 1
-        assert stats.skipped_version == 1
         assert stats.skipped_zero_signal == 1
         assert validated[0].pointer.validator_hotkey == "good"
 
     def test_empty_submissions(self):
         validated, stats = run_filter_pipeline(
             [], expected_window=42, validator_stakes={},
-            min_stake=0, local_version="4.0.0",
+            min_stake=0,
         )
         assert stats.passed == 0
         assert len(validated) == 0

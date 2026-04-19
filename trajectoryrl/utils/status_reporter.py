@@ -87,7 +87,7 @@ async def heartbeat(
         return False
 
 
-# Cache keyed by (miner_hotkey, pack_hash) → last valid pre-eval response.
+# Cache keyed by (miner_hotkey, identifier) → last valid pre-eval response.
 _pre_eval_cache: Dict[tuple, Dict[str, Any]] = {}
 
 
@@ -98,13 +98,24 @@ def _is_valid_pre_eval_response(data: Any) -> bool:
 
 async def pre_eval(
     miner_hotkey: str,
-    pack_hash: str,
+    pack_hash: Optional[str] = None,
     pack_url: Optional[str] = None,
     *,
+    epoch_number: Optional[int] = None,
     wallet=None,
     pre_eval_url: str = DEFAULT_PRE_EVAL_URL,
 ) -> Optional[Dict[str, Any]]:
     """Call the pre-eval API to check whether a miner's submission is allowed.
+
+    Supports two query modes:
+      - By pack_hash: checks a specific pack (used during per-miner evaluation)
+      - By epoch_number: server resolves the most recently submitted pack in
+        that epoch (used during aggregation to avoid pack-switch escapes)
+
+    At least one of pack_hash or epoch_number must be provided.
+
+    Signing is optional — the v2 endpoint is read-only. When wallet is
+    provided, the request is signed for auditability.
 
     Uses a local cache so that when the API is unreachable or returns an
     unexpected format, the last known-good response is used instead of
@@ -112,42 +123,48 @@ async def pre_eval(
 
     Args:
         miner_hotkey: Miner hotkey to check.
-        pack_hash: Pack hash submitted by the miner.
-        pack_url: Pack download URL (required by the server if this hash is new).
-        wallet: bt.Wallet with accessible hotkey for signing.
+        pack_hash: Pack hash submitted by the miner. Required if
+            epoch_number is not provided.
+        pack_url: Pack download URL (optional context for the server).
+        epoch_number: Epoch/window number. When provided, the server
+            returns the eval result for the miner's most recently
+            submitted pack in that epoch.
+        wallet: bt.Wallet with accessible hotkey for signing (optional).
         pre_eval_url: Pre-eval API endpoint.
 
     Returns:
         Parsed response dict on success or from cache, or None only if the
         request failed AND no cached result exists (fail-open).
     """
-    cache_key = (miner_hotkey, pack_hash)
-
-    if wallet is None:
-        logger.warning("pre_eval called without wallet — failing open")
+    if pack_hash is None and epoch_number is None:
+        logger.warning("pre_eval: neither pack_hash nor epoch_number provided — failing open")
         return None
 
-    try:
-        hotkey_kp = wallet.hotkey
-    except Exception:
-        logger.warning("pre_eval: wallet hotkey not available — failing open")
-        return None
-
-    validator_hotkey = hotkey_kp.ss58_address
-    timestamp = int(time.time())
-    message = f"trajectoryrl-report:{validator_hotkey}:{timestamp}"
-    sig = hotkey_kp.sign(message.encode())
-    signature = "0x" + (sig if isinstance(sig, bytes) else bytes(sig)).hex()
+    cache_key = (miner_hotkey, pack_hash or f"epoch:{epoch_number}")
 
     payload: Dict[str, Any] = {
-        "validator_hotkey": validator_hotkey,
-        "timestamp": timestamp,
-        "signature": signature,
         "miner_hotkey": miner_hotkey,
-        "pack_hash": pack_hash,
     }
+    if pack_hash is not None:
+        payload["pack_hash"] = pack_hash
+    if epoch_number is not None:
+        payload["epoch_number"] = epoch_number
     if pack_url is not None:
         payload["pack_url"] = pack_url
+
+    if wallet is not None:
+        try:
+            hotkey_kp = wallet.hotkey
+            validator_hotkey = hotkey_kp.ss58_address
+            timestamp = int(time.time())
+            message = f"trajectoryrl-report:{validator_hotkey}:{timestamp}"
+            sig = hotkey_kp.sign(message.encode())
+            signature = "0x" + (sig if isinstance(sig, bytes) else bytes(sig)).hex()
+            payload["validator_hotkey"] = validator_hotkey
+            payload["timestamp"] = timestamp
+            payload["signature"] = signature
+        except Exception:
+            logger.debug("pre_eval: wallet hotkey not available, sending unsigned")
 
     try:
         async with httpx.AsyncClient() as client:
@@ -178,19 +195,21 @@ async def pre_eval(
     # API failed or returned bad data — fall back to cache.
     cached = _pre_eval_cache.get(cache_key)
     if cached is not None:
+        identifier = pack_hash[:12] if pack_hash else f"epoch:{epoch_number}"
         logger.info(
             "Using cached pre-eval result for %s/%s: allowed=%s",
             miner_hotkey[:8],
-            pack_hash[:12],
+            identifier,
             cached.get("allowed"),
         )
         return cached
 
     # No cache available — fail-open.
+    identifier = pack_hash[:12] if pack_hash else f"epoch:{epoch_number}"
     logger.warning(
         "No cached pre-eval for %s/%s — failing open",
         miner_hotkey[:8],
-        pack_hash[:12],
+        identifier,
     )
     return None
 

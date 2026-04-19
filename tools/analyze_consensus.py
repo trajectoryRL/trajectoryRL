@@ -32,7 +32,7 @@ import aiohttp
 import bittensor as bt
 
 from trajectoryrl.utils.consensus import (
-    ConsensusPointer, ConsensusPayload, SCORING_VERSION,
+    ConsensusPointer, ConsensusPayload,
 )
 from trajectoryrl.utils.consensus_filter import run_filter_pipeline
 from trajectoryrl.utils.commitments import (
@@ -42,9 +42,11 @@ from trajectoryrl.scoring import compute_consensus_scores
 from trajectoryrl.utils.winner_state import (
     WinnerState, select_winner_with_protection,
 )
+from trajectoryrl.utils.status_reporter import pre_eval
 
 NETUID = 11
 NETWORK = "finney"
+SCORING_VERSION = 3
 IPFS_API_URL = "http://ipfs.metahash73.com:5001/api/v0"
 IPFS_GATEWAYS = [
     "https://ipfs.io",
@@ -52,8 +54,7 @@ IPFS_GATEWAYS = [
     "https://cloudflare-ipfs.com",
     "https://gateway.pinata.cloud",
 ]
-CONSENSUS_PROTOCOL_VERSION = 1
-CLAWBENCH_VERSION = "0.1.0"
+CONSENSUS_PROTOCOL_VERSION = 2
 DOWNLOAD_TIMEOUT = 60
 
 
@@ -225,7 +226,6 @@ async def run(args):
         expected_window=target_window,
         validator_stakes=validator_stakes,
         min_stake=0.0,
-        local_version=CLAWBENCH_VERSION,
         expected_protocol=CONSENSUS_PROTOCOL_VERSION,
         expected_scoring_version=scoring_ver,
     )
@@ -245,6 +245,11 @@ async def run(args):
     }
 
     # ---- 7. Winner selection ------------------------------------------------
+    eligible_scores = {
+        hk: s for hk, s in consensus_scores.items()
+        if hk not in consensus_disqualified
+    }
+
     prev_state = WinnerState(
         winner_hotkey=args.prev_winner,
         winner_score=args.prev_winner_score,
@@ -316,6 +321,10 @@ def main():
     parser.add_argument(
         "--scoring-version", type=int, default=None,
         help=f"Override scoring version filter (default: {SCORING_VERSION})",
+    )
+    parser.add_argument(
+        "--skip-pre-eval", action="store_true",
+        help="Skip pre-eval API checks",
     )
     args = parser.parse_args()
 
