@@ -7,10 +7,15 @@ with JSON integrity validation per source, runs the same filter pipeline
 and consensus computation used in production, then applies Winner
 Protection to determine the elected winner.
 
+New-season consensus: highest stake-weighted score wins.  There is no
+qualification gate — miners are either scored or disqualified (stake-
+weighted majority).  Winner Protection uses score_delta (challenger must
+beat winner_score × (1 + δ) to dethrone).
+
 Usage:
     python tools/analyze_consensus.py
     python tools/analyze_consensus.py --network finney --netuid 11
-    python tools/analyze_consensus.py --prev-winner 5Ew5PrAd... --prev-winner-cost 0.015
+    python tools/analyze_consensus.py --prev-winner 5Ew5PrAd... --prev-winner-score 0.75
 """
 
 import argparse
@@ -33,7 +38,7 @@ from trajectoryrl.utils.consensus_filter import run_filter_pipeline
 from trajectoryrl.utils.commitments import (
     fetch_validator_consensus_commitments, decode_dual_address,
 )
-from trajectoryrl.scoring import compute_consensus_costs
+from trajectoryrl.scoring import compute_consensus_scores
 from trajectoryrl.utils.winner_state import (
     WinnerState, select_winner_with_protection,
 )
@@ -193,7 +198,7 @@ async def run(args):
 
         if payload is not None:
             submissions.append((pointer, payload))
-            print(f"    OK — {len(payload.costs)} miners evaluated")
+            print(f"    OK — {len(payload.scores)} miners evaluated")
         else:
             print(f"    FAILED after {max_retries} attempts")
 
@@ -230,65 +235,72 @@ async def run(args):
         print("\nAll submissions filtered out!")
         return
 
-    # ---- 6. Compute consensus costs -----------------------------------------
-    consensus_costs, consensus_qualified = compute_consensus_costs(
-        validated,
-        qualification_stake_threshold=args.qual_threshold,
-    )
+    # ---- 6. Compute consensus scores -----------------------------------------
+    consensus_scores, consensus_disqualified = compute_consensus_scores(validated)
+
+    # Filter disqualified miners from scores before winner selection
+    eligible_scores = {
+        hk: s for hk, s in consensus_scores.items()
+        if hk not in consensus_disqualified
+    }
 
     # ---- 7. Winner selection ------------------------------------------------
     prev_state = WinnerState(
         winner_hotkey=args.prev_winner,
-        winner_cost=args.prev_winner_cost,
+        winner_score=args.prev_winner_score,
     )
     winner_hk, updated_state = select_winner_with_protection(
-        consensus_costs=consensus_costs,
-        consensus_qualified=consensus_qualified,
+        consensus_scores=eligible_scores,
         state=prev_state,
-        cost_delta=args.cost_delta,
+        score_delta=args.score_delta,
     )
 
     # ---- 8. Print results ---------------------------------------------------
-    n_qualified = sum(1 for q in consensus_qualified.values() if q)
+    n_disqualified = len(consensus_disqualified)
 
     sep()
     print(f"CONSENSUS RESULTS — Window {target_window}")
-    print(f"  {len(consensus_costs)} miners, {n_qualified} qualified, "
+    print(f"  {len(consensus_scores)} miners, {len(eligible_scores)} eligible, "
+          f"{n_disqualified} disqualified, "
           f"{len(validated)} validators passed filter")
-    print(f"  Qualification threshold: {args.qual_threshold}")
-    print(f"  Winner protection delta: {args.cost_delta}")
+    print(f"  Winner protection score delta: {args.score_delta}")
     sep("-")
 
-    print(f"\n  {'Rank':>4}  {'UID':>5}  {'Hotkey':<20}  {'Cost':>14}  {'Gate':>6}")
-    print(f"  {'----':>4}  {'---':>5}  {'------':<20}  {'----':>14}  {'----':>6}")
+    print(f"\n  {'Rank':>4}  {'UID':>5}  {'Hotkey':<20}  {'Score':>10}  {'Status':>6}")
+    print(f"  {'----':>4}  {'---':>5}  {'------':<20}  {'-----':>10}  {'------':>6}")
 
-    for rank, (hk, cost) in enumerate(
-        sorted(consensus_costs.items(), key=lambda x: x[1]), 1
+    for rank, (hk, score) in enumerate(
+        sorted(consensus_scores.items(), key=lambda x: x[1], reverse=True), 1
     ):
         uid = hk_to_uid.get(hk, -1)
-        gate = "PASS" if consensus_qualified.get(hk, False) else "FAIL"
+        status = "DISQ" if hk in consensus_disqualified else "OK"
         marker = " <- WINNER" if hk == winner_hk else ""
-        print(f"  {rank:>4}  {uid:>5}  {hk[:16]}...  ${cost:>13.6f}  {gate:>6}{marker}")
+        print(f"  {rank:>4}  {uid:>5}  {hk[:16]}...  {score:>10.4f}  {status:>6}{marker}")
 
     sep("=")
     if winner_hk:
         winner_uid = hk_to_uid.get(winner_hk, -1)
         print(f"  WINNER: UID {winner_uid}  {winner_hk}")
-        print(f"  COST:   ${consensus_costs.get(winner_hk, 0):.6f}")
+        print(f"  SCORE:  {consensus_scores.get(winner_hk, 0):.4f}")
 
         print(f"\n  Per-validator breakdown:")
         for sub_ptr, sub_payload in submissions:
             val_uid = hk_to_uid.get(sub_ptr.validator_hotkey, -1)
             val_stake = validator_stakes.get(sub_ptr.validator_hotkey, 0)
-            if winner_hk in sub_payload.costs:
-                q = sub_payload.qualified.get(winner_hk, False)
-                c = sub_payload.costs[winner_hk]
+            if winner_hk in sub_payload.scores:
+                disq = sub_payload.disqualified.get(winner_hk)
+                s = sub_payload.scores[winner_hk]
+                disq_str = f", disqualified={disq}" if disq else ""
                 print(f"    UID {val_uid:>3} (stake={val_stake:>10.4f}): "
-                      f"cost=${c:.6f}, qualified={'YES' if q else 'NO'}")
+                      f"score={s:.4f}{disq_str}")
+            elif winner_hk in sub_payload.disqualified:
+                reason = sub_payload.disqualified[winner_hk]
+                print(f"    UID {val_uid:>3} (stake={val_stake:>10.4f}): "
+                      f"disqualified ({reason})")
             else:
                 print(f"    UID {val_uid:>3} (stake={val_stake:>10.4f}): (not evaluated)")
     else:
-        print("  NO WINNER — all miners disqualified")
+        print("  NO WINNER — all miners disqualified or no scores")
     sep("=")
 
 
@@ -299,9 +311,8 @@ def main():
     parser.add_argument("--network", default=NETWORK)
     parser.add_argument("--netuid", type=int, default=NETUID)
     parser.add_argument("--prev-winner", type=str, default=None)
-    parser.add_argument("--prev-winner-cost", type=float, default=None)
-    parser.add_argument("--qual-threshold", type=float, default=0.5)
-    parser.add_argument("--cost-delta", type=float, default=0.10)
+    parser.add_argument("--prev-winner-score", type=float, default=None)
+    parser.add_argument("--score-delta", type=float, default=0.10)
     parser.add_argument(
         "--scoring-version", type=int, default=None,
         help=f"Override scoring version filter (default: {SCORING_VERSION})",

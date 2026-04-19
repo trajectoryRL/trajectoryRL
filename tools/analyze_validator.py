@@ -1,5 +1,8 @@
 """Fetch and analyze evaluation reports for a TrajectoryRL validator.
 
+Score-based analysis: shows score distribution, disqualification status,
+weight allocation, and per-miner drill-down.
+
 Usage:
     python analyze_validator.py                     # interactive: list validators, pick one
     python analyze_validator.py <hotkey>             # analyze a specific validator
@@ -24,8 +27,6 @@ from trajrl.display import (
     console,
     trunc,
     relative_time,
-    qual,
-    cost,
     score_fmt,
 )
 
@@ -71,23 +72,16 @@ def analyze_scores(client: TrajRLClient, validator_hotkey: str) -> dict:
         console.print(f"[yellow]No score entries for validator {trunc(validator_hotkey)}.[/]")
         return data
 
-    qualified = [e for e in entries if e.get("qualified")]
-    rejected = [e for e in entries if e.get("rejected")]
-    costs = [e["costUsd"] for e in entries if e.get("costUsd") is not None]
+    disqualified = [e for e in entries if e.get("disqualified")]
+    eligible = [e for e in entries if not e.get("disqualified")]
     scores = [e["score"] for e in entries if e.get("score") is not None]
     weights = [e["weight"] for e in entries if e.get("weight") is not None]
 
     summary_lines = [
         f"  Miners evaluated: {len(entries)}",
-        f"  Qualified: [green]{len(qualified)}[/]  |  Rejected: [red]{len(rejected)}[/]",
-        f"  Qualification rate: {len(qualified) / len(entries) * 100:.1f}%",
+        f"  Eligible: [green]{len(eligible)}[/]  |  Disqualified: [red]{len(disqualified)}[/]",
     ]
 
-    if costs:
-        summary_lines.append(
-            f"  Cost — min: {min(costs):.4f}  avg: {statistics.mean(costs):.4f}  "
-            f"max: {max(costs):.4f}  median: {statistics.median(costs):.4f}"
-        )
     if scores:
         summary_lines.append(
             f"  Score — min: {min(scores):.2f}  avg: {statistics.mean(scores):.2f}  "
@@ -106,7 +100,7 @@ def analyze_scores(client: TrajRLClient, validator_hotkey: str) -> dict:
         border_style="cyan",
     ))
 
-    _print_rejection_breakdown(rejected)
+    _print_disqualification_breakdown(disqualified)
     _print_weight_distribution(client, validator_hotkey)
     _print_scenario_heatmap(entries)
     _print_leaderboard(entries)
@@ -114,25 +108,25 @@ def analyze_scores(client: TrajRLClient, validator_hotkey: str) -> dict:
     return data
 
 
-def _print_rejection_breakdown(rejected: list[dict]) -> None:
-    if not rejected:
+def _print_disqualification_breakdown(disqualified: list[dict]) -> None:
+    if not disqualified:
         return
-    stages: dict[str, int] = {}
-    for e in rejected:
-        stage = e.get("rejectionStage") or "unknown"
-        stages[stage] = stages.get(stage, 0) + 1
+    reasons: dict[str, int] = {}
+    for e in disqualified:
+        reason = e.get("disqualifiedReason") or e.get("rejectionStage") or "unknown"
+        reasons[reason] = reasons.get(reason, 0) + 1
 
-    table = Table(title="Rejection Breakdown", box=box.SIMPLE_HEAVY)
-    table.add_column("Stage", style="red")
+    table = Table(title="Disqualification Breakdown", box=box.SIMPLE_HEAVY)
+    table.add_column("Reason", style="red")
     table.add_column("Count", justify="right")
-    for stage, cnt in sorted(stages.items(), key=lambda x: -x[1]):
-        table.add_row(stage, str(cnt))
+    for reason, cnt in sorted(reasons.items(), key=lambda x: -x[1]):
+        table.add_row(reason, str(cnt))
     console.print(table)
 
 
 _RE_MINER_WEIGHT = re.compile(
     r"Miner\s+(\d+)\s+\(([^)]+)\):\s+"
-    r"weight=([\d.]+),\s+cost=(\S+),\s+gate=(\w+),\s+score=([\d.]+)(.*)"
+    r"score=([\d.]+),\s+status=(\w+)(.*)"
 )
 _RE_OWNER_WEIGHT = re.compile(
     r"Owner\s+UID\s+(\d+):\s+weight=([\d.]+)\s+\(burn\)"
@@ -155,7 +149,7 @@ def _parse_weight_results(log_text: str) -> dict:
 
     in_section = False
     for line in log_text.splitlines():
-        if "WEIGHT RESULTS" in line or "ON-CHAIN WEIGHT SUBMISSION" in line:
+        if "WEIGHT RESULTS" in line or "ON-CHAIN WEIGHT SUBMISSION" in line or "CONSENSUS RESULTS" in line:
             in_section = True
             miners.clear()
             owner = None
@@ -173,15 +167,12 @@ def _parse_weight_results(log_text: str) -> dict:
                 continue
             m = _RE_MINER_WEIGHT.search(line)
             if m:
-                cost_str = m.group(4).lstrip("$")
                 miners.append({
                     "uid": int(m.group(1)),
                     "hotkey": m.group(2),
-                    "weight": float(m.group(3)),
-                    "cost": float(cost_str) if cost_str != "n/a" else None,
-                    "gate": m.group(5),
-                    "score": float(m.group(6)),
-                    "marker": m.group(7).strip(),
+                    "score": float(m.group(3)),
+                    "status": m.group(4),
+                    "marker": m.group(5).strip(),
                 })
                 continue
             if "=====" in line:
@@ -232,7 +223,7 @@ def _print_weight_distribution(client: TrajRLClient, validator_hotkey: str) -> N
             console.print("[yellow]No ON-CHAIN WEIGHT SUBMISSION found in cycle log.[/]")
         return
 
-    all_weights = [m["weight"] for m in miners]
+    all_weights = [m.get("weight", 0) for m in miners]
     if wr["owner"]:
         all_weights.append(wr["owner"]["weight"])
     total_weight = sum(all_weights) or 1.0
@@ -249,25 +240,22 @@ def _print_weight_distribution(client: TrajRLClient, validator_hotkey: str) -> N
             f"weight={wr['owner']['weight']:.4f} (burn)"
         )
 
-    nonzero_miner = [m["weight"] for m in miners if m["weight"] > 0]
     summary_lines.append(
-        f"  Miners: {len(miners)} total, "
-        f"[bold green]{len(nonzero_miner)}[/] with weight > 0"
+        f"  Miners: {len(miners)} total"
     )
 
-    winner = next((m for m in miners if "ON-CHAIN WINNER" in m.get("marker", "")), None)
+    winner = next((m for m in miners if "WINNER" in m.get("marker", "")), None)
     if winner:
         summary_lines.append(
             f"  [bold yellow]Winner:[/] UID {winner['uid']} "
             f"({winner['hotkey']})  "
-            f"weight={winner['weight']:.4f}  "
-            f"cost=${winner['cost']:.4f}  gate={winner['gate']}"
+            f"score={winner['score']:.4f}  status={winner.get('status', '?')}"
         )
 
-    passed = [m for m in miners if m["gate"] == "PASS"]
-    failed = [m for m in miners if m["gate"] == "FAIL"]
+    ok_miners = [m for m in miners if m.get("status") == "OK"]
+    disq_miners = [m for m in miners if m.get("status") == "DISQ"]
     summary_lines.append(
-        f"  Gate: [green]{len(passed)} PASS[/]  |  [red]{len(failed)} FAIL[/]"
+        f"  Status: [green]{len(ok_miners)} OK[/]  |  [red]{len(disq_miners)} DISQ[/]"
     )
 
     if wr["success"]:
@@ -284,74 +272,54 @@ def _print_weight_distribution(client: TrajRLClient, validator_hotkey: str) -> N
     if not miners:
         return
 
-    sorted_miners = sorted(miners, key=lambda m: m["weight"], reverse=True)
-    max_w = max(m["weight"] for m in sorted_miners) or 1
+    sorted_miners = sorted(miners, key=lambda m: m["score"], reverse=True)
 
-    table = Table(title="Weight Distribution", box=box.ROUNDED)
+    table = Table(title="Miner Scores (from cycle log)", box=box.ROUNDED)
     table.add_column("#", justify="right", style="dim")
     table.add_column("UID", justify="right")
     table.add_column("Hotkey", style="cyan")
-    table.add_column("Weight", justify="right", style="bold yellow")
-    table.add_column("Share %", justify="right")
-    table.add_column("Bar", min_width=20)
-    table.add_column("Gate", justify="center")
-    table.add_column("Cost", justify="right")
-    table.add_column("Score", justify="right")
+    table.add_column("Score", justify="right", style="bold yellow")
+    table.add_column("Status", justify="center")
     table.add_column("Note")
 
     for i, m in enumerate(sorted_miners, 1):
-        w = m["weight"]
-        share = (w / total_weight * 100) if total_weight else 0
-        bar_len = int(w / max_w * 20) if max_w else 0
-        bar = "[yellow]" + "█" * bar_len + "[/]" + "░" * (20 - bar_len)
-        gate_style = "green" if m["gate"] == "PASS" else "red"
-        cost_str = f"${m['cost']:.4f}" if m["cost"] is not None else "n/a"
+        status_style = "green" if m.get("status") == "OK" else "red"
         marker = m.get("marker", "")
-        note_style = "bold yellow" if "ON-CHAIN WINNER" in marker else "dim"
+        note_style = "bold yellow" if "WINNER" in marker else "dim"
 
         table.add_row(
             str(i),
             str(m["uid"]),
             m["hotkey"],
-            f"{w:.4f}",
-            f"{share:.1f}%",
-            bar,
-            f"[{gate_style}]{m['gate']}[/]",
-            cost_str,
-            f"{m['score']:.3f}",
+            f"{m['score']:.4f}",
+            f"[{status_style}]{m.get('status', '?')}[/]",
             f"[{note_style}]{marker}[/]" if marker else "",
         )
 
     if wr["owner"]:
         o = wr["owner"]
-        share = (o["weight"] / total_weight * 100) if total_weight else 0
-        bar_len = int(o["weight"] / max_w * 20) if max_w else 0
-        bar = "[red]" + "█" * bar_len + "[/]" + "░" * (20 - bar_len)
         table.add_row(
             "—", str(o["uid"]), "[dim]owner (burn)[/]",
-            f"{o['weight']:.4f}", f"{share:.1f}%", bar,
-            "—", "—", "—", "[red]BURN[/]",
+            "—", "—", "[red]BURN[/]",
         )
     console.print(table)
 
-    zero_pass = [m for m in miners if m["weight"] == 0 and m["gate"] == "PASS"]
-    if zero_pass:
+    disq_list = [m for m in miners if m.get("status") == "DISQ"]
+    if disq_list:
         table2 = Table(
-            title=f"PASS but Zero Weight ({len(zero_pass)} miners)",
+            title=f"Disqualified Miners ({len(disq_list)})",
             box=box.SIMPLE,
         )
         table2.add_column("UID", justify="right")
         table2.add_column("Hotkey", style="cyan")
-        table2.add_column("Cost", justify="right")
         table2.add_column("Score", justify="right")
-        for m in sorted(zero_pass, key=lambda x: x.get("cost") or 999):
-            cost_str = f"${m['cost']:.4f}" if m["cost"] is not None else "n/a"
-            table2.add_row(str(m["uid"]), m["hotkey"], cost_str, f"{m['score']:.3f}")
+        for m in sorted(disq_list, key=lambda x: x.get("score", 0), reverse=True):
+            table2.add_row(str(m["uid"]), m["hotkey"], f"{m['score']:.4f}")
         console.print(table2)
 
 
 def _print_scenario_heatmap(entries: list[dict]) -> None:
-    """Aggregate scenario-level qualification and cost across all miners."""
+    """Aggregate scenario-level scores across all miners."""
     scenario_stats: dict[str, dict] = {}
     for e in entries:
         sc = e.get("scenarioScores") or {}
@@ -359,12 +327,8 @@ def _print_scenario_heatmap(entries: list[dict]) -> None:
             if not isinstance(info, dict):
                 continue
             if name not in scenario_stats:
-                scenario_stats[name] = {"qual": 0, "total": 0, "costs": [], "scores": []}
+                scenario_stats[name] = {"total": 0, "scores": []}
             scenario_stats[name]["total"] += 1
-            if info.get("qualified"):
-                scenario_stats[name]["qual"] += 1
-            if info.get("cost") is not None:
-                scenario_stats[name]["costs"].append(info["cost"])
             if info.get("score") is not None:
                 scenario_stats[name]["scores"].append(info["score"])
 
@@ -373,20 +337,19 @@ def _print_scenario_heatmap(entries: list[dict]) -> None:
 
     table = Table(title="Scenario Analysis", box=box.ROUNDED)
     table.add_column("Scenario")
-    table.add_column("Pass Rate", justify="right")
-    table.add_column("Avg Cost", justify="right")
     table.add_column("Avg Score", justify="right")
+    table.add_column("Min", justify="right")
+    table.add_column("Max", justify="right")
     table.add_column("Miners", justify="right")
     for name, s in sorted(scenario_stats.items()):
-        rate = s["qual"] / s["total"] * 100 if s["total"] else 0
-        rate_style = "green" if rate >= 50 else "yellow" if rate >= 25 else "red"
-        avg_cost = statistics.mean(s["costs"]) if s["costs"] else None
         avg_score = statistics.mean(s["scores"]) if s["scores"] else None
+        min_score = min(s["scores"]) if s["scores"] else None
+        max_score = max(s["scores"]) if s["scores"] else None
         table.add_row(
             name,
-            f"[{rate_style}]{rate:.0f}%[/] ({s['qual']}/{s['total']})",
-            cost(avg_cost),
             score_fmt(avg_score),
+            score_fmt(min_score),
+            score_fmt(max_score),
             str(s["total"]),
         )
     console.print(table)
@@ -405,19 +368,19 @@ def _print_leaderboard(entries: list[dict]) -> None:
     table.add_column("#", justify="right", style="dim")
     table.add_column("Miner", style="cyan")
     table.add_column("UID", justify="right")
-    table.add_column("Qual", justify="center")
-    table.add_column("Cost", justify="right")
     table.add_column("Score", justify="right", style="bold")
     table.add_column("Weight", justify="right")
+    table.add_column("Status")
     for i, e in enumerate(ranked, 1):
+        is_disq = e.get("disqualified") or e.get("rejected")
+        status = "[red]DISQ[/]" if is_disq else "[green]OK[/]"
         table.add_row(
             str(i),
             trunc(e.get("minerHotkey")),
             str(e.get("uid") if e.get("uid") is not None else "—"),
-            qual(e.get("qualified")),
-            cost(e.get("costUsd")),
             score_fmt(e.get("score")),
             score_fmt(e.get("weight")),
+            status,
         )
     console.print(table)
 
@@ -446,8 +409,8 @@ def deep_miner_analysis(client: TrajRLClient, entries: list[dict], top_n: int = 
 
 def _print_miner_overview(data: dict) -> None:
     lines = [
-        f"  Rank: {data.get('rank', '—')}  |  Score: {score_fmt(data.get('score'))}  |  Cost: {cost(data.get('totalCostUsd'))}",
-        f"  Qualified: {'yes' if data.get('qualified') else 'no'}  |  Active: {'yes' if data.get('isActive') else 'no'}",
+        f"  Rank: {data.get('rank', '—')}  |  Score: {score_fmt(data.get('score'))}",
+        f"  Active: {'yes' if data.get('isActive') else 'no'}",
         f"  Pack: {trunc(data.get('packHash'), 10)}  |  Winner: {'yes' if data.get('isWinner') else 'no'}",
     ]
     ban = data.get("banRecord")
@@ -462,16 +425,12 @@ def _print_miner_validators(data: dict) -> None:
         return
     table = Table(title="Per-Validator Results", box=box.SIMPLE)
     table.add_column("Validator", style="cyan")
-    table.add_column("Qual", justify="center")
-    table.add_column("Cost", justify="right")
     table.add_column("Score", justify="right")
     table.add_column("Block", justify="right")
     table.add_column("Reported")
     for v in validators:
         table.add_row(
             trunc(v.get("hotkey")),
-            qual(v.get("qualified")),
-            cost(v.get("costUsd")),
             score_fmt(v.get("score")),
             str(v.get("blockHeight") or "—"),
             relative_time(v.get("createdAt")),

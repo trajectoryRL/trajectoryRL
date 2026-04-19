@@ -4,24 +4,26 @@ A collection of standalone diagnostic and analysis tools for the TrajectoryRL su
 
 ## analyze_consensus.py — On-chain consensus & winner election simulator
 
-Reads all validator consensus commitments from the Bittensor chain, downloads evaluation payloads from IPFS, computes stake-weighted consensus costs and qualification, then applies Winner Protection to determine the elected winner — exactly as a production validator would.
+Reads all validator consensus commitments from the Bittensor chain, downloads evaluation payloads from IPFS, computes stake-weighted consensus scores and disqualification, then applies Winner Protection to determine the elected winner — exactly as a production validator would.
+
+New-season consensus: highest stake-weighted score wins.  There is no qualification gate — miners are either scored or disqualified (stake-weighted majority).  Winner Protection uses score_delta (challenger must beat winner_score × (1 + δ) to dethrone).
 
 ### Usage
 
 ```bash
 python3 tools/analyze_consensus.py                                       # run with defaults
 python3 tools/analyze_consensus.py --network finney --netuid 11          # explicit chain params
-python3 tools/analyze_consensus.py --prev-winner 5Ew5P... --prev-winner-cost 0.015  # simulate winner protection
-python3 tools/analyze_consensus.py --qual-threshold 0.5 --cost-delta 0.10           # tune consensus params
+python3 tools/analyze_consensus.py --prev-winner 5Ew5P... --prev-winner-score 0.75  # simulate winner protection
+python3 tools/analyze_consensus.py --score-delta 0.10                    # tune winner protection threshold
 ```
 
 ### What it shows
 
 - **Window distribution** — which evaluation windows have validator submissions on-chain.
 - **Download status** — per-validator IPFS payload download results (with per-source JSON integrity validation and automatic gateway fallback on truncated data).
-- **Filter pipeline** — how many submissions passed the 6-layer filter (protocol, window, stake, integrity, version, zero-signal).
-- **Consensus costs** — all miners ranked by stake-weighted consensus cost, with qualification gate (PASS/FAIL).
-- **Winner election** — the elected winner, their consensus cost, and per-validator breakdown showing each validator's individual cost and qualification vote.
+- **Filter pipeline** — how many submissions passed the 7-layer filter (protocol, window, stake, integrity, version, scoring version, zero-signal).
+- **Consensus scores** — all miners ranked by stake-weighted consensus score (highest first), with disqualification status (OK/DISQ).
+- **Winner election** — the elected winner, their consensus score, and per-validator breakdown showing each validator's individual score and disqualification status.
 
 ### Options
 
@@ -30,9 +32,8 @@ python3 tools/analyze_consensus.py --qual-threshold 0.5 --cost-delta 0.10       
 | `--network` | `finney` | Subtensor network |
 | `--netuid` | `11` | Subnet UID |
 | `--prev-winner` | none | Previous winner hotkey for Winner Protection simulation |
-| `--prev-winner-cost` | none | Previous winner's locked-in cost |
-| `--qual-threshold` | `0.5` | Stake fraction required for consensus qualification |
-| `--cost-delta` | `0.10` | Winner Protection threshold (challenger must beat `winner_cost × (1 - δ)`) |
+| `--prev-winner-score` | none | Previous winner's locked-in score |
+| `--score-delta` | `0.10` | Winner Protection threshold (challenger must beat `winner_score × (1 + δ)`) |
 
 ### Dependencies
 
@@ -40,7 +41,7 @@ Requires `bittensor`, `aiohttp`, and the `trajectoryrl` package (project root).
 
 ## analyze_validator.py — Validator evaluation analysis
 
-Interactively inspect a validator's evaluation behavior: score distribution, miner qualification, cost breakdown, weight allocation, and per-miner drill-down.
+Interactively inspect a validator's evaluation behavior: score distribution, miner disqualification status, weight allocation, and per-miner drill-down.
 
 ### Usage
 
@@ -54,9 +55,9 @@ python3 tools/analyze_validator.py <hotkey> --dump      # dump raw JSON to file
 
 ### What it shows
 
-- **Score summary** — qualified / rejected counts, cost stats (min / max / mean / median), score & weight distributions.
-- **Weight distribution** — parsed from the validator's latest cycle log (WEIGHT RESULTS section), including per-miner weight, cost, owner hotkey, and set_weights status.
-- **Per-miner deep dive** (`--deep`) — per-scenario scores, pack-level timing, and individual eval details for every miner.
+- **Score summary** — eligible / disqualified counts, score stats (min / max / mean / median), weight distributions.
+- **Miner scores (from cycle log)** — parsed from the validator's latest cycle log (CONSENSUS RESULTS section), including per-miner score, status (OK/DISQ), and winner marker.
+- **Per-miner deep dive** (`--deep`) — per-scenario scores and individual eval details for every miner.
 
 ### Dependencies
 
