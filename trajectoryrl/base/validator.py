@@ -1056,6 +1056,30 @@ class TrajectoryValidator:
             f"(~{self.config.weight_interval_blocks * 12 // 60}min)"
         )
 
+        # Pull sandbox image early so SCORING_VERSION is correct for
+        # startup aggregation (otherwise it stays at the default=1).
+        if self.config.full_cycle_on_startup or self.config.aggregate_when_start:
+            try:
+                await self._sandbox_harness.pull_latest()
+                _consensus_mod.SCORING_VERSION = (
+                    self._sandbox_harness.scoring_version
+                )
+                logger.info(
+                    "scoring_version=%d (bench_version=%s) — set before "
+                    "startup aggregation",
+                    self._sandbox_harness.scoring_version,
+                    self._sandbox_harness.sandbox_version,
+                )
+                # Reload: __init__ loaded with stale SCORING_VERSION=1,
+                # which invalidated the saved state. Now that the real
+                # version is known, reload to recover _eval_pack_hash etc.
+                self._load_eval_state()
+            except Exception as e:
+                logger.warning(
+                    "Failed to pull sandbox image before startup aggregation: "
+                    "%s — scoring_version may be stale", e,
+                )
+
         if self.config.full_cycle_on_startup:
             try:
                 await self._full_cycle_on_startup()
