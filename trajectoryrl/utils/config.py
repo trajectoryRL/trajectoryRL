@@ -198,9 +198,9 @@ class ValidatorConfig:
             sandbox_timeout_per_episode=int(os.getenv("SANDBOX_TIMEOUT_PER_EPISODE", "180")),
             sandbox_num_episodes=int(os.getenv("SANDBOX_NUM_EPISODES", "4")),
             # --- Startup aggregation ---
-            aggregate_when_start=os.getenv("AGGREGATE_WHEN_START", "0") == "1",
+            aggregate_when_start=os.getenv("AGGREGATE_WHEN_START", "1") == "1",
             full_cycle_on_startup=os.getenv("FULL_CYCLE_ON_STARTUP", "0") == "1",
-            disable_winner_protection=os.getenv("DISABLE_WINNER_PROTECTION", "0") == "1",
+            disable_winner_protection=os.getenv("DISABLE_WINNER_PROTECTION", "1") == "1",
             # --- IM parameters are hardcoded (dataclass defaults) ---
             # Do NOT load from env: score_delta,
             # rho_reliability, consensus_epsilon, bootstrap_threshold,
