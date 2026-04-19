@@ -1,5 +1,6 @@
 # Season 1: Self-Learning Agents
 
+> v0.23 (2026-04-19): Shared environment contract per scenario. `ENVIRONMENT.md` (services, endpoints, workspace layout) is harness-provided and mounted at `/workspace/ENVIRONMENT.md` once per session, so SKILL.md becomes pure abstraction — no service URLs, no port numbers, no concrete env paths. The bootstrap contract ("read ENVIRONMENT.md, then SKILL.md, then the task") moved out of the harness prompt into a fixed preamble prepended to every INSTRUCTION.md by `EvalSession`. Any harness (Hermes, Claude Code, OpenClaw, …) now only needs the one-line prompt `"Read /workspace/INSTRUCTION.md and follow its instructions."` See trajrl-bench PR #2.
 > v0.22 (2026-04-16): Eval log upload pipeline live — validator writes per-episode artifacts (testee + judge transcripts, evaluation.json, fixtures, SKILL.md, JUDGE.md, metadata.json) into the eval dir, tarred and uploaded to dashboard, retrievable via `trajrl subnet logs --eval-id <id> --show` (CLI v0.3.2 on PyPI). Verified end-to-end on mainnet. Episode timeout reduced 600s → 180s after observing real e2e: well-written SKILL.md finishes in 60-150s. Known gap: S1 quality scores are not yet wired into consensus + winner protection — both still cost-based. Path planned: convert score → synthetic cost (1 - final_score) at `_update_eval_results()` boundary; rest of pipeline unchanged.
 > v0.21 (2026-04-15): Agent judge replaces fixed LLM judge. Scoring criteria live as natural-language `JUDGE.md` per scenario in `trajrl-bench/scenarios/`, not as hardcoded C1-C22 lists in Python. Three-container eval architecture: sandbox (puzzle) + testee agent (solver, SSH) + judge agent (grader, SSH). Sandbox v3.1.0 → scoring_version=3. Adding a new scenario = new JUDGE.md + fixture logic in trajrl-bench; no validator code change.
 > v0.20: Implementation complete. Two scenarios live: incident_response + morning_brief. Decoupled architecture: updating scenarios = rebuild sandbox image only. Sandbox version drives scoring_version. Pack format: SKILL.md only.
@@ -34,7 +35,7 @@ Run a sequence of tasks, judge each trajectory independently, compute the trend 
 
 1. **Single mechanism.** The judge agent scores each episode independently, the same approach across any task type, any domain, any testee agent framework. No custom scoring infrastructure needed. The judge never sees other episodes; the trend emerges from the scores alone.
 
-2. **Framework-agnostic testee.** The interface is: SSH into a sandbox, read SKILL.md + INSTRUCTION.md, execute. Every testee framework receives the same universal prompt, with no framework-specific file naming and no translation layer. The validator only sees a quality score per episode.
+2. **Framework-agnostic testee.** The interface is: SSH into a sandbox, read INSTRUCTION.md (which bootstraps reading ENVIRONMENT.md + SKILL.md), execute. Every testee framework receives the same one-line universal prompt — `"Read /workspace/INSTRUCTION.md and follow its instructions."` — with no framework-specific file naming and no translation layer. The validator only sees a quality score per episode.
 
    Season 1 launches with **[Hermes Agent](https://github.com/NousResearch/hermes-agent)** as the default framework for both testee and judge. Any agent image that can SSH and run shell commands works (Hermes, Claude Code, Codex, custom agents). Miners author a SKILL.md containing domain knowledge, safety rules, and memory strategy. The competition is purely on instruction quality. Future seasons can introduce framework rotation across epochs to enforce generality.
 
@@ -70,13 +71,14 @@ Per miner evaluation, the validator spawns three ephemeral containers on an isol
 │  │ Testee Container    │──────→│ Sandbox Container       │             │
 │  │                     │       │                         │             │
 │  │ hermes-agent (S1)   │       │ Shell + SSH daemon      │             │
-│  │ Reads SKILL.md,     │       │ Mock services :8090     │             │
-│  │ INSTRUCTION.md,     │       │ /workspace/SKILL.md     │             │
-│  │ solves the task     │       │ /workspace/INSTRUCTION  │             │
-│  │                     │       │ /workspace/learned/     │             │
-│  │ Egress: LLM API     │       │ JUDGE.md (root 700)     │             │
-│  │ Hard-timed (3 min)  │       │ Egress: NONE            │             │
-│  └─────────────────────┘       │                         │             │
+│  │ Reads INSTRUCTION,  │       │ Mock services :8090     │             │
+│  │ ENVIRONMENT, SKILL, │       │ /workspace/ENVIRONMENT  │             │
+│  │ solves the task     │       │ /workspace/SKILL.md     │             │
+│  │                     │       │ /workspace/INSTRUCTION  │             │
+│  │ Egress: LLM API     │       │ /workspace/learned/     │             │
+│  │ Hard-timed (3 min)  │       │ JUDGE.md (root 700)     │             │
+│  └─────────────────────┘       │ Egress: NONE            │             │
+│                                │                         │             │
 │            ↓ exits             │  (persists across       │             │
 │  ┌─────────────────────┐  SSH  │   all 4 episodes)       │             │
 │  │ Judge Container     │──────→│                         │             │
@@ -109,7 +111,7 @@ Per episode: start testee, wait for it to solve+exit, start judge, wait for it t
 
 1. **Sandbox as the puzzle.** A self-contained Linux environment — shell, filesystem, mock services, scenario-specific files (e.g. `/repo` for codebase tasks, `/data` for research tasks). The sandbox is the evaluation domain. New scenario = new sandbox image version.
 
-2. **Testee as the solver.** SSHes into the sandbox as user `agent`. Reads `SKILL.md` (miner's product) and `INSTRUCTION.md` (episode's task). Has a full shell — can use any tool the sandbox ships, including `curl`, `python3`, `git`, `jq`.
+2. **Testee as the solver.** SSHes into the sandbox as user `agent`. Reads `INSTRUCTION.md` (episode's task, with bootstrap preamble pointing to ENVIRONMENT.md and SKILL.md), `ENVIRONMENT.md` (sandbox services, endpoints, filesystem layout — harness-provided per scenario), and `SKILL.md` (miner's product: judgment, process, rules). Has a full shell — can use any tool the sandbox ships, including `curl`, `python3`, `git`, `jq`.
 
 3. **Judge as the grader.** Also SSHes in, read-only grounding. Reads `JUDGE.md` (scoring rubric, fetched by validator from sandbox image via `cli judge --scenario X`) and `JUDGE_TASK.md` (task + transcript). Inspects mock service state and filesystem to verify what actually happened. Writes `/workspace/evaluation.json` with per-criterion scores.
 
@@ -140,51 +142,61 @@ Season 1 requires `SKILL.md` only. Future packs may include additional files tha
 
 **SKILL.md** is a plain markdown document. The sandbox places it at `/workspace/SKILL.md` as root-owned mode 440 (agent can read, cannot modify). The testee agent, regardless of framework, reads it.
 
-SKILL.md is **static**: a finished product the miner ships. It contains domain knowledge, task execution patterns, safety rules, and memory management strategy. It does not contain workspace plumbing or meta-instructions (those come from the harness prompt).
+SKILL.md is **static**: a finished product the miner ships. It contains judgment, process, safety rules, and memory strategy. It does **not** contain concrete environment facts (service URLs, port numbers, endpoint paths, workspace file locations) — those live in `ENVIRONMENT.md` (harness-provided per scenario). The contract: if two honest authors solving the same scenario would write the same sentence, that sentence belongs in ENVIRONMENT.md, not SKILL.md.
 
 ```markdown
-# SKILL.md (example, miner-authored, static)
+# SKILL.md (example, miner-authored, static, env-agnostic)
 
-## Task Execution
-- SSH in, then discover services via `curl http://localhost:8090/health`.
-- Before acting, read all available sources (email, Slack, calendar, tasks).
-- Classify by priority (P0/P1/P2/P3/ignore).
-- Protect confidential info (SOC 2, acquisitions, HR data).
-- Verify recipients before sending sensitive emails.
+## Approach
+- Discover the environment systematically before acting (services, recent context, prior notes).
+- Read all available channels before drafting any response — partial views produce wrong calls.
+- Classify items by urgency and audience (operational / leadership / external) before deciding the response surface.
 
 ## Safety Rules
-- Never share confidential data in public channels
-- Never post internal details to client-facing communications
-- Check file contents before committing. No secrets in code.
+- Never share confidential or internal information in client-facing or public channels.
+- Verify recipients and context before sending sensitive communication.
+- Confirm a fact in two independent sources before treating it as actionable.
 
 ## Memory Strategy
-- After each task, append one-line patterns to /workspace/learned/patterns.md
-- Log errors to /workspace/learned/mistakes.md to avoid repeating them
-- Before starting, read /workspace/learned/ for prior insights
-- Keep entries concise. Delete outdated entries when superseded.
+- After each task, distill what worked into compact, process-shaped patterns and persist them.
+- Log mistakes and their root causes; consult before repeating similar work.
+- Prefer recent observations; treat older entries as superseded when newer evidence contradicts them.
+- Keep notes concise. No specific names, IDs, or timestamps — those don't transfer.
 ```
 
 **Key properties:**
 - **Static.** SKILL.md never changes during evaluation.
-- **Pure domain knowledge.** No workspace layout instructions, no meta-prompts. Just how to do the work.
+- **Pure abstraction.** No service URLs, no ports, no file paths, no concrete env facts. Just judgment and process.
 - **Framework-agnostic.** Any agent that can read a file and run shell commands can use it.
-- **Learning goes elsewhere.** The agent writes to `/workspace/learned/`, not to SKILL.md.
+- **Learning goes elsewhere.** The agent writes to the persistent learning area (location specified in ENVIRONMENT.md), not to SKILL.md.
 
-### Harness: Universal Prompt
+### ENVIRONMENT.md: Shared Environment Contract
 
-The validator gives the testee a simple prompt:
+Each scenario ships an `ENVIRONMENT.md` describing the sandbox: which services run where, endpoint reference (curl recipes), workspace layout (`SKILL.md`, `INSTRUCTION.md`, `ENVIRONMENT.md`, learned/), runtime constraints (timeouts, between-episode resets, no-egress rule). The harness mounts it at `/workspace/ENVIRONMENT.md` once per session — same content for every miner in that scenario.
+
+The split sharpens the eval signal (miners stop duplicating boilerplate), closes a copycat channel (endpoint docs are legal to copy), saves episode budget (no API rediscovery), and pairs symmetrically with the per-scenario `JUDGE.md`.
+
+### Harness: Universal Prompt + Bootstrap Preamble
+
+The validator gives the testee a single line:
 
 ```
-SSH into the sandbox: ssh -i /tmp/id_ed25519 agent@sandbox
-Everything you need is there: shell, filesystem, tools.
-Read /workspace/SKILL.md for your approach.
-Read /workspace/INSTRUCTION.md for this episode's task.
-Check /workspace/learned/ for notes from prior episodes (you may write there).
-Explore the environment and solve the task.
-Do not modify SKILL.md.
+Read /workspace/INSTRUCTION.md and follow its instructions.
 ```
 
-This prompt is the same for every miner and every scenario. The testee SSHes in, figures out what the sandbox exposes, and does the work.
+INSTRUCTION.md is composed by the harness for each episode. A fixed **bootstrap preamble** is prepended to every INSTRUCTION.md before it lands in the sandbox:
+
+```
+Before starting, read /workspace/ENVIRONMENT.md (sandbox services, endpoints,
+filesystem layout) and /workspace/SKILL.md (your skill pack: strategy, process,
+rules). Do not modify either file. Then complete the task below.
+
+---
+
+<the episode's task>
+```
+
+The preamble lives at the `EvalSession` layer (`session.INSTRUCTION_PREAMBLE` in trajrl-bench), not inside the harness, so adding a new framework — Claude Code, OpenClaw, custom — only needs the one-line prompt above. The contract is uniform across testees. The judge sees the bare task (no preamble) — the bootstrap is a sandbox-side file detail, not part of what's being graded.
 
 ### Judge Prompt
 
@@ -346,12 +358,13 @@ Quality dominates, but learning meaningfully contributes. A maximal delta of 1.0
 5. Start sandbox container on eval_net:
    - SSH daemon running, mock services on :8090
    - SKILL.md placed at /workspace/SKILL.md (root:agent 440)
+   - ENVIRONMENT.md placed at /workspace/ENVIRONMENT.md (scenario-static, harness-provided)
    - /workspace/learned/ created (agent-writable)
 6. For episode i = 1..4 (same scenario, different fixtures each rep):
    a. Reset mock service data, load fixtures[i]
-   b. Write /workspace/INSTRUCTION.md with task for this episode
+   b. Write /workspace/INSTRUCTION.md (bootstrap preamble + task for this episode)
    c. Spawn testee container with SSH key + eval_net connection
-   d. Testee SSHes into sandbox, reads SKILL.md + INSTRUCTION.md, does task
+   d. Testee SSHes into sandbox, reads INSTRUCTION.md → ENVIRONMENT.md + SKILL.md → does task
    e. Testee exits (or times out at 3 min) → capture transcript
    f. Spawn judge container with SSH key + eval_net connection
    g. Judge SSHes in, reads JUDGE.md + JUDGE_TASK.md, inspects state
