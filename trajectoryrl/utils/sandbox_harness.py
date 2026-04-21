@@ -681,7 +681,7 @@ class TrajectorySandboxHarness:
                 command=["chat", "-q", harness_prompt,
                          "-m", self._llm_model,
                          "-t", "terminal,file,code_execution,memory",
-                         "--quiet", "--yolo", "--max-turns", "30"],
+                         "--quiet", "--yolo", "--max-turns", "15"],
                 name=harness_name,
                 environment={
                     "HERMES_BUNDLED_SKILLS": "/nonexistent",
