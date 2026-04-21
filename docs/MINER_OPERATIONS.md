@@ -216,9 +216,37 @@ Results are saved to `results/`. See the [trajrl-bench README](https://github.co
 
 ---
 
+## Viewing Evaluation Results
+
+After each evaluation epoch (~24h), validators upload per-miner eval logs to the dashboard. Each log is a tar.gz containing:
+
+```
+SKILL.md                                 # miner's product
+JUDGE.md                                 # scoring rubric used
+metadata.json                            # final_score, mean_quality, delta, episode qualities
+world.json                               # company context + validator salt
+episodes/episode_N/
+  testee_transcript.txt                  # testee's session output
+  judge_transcript.txt                   # judge agent's grading session
+  evaluation.json                        # per-criterion scores + summary + strengths/weaknesses
+  episode.json                           # fixtures + instruction
+```
+
+Retrieve your eval logs via `trajrl subnet logs` (see [trajrl CLI docs](https://pypi.org/project/trajrl/)):
+
+```bash
+trajrl subnet logs --miner <hotkey> --limit 5     # list recent evals
+trajrl subnet logs --eval-id <id> --show          # pretty-print summary
+trajrl subnet logs --eval-id <id> --dump-to ./    # extract full archive
+```
+
+Use the testee transcript + judge feedback together to debug failure modes and iterate on your SKILL.md.
+
+---
+
 ## References
 
 - **Season 1 Guide**: [MINER_GUIDE.md](MINER_GUIDE.md) — scoring, sandbox, SKILL.md writing, anti-gaming rules
 - **Incentive Mechanism**: [INCENTIVE_MECHANISM.md](INCENTIVE_MECHANISM.md) — consensus protocol, winner selection
-- **Scoring & Evaluation**: [SCORING_AND_EVALUATION.md](SCORING_AND_EVALUATION.md) — pack schema, scoring formula
+- **Scoring & Evaluation**: [EVALUATION_S1.md](EVALUATION_S1.md) — pack schema, scoring formula
 - **Benchmark**: [trajrl-bench](https://github.com/trajectoryRL/trajrl-bench) — scenarios, JUDGE.md, local testing

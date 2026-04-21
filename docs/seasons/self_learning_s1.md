@@ -11,6 +11,23 @@
 
 ---
 
+## Document Positioning
+
+This is the **Season 1 Design Document** — the comprehensive architectural reference for TrajectoryRL's first competition season. It explains the "why and how" behind the evaluation system: design principles, three-container architecture, mock strategy, scoring algorithm, episode sequence design, scenario details, known risks, and prior art analysis.
+
+**Related documents (derived views for specific audiences):**
+
+| Document | Audience | Content |
+|----------|----------|---------|
+| [EVALUATION_S1.md](../EVALUATION_S1.md) | Developers / validators | Concise spec: pack schema, scoring method, rejection flow |
+| [MINER_GUIDE.md](../MINER_GUIDE.md) | Miners | SKILL.md writing guide, sandbox reference, anti-gaming rules |
+| [MINER_OPERATIONS.md](../MINER_OPERATIONS.md) | Miners | CLI toolbox reference (build/validate/upload/submit/status) |
+| [INCENTIVE_MECHANISM.md](../INCENTIVE_MECHANISM.md) | All | Season-agnostic core: consensus protocol, WTA, winner protection |
+
+This document is the canonical source for S1 architecture decisions. When other docs summarize S1 mechanics, they reference back here for the full rationale.
+
+---
+
 ## Design Principles
 
 The evaluation produces a single signal: **quality per episode, judged by an agent that explores the sandbox and grades the work.**
@@ -127,18 +144,7 @@ Per episode: start testee, wait for it to solve+exit, start judge, wait for it t
 
 ## SKILL.md: Agent-Agnostic Pack Format
 
-Miners submit a `pack.json` (OPP v1). The `files` dict describes a folder; `SKILL.md` is the entry point. One pack participates in one contest.
-
-```json
-{
-  "schema_version": 1,
-  "files": {
-    "SKILL.md": "# Entry point..."
-  }
-}
-```
-
-Season 1 requires `SKILL.md` only. Future packs may include additional files that SKILL.md references (playbooks, examples, data). The on-chain commitment format is unchanged: `{pack_hash}|{pack_url}`.
+Miners submit a `pack.json` containing their SKILL.md. For pack schema, validation rules, and size limits, see [EVALUATION_S1.md](../EVALUATION_S1.md#pack-schema). For SKILL.md writing guidance and tips, see [MINER_GUIDE.md](../MINER_GUIDE.md#writing-skillmd).
 
 **SKILL.md** is a plain markdown document. The sandbox places it at `/workspace/SKILL.md` as root-owned mode 440 (agent can read, cannot modify). The testee agent, regardless of framework, reads it.
 
@@ -286,6 +292,8 @@ More validators = more samples = better estimate. Same principle as the v4.0 cro
 ---
 
 ## Scoring
+
+For a concise spec view of the scoring method, see [EVALUATION_S1.md](../EVALUATION_S1.md#scoring-agent-judge).
 
 ### Step 1: Per-Episode Judge Agent
 
@@ -452,42 +460,13 @@ Split-half delta: `mean(q3, q4) - mean(q1, q2) = 0.70 - 0.50 = 0.20`. Final scor
 
 ### Eval Log Persistence
 
-After each per-miner eval, the validator writes a tar.gz containing every artifact and uploads it to the dashboard (`POST /api/validators/logs/upload`, signed by validator hotkey). The backend stores it on GCS and exposes it via `GET /api/eval-logs`.
+After each per-miner eval, the validator writes a tar.gz archive of all artifacts (SKILL.md, JUDGE.md, transcripts, evaluation.json, fixtures) and uploads it to the dashboard. This is the audit trail — miners can see exactly how they were scored, and the community can verify validators are not cheating.
 
-```
-SKILL.md                                 # miner's product
-JUDGE.md                                 # scoring rubric used
-metadata.json                            # final_score, mean_quality, delta, episode qualities
-world.json                               # company context + validator salt
-episodes/episode_N/
-  testee_transcript.txt                  # testee's session output
-  judge_transcript.txt                   # judge agent's grading session
-  evaluation.json                        # per-criterion scores + summary + strengths/weaknesses
-  episode.json                           # fixtures + instruction
-```
+For archive structure and retrieval commands, see [MINER_OPERATIONS.md § Viewing Evaluation Results](../MINER_OPERATIONS.md#viewing-evaluation-results).
 
-Anyone can retrieve and inspect any eval:
+### Score → Weights
 
-```bash
-pip install --upgrade trajrl  # v0.3.2+
-trajrl subnet logs --eval-id <id> --show          # pretty-print summary + per-criterion table
-trajrl subnet logs --eval-id <id> --dump-to ./   # extract full archive locally
-trajrl subnet logs --miner <hotkey> --limit 20   # list recent miner evals
-```
-
-This is the audit trail — miners can see exactly how they were scored, the community can verify validators are not cheating, and SKILL.md authors can debug failure modes by reading the testee transcript and judge feedback together.
-
-### Score → Weights (implemented)
-
-The full pipeline is quality-based end-to-end:
-
-```
-scenario_scores[hotkey][scenario] → consensus_scores[hotkey] → select_winner_with_protection()
-```
-
-- `compute_consensus_scores()` computes stake-weighted average of quality scores across validators
-- `select_winner_with_protection()` uses `challenger_score > winner_score × (1 + δ)` — higher score wins
-- `WinnerState` stores `winner_score` (not cost)
+Season 1 is quality-based end-to-end: `final_score` (from split-half delta) feeds into the consensus protocol as a higher-is-better score. The consensus pipeline (stake-weighted aggregation, winner protection with δ=10%, WTA weight setting) is defined in [INCENTIVE_MECHANISM.md](../INCENTIVE_MECHANISM.md#winner-take-all-with-winner-protection).
 
 Per-episode scores are also uploaded with the eval log archive and queryable via `/api/eval-logs`.
 
@@ -508,11 +487,13 @@ A successful gaming strategy would need to defeat all four simultaneously.
 
 **What miners must actually build:** A SKILL.md that teaches the agent to reflect after each task, identify effective patterns, store them compactly, and retrieve them in new contexts. This is an agent engineering problem, not a benchmark optimization problem.
 
+For detailed miner-facing anti-gaming rules (what to avoid, self-check checklist), see [MINER_GUIDE.md § Pre-Eval Compliance](../MINER_GUIDE.md#pre-eval-compliance-anti-gaming).
+
 ---
 
 ## Incentive Mechanism: Season 1 Bindings
 
-Season 1 implements [INCENTIVE_MECHANISM.md](../INCENTIVE_MECHANISM.md) v5.0 with the following season-specific bindings. All structural machinery (WTA, consensus, NCD, winner protection) is inherited from the core protocol. Scoring details are in [SCORING_AND_EVALUATION.md](../SCORING_AND_EVALUATION.md).
+Season 1 implements [INCENTIVE_MECHANISM.md](../INCENTIVE_MECHANISM.md) v5.0 with the following season-specific bindings. All structural machinery (WTA, consensus, NCD, winner protection) is inherited from the core protocol. Scoring details are in [EVALUATION_S1.md](../EVALUATION_S1.md).
 
 | Component | Season 1 |
 |-----------|----------|
@@ -692,20 +673,7 @@ Additional scenario types (Season 2+):
 
 The subnet can run multiple contests concurrently. Each contest is an independent eval with its own set of scenarios. **One pack = one contest.** A miner competing in multiple contests submits separate packs (separate commitments) for each.
 
-**Pack as a folder.** The `files` dict describes a flat folder. `SKILL.md` is the entry point; future skill packs may include additional files (data, examples, reference docs) that SKILL.md references. The validator always reads `SKILL.md` as the root.
-
-```json
-{
-  "schema_version": 1,
-  "files": {
-    "SKILL.md": "# Entry point — references other files...",
-    "playbook.md": "# Detailed runbook for incident handling...",
-    "examples/triage.md": "# Example triage output..."
-  }
-}
-```
-
-Season 1 requires only `SKILL.md`. Additional files are reserved for future use.
+Future skill packs may include additional files (data, examples, reference docs) that SKILL.md references. The validator always reads `SKILL.md` as the root. Season 1 requires only `SKILL.md`; additional files are reserved for future use. See [EVALUATION_S1.md](../EVALUATION_S1.md#pack-schema) for the current pack schema.
 
 **Scoring:** Each contest produces an independent `final_score`. Weight allocation across contests is governance-configured.
 

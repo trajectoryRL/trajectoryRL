@@ -8,11 +8,13 @@
 
 **Parent document**: [INCENTIVE_MECHANISM.md](INCENTIVE_MECHANISM.md) v5.0
 
+**Full design document**: [seasons/self_learning_s1.md](seasons/self_learning_s1.md) — architecture, mock strategy, episode design, scoring algorithm, scenarios, risk analysis
+
 ---
 
 ## Overview
 
-This document defines the **season-specific business logic** for TrajectoryRL evaluation: how packs are scored, what schema they must follow, what the evaluation benchmark looks like, and what measures prevent gaming at the scoring layer.
+This document is the **concise spec** for Season 1's evaluation business logic: how packs are scored, what schema they must follow, what the evaluation benchmark looks like, and what measures prevent gaming at the scoring layer. For the comprehensive design rationale, three-container architecture details, fixture factory, chained continuity design, and scenario descriptions, see the [Season 1 Design Document](seasons/self_learning_s1.md).
 
 The underlying consensus protocol, reward distribution, and winner-take-all mechanics are defined in [INCENTIVE_MECHANISM.md](INCENTIVE_MECHANISM.md) and remain stable across seasons. This document may change when the competition format evolves.
 

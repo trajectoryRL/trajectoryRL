@@ -22,7 +22,7 @@ The core loop:
 2. **Score competition**: Among qualified miners, the one with the best score wins
 3. **Consensus**: Validators independently evaluate, share results via off-chain protocol, and compute stake-weighted consensus before setting on-chain weights
 
-For the current season's scoring method, pack schema, and evaluation specifics, see [SCORING_AND_EVALUATION.md](SCORING_AND_EVALUATION.md).
+For the current season's scoring method, pack schema, and evaluation specifics, see [EVALUATION_S1.md](EVALUATION_S1.md).
 
 ---
 
@@ -331,7 +331,7 @@ Controlled by `TRAJECTORYRL_PRE_EVAL_ENABLED` (default: enabled).
 
 ### 7. Season-Specific Measures
 
-Each season defines additional anti-gaming measures specific to its evaluation method. See [SCORING_AND_EVALUATION.md](SCORING_AND_EVALUATION.md) for current-season measures (e.g., pack integrity analysis, grounding requirements, judge isolation).
+Each season defines additional anti-gaming measures specific to its evaluation method. See [EVALUATION_S1.md](EVALUATION_S1.md) for current-season measures (e.g., pack integrity analysis, grounding requirements, judge isolation).
 
 ---
 
@@ -608,7 +608,7 @@ Bootstrap:     top-3 qualified get 70/20/10
 
 | Version | Date | Summary |
 |---------|------|---------|
-| v5.0 | 2026-04-21 | Refactored into season-agnostic core. Extracted scoring, pack schema, and evaluation details to SCORING_AND_EVALUATION.md. Abstracted "cost" to "score" (direction defined per season). |
+| v5.0 | 2026-04-21 | Refactored into season-agnostic core. Extracted scoring, pack schema, and evaluation details to EVALUATION_S1.md. Abstracted "cost" to "score" (direction defined per season). |
 | v4.2 | 2026-03-29 | Simplified winner selection: removed EMA, unified Winner Protection (δ=10%), stake-weighted majority qualification. |
 | v4.1 | 2026-03-15 | Added two-phase off-chain consensus protocol (CAS + pointer registration). |
 | v4.0 | 2026-03-01 | Replaced regex-based scoring with LLM-as-judge. |
@@ -621,7 +621,7 @@ Bootstrap:     top-3 qualified get 70/20/10
 - **Dynamic TAO**: https://docs.bittensor.com/dtao
 - **Yuma Consensus 3**: https://docs.learnbittensor.org/learn/yc3-blog
 - **YC3 Migration Guide**: https://docs.learnbittensor.org/learn/yuma3-migration-guide
-- **Current Season Scoring**: [SCORING_AND_EVALUATION.md](SCORING_AND_EVALUATION.md) - pack schema, evaluation method, scoring details
+- **Current Season Scoring**: [EVALUATION_S1.md](EVALUATION_S1.md) - pack schema, evaluation method, scoring details
 - **Miner Guide**: [MINER_OPERATIONS.md](MINER_OPERATIONS.md) - reference miner, local testing, submission workflow
 - **Validator Guide**: [VALIDATOR_OPERATIONS.md](VALIDATOR_OPERATIONS.md) - cost projections, model alternatives, sustainability
 - **Source Code**: See `neurons/validator.py` and `trajectoryrl/` package
