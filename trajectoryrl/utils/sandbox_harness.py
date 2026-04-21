@@ -804,6 +804,7 @@ class TrajectorySandboxHarness:
 
         judge_instruction = self._build_judge_instruction(
             episode_index, ep_data, world_data, episode.transcript,
+            timed_out=episode.timed_out,
         )
 
         try:
@@ -961,11 +962,28 @@ You are evaluating an AI agent's performance on a workplace scenario.
     def _build_judge_instruction(
         self, episode_index: int, ep_data: dict,
         world_data: dict, transcript: str,
+        *, timed_out: bool = False,
     ) -> str:
         """Build JUDGE_TASK.md with all evidence for one episode."""
+        timeout_notice = ""
+        if timed_out:
+            timeout_notice = f"""
+## ⚠ Timeout Notice
+The agent was **terminated after exceeding the {self.config.sandbox_timeout_per_episode}s time limit**.
+It did NOT exit on its own. Any work shown in the transcript or sandbox state
+is partial — the agent may have intended to do more but ran out of time.
+
+Factor this into your scoring:
+- **efficiency** should be penalized: a well-designed agent should complete
+  its work within the allotted time.
+- **completeness** should reflect only what was actually accomplished, not
+  what might have been intended.
+- **judgment** should consider whether the agent prioritized the most
+  important actions given limited time.
+"""
         return f"""\
 # Episode {episode_index} — Evidence for Evaluation
-
+{timeout_notice}
 ## Company Context
 {json.dumps(world_data, indent=2)}
 
