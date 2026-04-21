@@ -1870,6 +1870,20 @@ class TrajectoryValidator:
             self._disqualified_miners[commitment.hotkey] = "s1_eval_error"
             return None
 
+        # Log per-episode transcript tails to miner detail log
+        for ep in result.session_result.episodes:
+            idx = ep.episode_index
+            if ep.transcript:
+                mlog.info(
+                    "Episode %d testee transcript tail (%d chars):\n%s",
+                    idx, len(ep.transcript), ep.transcript[-3000:],
+                )
+            if ep.judge_transcript:
+                mlog.info(
+                    "Episode %d judge transcript tail (%d chars):\n%s",
+                    idx, len(ep.judge_transcript), ep.judge_transcript[-3000:],
+                )
+
         # Map S1 result to validator pipeline format.
         # S1 uses a single "scenario" (incident_response) with quality scoring.
         scenario_name = result.scenario_name

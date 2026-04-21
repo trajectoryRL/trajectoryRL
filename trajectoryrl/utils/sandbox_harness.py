@@ -736,10 +736,9 @@ class TrajectorySandboxHarness:
                     pass
 
                 logger.info(
-                    "[%s] Episode %d testee transcript tail (%d chars):\n%s",
+                    "[%s] Episode %d testee transcript captured (%d chars)",
                     session_id, episode_index,
                     len(episode.transcript or ""),
-                    (episode.transcript or "")[-3000:],
                 )
 
             finally:
@@ -874,10 +873,9 @@ class TrajectorySandboxHarness:
                 pass
 
             logger.info(
-                "[%s] Episode %d judge transcript tail (%d chars):\n%s",
+                "[%s] Episode %d judge transcript captured (%d chars)",
                 session_id, episode_index,
                 len(episode.judge_transcript or ""),
-                (episode.judge_transcript or "")[-3000:],
             )
 
             # Read evaluation.json from the judge container via get_archive
