@@ -587,6 +587,15 @@ class TrajectorySandboxHarness:
             # Fetch JUDGE.md once per session (same for all 4 episodes)
             session_result.judge_skill = self._build_judge_skill(scenario)
 
+            # Fetch ENVIRONMENT.md once per session and inject into /workspace.
+            # Permissions mirror SKILL.md (root:agent 440): agent can read but
+            # cannot mutate it across episodes.
+            environment_md = self._fetch_environment_md(scenario)
+            if environment_md:
+                _put_file(sandbox, "/workspace/ENVIRONMENT.md", environment_md)
+                sandbox.exec_run(["chown", "root:agent", "/workspace/ENVIRONMENT.md"])
+                sandbox.exec_run(["chmod", "440", "/workspace/ENVIRONMENT.md"])
+
             # Run each episode
             for i, ep_data in enumerate(episodes_data):
                 episode = self._run_episode(
@@ -929,6 +938,26 @@ class TrajectorySandboxHarness:
             logger.warning("Failed to fetch JUDGE.md for %s: %s (using fallback)",
                            scenario, e)
         return self._fallback_judge_skill(scenario)
+
+    def _fetch_environment_md(self, scenario: str) -> str:
+        """Fetch ENVIRONMENT.md for a scenario from the sandbox image.
+
+        ENVIRONMENT.md describes the immutable environment contract (paths,
+        services, conventions) that the agent can rely on across episodes.
+        Returns empty string on failure so the caller can skip injection.
+        """
+        try:
+            output = self.client.containers.run(
+                self._sandbox_image, entrypoint="",
+                command=["python", "-m", "trajrl_bench.cli", "environment",
+                         "--scenario", scenario],
+                remove=True, stdout=True, stderr=True,
+            )
+            return output.decode().strip()
+        except Exception as e:
+            logger.warning("Failed to fetch ENVIRONMENT.md for %s: %s",
+                           scenario, e)
+            return ""
 
     def _fallback_judge_skill(self, scenario: str) -> str:
         """Generic fallback JUDGE.md if the sandbox image doesn't have one."""
