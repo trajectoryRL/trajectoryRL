@@ -6,6 +6,7 @@ without requiring Docker or real LLM API calls.
 
 import pytest
 from dataclasses import dataclass, field
+from unittest.mock import MagicMock
 
 from trajectoryrl.utils.config import ValidatorConfig
 from trajectoryrl.utils.sandbox_harness import (
@@ -13,6 +14,7 @@ from trajectoryrl.utils.sandbox_harness import (
     SandboxEvaluationResult,
     _SessionResult,
     _EpisodeResult,
+    _EMPTY_TRANSCRIPT_THRESHOLD,
 )
 
 
@@ -125,10 +127,81 @@ class TestConfigWiring:
         assert hasattr(ValidatorConfig, "harness_image")
         assert hasattr(ValidatorConfig, "sandbox_timeout_per_episode")
         assert hasattr(ValidatorConfig, "sandbox_num_episodes")
+        assert hasattr(ValidatorConfig, "sandbox_idle_timeout")
 
     def test_season1_defaults(self):
         assert ValidatorConfig.sandbox_num_episodes == 4
         assert ValidatorConfig.sandbox_timeout_per_episode == 180
+        assert ValidatorConfig.sandbox_idle_timeout == 45
+
+
+# ---------------------------------------------------------------------------
+# Tests: Empty-transcript judge skip
+# ---------------------------------------------------------------------------
+
+class TestEmptyTranscriptThreshold:
+    def test_threshold_is_reasonable(self):
+        # Hermes startup boilerplate is ~130 chars; a working agent
+        # always produces multi-kB transcripts. The threshold sits
+        # between those two regimes.
+        assert 130 < _EMPTY_TRANSCRIPT_THRESHOLD < 1000
+
+
+# ---------------------------------------------------------------------------
+# Tests: Orphan container cleanup
+# ---------------------------------------------------------------------------
+
+class TestOrphanCleanup:
+    def _make_harness(self, tmp_path) -> TrajectorySandboxHarness:
+        cfg = ValidatorConfig(
+            pack_cache_dir=tmp_path / "packs",
+            log_dir=tmp_path / "logs",
+            eval_state_path=tmp_path / "eval_state.json",
+            winner_state_path=tmp_path / "winner_state.json",
+        )
+        h = TrajectorySandboxHarness(cfg)
+        h._docker_client = MagicMock()
+        return h
+
+    def test_cleanup_removes_labeled_containers_and_networks(self, tmp_path):
+        h = self._make_harness(tmp_path)
+        c1 = MagicMock(); c1.name = "sandbox_abc"
+        c2 = MagicMock(); c2.name = "testee_abc_ep0"
+        n1 = MagicMock(); n1.name = "eval_abc"
+        h.client.containers.list.return_value = [c1, c2]
+        h.client.networks.list.return_value = [n1]
+
+        h._cleanup_orphan_containers()
+
+        h.client.containers.list.assert_called_once_with(
+            all=True, filters={"label": "trajectoryrl.role"},
+        )
+        h.client.networks.list.assert_called_once_with(
+            filters={"label": "trajectoryrl.role"},
+        )
+        c1.remove.assert_called_once_with(force=True)
+        c2.remove.assert_called_once_with(force=True)
+        n1.remove.assert_called_once_with()
+
+    def test_cleanup_swallows_per_item_failures(self, tmp_path):
+        h = self._make_harness(tmp_path)
+        bad = MagicMock(); bad.name = "bad"; bad.remove.side_effect = RuntimeError("nope")
+        good = MagicMock(); good.name = "good"
+        h.client.containers.list.return_value = [bad, good]
+        h.client.networks.list.return_value = []
+
+        # Must not raise even when one container removal fails.
+        h._cleanup_orphan_containers()
+
+        good.remove.assert_called_once_with(force=True)
+
+    def test_cleanup_swallows_list_failure(self, tmp_path):
+        h = self._make_harness(tmp_path)
+        h.client.containers.list.side_effect = RuntimeError("docker down")
+        h.client.networks.list.side_effect = RuntimeError("docker down")
+
+        # Must not raise even if Docker is entirely unreachable.
+        h._cleanup_orphan_containers()
 
 
 # ---------------------------------------------------------------------------

@@ -117,6 +117,10 @@ class ValidatorConfig:
     harness_image: str = "ghcr.io/trajectoryrl/hermes-agent:latest"
     sandbox_timeout_per_episode: int = 180  # 3 min per episode
     sandbox_num_episodes: int = 4
+    # Kill testee early if no transcript growth for this many seconds.
+    # An idle Hermes agent (only initialization output) wastes the full
+    # per-episode timeout otherwise; capped at sandbox_timeout_per_episode.
+    sandbox_idle_timeout: int = 45
 
     # Evaluation state persistence
     eval_state_path: Path = field(
@@ -197,6 +201,7 @@ class ValidatorConfig:
             harness_image=os.getenv("HARNESS_IMAGE", "ghcr.io/trajectoryrl/hermes-agent:latest"),
             sandbox_timeout_per_episode=int(os.getenv("SANDBOX_TIMEOUT_PER_EPISODE", "180")),
             sandbox_num_episodes=int(os.getenv("SANDBOX_NUM_EPISODES", "4")),
+            sandbox_idle_timeout=int(os.getenv("SANDBOX_IDLE_TIMEOUT", "45")),
             # --- Startup aggregation ---
             aggregate_when_start=os.getenv("AGGREGATE_WHEN_START", "1") == "1",
             full_cycle_on_startup=os.getenv("FULL_CYCLE_ON_STARTUP", "0") == "1",
