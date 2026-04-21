@@ -281,6 +281,15 @@ def _generate_keypair() -> tuple[str, str]:
 # the container must be owned by (or readable by) this uid.
 _HERMES_UID = 10000
 
+# Transcripts shorter than this are considered "agent never woke up"
+# (only Hermes startup boilerplate, no LLM calls were made). Skipping
+# the judge for these episodes saves 1-3 minutes each — a real working
+# agent always produces multi-kB transcripts.
+_EMPTY_TRANSCRIPT_THRESHOLD = 200
+
+# Polling cadence for the testee idle-timeout watchdog.
+_TESTEE_POLL_INTERVAL = 5.0
+
 # Pre-entrypoint wrapper for Hermes containers: executed as root before
 # the image's own entrypoint gosu-drops to the hermes user. Chowns
 # /workspace so the judge can write /workspace/evaluation.json (Docker
@@ -402,7 +411,62 @@ class TrajectorySandboxHarness:
         except Exception as e:
             logger.warning("Failed to pull latest images: %s (using cached)", e)
 
+    def _cleanup_orphan_containers(self) -> None:
+        """Remove leftover sandbox/testee/judge containers and networks.
+
+        When the validator process is killed (OOM, docker stop, host
+        reboot), the per-eval `finally` blocks never run, so containers
+        and networks tagged with `trajectoryrl.role` keep running
+        forever. This routine reaps any such orphans before the next
+        eval cycle. Best-effort: failures are logged but never raise.
+        """
+        try:
+            orphans = self.client.containers.list(
+                all=True, filters={"label": "trajectoryrl.role"},
+            )
+        except Exception as e:
+            logger.warning("Orphan cleanup: failed to list containers: %s", e)
+            orphans = []
+
+        removed = 0
+        for c in orphans:
+            try:
+                c.remove(force=True)
+                removed += 1
+            except Exception as e:
+                logger.warning(
+                    "Orphan cleanup: failed to remove container %s: %s",
+                    getattr(c, "name", "?"), e,
+                )
+
+        try:
+            stale_nets = self.client.networks.list(
+                filters={"label": "trajectoryrl.role"},
+            )
+        except Exception as e:
+            logger.warning("Orphan cleanup: failed to list networks: %s", e)
+            stale_nets = []
+
+        nets_removed = 0
+        for n in stale_nets:
+            try:
+                n.remove()
+                nets_removed += 1
+            except Exception as e:
+                logger.warning(
+                    "Orphan cleanup: failed to remove network %s: %s",
+                    getattr(n, "name", "?"), e,
+                )
+
+        if removed or nets_removed:
+            logger.info(
+                "Orphan cleanup: removed %d container(s), %d network(s)",
+                removed, nets_removed,
+            )
+
     def _pull_sync(self) -> None:
+        self._cleanup_orphan_containers()
+
         for image in [self._sandbox_image, self._harness_image]:
             try:
                 logger.info("Pulling latest image: %s", image)
@@ -713,34 +777,7 @@ class TrajectorySandboxHarness:
             harness.start()
 
             try:
-                # Wait for harness to complete
-                timeout = self.config.sandbox_timeout_per_episode
-                try:
-                    result = harness.wait(timeout=timeout)
-                    exit_code = result.get("StatusCode", -1)
-                except Exception:
-                    logger.warning("[%s] Episode %d timed out after %ds",
-                                   session_id, episode_index, timeout)
-                    try:
-                        harness.kill()
-                    except Exception:
-                        pass
-                    episode.timed_out = True
-
-                # Capture transcript
-                try:
-                    episode.transcript = harness.logs(
-                        stdout=True, stderr=False
-                    ).decode(errors="replace")
-                except Exception:
-                    pass
-
-                logger.info(
-                    "[%s] Episode %d testee transcript captured (%d chars)",
-                    session_id, episode_index,
-                    len(episode.transcript or ""),
-                )
-
+                self._wait_for_testee(harness, episode, session_id, episode_index)
             finally:
                 try:
                     harness.stop(timeout=3)
@@ -758,20 +795,39 @@ class TrajectorySandboxHarness:
                     pass
 
             # -----------------------------------------------------------
-            # Score via agent judge (explores sandbox state via SSH + HTTP)
+            # Score via agent judge (explores sandbox state via SSH + HTTP).
+            # Skip when the testee produced effectively no output — the
+            # judge would just confirm zero work done after burning more
+            # minutes of LLM time.
             # -----------------------------------------------------------
-            self._score_episode_agent(
-                session_id=session_id,
-                episode_index=episode_index,
-                episode=episode,
-                ep_data=ep_data,
-                world_data=world_data,
-                scenario=scenario,
-                sandbox=sandbox,
-                network=network,
-                private_key=private_key,
-                judge_skill=judge_skill,
-            )
+            transcript_len = len(episode.transcript or "")
+            if transcript_len < _EMPTY_TRANSCRIPT_THRESHOLD:
+                logger.info(
+                    "[%s] Episode %d: empty testee transcript (%d chars), "
+                    "skipping judge (quality=0.0)",
+                    session_id, episode_index, transcript_len,
+                )
+                episode.quality = 0.0
+                episode.judge_result = {
+                    "quality": 0.0,
+                    "summary": (
+                        "Testee produced no meaningful transcript "
+                        f"({transcript_len} chars); judge skipped."
+                    ),
+                }
+            else:
+                self._score_episode_agent(
+                    session_id=session_id,
+                    episode_index=episode_index,
+                    episode=episode,
+                    ep_data=ep_data,
+                    world_data=world_data,
+                    scenario=scenario,
+                    sandbox=sandbox,
+                    network=network,
+                    private_key=private_key,
+                    judge_skill=judge_skill,
+                )
 
             logger.info("[%s] Episode %d quality=%.3f",
                         session_id, episode_index, episode.quality)
@@ -783,6 +839,91 @@ class TrajectorySandboxHarness:
 
         episode.duration_s = time.time() - t0
         return episode
+
+    def _wait_for_testee(
+        self, harness: Container, episode: _EpisodeResult,
+        session_id: str, episode_index: int,
+    ) -> None:
+        """Wait for the testee container with an idle-output watchdog.
+
+        A real working agent emits transcript output continuously
+        (LLM responses, tool calls, intermediate text). An agent that
+        only printed Hermes startup boilerplate ("Dropping root
+        privileges", "Syncing bundled skills") and then went silent
+        is never going to do anything — kill it early instead of
+        burning the full per-episode budget.
+
+        The watchdog kills the container if container logs do not
+        grow for ``sandbox_idle_timeout`` seconds, capped by the
+        absolute ``sandbox_timeout_per_episode``. Either way the
+        captured transcript is whatever the container emitted.
+        """
+        max_total = float(self.config.sandbox_timeout_per_episode)
+        idle_limit = float(
+            min(self.config.sandbox_idle_timeout, max_total)
+        )
+
+        start_ts = time.time()
+        last_progress_ts = start_ts
+        last_size = 0
+        timed_out_reason: str | None = None
+
+        while True:
+            try:
+                wait_for = min(_TESTEE_POLL_INTERVAL, idle_limit)
+                result = harness.wait(timeout=wait_for)
+                # Container exited within the polling slice.
+                _ = result.get("StatusCode", -1)
+                break
+            except Exception:
+                pass  # poll timeout — still running, continue watchdog
+
+            now = time.time()
+
+            try:
+                current_logs = harness.logs(stdout=True, stderr=False)
+                current_size = len(current_logs or b"")
+            except Exception:
+                current_size = last_size
+
+            if current_size > last_size:
+                last_size = current_size
+                last_progress_ts = now
+
+            if now - last_progress_ts >= idle_limit:
+                timed_out_reason = (
+                    f"idle (no transcript growth for {idle_limit:.0f}s)"
+                )
+                break
+
+            if now - start_ts >= max_total:
+                timed_out_reason = f"hard timeout after {max_total:.0f}s"
+                break
+
+        if timed_out_reason is not None:
+            logger.warning(
+                "[%s] Episode %d killed: %s",
+                session_id, episode_index, timed_out_reason,
+            )
+            try:
+                harness.kill()
+            except Exception:
+                pass
+            episode.timed_out = True
+
+        try:
+            episode.transcript = harness.logs(
+                stdout=True, stderr=False
+            ).decode(errors="replace")
+        except Exception:
+            pass
+
+        logger.info(
+            "[%s] Episode %d testee transcript captured (%d chars, %.1fs)",
+            session_id, episode_index,
+            len(episode.transcript or ""),
+            time.time() - start_ts,
+        )
 
     def _score_episode_agent(
         self, session_id: str, episode_index: int,
