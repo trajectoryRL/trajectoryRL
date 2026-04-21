@@ -1,18 +1,10 @@
 """TrajectoryRL Miner — Pack building and on-chain submission.
 
-Miners don't run a server. The workflow is:
-
-Season 1 (SKILL.md):
+Season 1 workflow:
     1. Write SKILL.md
-    2. Build pack.json: {"schema_version": 1, "files": {"SKILL.md": "..."}}
+    2. Build pack: build_s1_pack(skill_content) -> {"schema_version": 1, "files": {"SKILL.md": "..."}}
     3. Upload pack.json to a public HTTP endpoint
-    4. Submit on-chain commitment via set_commitment
-
-v4.0 (OPP JSON — legacy):
-    1. Write AGENTS.md (policy document)
-    2. Build a pack.json (OPP v1 format with AGENTS.md, tool_policy, metadata)
-    3. Upload pack.json to a public HTTP endpoint
-    4. Submit on-chain commitment via set_commitment
+    4. Submit on-chain commitment via submit_commitment(pack_hash, pack_url)
 
 The on-chain commitment is block-timestamped, establishing first-mover
 precedence. Validators read commitments and fetch packs via HTTP.
@@ -23,34 +15,28 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import bittensor as bt
 
-from ..utils.opp_schema import validate_opp_schema
 from ..utils.commitments import parse_commitment
 
 logger = logging.getLogger(__name__)
 
 MAX_COMMITMENT_BYTES = 128
+MAX_PACK_SIZE = 32768
 
 
 class TrajectoryMiner:
     """TrajectoryRL miner for building and submitting policy packs.
 
-    Example (S1 — submit SKILL.md pack)::
+    Example::
 
         miner = TrajectoryMiner(wallet_name="miner", wallet_hotkey="default")
-        pack = {"schema_version": 1, "files": {"SKILL.md": open("SKILL.md").read()}}
-        pack_hash = TrajectoryMiner.compute_pack_hash(pack)
-        TrajectoryMiner.save_pack(pack, "pack.json")
+        pack = TrajectoryMiner.build_s1_pack(open("SKILL.md").read())
+        pack_hash = TrajectoryMiner.save_pack(pack, "pack.json")
+        # Upload pack.json to a public URL, then:
         miner.submit_commitment(pack_hash, "https://example.com/pack.json")
-
-    Example (v4.0 — submit OPP pack)::
-
-        miner = TrajectoryMiner(wallet_name="miner", wallet_hotkey="default")
-        pack = miner.build_pack(agents_md="path/to/AGENTS.md")
-        miner.submit(pack, pack_url="https://trajrl.com/samples/pack.json")
     """
 
     def __init__(
@@ -65,7 +51,6 @@ class TrajectoryMiner:
         self.netuid = netuid if netuid is not None else int(os.environ.get("NETUID", "11"))
         self.network = network or os.environ.get("NETWORK", "finney")
 
-        # Lazy-init Bittensor (only needed for on-chain operations)
         self._wallet: Optional[bt.Wallet] = None
         self._subtensor: Optional[bt.Subtensor] = None
 
@@ -93,97 +78,72 @@ class TrajectoryMiner:
             self._subtensor = None
 
     # ------------------------------------------------------------------
-    # Pack building
+    # Pack building (Season 1)
     # ------------------------------------------------------------------
 
     @staticmethod
-    def build_pack(
-        agents_md: str,
-        pack_name: str = "my-pack",
-        pack_version: str = "1.0.0",
-        soul_md: Optional[str] = None,
-        extra_files: Optional[Dict[str, str]] = None,
-        tool_allow: Optional[list] = None,
-        tool_deny: Optional[list] = None,
-        stop_rules: Optional[list] = None,
-    ) -> dict:
-        """Build an OPP v1 pack from an AGENTS.md string or file path.
+    def build_s1_pack(skill_md: str) -> dict:
+        """Build a Season 1 pack from SKILL.md content.
 
         Args:
-            agents_md: AGENTS.md content string, or path to a file.
-            pack_name: Pack name for metadata.
-            pack_version: Semver string (e.g., "1.0.0").
-            soul_md: Optional SOUL.md content or file path.
-            extra_files: Optional dict of filename -> content to include.
-            tool_allow: Tools to allow (default: exec, slack, memory_search,
-                memory_get, read).
-            tool_deny: Tools to deny (default: admin_*, shell).
-            stop_rules: Optional stop rules list.
+            skill_md: SKILL.md content string.
 
         Returns:
-            OPP v1 pack dict, ready for JSON serialization.
+            Pack dict: {"schema_version": 1, "files": {"SKILL.md": content}}
         """
-        agents_content = _read_or_use(agents_md)
-        soul_content = _read_or_use(soul_md) if soul_md else None
-
-        files = {"AGENTS.md": agents_content}
-        if soul_content:
-            files["SOUL.md"] = soul_content
-        if extra_files:
-            files.update(extra_files)
-
-        if tool_allow is None:
-            tool_allow = ["exec", "slack", "memory_search", "memory_get", "read"]
-        if tool_deny is None:
-            tool_deny = ["admin_*", "shell"]
-
-        pack = {
+        return {
             "schema_version": 1,
-            "files": files,
-            "tool_policy": {
-                "allow": tool_allow,
-                "deny": tool_deny,
-            },
-            "metadata": {
-                "pack_name": pack_name,
-                "pack_version": pack_version,
-                "target_suite": "trajrl-bench",
+            "files": {
+                "SKILL.md": skill_md,
             },
         }
 
-        if stop_rules:
-            pack["stop_rules"] = stop_rules
+    @staticmethod
+    def validate_s1(pack: dict) -> List[str]:
+        """Validate a pack against Season 1 requirements.
 
-        return pack
+        Returns:
+            List of issues (empty list = valid).
+        """
+        issues = []
+
+        if pack.get("schema_version") != 1:
+            issues.append(f"schema_version must be 1, got {pack.get('schema_version')}")
+
+        files = pack.get("files")
+        if not isinstance(files, dict):
+            issues.append("missing or invalid 'files' dict")
+            return issues
+
+        if "SKILL.md" not in files:
+            issues.append("files must contain 'SKILL.md'")
+            return issues
+
+        skill = files["SKILL.md"]
+        if not isinstance(skill, str):
+            issues.append("files['SKILL.md'] must be a string")
+        elif not skill.strip():
+            issues.append("SKILL.md must not be empty")
+
+        size = len(json.dumps(pack, sort_keys=True))
+        if size > MAX_PACK_SIZE:
+            issues.append(f"pack size {size} bytes exceeds limit ({MAX_PACK_SIZE})")
+
+        return issues
+
+    # ------------------------------------------------------------------
+    # Pack I/O
+    # ------------------------------------------------------------------
 
     @staticmethod
     def load_pack(path: str) -> dict:
-        """Load a pack.json from disk.
-
-        Args:
-            path: Path to pack.json file.
-
-        Returns:
-            Parsed pack dict.
-
-        Raises:
-            FileNotFoundError: If path doesn't exist.
-            json.JSONDecodeError: If file is not valid JSON.
-        """
+        """Load a pack.json from disk."""
         with open(path) as f:
             return json.load(f)
 
     @staticmethod
     def save_pack(pack: dict, path: str) -> str:
-        """Save pack to disk and return its SHA256 hash.
-
-        Args:
-            pack: OPP v1 pack dict.
-            path: Output file path.
-
-        Returns:
-            SHA256 hex digest of the canonical JSON.
-        """
+        """Save pack to disk and return its SHA256 hash."""
         canonical = json.dumps(pack, sort_keys=True)
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
@@ -192,31 +152,13 @@ class TrajectoryMiner:
 
     @staticmethod
     def compute_pack_hash(pack: dict) -> str:
-        """Compute content-addressed SHA256 hash of a JSON pack (v4.0).
+        """Compute content-addressed SHA256 hash of a pack.
 
         Uses ``json.dumps(pack, sort_keys=True)`` for deterministic
         serialization, matching the validator's hash computation.
-
-        Args:
-            pack: OPP v1 pack dict.
-
-        Returns:
-            64-char lowercase hex SHA256 digest.
         """
         canonical = json.dumps(pack, sort_keys=True)
         return hashlib.sha256(canonical.encode()).hexdigest()
-
-    @staticmethod
-    def validate(pack: dict) -> "ValidationResult":
-        """Validate pack against OPP v1 schema locally.
-
-        Args:
-            pack: Pack dict to validate.
-
-        Returns:
-            ValidationResult with passed/issues.
-        """
-        return validate_opp_schema(pack)
 
     # ------------------------------------------------------------------
     # On-chain commitment
@@ -229,12 +171,8 @@ class TrajectoryMiner:
     ) -> str:
         """Format a commitment string for on-chain submission.
 
-        Args:
-            pack_hash: SHA256 hex of the canonical pack JSON (64 chars).
-            pack_url: HTTP(S) URL where pack.json is hosted.
-
         Returns:
-            Pipe-delimited commitment string (≤256 bytes).
+            Pipe-delimited commitment string (≤128 bytes).
 
         Raises:
             ValueError: If inputs are invalid.
@@ -264,10 +202,6 @@ class TrajectoryMiner:
     ) -> bool:
         """Submit on-chain commitment via set_commitment.
 
-        Args:
-            pack_hash: SHA256 hex of the canonical pack JSON.
-            pack_url: HTTP(S) URL where pack.json is publicly accessible.
-
         Returns:
             True if commitment was submitted successfully.
         """
@@ -290,12 +224,11 @@ class TrajectoryMiner:
                 block,
             )
 
-            # Verify the commitment actually landed on-chain
             stored = self.get_current_commitment()
             if stored is None:
                 logger.warning(
                     "Commitment not found on-chain after submission. "
-                    "It may take a few blocks to finalize, or the extrinsic may have failed silently."
+                    "It may take a few blocks to finalize."
                 )
                 return False
 
@@ -319,15 +252,11 @@ class TrajectoryMiner:
             return False
         except bt.ChainConnectionError as e:
             logger.error(
-                "Cannot connect to %s network. Check network connectivity "
-                "and that the chain endpoint is reachable: %s", self.network, e,
+                "Cannot connect to %s network: %s", self.network, e,
             )
             return False
         except bt.KeyFileError as e:
-            logger.error(
-                "Wallet key file error: %s. "
-                "Check wallet exists with: btcli wallet list", e,
-            )
+            logger.error("Wallet key file error: %s", e)
             return False
         except bt.ChainTransactionError as e:
             logger.error("Chain transaction failed: %s", e)
@@ -347,59 +276,11 @@ class TrajectoryMiner:
             commitments = self.subtensor.get_all_commitments(netuid=self.netuid)
             return commitments.get(hotkey)
         except bt.ChainConnectionError as e:
-            logger.error(
-                "Cannot connect to %s network. Check network connectivity "
-                "and that the chain endpoint is reachable: %s", self.network, e,
-            )
+            logger.error("Cannot connect to %s network: %s", self.network, e)
             return None
         except bt.KeyFileError as e:
-            logger.error(
-                "Wallet key file error: %s. "
-                "Check wallet exists with: btcli wallet list", e,
-            )
+            logger.error("Wallet key file error: %s", e)
             return None
         except Exception as e:
             logger.error("Failed to read commitment (%s): %s", type(e).__name__, e)
             return None
-
-    # ------------------------------------------------------------------
-    # Full submit workflow
-    # ------------------------------------------------------------------
-
-    def submit(
-        self,
-        pack: dict,
-        pack_url: str,
-    ) -> bool:
-        """Full submission workflow: validate + commit on-chain.
-
-        Args:
-            pack: OPP v1 pack dict.
-            pack_url: Public URL where pack.json is hosted.
-
-        Returns:
-            True if everything succeeded.
-        """
-        result = self.validate(pack)
-        if not result.passed:
-            logger.error(f"Pack validation failed: {result.issues}")
-            return False
-
-        pack_hash = self.compute_pack_hash(pack)
-        logger.info(f"Pack hash: {pack_hash}")
-        logger.info(f"Pack size: {len(json.dumps(pack))} bytes")
-
-        return self.submit_commitment(pack_hash, pack_url)
-
-
-def _read_or_use(value: str) -> str:
-    """If value is a file path that exists, read it. Otherwise use as-is."""
-    if len(value) > 4096:
-        return value
-    try:
-        p = Path(value)
-        if p.exists() and p.is_file():
-            return p.read_text()
-    except OSError:
-        pass
-    return value

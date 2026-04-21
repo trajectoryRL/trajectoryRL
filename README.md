@@ -142,7 +142,7 @@ cp .env.example .env      # add your LLM API key
 make test-hermes          # run one episode with real agent + real judge
 ```
 
-See [MINER_GUIDE_S1.md](MINER_GUIDE_S1.md) for the full guide: SKILL.md authoring, sandbox environment, scoring, and tips.
+See [MINER_GUIDE.md](docs/MINER_GUIDE.md) for the full guide: SKILL.md authoring, sandbox environment, scoring, and tips.
 
 ## trajrl — consume what the playground produces
 
@@ -161,8 +161,8 @@ Source, skill catalog, and full documentation: https://github.com/trajectoryRL/t
 
 ## Documentation
 
-- **[Miner Guide](MINER_GUIDE_S1.md)** — SKILL.md authoring, sandbox environment, scoring, and submission
-- **[Season 1 Spec](seasons/self_learning_s1.md)** — Design doc: sandbox architecture, scoring formula, scenarios
+- **[Miner Guide](docs/MINER_GUIDE.md)** — SKILL.md authoring, sandbox environment, scoring, and submission
+- **[Season 1 Spec](docs/seasons/self_learning_s1.md)** — Design doc: sandbox architecture, scoring formula, scenarios
 - **[TrajRL-Bench](https://github.com/trajectoryRL/trajrl-bench)** — Agent skills benchmark (sandbox + testee + judge agent, three-container Docker)
 - **[trajrl CLI](https://github.com/trajectoryRL/trajrl)** — Install and use skills produced by the subnet
 

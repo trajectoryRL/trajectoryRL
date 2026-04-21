@@ -18,15 +18,6 @@ fi
 
 echo "✓ Python $python_version"
 
-# Check for ClawBench
-if [ ! -d "./clawbench" ]; then
-    echo "⚠️  ClawBench not found in ./clawbench"
-    echo "   Clone it: git clone https://github.com/trajectoryRL/clawbench.git ./clawbench"
-    exit 1
-fi
-
-echo "✓ ClawBench found"
-
 # Create .env if missing
 if [ ! -f ".env" ]; then
     echo "Creating .env from template..."

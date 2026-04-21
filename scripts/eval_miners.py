@@ -4,7 +4,7 @@
 exec python -u scripts/eval_miners.py --miner-uid 225 "$@"
 
 Reads miner commitments from the chain, fetches & verifies packs,
-runs ClawBench evaluation on all scenarios, and prints results.
+runs trajrl-bench evaluation on all scenarios, and prints results.
 No side effects: no weight setting, no eval state persistence, no on-chain writes.
 
 Can be used as a Docker entrypoint (like neurons/validator.py) or standalone.
@@ -37,10 +37,9 @@ Environment variables (also read from .env.validator):
     WALLET_HOTKEY             Hotkey name                  (default: default)
     NETUID                    Subnet UID                   (default: 11)
     NETWORK                   Subtensor network            (default: finney)
-    CLAWBENCH_DEFAULT_MODEL   LLM model                   (default: zhipu/glm-5.1)
-    CLAWBENCH_LLM_API_KEY     API key
-    CLAWBENCH_LLM_BASE_URL    Base URL
-    CLAWBENCH_PATH            Path to clawbench directory
+    LLM_MODEL                 LLM model                   (default: zhipu/glm-5.1)
+    LLM_API_KEY               API key
+    LLM_BASE_URL              Base URL
 """
 
 import argparse
@@ -59,7 +58,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import yaml
 
-from trajectoryrl.utils.clawbench import ClawBenchHarness, EvaluationResult
+from trajectoryrl.utils.sandbox_harness import TrajectorySandboxHarness, SandboxEvaluationResult as EvaluationResult
 from trajectoryrl.utils.opp_schema import validate_opp_schema
 from trajectoryrl.utils.github import PackFetcher
 from trajectoryrl.utils.commitments import fetch_all_commitments
@@ -87,7 +86,7 @@ async def evaluate_single_miner(
     args,
     metagraph,
     commitments,
-    harness: ClawBenchHarness,
+    harness: TrajectorySandboxHarness,
     judge: TrajectoryJudge,
     scenarios_path: Path,
     epoch_seed: int,
@@ -304,32 +303,29 @@ async def run_evaluation(args):
     logger.info("Reading on-chain commitments...")
     commitments = fetch_all_commitments(subtensor, args.netuid, metagraph)
 
-    # --- 3. Prepare ClawBench harness ---
-    clawbench_path = Path(args.clawbench_path)
-    model = args.model or os.getenv("CLAWBENCH_DEFAULT_MODEL", "zhipu/glm-5.1")
-    api_key = args.api_key or os.getenv("CLAWBENCH_LLM_API_KEY", "")
+    # --- 3. Prepare evaluation harness ---
+    model = args.model or os.getenv("LLM_MODEL") or os.getenv("CLAWBENCH_DEFAULT_MODEL", "zhipu/glm-5.1")
+    api_key = args.api_key or os.getenv("LLM_API_KEY") or os.getenv("CLAWBENCH_LLM_API_KEY", "")
     base_url = args.base_url or os.getenv(
-        "CLAWBENCH_LLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4"
+        "LLM_BASE_URL") or os.getenv("CLAWBENCH_LLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4"
     )
 
     if not api_key:
-        logger.error("No LLM API key configured. Set CLAWBENCH_LLM_API_KEY or --api-key")
+        logger.error("No LLM API key configured. Set LLM_API_KEY or --api-key")
         return 1
 
-    logger.info(f"ClawBench path: {clawbench_path}")
     logger.info(f"Model: {model}")
     logger.info(f"Base URL: {base_url}")
     logger.info(f"Timeout: {args.timeout}s per scenario")
 
     workspace_path = Path(args.workspace_path) if args.workspace_path else None
 
-    harness = ClawBenchHarness(
-        clawbench_path=clawbench_path,
+    harness = TrajectorySandboxHarness(
         timeout=args.timeout,
         workspace_path=workspace_path,
-        clawbench_default_model=model,
-        clawbench_api_key=api_key,
-        clawbench_base_url=base_url,
+        llm_model=model,
+        llm_api_key=api_key,
+        llm_base_url=base_url,
     )
 
     judge = TrajectoryJudge(
@@ -337,7 +333,7 @@ async def run_evaluation(args):
         api_key=api_key,
         base_url=base_url,
     )
-    scenarios_path = clawbench_path / "scenarios"
+    scenarios_path = PROJECT_ROOT / "scenarios"
     logger.info("Judge: TrajectoryJudge enabled")
 
     # --- 4. Generate epoch context (same as validator) ---
@@ -474,12 +470,7 @@ def main():
     parser.add_argument("--base-url", type=str, default=None, help="Base URL for the LLM API")
 
     # Paths
-    parser.add_argument(
-        "--clawbench-path", type=str,
-        default=os.getenv("CLAWBENCH_PATH", str(PROJECT_ROOT / "clawbench")),
-        help="Path to clawbench directory",
-    )
-    parser.add_argument("--workspace-path", type=str, default=None, help="Workspace path for OpenClaw")
+    parser.add_argument("--workspace-path", type=str, default=None, help="Workspace path")
 
     # Output
     parser.add_argument("--output", "-o", type=str, default=None, help="Write full results to JSON file")

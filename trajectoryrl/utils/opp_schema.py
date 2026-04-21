@@ -1,9 +1,9 @@
-"""OpenClaw Policy Pack (OPP) v1 schema validation.
+"""Policy Pack (OPP) v1 schema validation.
 
 The OPP format is designed to be:
 - Portable: Copy files to workspace, apply tool_policy to config
 - Content-addressed: sha256(pack_json) uniquely identifies the artifact
-- OpenClaw-compatible: Maps 1:1 to AGENTS.md, SOUL.md, tool policy
+- Agent-runtime compatible: Maps 1:1 to AGENTS.md, SOUL.md, tool policy
 - Validator-friendly: Can be evaluated in sandbox without trusting miner
 """
 
@@ -106,7 +106,7 @@ def _validate_tool_policy(tool_policy: dict) -> List[str]:
     # Check for legacy 'allowed'/'denied' (should be 'allow'/'deny')
     if "allowed" in tool_policy or "denied" in tool_policy:
         issues.append(
-            "Use 'allow'/'deny' (OpenClaw semantics), not 'allowed'/'denied'"
+            "Use 'allow'/'deny' semantics, not 'allowed'/'denied'"
         )
 
     # Validate allow list

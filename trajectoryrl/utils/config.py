@@ -212,19 +212,14 @@ class ValidatorConfig:
 
 @dataclass
 class MinerConfig:
-    """Configuration for TrajectoryRL miner.
+    """Configuration for TrajectoryRL miner CLI.
 
     Attributes:
         wallet_name: Wallet name
         wallet_hotkey: Hotkey name
         netuid: Subnet UID (11 for TrajectoryRL)
         network: Bittensor network (finney, test, local)
-        check_interval: Seconds between submission cycles in run mode
         log_level: Logging level
-        llm_api_key: API key for the OpenAI-compatible LLM endpoint
-        llm_base_url: Base URL for the OpenAI-compatible LLM endpoint
-        llm_model: Model name for AGENTS.md generation (e.g. glm-5.1)
-        pack_url: Pre-set pack URL (skips S3 upload if set)
     """
 
     wallet_name: str = "miner"
@@ -232,17 +227,7 @@ class MinerConfig:
     netuid: int = 11
     network: str = "finney"
 
-    check_interval: int = 3600
-
     log_level: str = "INFO"
-
-    # LLM pack generation (default mode) — OpenAI-compatible endpoint
-    llm_api_key: str = ""
-    llm_base_url: str = DEFAULT_LLM_BASE_URL
-    llm_model: str = DEFAULT_LLM_MODEL
-
-    # Pre-built pack URL (skips S3 upload if set)
-    pack_url: str = ""
 
     @classmethod
     def from_env(cls, dotenv_path: Optional[Path] = None) -> "MinerConfig":
@@ -264,10 +249,5 @@ class MinerConfig:
             wallet_hotkey=os.getenv("WALLET_HOTKEY", "default"),
             netuid=int(os.getenv("NETUID", "11")),
             network=os.getenv("NETWORK", "finney"),
-            check_interval=int(os.getenv("CHECK_INTERVAL", "3600")),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
-            llm_api_key=os.getenv("LLM_API_KEY") or os.getenv("CLAWBENCH_LLM_API_KEY", ""),
-            llm_base_url=os.getenv("LLM_BASE_URL") or os.getenv("CLAWBENCH_LLM_BASE_URL", DEFAULT_LLM_BASE_URL),
-            llm_model=os.getenv("LLM_MODEL") or os.getenv("CLAWBENCH_DEFAULT_MODEL", DEFAULT_LLM_MODEL),
-            pack_url=os.getenv("PACK_URL", ""),
         )

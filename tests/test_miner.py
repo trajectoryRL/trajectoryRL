@@ -1,4 +1,4 @@
-"""Tests for TrajectoryRL miner: pack building, validation, commitment formatting, daemon."""
+"""Tests for TrajectoryRL miner: S1 pack building, validation, commitment formatting."""
 
 import hashlib
 import json
@@ -14,82 +14,25 @@ from trajectoryrl.base.miner import TrajectoryMiner
 
 
 # ===================================================================
-# Pack Building
+# Pack Building (Season 1)
 # ===================================================================
 
 
-class TestBuildPack:
-    """Tests for TrajectoryMiner.build_pack()."""
+class TestBuildS1Pack:
+    """Tests for TrajectoryMiner.build_s1_pack()."""
 
     def test_minimal_pack(self):
-        """Build a minimal valid pack from inline AGENTS.md content."""
-        pack = TrajectoryMiner.build_pack(agents_md="# My Policy\nBe safe.")
+        """Build a minimal valid pack from SKILL.md content."""
+        pack = TrajectoryMiner.build_s1_pack("# My Skill\nBe effective.")
         assert pack["schema_version"] == 1
-        assert "AGENTS.md" in pack["files"]
-        assert pack["files"]["AGENTS.md"] == "# My Policy\nBe safe."
-        assert pack["metadata"]["pack_name"] == "my-pack"
-        assert pack["metadata"]["pack_version"] == "1.0.0"
-        assert pack["metadata"]["target_suite"] == "clawbench_v1"
-        assert "exec" in pack["tool_policy"]["allow"]
-        assert "admin_*" in pack["tool_policy"]["deny"]
+        assert "SKILL.md" in pack["files"]
+        assert pack["files"]["SKILL.md"] == "# My Skill\nBe effective."
 
-    def test_with_soul_md(self):
-        """Pack includes SOUL.md when provided."""
-        pack = TrajectoryMiner.build_pack(
-            agents_md="# Policy", soul_md="Be friendly."
-        )
-        assert "SOUL.md" in pack["files"]
-        assert pack["files"]["SOUL.md"] == "Be friendly."
-
-    def test_with_extra_files(self):
-        """Extra files are included in the pack."""
-        pack = TrajectoryMiner.build_pack(
-            agents_md="# Policy",
-            extra_files={"RULES.md": "Some rules"},
-        )
-        assert "RULES.md" in pack["files"]
-
-    def test_custom_metadata(self):
-        """Custom pack name and version."""
-        pack = TrajectoryMiner.build_pack(
-            agents_md="# Policy",
-            pack_name="super-pack",
-            pack_version="2.1.0",
-        )
-        assert pack["metadata"]["pack_name"] == "super-pack"
-        assert pack["metadata"]["pack_version"] == "2.1.0"
-
-    def test_custom_tool_policy(self):
-        """Custom allow/deny lists."""
-        pack = TrajectoryMiner.build_pack(
-            agents_md="# Policy",
-            tool_allow=["exec", "read"],
-            tool_deny=["shell", "admin_*"],
-        )
-        assert pack["tool_policy"]["allow"] == ["exec", "read"]
-        assert pack["tool_policy"]["deny"] == ["shell", "admin_*"]
-
-    def test_stop_rules(self):
-        """Stop rules are included when provided."""
-        pack = TrajectoryMiner.build_pack(
-            agents_md="# Policy",
-            stop_rules=["max_tool_calls: 20"],
-        )
-        assert pack["stop_rules"] == ["max_tool_calls: 20"]
-
-    def test_no_stop_rules_by_default(self):
-        """No stop_rules key when not provided."""
-        pack = TrajectoryMiner.build_pack(agents_md="# Policy")
-        assert "stop_rules" not in pack
-
-    def test_read_from_file(self, tmp_path):
-        """Build pack from a file path."""
-        agents_file = tmp_path / "AGENTS.md"
-        agents_file.write_text("# File-based policy\nDo good things.")
-
-        pack = TrajectoryMiner.build_pack(agents_md=str(agents_file))
-        assert "File-based policy" in pack["files"]["AGENTS.md"]
-        assert "Do good things." in pack["files"]["AGENTS.md"]
+    def test_only_schema_version_and_files(self):
+        """S1 pack contains only schema_version and files."""
+        pack = TrajectoryMiner.build_s1_pack("# Skill")
+        assert set(pack.keys()) == {"schema_version", "files"}
+        assert set(pack["files"].keys()) == {"SKILL.md"}
 
 
 # ===================================================================
@@ -102,31 +45,31 @@ class TestPackHash:
 
     def test_deterministic(self):
         """Same pack always produces same hash."""
-        pack = TrajectoryMiner.build_pack(agents_md="# Test")
+        pack = TrajectoryMiner.build_s1_pack("# Test")
         h1 = TrajectoryMiner.compute_pack_hash(pack)
         h2 = TrajectoryMiner.compute_pack_hash(pack)
         assert h1 == h2
 
     def test_correct_format(self):
         """Hash is 64 lowercase hex chars."""
-        pack = TrajectoryMiner.build_pack(agents_md="# Test")
+        pack = TrajectoryMiner.build_s1_pack("# Test")
         h = TrajectoryMiner.compute_pack_hash(pack)
         assert len(h) == 64
         assert all(c in "0123456789abcdef" for c in h)
 
     def test_different_content_different_hash(self):
-        """Different AGENTS.md content produces different hash."""
+        """Different SKILL.md content produces different hash."""
         h1 = TrajectoryMiner.compute_pack_hash(
-            TrajectoryMiner.build_pack(agents_md="# Policy A")
+            TrajectoryMiner.build_s1_pack("# Skill A")
         )
         h2 = TrajectoryMiner.compute_pack_hash(
-            TrajectoryMiner.build_pack(agents_md="# Policy B")
+            TrajectoryMiner.build_s1_pack("# Skill B")
         )
         assert h1 != h2
 
     def test_matches_manual_sha256(self):
         """Hash matches manual SHA256 of canonical JSON."""
-        pack = TrajectoryMiner.build_pack(agents_md="# Test")
+        pack = TrajectoryMiner.build_s1_pack("# Test")
         canonical = json.dumps(pack, sort_keys=True)
         expected = hashlib.sha256(canonical.encode()).hexdigest()
         assert TrajectoryMiner.compute_pack_hash(pack) == expected
@@ -142,7 +85,7 @@ class TestPackIO:
 
     def test_save_and_load_roundtrip(self, tmp_path):
         """Save then load produces identical pack."""
-        pack = TrajectoryMiner.build_pack(agents_md="# My Policy")
+        pack = TrajectoryMiner.build_s1_pack("# My Skill")
         path = str(tmp_path / "pack.json")
 
         TrajectoryMiner.save_pack(pack, path)
@@ -152,7 +95,7 @@ class TestPackIO:
 
     def test_save_returns_hash(self, tmp_path):
         """save_pack returns the correct SHA256 hash."""
-        pack = TrajectoryMiner.build_pack(agents_md="# Test")
+        pack = TrajectoryMiner.build_s1_pack("# Test")
         path = str(tmp_path / "pack.json")
 
         returned_hash = TrajectoryMiner.save_pack(pack, path)
@@ -161,7 +104,7 @@ class TestPackIO:
 
     def test_save_creates_parent_dirs(self, tmp_path):
         """save_pack creates parent directories if needed."""
-        pack = TrajectoryMiner.build_pack(agents_md="# Test")
+        pack = TrajectoryMiner.build_s1_pack("# Test")
         path = str(tmp_path / "nested" / "deep" / "pack.json")
 
         TrajectoryMiner.save_pack(pack, path)
@@ -174,41 +117,48 @@ class TestPackIO:
 
 
 # ===================================================================
-# Schema Validation
+# Schema Validation (Season 1)
 # ===================================================================
 
 
-class TestMinerValidate:
-    """Tests for miner-side schema validation."""
+class TestValidateS1:
+    """Tests for S1 schema validation."""
 
     def test_valid_pack_passes(self):
-        """Standard pack passes validation."""
-        pack = TrajectoryMiner.build_pack(agents_md="# Policy\nBe safe.")
-        result = TrajectoryMiner.validate(pack)
-        assert result.passed
-        assert len(result.issues) == 0
+        """Standard S1 pack passes validation."""
+        pack = TrajectoryMiner.build_s1_pack("# Skill\nBe effective.")
+        issues = TrajectoryMiner.validate_s1(pack)
+        assert issues == []
 
-    def test_missing_agents_md_fails(self):
-        """Pack without AGENTS.md fails."""
-        pack = TrajectoryMiner.build_pack(agents_md="# Policy")
-        del pack["files"]["AGENTS.md"]
-        result = TrajectoryMiner.validate(pack)
-        assert not result.passed
+    def test_missing_skill_md_fails(self):
+        """Pack without SKILL.md fails."""
+        pack = {"schema_version": 1, "files": {}}
+        issues = TrajectoryMiner.validate_s1(pack)
+        assert any("SKILL.md" in i for i in issues)
+
+    def test_empty_skill_md_fails(self):
+        """Pack with empty SKILL.md fails."""
+        pack = {"schema_version": 1, "files": {"SKILL.md": "   "}}
+        issues = TrajectoryMiner.validate_s1(pack)
+        assert any("empty" in i for i in issues)
 
     def test_too_large_fails(self):
         """Pack exceeding 32KB fails."""
-        pack = TrajectoryMiner.build_pack(agents_md="x" * 40000)
-        result = TrajectoryMiner.validate(pack)
-        assert not result.passed
-        assert any("too large" in issue.lower() or "32" in issue for issue in result.issues)
+        pack = TrajectoryMiner.build_s1_pack("x" * 40000)
+        issues = TrajectoryMiner.validate_s1(pack)
+        assert any("size" in i or "limit" in i for i in issues)
 
-    def test_bad_semver_fails(self):
-        """Invalid pack_version fails."""
-        pack = TrajectoryMiner.build_pack(
-            agents_md="# Policy", pack_version="not.a.version"
-        )
-        result = TrajectoryMiner.validate(pack)
-        assert not result.passed
+    def test_wrong_schema_version_fails(self):
+        """Wrong schema_version fails."""
+        pack = {"schema_version": 2, "files": {"SKILL.md": "# Skill"}}
+        issues = TrajectoryMiner.validate_s1(pack)
+        assert any("schema_version" in i for i in issues)
+
+    def test_missing_files_dict_fails(self):
+        """Missing files dict fails."""
+        pack = {"schema_version": 1}
+        issues = TrajectoryMiner.validate_s1(pack)
+        assert any("files" in i for i in issues)
 
 
 # ===================================================================
@@ -275,7 +225,7 @@ class TestCommitmentFormat:
             )
 
     def test_too_long_url_raises(self):
-        """URL that exceeds 256-byte commitment limit raises ValueError."""
+        """URL that exceeds 128-byte commitment limit raises ValueError."""
         long_url = "https://example.com/" + "a" * 300
         with pytest.raises(ValueError, match="too long"):
             TrajectoryMiner.format_commitment(
@@ -285,67 +235,59 @@ class TestCommitmentFormat:
 
 
 # ===================================================================
-# Submit Workflow (mocked Bittensor)
+# Submit Commitment (mocked Bittensor)
 # ===================================================================
 
 
-class TestSubmitWorkflow:
-    """Tests for the full submit() workflow with mocked chain."""
+class TestSubmitCommitment:
+    """Tests for submit_commitment with mocked chain."""
 
     def _make_miner(self):
         """Create a miner with mocked Bittensor components."""
-        with patch("trajectoryrl.base.miner.bt") as mock_bt:
-            mock_wallet = MagicMock()
-            mock_bt.Wallet.return_value = mock_wallet
+        miner = TrajectoryMiner(
+            wallet_name="test",
+            wallet_hotkey="default",
+            netuid=11,
+            network="test",
+        )
+        miner._wallet = MagicMock()
+        miner._subtensor = MagicMock()
+        return miner
 
-            mock_subtensor = MagicMock()
-            mock_subtensor.set_commitment.return_value = True
-            mock_bt.Subtensor.return_value = mock_subtensor
-
-            miner = TrajectoryMiner(
-                wallet_name="test",
-                wallet_hotkey="default",
-                netuid=11,
-                network="test",
-            )
-            # Force lazy init
-            miner._wallet = mock_wallet
-            miner._subtensor = mock_subtensor
-            return miner
-
-    def test_submit_valid_pack(self):
-        """Submit succeeds with valid pack and URL."""
+    def test_submit_success(self):
+        """submit_commitment succeeds when chain accepts."""
         miner = self._make_miner()
-        pack = TrajectoryMiner.build_pack(agents_md="# Policy\nBe safe.")
-        pack_hash = TrajectoryMiner.compute_pack_hash(pack)
+        pack_hash = "a" * 64
         pack_url = "https://trajrl.com/samples/pack.json"
 
-        # set_commitment returns True, get_current_block returns a block number,
-        # and get_current_commitment returns a commitment string that matches
-        # the expected hash (for the on-chain verification step).
         miner._subtensor.set_commitment.return_value = True
         miner._subtensor.get_current_block.return_value = 12345
         commitment_str = f"{pack_hash}|{pack_url}"
         miner.get_current_commitment = MagicMock(return_value=commitment_str)
 
-        success = miner.submit(
-            pack=pack,
-            pack_url=pack_url,
-        )
+        success = miner.submit_commitment(pack_hash, pack_url)
         assert success
         miner._subtensor.set_commitment.assert_called_once()
 
-    def test_submit_invalid_pack_fails(self):
-        """Submit fails if pack doesn't pass schema validation."""
+    def test_not_registered_error(self):
+        """NotRegisteredError returns False with actionable message."""
         miner = self._make_miner()
-        pack = {"schema_version": 1}  # Missing required fields
+        miner._subtensor.set_commitment.side_effect = bt.NotRegisteredError()
 
-        success = miner.submit(
-            pack=pack,
-            pack_url="https://trajrl.com/samples/pack.json",
+        result = miner.submit_commitment(
+            "a" * 64, "https://trajrl.com/samples/pack.json"
         )
-        assert not success
-        miner._subtensor.set_commitment.assert_not_called()
+        assert result is False
+
+    def test_chain_connection_error(self):
+        """ChainConnectionError returns False."""
+        miner = self._make_miner()
+        miner._subtensor.set_commitment.side_effect = bt.ChainConnectionError()
+
+        result = miner.submit_commitment(
+            "a" * 64, "https://trajrl.com/samples/pack.json"
+        )
+        assert result is False
 
 
 # ===================================================================
@@ -358,43 +300,27 @@ class TestStatus:
 
     def test_no_commitment(self):
         """Returns None when no commitment exists."""
-        with patch("trajectoryrl.base.miner.bt") as mock_bt:
-            mock_wallet = MagicMock()
-            mock_wallet.hotkey.ss58_address = "5FakeHotkey"
-            mock_bt.Wallet.return_value = mock_wallet
+        miner = TrajectoryMiner()
+        miner._wallet = MagicMock()
+        miner._wallet.hotkey.ss58_address = "5FakeHotkey"
+        miner._subtensor = MagicMock()
+        miner._subtensor.get_all_commitments.return_value = {}
 
-            mock_subtensor = MagicMock()
-            mock_subtensor.get_all_commitments.return_value = {}
-            mock_bt.Subtensor.return_value = mock_subtensor
-
-            miner = TrajectoryMiner()
-            miner._wallet = mock_wallet
-            miner._subtensor = mock_subtensor
-
-            result = miner.get_current_commitment()
-            assert result is None
+        result = miner.get_current_commitment()
+        assert result is None
 
     def test_existing_commitment(self):
         """Returns raw commitment string when set."""
         raw = "a" * 64 + "|https://trajrl.com/samples/pack.json"
 
-        with patch("trajectoryrl.base.miner.bt") as mock_bt:
-            mock_wallet = MagicMock()
-            mock_wallet.hotkey.ss58_address = "5FakeHotkey"
-            mock_bt.Wallet.return_value = mock_wallet
+        miner = TrajectoryMiner()
+        miner._wallet = MagicMock()
+        miner._wallet.hotkey.ss58_address = "5FakeHotkey"
+        miner._subtensor = MagicMock()
+        miner._subtensor.get_all_commitments.return_value = {"5FakeHotkey": raw}
 
-            mock_subtensor = MagicMock()
-            mock_subtensor.get_all_commitments.return_value = {
-                "5FakeHotkey": raw,
-            }
-            mock_bt.Subtensor.return_value = mock_subtensor
-
-            miner = TrajectoryMiner()
-            miner._wallet = mock_wallet
-            miner._subtensor = mock_subtensor
-
-            result = miner.get_current_commitment()
-            assert result == raw
+        result = miner.get_current_commitment()
+        assert result == raw
 
 
 # ===================================================================
@@ -403,21 +329,50 @@ class TestStatus:
 
 
 class TestMinerCLI:
-    """Tests for neurons/miner.py CLI parsing."""
+    """Tests for neurons/miner.py CLI."""
 
-    def test_build_help(self):
-        """Build subcommand parses without error."""
+    def test_no_subcommand_shows_help(self, capsys):
+        """No subcommand prints help and returns 0."""
         import neurons.miner as cli
-        import sys
+
         with patch.object(sys, "argv", ["miner.py"]):
             result = cli.main()
             assert result == 0
+
+    def test_build_valid_skill(self, tmp_path):
+        """Build subcommand with valid SKILL.md."""
+        import neurons.miner as cli
+
+        skill_file = tmp_path / "SKILL.md"
+        skill_file.write_text("# My Skill\nBe effective.")
+
+        args = MagicMock()
+        args.skill_md = str(skill_file)
+        args.output = str(tmp_path / "pack.json")
+
+        result = cli.cmd_build(args)
+        assert result == 0
+        assert (tmp_path / "pack.json").exists()
+
+    def test_build_empty_skill_fails(self, tmp_path):
+        """Build subcommand fails with empty SKILL.md."""
+        import neurons.miner as cli
+
+        skill_file = tmp_path / "SKILL.md"
+        skill_file.write_text("")
+
+        args = MagicMock()
+        args.skill_md = str(skill_file)
+        args.output = str(tmp_path / "pack.json")
+
+        result = cli.cmd_build(args)
+        assert result == 1
 
     def test_validate_valid_pack(self, tmp_path):
         """Validate subcommand with a valid pack."""
         import neurons.miner as cli
 
-        pack = TrajectoryMiner.build_pack(agents_md="# Policy\nBe safe.")
+        pack = TrajectoryMiner.build_s1_pack("# Skill\nBe effective.")
         pack_path = str(tmp_path / "pack.json")
         TrajectoryMiner.save_pack(pack, pack_path)
 
@@ -431,16 +386,7 @@ class TestMinerCLI:
         """Validate subcommand catches invalid pack."""
         import neurons.miner as cli
 
-        bad_pack = {
-            "schema_version": 1,
-            "files": {},
-            "tool_policy": {"allow": [], "deny": []},
-            "metadata": {
-                "pack_name": "bad",
-                "pack_version": "1.0.0",
-                "target_suite": "clawbench_v1",
-            },
-        }
+        bad_pack = {"schema_version": 1, "files": {}}
         pack_path = str(tmp_path / "bad.json")
         with open(pack_path, "w") as f:
             json.dump(bad_pack, f)
@@ -453,17 +399,12 @@ class TestMinerCLI:
 
 
 # ===================================================================
-# CLI Help Output (subcommand --help)
+# CLI Help Output
 # ===================================================================
 
 
 class TestCLIHelp:
-    """Verify that subcommand --help shows the correct arguments.
-
-    Regression test: bittensor's import side-effects can hijack argparse,
-    causing --help to show bittensor's logging flags instead of the
-    subcommand's own arguments.
-    """
+    """Verify that subcommand --help shows the correct arguments."""
 
     @staticmethod
     def _get_help(subcommand: str) -> str:
@@ -478,6 +419,13 @@ class TestCLIHelp:
         )
         return result.stdout + result.stderr
 
+    def test_build_help_shows_skill_md(self):
+        """'miner.py build --help' must show skill_md argument."""
+        output = self._get_help("build")
+        assert "skill_md" in output, (
+            f"build --help should show 'skill_md' argument, got:\n{output}"
+        )
+
     def test_submit_help_shows_pack_url(self):
         """'miner.py submit --help' must show the pack_url argument."""
         output = self._get_help("submit")
@@ -485,18 +433,11 @@ class TestCLIHelp:
             f"submit --help should show 'pack_url' argument, got:\n{output}"
         )
 
-    def test_build_help_shows_agents_md(self):
-        """'miner.py build --help' must show --agents-md."""
-        output = self._get_help("build")
-        assert "--agents-md" in output, (
-            f"build --help should show '--agents-md', got:\n{output}"
-        )
-
-    def test_run_help_shows_mode(self):
-        """'miner.py run --help' must show --mode."""
-        output = self._get_help("run")
-        assert "--mode" in output, (
-            f"run --help should show '--mode', got:\n{output}"
+    def test_upload_help_shows_pack_path(self):
+        """'miner.py upload --help' must show pack_path argument."""
+        output = self._get_help("upload")
+        assert "pack_path" in output, (
+            f"upload --help should show 'pack_path' argument, got:\n{output}"
         )
 
     def test_validate_help_shows_pack_path(self):
@@ -509,82 +450,7 @@ class TestCLIHelp:
     def test_top_level_help_shows_subcommands(self):
         """'miner.py --help' must list all subcommands."""
         output = self._get_help("")
-        for cmd in ("build", "validate", "submit", "run", "status"):
+        for cmd in ("build", "validate", "upload", "submit", "status"):
             assert cmd in output, (
                 f"top-level --help should list '{cmd}', got:\n{output}"
             )
-
-
-# ===================================================================
-# Tiered Exception Handling
-# ===================================================================
-
-
-class TestSubmitExceptions:
-    """Tests for tiered exception handling in submit_commitment/get_current_commitment."""
-
-    def _make_miner(self):
-        miner = TrajectoryMiner(
-            wallet_name="test", wallet_hotkey="default",
-            netuid=11, network="test",
-        )
-        miner._wallet = MagicMock()
-        miner._subtensor = MagicMock()
-        return miner
-
-    def test_not_registered_error(self):
-        """NotRegisteredError produces actionable btcli guidance."""
-        miner = self._make_miner()
-        miner._subtensor.set_commitment.side_effect = bt.NotRegisteredError()
-
-        with patch("trajectoryrl.base.miner.logger") as mock_logger:
-            result = miner.submit_commitment(
-                "a" * 64, "https://trajrl.com/samples/pack.json"
-            )
-            assert result is False
-            log_msg = mock_logger.error.call_args[0][0]
-            assert "not registered" in log_msg.lower()
-            assert "btcli subnet register" in log_msg
-
-    def test_chain_connection_error(self):
-        """ChainConnectionError produces connectivity guidance."""
-        miner = self._make_miner()
-        miner._subtensor.set_commitment.side_effect = bt.ChainConnectionError()
-
-        with patch("trajectoryrl.base.miner.logger") as mock_logger:
-            result = miner.submit_commitment(
-                "a" * 64, "https://trajrl.com/samples/pack.json"
-            )
-            assert result is False
-            log_msg = mock_logger.error.call_args[0][0]
-            assert "connect" in log_msg.lower()
-
-    def test_get_commitment_chain_error(self):
-        """get_current_commitment handles ChainConnectionError gracefully."""
-        miner = self._make_miner()
-        miner._wallet.hotkey.ss58_address = "5FakeKey"
-        miner._subtensor.get_all_commitments.side_effect = bt.ChainConnectionError()
-
-        with patch("trajectoryrl.base.miner.logger") as mock_logger:
-            result = miner.get_current_commitment()
-            assert result is None
-            log_msg = mock_logger.error.call_args[0][0]
-            assert "connect" in log_msg.lower()
-
-
-# ===================================================================
-# Daemon Mode
-# ===================================================================
-
-
-class TestDaemonEntryPoint:
-    """Tests for CLI entry point behavior with no subcommand."""
-
-    def test_no_subcommand_shows_help(self, capsys):
-        """No subcommand → prints help and returns 0."""
-        import sys
-        import neurons.miner as cli
-
-        with patch.object(sys, "argv", ["miner.py"]):
-            result = cli.main()
-            assert result == 0

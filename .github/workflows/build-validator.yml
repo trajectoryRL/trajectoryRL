@@ -1,7 +1,7 @@
 # Build and push validator Docker image to GHCR
 #
-# All-in-one image: validator + mock-tools + OpenClaw gateway.
-# Multi-stage build compiles OpenClaw (Node.js) then bundles with Python runtime.
+# All-in-one image: validator + mock-tools + agent gateway.
+# Multi-stage build bundles with Python runtime.
 #
 # Triggers:
 #   - push to staging branch → image tags: staging, sha-<commit>
@@ -22,14 +22,9 @@ on:
     paths:
       - "neurons/**"
       - "trajectoryrl/**"
-      - "clawbench"
-      - "clawbench/**"
-      - "openclaw"
-      - "openclaw/**"
       - "docker/**"
       - "pyproject.toml"
       - ".github/workflows/**"
-      - ".gitmodules"
     tags:
       - "v*"
 
@@ -47,8 +42,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: true
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

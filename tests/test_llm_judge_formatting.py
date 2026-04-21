@@ -35,7 +35,7 @@ def judge():
     return TrajectoryJudge()
 
 
-# --- Realistic tool response shapes (from ClawBench mock_tools/server.py) ---
+# --- Realistic tool response shapes (from mock_tools/server.py) ---
 
 EXEC_HIMALAYA_RESPONSE = {
     "status": "completed",

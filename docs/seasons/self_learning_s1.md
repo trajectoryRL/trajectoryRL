@@ -477,20 +477,19 @@ trajrl subnet logs --miner <hotkey> --limit 20   # list recent miner evals
 
 This is the audit trail — miners can see exactly how they were scored, the community can verify validators are not cheating, and SKILL.md authors can debug failure modes by reading the testee transcript and judge feedback together.
 
-### Score → Weights (current gap, fix planned)
+### Score → Weights (implemented)
 
-The S1 quality score is correctly captured in `eval_result["judge_details"][scenario]["overall_score"]` and uploaded with the eval log archive, but as of v0.22 it is **not yet wired into consensus aggregation or `set_weights`**. The on-chain weight pipeline is still cost-based (`raw_costs` → `consensus_costs` → `select_winner_with_protection`).
+The full pipeline is quality-based end-to-end:
 
-Planned fix (low-risk, no consensus protocol change): convert quality score → synthetic cost at the boundary in `_update_eval_results()`:
-
-```python
-synthetic_cost = 1.0 - judge_details[scenario]["overall_score"]
-self.raw_costs[hotkey][scenario] = synthetic_cost
+```
+scenario_scores[hotkey][scenario] → consensus_scores[hotkey] → select_winner_with_protection()
 ```
 
-The rest of the pipeline (consensus aggregation, Winner Protection, weight setting) is unchanged. Lower cost still wins, which after inversion means higher score wins. Winner Protection's `δ=0.10` becomes a relative score margin equivalent to "challenger must be ≥10% better in (1−score) space".
+- `compute_consensus_scores()` computes stake-weighted average of quality scores across validators
+- `select_winner_with_protection()` uses `challenger_score > winner_score × (1 + δ)` — higher score wins
+- `WinnerState` stores `winner_score` (not cost)
 
-This decision keeps the consensus payload format stable across v4.0/S1 (no payload schema change) and avoids a Winner Protection rewrite. Trade-off: per-miner score is not directly readable in the on-chain payload, but it's still queryable via `/api/eval-logs` (the audit trail).
+Per-episode scores are also uploaded with the eval log archive and queryable via `/api/eval-logs`.
 
 ---
 
@@ -511,21 +510,20 @@ A successful gaming strategy would need to defeat all four simultaneously.
 
 ---
 
-## Incentive Mechanism: Season 1 Amendment
+## Incentive Mechanism: Season 1 Bindings
 
-Season 1 amends [INCENTIVE_MECHANISM.md](INCENTIVE_MECHANISM.md) v4.2 by replacing **cost-based competition** with **quality-based competition**. All structural machinery is inherited unchanged. Only the competition metric and its direction change.
+Season 1 implements [INCENTIVE_MECHANISM.md](../INCENTIVE_MECHANISM.md) v5.0 with the following season-specific bindings. All structural machinery (WTA, consensus, NCD, winner protection) is inherited from the core protocol. Scoring details are in [SCORING_AND_EVALUATION.md](../SCORING_AND_EVALUATION.md).
 
-| Component | v4.0 (cost-based) | Season 1 (quality-based) |
-|-----------|-------------------|--------------------------|
-| **Competition metric** | `consensus_cost` (lower wins) | `final_score` (higher wins) |
-| **Winner selection** | Lowest cost among qualified | Highest `final_score` |
-| **Qualification gate** | All safety + correctness pass | `final_score > 0` (any non-zero quality) |
-| **Winner Protection** | `challenger_cost < winner_cost × (1 - δ)` | `challenger_score > winner_score × (1 + δ)` |
-| **Winner self-update** | Lower own winning cost | Raise own winning score |
-| **Pack format** | PolicyBundle (AGENTS.md + tool_policy) | Skill pack (SKILL.md entry point, one pack per contest) |
-| **NCD target** | AGENTS.md content | SKILL.md content |
+| Component | Season 1 |
+|-----------|----------|
+| **Score direction** | Higher is better (`challenger_score > winner_score × (1 + δ)`) |
+| **Score source** | `consensus_score` = stake-weighted average of judge quality scores |
+| **Qualification gate** | `final_score > 0` (any non-zero quality) |
+| **Pack format** | Skill pack (SKILL.md entry point, one pack per contest) |
+| **NCD target** | SKILL.md content |
+| **Harness** | [Hermes Agent](https://github.com/NousResearch/hermes-agent) (SSH terminal backend) |
 
-Winner Protection flips direction: `challenger_score > winner_score × (1 + δ)` where δ=0.10. Everything else (WTA, NCD threshold 0.80, consensus aggregation, inactivity 14400 blocks, evaluation cadence, weight setting) works identically to v4.2.
+WTA, NCD threshold 0.80, consensus aggregation, inactivity 14400 blocks, evaluation cadence, weight setting — all work identically to the core protocol.
 
 ---
 

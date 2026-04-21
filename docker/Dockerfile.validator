@@ -1,7 +1,7 @@
 # TrajectoryRL Validator
 #
 # Season 1: validator orchestrates trajrl-bench sandbox containers via
-# Docker API.  No embedded OpenClaw or mock-tools needed.
+# Docker API.  No embedded agent gateway or mock-tools needed.
 #
 # Build (from repo root):
 #   docker build -f docker/Dockerfile.validator -t trajectoryrl-validator .

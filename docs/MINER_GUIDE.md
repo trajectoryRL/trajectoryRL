@@ -41,11 +41,11 @@ Season 1 requires `SKILL.md` only. Future packs may include additional files tha
 
 ### What's different from v4.0
 
-| | v4.0 (ClawBench) | Season 1 |
+| | v4.0 (legacy) | Season 1 |
 |---|---|---|
 | File | `AGENTS.md` | `SKILL.md` |
 | Other files | `SOUL.md`, `tool_policy`, etc. | S1: SKILL.md only. Future: additional files SKILL.md references |
-| Interface | Tool-call API (OpenClaw) | Shell (SSH into sandbox, use `curl`) |
+| Interface | Tool-call API | Shell (SSH into sandbox, use `curl`) |
 | Scoring | Cost-based (cheapest wins) | Quality-based (best work wins) |
 | Agent control | Tool allowlist/denylist | No tool list -- agent has a shell, security is infrastructure-level |
 
@@ -109,6 +109,93 @@ Before starting, read all of /workspace/learned/ and apply prior knowledge.
 - Scenario-specific workflows (your SKILL.md should work across different scenarios)
 - References to specific criteria IDs (the judge criteria may change between scenarios)
 - Static task checklists — the value is in the learning loop, not a fixed playbook
+
+---
+
+## Pre-Eval Compliance (Anti-Gaming)
+
+> If an author could NOT have written your SKILL.md without knowing the benchmark's exact scenarios and scoring rubric — it will be flagged as cheating.
+
+Write a **genuinely general-purpose skill** that guides an agent to reason dynamically, not a benchmark-specific recipe. The pre-eval gate checks for these red lines:
+
+### 1. Hardcoded Benchmark Answers
+
+Do not embed specific identifiers or data that should be retrieved at runtime:
+- Incident details (root causes, timelines, SLA numbers)
+- Company/team/person names from evaluation fixtures
+- PR numbers, task IDs, bug descriptions
+- Specific Slack channels or email subjects
+- Pre-written status updates or briefs
+
+**Instead:** Instruct the agent to retrieve information dynamically.
+
+### 2. Static Response Mapping
+
+Do not map keywords or triggers to fixed outputs:
+```
+If task involves "incident" → post this exact update
+If message contains "standup" → output fixed text
+```
+
+**Instead:** Provide behavioral guidance; let the agent generate responses from retrieved data.
+
+### 3. Tool Avoidance
+
+Do not disable or discourage tools needed for data retrieval:
+- Blanket: "Do not use tools" / "Avoid external access"
+- Selective: "Do not read email" / "Skip Slack"
+- Cost-gaming: "Limit to 2 tool calls"
+
+**Instead:** Suggest efficient tool use without forbidding necessary ones.
+
+### 4. Scenario-Specific Playbooks
+
+Do not write dedicated sections that map 1-to-1 to benchmark scenarios with per-scenario output templates.
+
+Red flags:
+- Exactly N detailed playbooks matching the N benchmark scenarios
+- Per-scenario output templates (exact section names, field lists, formatting rules)
+- Instructions that only make sense if the author knows the eval scenarios
+
+**Instead:** Provide general guidance applicable to diverse tasks.
+
+### 5. Evaluation Rubric Reverse-Engineering
+
+Do not embed rules that mirror the automated scoring system:
+- Checklists matching judge criteria names verbatim
+- Regex/pattern gaming ("word X must NOT appear within N characters of word Y")
+- Banned word lists with exact replacements
+- Exact tool-call budgets per scenario type
+- Output templates designed to hit scoring keywords
+
+**Instead:** Give general quality guidance, not encoded evaluator logic.
+
+### 6. Benchmark Coverage Overfitting
+
+Do not tailor the skill to cover exactly and only the benchmark's scenarios:
+- Addressing only known scenarios with zero other task types
+- Per-scenario gate criteria that mirror judge rubrics
+- Suspiciously precise knowledge of what the evaluator grades on
+
+**Instead:** Write a genuinely general skill that handles tasks beyond the benchmark scope.
+
+### 7. Hardcoded Benchmark Infrastructure
+
+Do not embed specific API endpoints, port numbers, URLs, or shell commands from the benchmark runtime:
+- Full API URLs (e.g. `http://localhost:8090/api/v2/messages`)
+- Pre-written `curl` commands
+- Hardcoded port numbers (e.g. `8090`)
+- Complete API reference manuals for the benchmark environment
+
+**Instead:** Let the agent discover available services dynamically at runtime (read ENVIRONMENT.md).
+
+### Self-Check Before Submitting
+
+1. **Generality** — Does this skill still make sense in a completely new, unseen scenario?
+2. **Knowledge source** — Could every instruction be written without knowing the benchmark?
+3. **Tool freedom** — Can the agent still use all necessary tools?
+4. **Output flexibility** — Must the agent decide output format at runtime?
+5. **Scope** — Does the skill cover task types beyond the benchmark?
 
 ---
 

@@ -2,7 +2,7 @@
 """Quick test for LLM-as-judge (Phase 1 + Phase 2).
 
 Usage:
-    # Uses CLAWBENCH_LLM_API_KEY / CLAWBENCH_LLM_BASE_URL / CLAWBENCH_DEFAULT_MODEL env vars
+    # Uses LLM_API_KEY / LLM_BASE_URL / LLM_MODEL env vars
     python scripts/test_llm_judge.py
 
     # Or override:
@@ -281,13 +281,13 @@ from trajectoryrl.utils.sandbox_harness import _strip_provider_prefix
 async def test_phase1():
     """Test Phase 1: Pack integrity analysis."""
     model = _strip_provider_prefix(
-        os.getenv("JUDGE_MODEL") or os.getenv("CLAWBENCH_DEFAULT_MODEL", "")
+        os.getenv("JUDGE_MODEL") or os.getenv("LLM_MODEL") or os.getenv("CLAWBENCH_DEFAULT_MODEL", "")
     )
-    api_key = os.getenv("JUDGE_API_KEY") or os.getenv("CLAWBENCH_LLM_API_KEY", "")
-    base_url = os.getenv("JUDGE_BASE_URL") or os.getenv("CLAWBENCH_LLM_BASE_URL", "")
+    api_key = os.getenv("JUDGE_API_KEY") or os.getenv("LLM_API_KEY") or os.getenv("CLAWBENCH_LLM_API_KEY", "")
+    base_url = os.getenv("JUDGE_BASE_URL") or os.getenv("LLM_BASE_URL") or os.getenv("CLAWBENCH_LLM_BASE_URL", "")
 
     if not api_key:
-        logger.error("No API key set. Export CLAWBENCH_LLM_API_KEY or JUDGE_API_KEY.")
+        logger.error("No API key set. Export LLM_API_KEY or JUDGE_API_KEY.")
         return False
 
     judge = PackIntegrityJudge(model=model, api_key=api_key, base_url=base_url)
@@ -340,10 +340,10 @@ async def test_phase1():
 async def test_phase2():
     """Test Phase 2: Trajectory judge."""
     model = _strip_provider_prefix(
-        os.getenv("JUDGE_MODEL") or os.getenv("CLAWBENCH_DEFAULT_MODEL", "")
+        os.getenv("JUDGE_MODEL") or os.getenv("LLM_MODEL") or os.getenv("CLAWBENCH_DEFAULT_MODEL", "")
     )
-    api_key = os.getenv("JUDGE_API_KEY") or os.getenv("CLAWBENCH_LLM_API_KEY", "")
-    base_url = os.getenv("JUDGE_BASE_URL") or os.getenv("CLAWBENCH_LLM_BASE_URL", "")
+    api_key = os.getenv("JUDGE_API_KEY") or os.getenv("LLM_API_KEY") or os.getenv("CLAWBENCH_LLM_API_KEY", "")
+    base_url = os.getenv("JUDGE_BASE_URL") or os.getenv("LLM_BASE_URL") or os.getenv("CLAWBENCH_LLM_BASE_URL", "")
 
     if not api_key:
         logger.error("No API key set.")
@@ -354,7 +354,7 @@ async def test_phase2():
     # Load morning_brief scenario
     scenario_path = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "clawbench", "scenarios", "morning_brief.yaml",
+        "scenarios", "morning_brief.yaml",
     )
     with open(scenario_path) as f:
         scenario = yaml.safe_load(f)

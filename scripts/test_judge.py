@@ -51,8 +51,8 @@ def load_env():
 
 
 def load_scenario_config(scenario_name: str) -> dict:
-    """Load scenario YAML from clawbench/scenarios/."""
-    scenario_path = ROOT / "clawbench" / "scenarios" / f"{scenario_name}.yaml"
+    """Load scenario YAML from scenarios/."""
+    scenario_path = ROOT / "scenarios" / f"{scenario_name}.yaml"
     if not scenario_path.exists():
         raise FileNotFoundError(f"Scenario not found: {scenario_path}")
     with open(scenario_path) as f:
@@ -169,7 +169,7 @@ def main():
 
     # Create judge
     judge = TrajectoryJudge(
-        model=args.model or os.environ.get("CLAWBENCH_DEFAULT_MODEL", ""),
+        model=args.model or os.environ.get("LLM_MODEL") or os.environ.get("CLAWBENCH_DEFAULT_MODEL", ""),
     )
 
     # Print prompt stats (always)

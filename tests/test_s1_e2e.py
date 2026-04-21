@@ -11,7 +11,7 @@ Requirements:
   - Docker daemon running
   - Images cached: ghcr.io/trajectoryrl/trajrl-bench:latest,
     ghcr.io/trajectoryrl/hermes-agent:latest
-  - CLAWBENCH_LLM_API_KEY set (OpenRouter or compatible)
+  - LLM_API_KEY set (OpenRouter or compatible)
 
 Run:
   cd trajectoryRL
@@ -32,10 +32,10 @@ import pytest
 
 docker = pytest.importorskip("docker")
 
-LLM_API_KEY = os.environ.get("CLAWBENCH_LLM_API_KEY", "")
-LLM_BASE_URL = os.environ.get("CLAWBENCH_LLM_BASE_URL", "https://openrouter.ai/api/v1")
+LLM_API_KEY = os.environ.get("LLM_API_KEY") or os.environ.get("CLAWBENCH_LLM_API_KEY", "")
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL") or os.environ.get("CLAWBENCH_LLM_BASE_URL", "https://openrouter.ai/api/v1")
 from trajectoryrl.utils.sandbox_harness import _strip_provider_prefix
-_raw_model = os.environ.get("CLAWBENCH_DEFAULT_MODEL", "z-ai/glm-5.1")
+_raw_model = os.environ.get("LLM_MODEL") or os.environ.get("CLAWBENCH_DEFAULT_MODEL", "z-ai/glm-5.1")
 LLM_MODEL = _strip_provider_prefix(_raw_model)
 
 SANDBOX_IMAGE = os.environ.get("SANDBOX_IMAGE", "ghcr.io/trajectoryrl/trajrl-bench:latest")
@@ -54,7 +54,7 @@ def _skip_if_no_docker():
 
 def _skip_if_no_api_key():
     if not LLM_API_KEY:
-        pytest.skip("CLAWBENCH_LLM_API_KEY not set")
+        pytest.skip("LLM_API_KEY not set")
 
 
 # ---------------------------------------------------------------------------
@@ -99,10 +99,6 @@ def _make_config(num_episodes: int = 4, timeout: int = 300):
     """Build a ValidatorConfig for S1 testing."""
     from trajectoryrl.utils.config import ValidatorConfig
 
-    clawbench_path = Path("/tmp/clawbench-test")
-    clawbench_path.mkdir(parents=True, exist_ok=True)
-    (clawbench_path / "scenarios").mkdir(parents=True, exist_ok=True)
-
     return ValidatorConfig(
         wallet_name="test",
         wallet_hotkey="test",
@@ -111,12 +107,11 @@ def _make_config(num_episodes: int = 4, timeout: int = 300):
         evaluation_harness="trajrl-bench",
         sandbox_image=SANDBOX_IMAGE,
         harness_image=HARNESS_IMAGE,
-        clawbench_api_key=LLM_API_KEY,
-        clawbench_base_url=LLM_BASE_URL,
-        clawbench_default_model=LLM_MODEL,
+        llm_api_key=LLM_API_KEY,
+        llm_base_url=LLM_BASE_URL,
+        llm_model=LLM_MODEL,
         sandbox_num_episodes=num_episodes,
         sandbox_timeout_per_episode=timeout,
-        clawbench_path=clawbench_path,
         eval_state_path=Path("/tmp/trajrl-test-eval-state.json"),
         winner_state_path=Path("/tmp/trajrl-test-winner.json"),
         pack_cache_dir=Path("/tmp/trajrl-test-packs"),

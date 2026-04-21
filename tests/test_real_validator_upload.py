@@ -18,7 +18,7 @@ Requirements:
   - Docker daemon running
   - ghcr.io/trajectoryrl/trajrl-bench + hermes-agent images available
   - Real validator wallet at ~/.bittensor/wallets/{WALLET_NAME}/
-  - .env.validator sourced (CLAWBENCH_LLM_API_KEY etc.)
+  - .env.validator sourced (LLM_API_KEY etc.)
   - Network access to trajrl.com
 
 Usage:
@@ -96,16 +96,12 @@ def _make_config():
     """Build a minimal ValidatorConfig just for running the sandbox harness."""
     from trajectoryrl.utils.config import ValidatorConfig
 
-    # clawbench_path must exist (validator config validates it)
-    clawbench_path = Path("/tmp/trajrl-real-test-clawbench")
-    clawbench_path.mkdir(parents=True, exist_ok=True)
-    (clawbench_path / "scenarios").mkdir(parents=True, exist_ok=True)
-
-    api_key = os.environ["CLAWBENCH_LLM_API_KEY"]
-    base_url = os.environ.get("CLAWBENCH_LLM_BASE_URL",
-                              "https://openrouter.ai/api/v1")
-    model = _strip_provider_prefix(os.environ.get(
-        "CLAWBENCH_DEFAULT_MODEL", "z-ai/glm-5.1"))
+    api_key = os.environ.get("LLM_API_KEY") or os.environ["CLAWBENCH_LLM_API_KEY"]
+    base_url = os.environ.get("LLM_BASE_URL") or os.environ.get(
+        "CLAWBENCH_LLM_BASE_URL", "https://openrouter.ai/api/v1")
+    model = _strip_provider_prefix(
+        os.environ.get("LLM_MODEL") or os.environ.get(
+            "CLAWBENCH_DEFAULT_MODEL", "z-ai/glm-5.1"))
 
     return ValidatorConfig(
         wallet_name=os.environ.get("WALLET_NAME", "sn11-owner"),
@@ -121,12 +117,11 @@ def _make_config():
             "HARNESS_IMAGE",
             "ghcr.io/trajectoryrl/hermes-agent:latest",
         ),
-        clawbench_api_key=api_key,
-        clawbench_base_url=base_url,
-        clawbench_default_model=model,
+        llm_api_key=api_key,
+        llm_base_url=base_url,
+        llm_model=model,
         sandbox_num_episodes=4,
         sandbox_timeout_per_episode=300,
-        clawbench_path=clawbench_path,
         eval_state_path=Path("/tmp/trajrl-real-test-eval-state.json"),
         winner_state_path=Path("/tmp/trajrl-real-test-winner.json"),
         pack_cache_dir=Path("/tmp/trajrl-real-test-packs"),
@@ -183,7 +178,7 @@ async def main():
         sys.exit(1)
 
     print(f"  Validator: {validator_hotkey}")
-    print(f"  Model:     {config.clawbench_default_model}")
+    print(f"  Model:     {config.llm_model}")
     print(f"  Sandbox:   {config.sandbox_image}")
     print(f"  Hermes:    {config.harness_image}")
 

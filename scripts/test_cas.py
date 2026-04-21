@@ -68,7 +68,7 @@ def get_config():
 def make_test_payload() -> bytes:
     """Build a minimal JSON payload for testing."""
     payload = {
-        "clawbench_version": "test",
+        "scoring_version": "test",
         "costs": {"test_miner_hk": 0.042},
         "disqualified": {},
         "protocol_version": 1,

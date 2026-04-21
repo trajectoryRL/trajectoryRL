@@ -1,37 +1,31 @@
 #!/usr/bin/env python3
-"""TrajectoryRL Miner — CLI + run modes.
+"""TrajectoryRL Miner — CLI toolbox for pack building and submission.
 
-CLI commands (one-shot):
-    python neurons/miner.py build --agents-md ./AGENTS.md -o pack.json
-    python neurons/miner.py validate pack.json
-    python neurons/miner.py submit https://example.com/pack.json
+Commands:
+    python neurons/miner.py build     SKILL.md [-o pack.json]
+    python neurons/miner.py validate  pack.json
+    python neurons/miner.py upload    pack.json [--bucket ...] [--endpoint-url ...]
+    python neurons/miner.py submit    <pack_url>
     python neurons/miner.py status
 
-Run modes (long-running daemon):
-    python neurons/miner.py run --mode demo      # submit sample pack periodically
-    python neurons/miner.py run --mode default    # LLM generate → build → upload → submit
-
 Config is loaded from .env.miner (or environment variables):
-    WALLET_NAME, WALLET_HOTKEY, NETUID, NETWORK, CHECK_INTERVAL, LOG_LEVEL
-    LLM_API_KEY, LLM_MODEL, S3_BUCKET, S3_ENDPOINT_URL, S3_REGION, PACK_URL
+    WALLET_NAME, WALLET_HOTKEY, NETUID, NETWORK
+    S3_BUCKET, S3_ENDPOINT_URL, S3_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
 """
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import logging
+import os
 import sys
-import time
-from typing import TYPE_CHECKING, Optional
+from pathlib import Path
+from typing import Optional
 
-if TYPE_CHECKING:
-    from trajectoryrl.utils.config import MinerConfig
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 logger = logging.getLogger(__name__)
-
-DEMO_PACK_URL = "https://trajrl.com/samples/pack.json"
 
 
 def _fetch_pack(url: str) -> dict:
@@ -43,21 +37,7 @@ def _fetch_pack(url: str) -> dict:
         return json.loads(resp.read())
 
 
-def _get_onchain_hash(miner) -> Optional[str]:
-    from trajectoryrl.utils.commitments import parse_commitment
-
-    try:
-        raw = miner.get_current_commitment()
-        if raw:
-            parsed = parse_commitment(raw)
-            if parsed:
-                return parsed[0]
-    except Exception:
-        logger.debug("Failed to read on-chain commitment", exc_info=True)
-    return None
-
-
-def _make_miner(config: MinerConfig):
+def _make_miner(config):
     from trajectoryrl.base.miner import TrajectoryMiner
 
     return TrajectoryMiner(
@@ -69,187 +49,6 @@ def _make_miner(config: MinerConfig):
 
 
 # ===================================================================
-# run --mode demo
-# ===================================================================
-
-
-async def _run_demo(config: MinerConfig):
-    """Periodically fetch the sample pack and submit on-chain."""
-    from trajectoryrl.base.miner import TrajectoryMiner
-
-    miner = _make_miner(config)
-    interval = config.check_interval
-    start_time = time.time()
-
-    logger.info("=== Demo mode ===")
-    logger.info("  pack_url: %s", DEMO_PACK_URL)
-    logger.info("  interval: %ds", interval)
-
-    last_hash = _get_onchain_hash(miner)
-    if last_hash:
-        logger.info("  on-chain: %s...", last_hash[:16])
-
-    while True:
-        try:
-            pack = _fetch_pack(DEMO_PACK_URL)
-
-            result = TrajectoryMiner.validate(pack)
-            if not result.passed:
-                logger.error("Pack validation failed: %s", result.issues)
-                await asyncio.sleep(interval)
-                continue
-
-            pack_hash = TrajectoryMiner.compute_pack_hash(pack)
-            if pack_hash == last_hash:
-                logger.info("Pack unchanged (%s...), sleeping %ds",
-                            pack_hash[:16], interval)
-                await asyncio.sleep(interval)
-                continue
-
-            logger.info("Submitting pack %s...", pack_hash[:16])
-            if miner.submit(pack, pack_url=DEMO_PACK_URL):
-                last_hash = pack_hash
-                logger.info("Submitted successfully")
-            else:
-                logger.error("Submission failed, retrying next cycle")
-
-            await asyncio.sleep(interval)
-
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            logger.info("Demo mode stopped")
-            break
-        except Exception:
-            logger.exception("Error in demo loop, retrying in %ds", interval)
-            await asyncio.sleep(interval)
-
-
-# ===================================================================
-# run --mode default
-# ===================================================================
-
-
-async def _run_default(config: MinerConfig):
-    """Production mining loop: generate AGENTS.md → build pack → upload → submit.
-
-    Each cycle:
-        1. Generate (or improve) AGENTS.md via LLM
-        2. Build OPP v1 pack
-        3. Validate locally
-        4. Skip if hash unchanged
-        5. Upload to S3 (or use pre-set PACK_URL)
-        6. Submit on-chain commitment
-    """
-    from trajectoryrl.base.miner import TrajectoryMiner
-    from trajectoryrl.utils.pack_generator import generate_agents_md
-
-    # --- Config validation (fail fast) ---
-    from trajectoryrl.utils.llm_client import has_api_key
-    if not has_api_key():
-        logger.error(
-            "LLM_API_KEY not set. Required for AGENTS.md generation.",
-        )
-        sys.exit(1)
-
-    # Init storage (reads S3_BUCKET from env; raises ValueError if missing)
-    storage = None
-    if not config.pack_url:
-        from trajectoryrl.utils.oss_storage import OSSStorage
-        try:
-            storage = OSSStorage()
-        except ValueError as e:
-            logger.error("S3 not configured and PACK_URL not set: %s", e)
-            sys.exit(1)
-
-    miner = _make_miner(config)
-    interval = config.check_interval
-    start_time = time.time()
-
-    logger.info("=== Default mode ===")
-    logger.info("  model:    %s", config.llm_model)
-    if storage:
-        logger.info("  upload:   %s (bucket)", storage.bucket)
-    else:
-        logger.info("  pack_url: %s (you must upload pack yourself)", config.pack_url)
-    logger.info("  interval: %ds", interval)
-
-    last_hash = _get_onchain_hash(miner)
-    if last_hash:
-        logger.info("  on-chain: %s...", last_hash[:16])
-
-    previous_agents_md: Optional[str] = None
-
-    try:
-        while True:
-            try:
-                # Step 1: Generate AGENTS.md
-                logger.info("Generating AGENTS.md...")
-                agents_md = await asyncio.to_thread(
-                    generate_agents_md,
-                    api_key=config.llm_api_key,
-                    base_url=config.llm_base_url,
-                    model=config.llm_model,
-                    previous_agents_md=previous_agents_md,
-                )
-
-                # Step 2: Build pack
-                pack = TrajectoryMiner.build_pack(agents_md=agents_md)
-
-                # Step 3: Validate
-                result = TrajectoryMiner.validate(pack)
-                if not result.passed:
-                    logger.error("Pack validation failed: %s", result.issues)
-                    await asyncio.sleep(interval)
-                    continue
-
-                # Step 4: Check if hash changed
-                pack_hash = TrajectoryMiner.compute_pack_hash(pack)
-                if pack_hash == last_hash:
-                    logger.info("Pack unchanged (%s...), sleeping %ds",
-                                pack_hash[:16], interval)
-                    previous_agents_md = agents_md
-                    await asyncio.sleep(interval)
-                    continue
-
-                # Step 5: Upload (or save locally for manual upload)
-                if storage:
-                    pack_url = await asyncio.to_thread(
-                        storage.upload_pack, pack,
-                    )
-                else:
-                    pack_url = config.pack_url
-                    local_path = "pack.json"
-                    TrajectoryMiner.save_pack(pack, local_path)
-                    logger.info(
-                        "Pack saved to %s — upload to %s before "
-                        "validators fetch it",
-                        local_path,
-                        pack_url,
-                    )
-
-                # Step 6: Submit on-chain
-                logger.info("Submitting pack %s...", pack_hash[:16])
-                if miner.submit(pack, pack_url=pack_url):
-                    last_hash = pack_hash
-                    logger.info("Submitted successfully")
-                else:
-                    logger.error("Submission failed, retrying next cycle")
-
-                # Store for next cycle's improvement prompt
-                previous_agents_md = agents_md
-
-                await asyncio.sleep(interval)
-
-            except (KeyboardInterrupt, asyncio.CancelledError):
-                logger.info("Default mode stopped")
-                break
-            except Exception:
-                logger.exception("Error in default loop, retrying in %ds", interval)
-                await asyncio.sleep(interval)
-    finally:
-        miner.close()
-
-
-# ===================================================================
 # CLI commands
 # ===================================================================
 
@@ -257,70 +56,133 @@ async def _run_default(config: MinerConfig):
 def cmd_build(args):
     from trajectoryrl.base.miner import TrajectoryMiner
 
-    pack = TrajectoryMiner.build_pack(
-        agents_md=args.agents_md,
-        pack_name=args.pack_name,
-        pack_version=args.pack_version,
-        soul_md=args.soul_md,
-    )
+    skill_path = args.skill_md
+    try:
+        skill_content = open(skill_path).read()
+    except FileNotFoundError:
+        print(f"Error: file not found: {skill_path}")
+        return 1
 
+    if not skill_content.strip():
+        print(f"Error: {skill_path} is empty")
+        return 1
+
+    pack = TrajectoryMiner.build_s1_pack(skill_content)
     pack_hash = TrajectoryMiner.save_pack(pack, args.output)
     size = len(json.dumps(pack, sort_keys=True))
 
     print(f"Pack built: {args.output}")
     print(f"  Hash:  {pack_hash}")
     print(f"  Size:  {size} bytes (limit: 32768)")
-    print(f"  Files: {list(pack['files'].keys())}")
 
-    result = TrajectoryMiner.validate(pack)
-    if result.passed:
-        print("  Schema: PASSED")
-    else:
-        print("  Schema: FAILED")
-        for issue in result.issues:
-            print(f"    - {issue}")
+    if size > 32768:
+        print("  Valid: FAILED (exceeds 32 KB size limit)")
         return 1
+
+    print("  Valid: PASSED")
     return 0
 
 
 def cmd_validate(args):
     from trajectoryrl.base.miner import TrajectoryMiner
 
-    pack = TrajectoryMiner.load_pack(args.pack_path)
-    result = TrajectoryMiner.validate(pack)
+    try:
+        pack = TrajectoryMiner.load_pack(args.pack_path)
+    except FileNotFoundError:
+        print(f"Error: file not found: {args.pack_path}")
+        return 1
+    except json.JSONDecodeError as e:
+        print(f"Error: invalid JSON: {e}")
+        return 1
+
     pack_hash = TrajectoryMiner.compute_pack_hash(pack)
     size = len(json.dumps(pack, sort_keys=True))
 
     print(f"Pack: {args.pack_path}")
     print(f"  Hash:    {pack_hash}")
     print(f"  Size:    {size} bytes (limit: 32768)")
-    print(f"  Name:    {pack.get('metadata', {}).get('pack_name', '?')}")
-    print(f"  Version: {pack.get('metadata', {}).get('pack_version', '?')}")
     print(f"  Files:   {list(pack.get('files', {}).keys())}")
 
-    if result.passed:
+    issues = TrajectoryMiner.validate_s1(pack)
+    if not issues:
         print("  Schema:  PASSED")
         return 0
     else:
         print("  Schema:  FAILED")
-        for issue in result.issues:
+        for issue in issues:
             print(f"    - {issue}")
         return 1
 
 
+def cmd_upload(args):
+    from trajectoryrl.utils.oss_storage import OSSStorage
+
+    try:
+        with open(args.pack_path) as f:
+            pack = json.load(f)
+    except FileNotFoundError:
+        print(f"Error: file not found: {args.pack_path}")
+        return 1
+    except json.JSONDecodeError as e:
+        print(f"Error: invalid JSON: {e}")
+        return 1
+
+    kwargs = {}
+    if args.bucket:
+        kwargs["bucket"] = args.bucket
+    if args.endpoint_url:
+        kwargs["endpoint_url"] = args.endpoint_url
+    if args.region:
+        kwargs["region"] = args.region
+
+    try:
+        storage = OSSStorage(**kwargs) if kwargs else OSSStorage()
+    except ValueError as e:
+        print(f"Error: S3 not configured: {e}")
+        print("Set S3_BUCKET, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY in environment")
+        return 1
+
+    try:
+        url = storage.upload_pack(pack)
+    except Exception as e:
+        print(f"Error: upload failed: {e}")
+        return 1
+
+    print(f"Uploaded: {url}")
+    print(f"Use this URL with: python neurons/miner.py submit {url}")
+    return 0
+
+
 def cmd_submit(args):
+    from trajectoryrl.base.miner import TrajectoryMiner
     from trajectoryrl.utils.config import MinerConfig
+
     config = MinerConfig.from_env()
     miner = _make_miner(config)
-    pack = _fetch_pack(args.pack_url)
-    success = miner.submit(pack=pack, pack_url=args.pack_url)
+
+    try:
+        pack = _fetch_pack(args.pack_url)
+    except Exception as e:
+        print(f"Error: cannot fetch pack from {args.pack_url}: {e}")
+        return 1
+
+    issues = TrajectoryMiner.validate_s1(pack)
+    if issues:
+        print("Error: pack validation failed:")
+        for issue in issues:
+            print(f"  - {issue}")
+        return 1
+
+    pack_hash = TrajectoryMiner.compute_pack_hash(pack)
+    print(f"Pack hash: {pack_hash}")
+    print(f"Pack URL:  {args.pack_url}")
+    print(f"Submitting on-chain...")
+
+    success = miner.submit_commitment(pack_hash, args.pack_url)
+    miner.close()
 
     if success:
-        from trajectoryrl.base.miner import TrajectoryMiner
-        pack_hash = TrajectoryMiner.compute_pack_hash(pack)
-        print(f"Submitted successfully!")
-        print(f"  Pack hash: {pack_hash}")
-        print(f"  Pack URL:  {args.pack_url}")
+        print("Submitted successfully!")
         return 0
     else:
         print("Submission failed. Check logs for details.")
@@ -334,30 +196,22 @@ def cmd_status(args):
     config = MinerConfig.from_env()
     miner = _make_miner(config)
     raw = miner.get_current_commitment()
+    miner.close()
+
     if raw is None:
         print("No commitment found on-chain.")
         return 1
 
-    print(f"Raw commitment: {raw}")
+    print(f"On-chain commitment:")
     parsed = parse_commitment(raw)
     if parsed:
         pack_hash, pack_url = parsed
         print(f"  Pack hash: {pack_hash}")
         print(f"  Pack URL:  {pack_url}")
     else:
+        print(f"  Raw: {raw}")
         print("  (could not parse commitment)")
     return 0
-
-
-def cmd_run(args):
-    from trajectoryrl.utils.config import MinerConfig
-    config = MinerConfig.from_env()
-    if args.interval is not None:
-        config.check_interval = args.interval
-    if args.mode == "demo":
-        return asyncio.run(_run_demo(config))
-    else:
-        return asyncio.run(_run_default(config))
 
 
 # ===================================================================
@@ -366,9 +220,28 @@ def cmd_run(args):
 
 
 def main():
+    from pathlib import Path
+
+    # Load .env.miner if present (wallet, S3 config, etc.)
+    try:
+        from dotenv import load_dotenv
+        env_path = Path(__file__).resolve().parent.parent / ".env.miner"
+        if env_path.exists():
+            load_dotenv(env_path)
+    except ImportError:
+        pass
+
     parser = argparse.ArgumentParser(
-        description="TrajectoryRL Miner",
+        description="TrajectoryRL Miner CLI",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Examples:
+  %(prog)s build SKILL.md -o pack.json
+  %(prog)s validate pack.json
+  %(prog)s upload pack.json
+  %(prog)s submit https://your-bucket.s3.amazonaws.com/pack.json
+  %(prog)s status
+""",
     )
     parser.add_argument(
         "--log-level", default=None,
@@ -376,29 +249,27 @@ def main():
     )
     sub = parser.add_subparsers(dest="command")
 
-    p_build = sub.add_parser("build", help="Build pack.json from AGENTS.md")
-    p_build.add_argument("--agents-md", required=True)
-    p_build.add_argument("--soul-md", default=None)
-    p_build.add_argument("--pack-name", default="my-pack")
-    p_build.add_argument("--pack-version", default="1.0.0")
-    p_build.add_argument("--output", "-o", default="pack.json")
+    # build
+    p_build = sub.add_parser("build", help="Build pack.json from SKILL.md")
+    p_build.add_argument("skill_md", help="Path to SKILL.md file")
+    p_build.add_argument("--output", "-o", default="pack.json", help="Output path")
 
+    # validate
     p_validate = sub.add_parser("validate", help="Validate pack.json locally")
-    p_validate.add_argument("pack_path")
+    p_validate.add_argument("pack_path", help="Path to pack.json")
 
+    # upload
+    p_upload = sub.add_parser("upload", help="Upload pack.json to S3-compatible storage")
+    p_upload.add_argument("pack_path", help="Path to pack.json")
+    p_upload.add_argument("--bucket", default=None, help="Override S3_BUCKET")
+    p_upload.add_argument("--endpoint-url", default=None, help="Override S3_ENDPOINT_URL")
+    p_upload.add_argument("--region", default=None, help="Override S3_REGION")
+
+    # submit
     p_submit = sub.add_parser("submit", help="Submit pack on-chain")
     p_submit.add_argument("pack_url", help="Public URL where pack.json is hosted")
 
-    p_run = sub.add_parser("run", help="Run miner daemon")
-    p_run.add_argument(
-        "--mode", required=True, choices=["demo", "default"],
-        help="demo: submit sample pack; default: LLM generate + upload + submit",
-    )
-    p_run.add_argument(
-        "--interval", type=int, default=None,
-        help="Seconds between submission cycles (overrides CHECK_INTERVAL)",
-    )
-
+    # status
     sub.add_parser("status", help="Check on-chain commitment")
 
     args = parser.parse_args()
@@ -407,9 +278,7 @@ def main():
         parser.print_help()
         return 0
 
-    from trajectoryrl.utils.config import MinerConfig
-    config = MinerConfig.from_env()
-    log_level = args.log_level or config.log_level
+    log_level = args.log_level or "WARNING"
     logging.basicConfig(
         level=getattr(logging, log_level),
         format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -418,9 +287,9 @@ def main():
     dispatch = {
         "build": cmd_build,
         "validate": cmd_validate,
+        "upload": cmd_upload,
         "submit": cmd_submit,
         "status": cmd_status,
-        "run": cmd_run,
     }
     return dispatch[args.command](args)
 

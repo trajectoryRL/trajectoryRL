@@ -4,14 +4,14 @@
 exec python -u scripts/eval_pack.py --pack pack.json "$@"
 
 Reads a local OPP v1 pack JSON (or an AGENTS.md), validates schema, runs
-ClawBench evaluation on all (or selected) scenarios via the Docker services,
+trajrl-bench evaluation on all (or selected) scenarios via the Docker services,
 scores against the real rubric, and reports qualification gate + cost.
 
 No chain connection needed — pure local evaluation.
 
 Prerequisites:
     1. Docker services running:
-         cd clawbench && docker compose up -d
+         docker compose up -d
     2. LLM API key configured (env var or --api-key)
 
 Usage:
@@ -31,9 +31,9 @@ Usage:
     python scripts/eval_pack.py --pack pack.json -v -o results.json
 
 Environment variables:
-    CLAWBENCH_DEFAULT_MODEL   LLM model           (default: zhipu/glm-5.1)
-    CLAWBENCH_LLM_API_KEY     API key for LLM
-    CLAWBENCH_LLM_BASE_URL    LLM base URL        (default: https://open.bigmodel.cn/api/paas/v4)
+    LLM_MODEL                 LLM model           (default: zhipu/glm-5.1)
+    LLM_API_KEY               API key for LLM
+    LLM_BASE_URL              LLM base URL        (default: https://open.bigmodel.cn/api/paas/v4)
 """
 
 import argparse
@@ -57,7 +57,7 @@ _bt = ModuleType("bittensor")
 _bt.Synapse = type("Synapse", (), {})  # type: ignore[attr-defined]
 sys.modules.setdefault("bittensor", _bt)
 
-from trajectoryrl.utils.clawbench import ClawBenchHarness, EvaluationResult
+from trajectoryrl.utils.sandbox_harness import TrajectorySandboxHarness, SandboxEvaluationResult as EvaluationResult
 from trajectoryrl.utils.opp_schema import validate_opp_schema
 from trajectoryrl.utils.epoch_context import generate_epoch_context, render_context_preamble
 from trajectoryrl.utils.llm_judge import TrajectoryJudge
@@ -97,7 +97,7 @@ def pack_from_agents_md(path: str) -> dict:
         "metadata": {
             "pack_name": Path(path).stem,
             "pack_version": "1.0.0",
-            "target_suite": "clawbench_v1",
+            "target_suite": "trajrl_bench_v1",
         },
     }
 
@@ -106,14 +106,14 @@ def pack_hash(pack: dict) -> str:
     return hashlib.sha256(json.dumps(pack, sort_keys=True).encode()).hexdigest()
 
 
-def check_services(mock_url: str, openclaw_url: str, token: str = "") -> bool:
+def check_services(mock_url: str, agent_url: str, token: str = "") -> bool:
     """Return True if both Docker services respond to /health."""
     import httpx
     ok = True
-    for name, url in [("mock-tools", mock_url), ("openclaw", openclaw_url)]:
+    for name, url in [("mock-tools", mock_url), ("agent-gateway", agent_url)]:
         try:
             headers = {}
-            if token and name == "openclaw":
+            if token and name == "agent-gateway":
                 headers["Authorization"] = f"Bearer {token}"
             r = httpx.get(f"{url}/health", timeout=5, headers=headers)
             if r.status_code == 200:
@@ -157,38 +157,36 @@ async def run(args) -> int:
 
     # ── 3. Check Docker services ──────────────────────────────────────────
     mock_url = os.getenv("MOCK_TOOLS_URL", "http://localhost:3001")
-    openclaw_url = os.getenv("OPENCLAW_URL", "http://localhost:18789")
+    agent_url = os.getenv("AGENT_GATEWAY_URL", os.getenv("OPENCLAW_URL", "http://localhost:18789"))
 
-    openclaw_token = os.getenv("OPENCLAW_GATEWAY_TOKEN", "sandbox-token-12345")
+    agent_token = os.getenv("AGENT_GATEWAY_TOKEN", os.getenv("OPENCLAW_GATEWAY_TOKEN", "sandbox-token-12345"))
 
     logger.info("Services:")
-    if not check_services(mock_url, openclaw_url, token=openclaw_token):
+    if not check_services(mock_url, agent_url, token=agent_token):
         logger.error(
             "\nDocker services not running.  Start them:\n"
-            "  cd clawbench && docker compose up -d\n"
+            "  docker compose up -d\n"
             "Then wait ~30s and retry."
         )
         return 1
 
-    # ── 4. ClawBench harness ──────────────────────────────────────────────
-    clawbench_path = Path(args.clawbench_path)
-    model = args.model or os.getenv("CLAWBENCH_DEFAULT_MODEL", "zhipu/glm-5.1")
-    api_key = args.api_key or os.getenv("CLAWBENCH_LLM_API_KEY", "")
+    # ── 4. Evaluation harness ─────────────────────────────────────────────
+    model = args.model or os.getenv("LLM_MODEL") or os.getenv("CLAWBENCH_DEFAULT_MODEL", "zhipu/glm-5.1")
+    api_key = args.api_key or os.getenv("LLM_API_KEY") or os.getenv("CLAWBENCH_LLM_API_KEY", "")
     base_url = args.base_url or os.getenv(
-        "CLAWBENCH_LLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4",
+        "LLM_BASE_URL") or os.getenv("CLAWBENCH_LLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4",
     )
     if not api_key:
-        logger.error("No LLM API key.  Set CLAWBENCH_LLM_API_KEY or --api-key")
+        logger.error("No LLM API key.  Set LLM_API_KEY or --api-key")
         return 1
 
     workspace = Path(args.workspace) if args.workspace else None
-    harness = ClawBenchHarness(
-        clawbench_path=clawbench_path,
+    harness = TrajectorySandboxHarness(
         timeout=args.timeout,
         workspace_path=workspace,
-        clawbench_default_model=model,
-        clawbench_api_key=api_key,
-        clawbench_base_url=base_url,
+        llm_model=model,
+        llm_api_key=api_key,
+        llm_base_url=base_url,
     )
     logger.info(f"Model:     {model}")
     logger.info(f"Timeout:   {args.timeout}s/scenario")
@@ -199,7 +197,7 @@ async def run(args) -> int:
         api_key=api_key,
         base_url=base_url,
     )
-    scenarios_path = clawbench_path / "scenarios"
+    scenarios_path = PROJECT_ROOT / "scenarios"
     logger.info("Judge:     TrajectoryJudge enabled")
 
     # ── 5. Epoch context ──────────────────────────────────────────────────
@@ -381,7 +379,7 @@ async def run(args) -> int:
 
 def main():
     p = argparse.ArgumentParser(
-        description="Evaluate a local pack against ClawBench (no chain needed).",
+        description="Evaluate a local pack against trajrl-bench (no chain needed).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "examples:\n"
@@ -405,8 +403,6 @@ def main():
     p.add_argument("--model", help="LLM model override")
     p.add_argument("--api-key", help="LLM API key override")
     p.add_argument("--base-url", help="LLM base URL override")
-    p.add_argument("--clawbench-path", default=str(PROJECT_ROOT / "clawbench"),
-                   help="Path to clawbench dir")
     p.add_argument("--workspace", default=None, help="Workspace path override")
     p.add_argument("-o", "--output", help="Save results to JSON file")
     p.add_argument("-v", "--verbose", action="store_true",

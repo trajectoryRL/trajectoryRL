@@ -1,6 +1,6 @@
 # TrajectoryRL Docker Deployment
 
-Docker is the **recommended way** to run TrajectoryRL validators and miners. A single all-in-one image contains everything needed: validator, mock-tools server, and OpenClaw gateway. Watchtower auto-updates the image from GHCR.
+Docker is the **recommended way** to run TrajectoryRL validators and miners. A single all-in-one image contains everything needed: validator, mock-tools server, and agent gateway. Watchtower auto-updates the image from GHCR.
 
 ## Quick Start — Validator
 
@@ -11,7 +11,7 @@ cd trajectoryRL
 
 # 2. Configure
 cp .env.example .env.validator
-# Edit .env.validator: set WALLET_NAME, WALLET_HOTKEY, CLAWBENCH_LLM_API_KEY
+# Edit .env.validator: set WALLET_NAME, WALLET_HOTKEY, LLM_API_KEY
 
 # 3. Start
 docker compose -f docker/docker-compose.validator.yml --env-file .env.validator up -d
@@ -30,9 +30,9 @@ WALLET_NAME=validator
 WALLET_HOTKEY=default
 NETUID=11
 NETWORK=finney
-CLAWBENCH_LLM_API_KEY=...
-CLAWBENCH_LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
-CLAWBENCH_DEFAULT_MODEL=zhipu/glm-5.1
+LLM_API_KEY=...
+LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
+LLM_MODEL=zhipu/glm-5.1
 
 # Optional
 LOG_LEVEL=INFO                    # DEBUG for development
@@ -94,7 +94,7 @@ The all-in-one validator image runs three processes managed by a bash entrypoint
 │  trajectoryrl-validator container           │
 │                                             │
 │  1. mock-tools   (port 3001)  ─ background  │
-│  2. OpenClaw     (port 18789) ─ background  │
+│  2. agent gw     (port 18789) ─ background  │
 │  3. validator    (PID 1)      ─ foreground  │
 │                                             │
 │  Shared: /workspace (AGENTS.md, fixtures)   │
@@ -102,8 +102,8 @@ The all-in-one validator image runs three processes managed by a bash entrypoint
 ```
 
 - **mock-tools**: Deterministic tool responses from fixtures (email, calendar, Slack, tasks)
-- **OpenClaw gateway**: LLM agent orchestrator with clawbench-tools plugin
-- **validator**: Reads on-chain commitments, fetches packs, evaluates via ClawBench, sets weights
+- **agent gateway**: LLM agent orchestrator with tool plugins
+- **validator**: Reads on-chain commitments, fetches packs, evaluates via trajrl-bench, sets weights
 
 Watchtower polls GHCR every 5 minutes and auto-updates the entire image.
 
@@ -124,18 +124,17 @@ docker compose -f docker/docker-compose.validator.yml logs validator
 
 # Look for:
 #   [entrypoint] mock-tools ready
-#   [entrypoint] OpenClaw gateway ready
 #   [entrypoint] Starting validator...
 
 # Common issues:
-# 1. Missing API key → Add CLAWBENCH_LLM_API_KEY to .env.validator
+# 1. Missing API key → Add LLM_API_KEY to .env.validator
 # 2. Wallet not found → Ensure ~/.bittensor/wallets exists
 ```
 
 ### Scores are all identical / evaluations complete instantly
-OpenClaw may be failing silently. Check the container logs for OpenClaw errors:
+The agent gateway may be failing silently. Check the container logs for errors:
 ```bash
-docker compose -f docker/docker-compose.validator.yml logs validator | grep -i "openclaw\|error"
+docker compose -f docker/docker-compose.validator.yml logs validator | grep -i "error"
 ```
 
 ### Network issues
