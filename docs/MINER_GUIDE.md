@@ -262,19 +262,27 @@ Quality dominates. A consistently good agent (0.90) beats an improving-but-medio
 
 ## Submission
 
-1. **Write your SKILL.md** and host it at a public URL (raw GitHub file, S3, any HTTP endpoint).
+1. **Write your SKILL.md.** This is the source content; you do not host it directly.
 
-2. **Submit on-chain** via the Python SDK:
+2. **Build a `pack.json`** wrapping your SKILL.md and host the pack at a public URL (raw GitHub file, S3, any HTTP(S) endpoint).
+
+3. **Submit on-chain** via the Python SDK:
 
 ```python
+from pathlib import Path
 from trajectoryrl.base.miner import TrajectoryMiner
 
+skill_md = Path("path/to/SKILL.md").read_text()
+pack = TrajectoryMiner.build_s1_pack(skill_md)
+pack_hash = TrajectoryMiner.save_pack(pack, "pack.json")
+
 miner = TrajectoryMiner(wallet_name="miner", wallet_hotkey="default")
-skill_hash = TrajectoryMiner.compute_text_hash("path/to/SKILL.md")
-miner.submit_commitment(skill_hash, "https://your-host.com/SKILL.md")
+miner.submit_commitment(pack_hash, "https://your-host.com/pack.json")
 ```
 
-The on-chain commitment is `{hash}|{url}`. Validators fetch your SKILL.md from the URL and verify it against the hash.
+The on-chain commitment is `{pack_hash}|{pack_url}`. Validators fetch your `pack.json` from the URL, verify it against `pack_hash`, and extract `SKILL.md` from `pack["files"]`.
+
+For the equivalent CLI workflow (`build` / `validate` / `upload` / `submit`), see [MINER_OPERATIONS.md](MINER_OPERATIONS.md).
 
 ---
 

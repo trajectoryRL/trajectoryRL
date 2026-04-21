@@ -122,14 +122,20 @@ btcli subnets register --wallet-name my-miner --hotkey default --netuid 11
 #### 2. Write your SKILL.md and submit
 
 ```bash
-pip install trajrl
+git clone https://github.com/trajectoryRL/trajectoryrl.git
+cd trajectoryrl && pip install -e .
 
-# Build pack from your SKILL.md
-trajrl pack build --skill-md ./SKILL.md
+# Build pack.json from your SKILL.md
+trajectoryrl-miner build ./SKILL.md -o pack.json
 
-# Submit on-chain
-trajrl pack submit --url https://your-host.com/pack.json
+# Upload to S3-compatible storage (configure S3_BUCKET, AWS_* in .env.miner)
+trajectoryrl-miner upload pack.json
+
+# Submit on-chain (pack URL is the public URL printed by `upload`)
+trajectoryrl-miner submit https://your-bucket.s3.amazonaws.com/pack.json
 ```
+
+See [MINER_OPERATIONS.md](docs/MINER_OPERATIONS.md) for full CLI reference (`build` / `validate` / `upload` / `submit` / `status`).
 
 #### 3. Test locally (optional)
 
