@@ -652,6 +652,7 @@ class TrajectorySandboxHarness:
 
         try:
             # Load fixtures into sandbox mock services + write INSTRUCTION.md
+            t_setup = time.time()
             sandbox.exec_run(["sh", "-c", "curl -s -X POST http://localhost:8090/reset"])
             fixtures_json = json.dumps(ep_data["fixtures"])
             _put_file(sandbox, "/tmp/fixtures.json", fixtures_json)
@@ -661,8 +662,10 @@ class TrajectorySandboxHarness:
             _put_file(sandbox, "/workspace/INSTRUCTION.md", ep_data["instruction_md"])
             sandbox.exec_run(["chown", "root:agent", "/workspace/INSTRUCTION.md"])
             sandbox.exec_run(["chmod", "440", "/workspace/INSTRUCTION.md"])
+            logger.info("[%s] ep%d STAGE setup_fixtures: %.1fs",
+                        session_id, episode_index, time.time() - t_setup)
 
-            # Start testee agent. Gets SSH creds to the sandbox.
+            t_testee_create = time.time()
             harness_name = f"testee_{session_id}_ep{episode_index}"
             harness_prompt = (
                 "SSH into the sandbox: `ssh -o StrictHostKeyChecking=no "
@@ -720,7 +723,11 @@ class TrajectorySandboxHarness:
             )
 
             harness.start()
+            logger.info("[%s] ep%d STAGE testee_create_start: %.1fs",
+                        session_id, episode_index,
+                        time.time() - t_testee_create)
 
+            t_testee_wait = time.time()
             try:
                 # Wait for harness to complete
                 timeout = self.config.sandbox_timeout_per_episode
@@ -736,7 +743,13 @@ class TrajectorySandboxHarness:
                         pass
                     episode.timed_out = True
 
-                # Capture transcript
+                logger.info(
+                    "[%s] ep%d STAGE testee_wait: %.1fs (timed_out=%s)",
+                    session_id, episode_index,
+                    time.time() - t_testee_wait, episode.timed_out,
+                )
+
+                t_testee_log = time.time()
                 try:
                     episode.transcript = harness.logs(
                         stdout=True, stderr=False
@@ -745,19 +758,26 @@ class TrajectorySandboxHarness:
                     pass
 
                 logger.info(
-                    "[%s] Episode %d testee transcript captured (%d chars)",
+                    "[%s] ep%d STAGE testee_logs: %.1fs (%d chars)",
                     session_id, episode_index,
+                    time.time() - t_testee_log,
                     len(episode.transcript or ""),
                 )
 
             finally:
+                t_testee_cleanup = time.time()
                 try:
                     harness.stop(timeout=3)
                     harness.remove(force=True)
                 except Exception:
                     pass
+                logger.info(
+                    "[%s] ep%d STAGE testee_cleanup: %.1fs",
+                    session_id, episode_index,
+                    time.time() - t_testee_cleanup,
+                )
 
-            # Capture mock state
+            t_state = time.time()
             code, state_raw = sandbox.exec_run(
                 ["sh", "-c", "curl -s http://localhost:8090/state"])
             if code == 0 and state_raw:
@@ -765,10 +785,10 @@ class TrajectorySandboxHarness:
                     episode.mock_state = json.loads(state_raw.decode())
                 except Exception:
                     pass
+            logger.info("[%s] ep%d STAGE mock_state_capture: %.1fs",
+                        session_id, episode_index, time.time() - t_state)
 
-            # -----------------------------------------------------------
-            # Score via agent judge (explores sandbox state via SSH + HTTP)
-            # -----------------------------------------------------------
+            t_judge = time.time()
             self._score_episode_agent(
                 session_id=session_id,
                 episode_index=episode_index,
@@ -781,6 +801,8 @@ class TrajectorySandboxHarness:
                 private_key=private_key,
                 judge_skill=judge_skill,
             )
+            logger.info("[%s] ep%d STAGE judge_total: %.1fs",
+                        session_id, episode_index, time.time() - t_judge)
 
             logger.info("[%s] Episode %d quality=%.3f",
                         session_id, episode_index, episode.quality)
@@ -816,6 +838,7 @@ class TrajectorySandboxHarness:
             timed_out=episode.timed_out,
         )
 
+        t_judge_create = time.time()
         try:
             judge = self.client.containers.create(
                 self._harness_image,
@@ -864,32 +887,42 @@ class TrajectorySandboxHarness:
                 mode=0o644, uid=_HERMES_UID, gid=_HERMES_UID,
             )
             judge.start()
+            logger.info("[%s] ep%d STAGE judge_create_start: %.1fs",
+                        session_id, episode_index,
+                        time.time() - t_judge_create)
 
+            t_judge_wait = time.time()
+            judge_timed_out = False
             try:
                 judge.wait(timeout=180)  # 3 min max for judging
             except Exception:
+                judge_timed_out = True
                 logger.warning("[%s] Episode %d judge agent timed out",
                                session_id, episode_index)
                 try:
                     judge.kill()
                 except Exception:
                     pass
+            logger.info(
+                "[%s] ep%d STAGE judge_wait: %.1fs (timed_out=%s)",
+                session_id, episode_index,
+                time.time() - t_judge_wait, judge_timed_out,
+            )
 
-            # Capture judge transcript for eval log upload
+            t_judge_log = time.time()
             try:
                 episode.judge_transcript = judge.logs(
                     stdout=True, stderr=False).decode(errors="replace")
             except Exception:
                 pass
-
             logger.info(
-                "[%s] Episode %d judge transcript captured (%d chars)",
+                "[%s] ep%d STAGE judge_logs: %.1fs (%d chars)",
                 session_id, episode_index,
+                time.time() - t_judge_log,
                 len(episode.judge_transcript or ""),
             )
 
-            # Read evaluation.json from the judge container via get_archive
-            # (works even after the container has exited)
+            t_judge_archive = time.time()
             try:
                 archive, _ = judge.get_archive("/workspace/evaluation.json")
                 buf = io.BytesIO()
@@ -910,13 +943,20 @@ class TrajectorySandboxHarness:
             except (json.JSONDecodeError, ValueError) as e:
                 logger.warning("[%s] Episode %d: failed to parse judge output: %s",
                                session_id, episode_index, e)
+            logger.info("[%s] ep%d STAGE judge_archive: %.1fs",
+                        session_id, episode_index,
+                        time.time() - t_judge_archive)
 
         finally:
+            t_judge_cleanup = time.time()
             try:
                 judge.stop(timeout=3)
                 judge.remove(force=True)
             except Exception:
                 pass
+            logger.info("[%s] ep%d STAGE judge_cleanup: %.1fs",
+                        session_id, episode_index,
+                        time.time() - t_judge_cleanup)
 
     def _build_judge_skill(self, scenario: str) -> str:
         """Fetch JUDGE.md for a scenario from the sandbox image.

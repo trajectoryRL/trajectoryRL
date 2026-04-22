@@ -59,6 +59,10 @@ from ..utils.winner_state import (
     WinnerState, select_winner_with_protection,
     save_winner_state, load_winner_state,
 )
+from ..utils.miner_eval import (
+    evaluate_miner_s1,
+    SKIP_PACK_VERIFY,
+)
 from ..utils.commitments import (
     MinerCommitment, fetch_all_commitments,
     ValidatorConsensusCommitment, fetch_validator_consensus_commitments,
@@ -1778,14 +1782,16 @@ class TrajectoryValidator:
     ) -> Optional[Dict]:
         """Evaluate a single miner via trajrl-bench sandbox.
 
-        Flow:
-        1. Fetch + verify submission (usually cache hit after cycle NCD prefetch)
-        2. Run trajrl-bench sandbox evaluation (SKILL.md + SSH + LLM judge)
-        3. Return quality-based scores
+        Delegates the real work to ``evaluate_miner_s1`` (shared with
+        ``scripts/eval_miners.py``). This method only:
+        - Resolves the per-miner file logger and the wallet-derived salt.
+        - Maps the helper's outcome back into the validator pipeline dict
+          shape and updates ``_disqualified_miners`` for non-pack-verify
+          skips (matching pre-refactor behavior).
 
         Returns:
-            Dict with keys "qualified", "judge_details" mapping
-            scenario_name to values, or None if pre-evaluation checks fail.
+            Dict with keys "qualified", "judge_details", ... or ``None``
+            if pre-evaluation checks fail.
         """
         mlog = self._get_miner_logger(commitment.hotkey)
         mlog.info(
@@ -1793,134 +1799,38 @@ class TrajectoryValidator:
             f"(hotkey={commitment.hotkey[:8]}, hash={commitment.pack_hash[:12]}...)"
         )
 
-        # Step 1: Fetch and verify submission from HTTP URL
-        verification = await self.pack_fetcher.verify_submission(
-            pack_url=commitment.pack_url,
-            pack_hash=commitment.pack_hash,
-        )
-
-        if not verification.valid:
-            mlog.warning(
-                f"Pack verification failed: {verification.error}"
-            )
-            return None
-
-        return await self._evaluate_miner_s1(
-            miner_uid=miner_uid,
+        outcome = await evaluate_miner_s1(
+            harness=self._sandbox_harness,
+            pack_fetcher=self.pack_fetcher,
             commitment=commitment,
-            pack=verification.pack_content,
             epoch_seed=epoch_seed,
-            block_height=block_height,
+            validator_salt=self._default_validator_salt(),
+            mlog=mlog,
         )
 
-    async def _evaluate_miner_s1(
-        self,
-        miner_uid: int,
-        commitment: "MinerCommitment",
-        pack: dict,
-        epoch_seed: int,
-        block_height: int = 0,
-    ) -> Optional[Dict]:
-        """Season 1 evaluation path: trajrl-bench with LLM judge.
-
-        Runs N episodes of the same scenario in an SSH sandbox with
-        Hermes Agent. Uses split-half delta scoring (quality-based,
-        not cost-based).
-
-        Returns same shape as _evaluate_miner for pipeline compatibility:
-            {"qualified": {...}, "judge_details": {...}, ...}
-        """
-        mlog = self._get_miner_logger(commitment.hotkey)
-
-        files = pack.get("files", {})
-        if "SKILL.md" not in files:
-            mlog.warning("Pack missing SKILL.md in files")
-            self._disqualified_miners[commitment.hotkey] = "missing_skill_md"
+        if not outcome.success:
+            # Match pre-refactor semantics: pack-verify failures return
+            # None silently; SKILL.md and harness errors mark the miner
+            # as disqualified for this evaluation cycle.
+            if outcome.skip_reason and outcome.skip_reason != SKIP_PACK_VERIFY:
+                self._disqualified_miners[commitment.hotkey] = outcome.skip_reason
             return None
 
-        extra_files = [f for f in files if f != "SKILL.md"]
-        if extra_files:
-            mlog.warning("S1 pack contains unexpected files: %s", extra_files)
-
-        skill_md = files["SKILL.md"]
-        if not skill_md or not skill_md.strip():
-            mlog.warning("Empty SKILL.md submission")
-            self._disqualified_miners[commitment.hotkey] = "empty_skill_md"
-            return None
-
-        mlog.info(
-            "S1 evaluation: %d episodes, skill_md=%d chars",
-            self.config.sandbox_num_episodes, len(skill_md),
-        )
-
-        try:
-            result = await self._sandbox_harness.evaluate_miner(
-                skill_md=skill_md,
-                epoch_seed=epoch_seed,
-                pack_hash=commitment.pack_hash,
-                validator_salt=self._default_validator_salt(),
-            )
-        except Exception as e:
-            mlog.error("S1 evaluation failed: %s", e, exc_info=True)
-            self._disqualified_miners[commitment.hotkey] = "s1_eval_error"
-            return None
-
-        if result.error:
-            mlog.warning("S1 evaluation error: %s", result.error)
-            self._disqualified_miners[commitment.hotkey] = "s1_eval_error"
-            return None
-
-        # Log per-episode transcript tails to miner detail log
-        for ep in result.session_result.episodes:
-            idx = ep.episode_index
-            if ep.transcript:
-                mlog.info(
-                    "Episode %d testee transcript tail (%d chars):\n%s",
-                    idx, len(ep.transcript), ep.transcript[-3000:],
-                )
-            if ep.judge_transcript:
-                mlog.info(
-                    "Episode %d judge transcript tail (%d chars):\n%s",
-                    idx, len(ep.judge_transcript), ep.judge_transcript[-3000:],
-                )
-
-        # Map S1 result to validator pipeline format.
-        # S1 uses a single "scenario" (incident_response) with quality scoring.
-        scenario_name = result.scenario_name
-        qualified = result.success
-
-        mlog.info(
-            "S1 result: final_score=%.3f, mean_quality=%.3f, delta=%.3f, "
-            "episodes=%s, qualified=%s",
-            result.score, result.mean_quality, result.delta,
-            result.episode_qualities, qualified,
-        )
-
-        scenario_qualified = {scenario_name: qualified}
-        scenario_judge_details = {
-            scenario_name: {
-                "overall_score": round(result.score, 4),
-                "mean_quality": round(result.mean_quality, 4),
-                "delta": round(result.delta, 4),
-                "early_mean": round(result.early_mean, 4),
-                "late_mean": round(result.late_mean, 4),
-                "episode_qualities": [round(q, 4) for q in result.episode_qualities],
-                "qualification_gate": qualified,
-                "harness": "trajrl-bench",
-                "sandbox_version": self._sandbox_harness.sandbox_version,
-            },
+        scenario_qualified = {
+            sn: d["qualification_gate"]
+            for sn, d in outcome.judge_details.items()
         }
 
         return {
             "qualified": scenario_qualified,
             "token_usage": {},
             "model_usage": {},
-            "judge_details": scenario_judge_details,
+            "judge_details": outcome.judge_details,
             "session_keys": {},
             "session_files": {},
             # S1-specific: full SandboxEvaluationResult for eval log upload.
             # Not serialized — consumed by _fire_upload_eval_logs and dropped.
-            "_s1_sandbox_result": result,
+            "_s1_sandbox_result": outcome.sandbox_result,
         }
 
     def _default_validator_salt(self) -> str:

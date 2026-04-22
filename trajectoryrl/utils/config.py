@@ -174,6 +174,8 @@ class ValidatorConfig:
                 os.getenv("EMA_STATE_PATH", "/var/lib/trajectoryrl/eval_state.json"),
             )),
             winner_state_path=Path(os.getenv("WINNER_STATE_PATH", "/var/lib/trajectoryrl/winner_state.json")),
+            pack_cache_dir=Path(os.getenv("PACK_CACHE_DIR", "/var/lib/trajectoryrl/packs")),
+            log_dir=Path(os.getenv("LOG_DIR", "./logs")),
             # --- LLM (new names preferred, legacy CLAWBENCH_* still supported) ---
             llm_model=os.getenv("LLM_MODEL") or os.getenv("CLAWBENCH_DEFAULT_MODEL", DEFAULT_LLM_MODEL),
             llm_api_key=os.getenv("LLM_API_KEY") or os.getenv("CLAWBENCH_LLM_API_KEY", ""),

@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """Evaluate a local pack file as a validator would (Season 1 sandbox).
 
-exec python -u scripts/eval_pack.py --pack pack.json "$@"
-
 Reads a local Season 1 pack JSON (or a bare SKILL.md), validates schema,
 runs the trajrl-bench 3-container evaluation (sandbox + testee + judge),
 and prints the split-half delta scoring summary.
@@ -11,34 +9,24 @@ No chain connection needed — pure local evaluation. Same harness and
 scoring as ``scripts/eval_miners.py`` but skips the on-chain commitment
 fetch in favour of a local pack file.
 
+Configuration is taken from ``.env.validator`` via ``ValidatorConfig.from_env``.
+The CLI exposes only the few flags that are unique to local pack
+debugging: which pack/SKILL.md to evaluate, how to render output, and
+an optional epoch seed override for reproducibility.
+
 Prerequisites:
     1. Docker daemon running
-    2. LLM API key configured (env var or --api-key)
+    2. LLM API key configured in ``.env.validator`` (LLM_API_KEY)
 
 Usage:
-    # Evaluate a pack JSON file:
     python scripts/eval_pack.py --pack pack.json
-
-    # Or just a SKILL.md (auto-wraps into a minimal S1 pack):
     python scripts/eval_pack.py --skill-md SKILL.md
-
-    # Override episode count:
-    python scripts/eval_pack.py --pack pack.json --num-episodes 2
-
-    # Save eval artifacts (transcripts, evaluation.json, world.json):
     python scripts/eval_pack.py --pack pack.json -o ./eval_output
-
-    # Save summary as JSON:
     python scripts/eval_pack.py --pack pack.json --json results.json
 
-Environment variables (also read from .env.validator):
-    LLM_MODEL                 LLM model           (default: glm-5.1)
-    LLM_API_KEY               API key for LLM
-    LLM_BASE_URL              LLM base URL        (default: https://open.bigmodel.cn/api/paas/v4)
-    SANDBOX_IMAGE             Sandbox image       (default: ghcr.io/trajectoryrl/trajrl-bench:latest)
-    HARNESS_IMAGE             Hermes image        (default: ghcr.io/trajectoryrl/hermes-agent:latest)
-    SANDBOX_NUM_EPISODES      Episodes per eval   (default: 4)
-    SANDBOX_TIMEOUT_PER_EPISODE  Per-episode timeout in seconds  (default: 180)
+To override env values temporarily:
+    LLM_MODEL=openai/gpt-4o python scripts/eval_pack.py --pack pack.json
+    SANDBOX_NUM_EPISODES=2 python scripts/eval_pack.py --pack pack.json
 """
 
 import argparse
@@ -50,67 +38,82 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from trajectoryrl.utils.sandbox_harness import (
-    TrajectorySandboxHarness,
-    SandboxEvaluationResult,
-)
 from trajectoryrl.utils.config import ValidatorConfig
+from trajectoryrl.utils.sandbox_harness import (
+    SandboxEvaluationResult,
+    TrajectorySandboxHarness,
+)
 from trajectoryrl.base.miner import TrajectoryMiner
 
 logger = logging.getLogger("eval_pack")
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+def _setup_logging(level_name: str) -> None:
+    """Configure stderr logging for the CLI and project loggers."""
+    level = getattr(logging, level_name)
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    ))
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(handler)
+    root.setLevel(level)
+    for name in (
+        "eval_pack",
+        "trajectoryrl",
+        "trajectoryrl.utils.sandbox_harness",
+    ):
+        lg = logging.getLogger(name)
+        lg.setLevel(level)
+        lg.propagate = True
 
-def load_pack(path: str) -> dict:
+
+def _load_pack(path: str) -> dict:
     with open(path) as f:
         return json.load(f)
 
 
-def pack_from_skill_md(path: str) -> dict:
+def _pack_from_skill_md(path: str) -> dict:
     """Wrap a bare SKILL.md file into a minimal S1 pack."""
     content = Path(path).read_text()
     return TrajectoryMiner.build_s1_pack(content)
 
 
-def compute_pack_hash(pack: dict) -> str:
+def _compute_pack_hash(pack: dict) -> str:
     canonical = json.dumps(pack, sort_keys=True)
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
-def compute_local_salt(pack_hash: str) -> str:
+def _compute_local_salt(pack_hash: str) -> str:
     """Deterministic per-pack salt for local evaluation runs."""
     data = f"eval_pack_cli:{pack_hash}".encode()
     return hashlib.sha256(data).hexdigest()[:16]
 
 
-def print_summary(
+def _print_summary(
     source: str,
     pack_hash: str,
     result: SandboxEvaluationResult,
     sandbox_version: str,
     scoring_version: int,
 ) -> bool:
-    """Print S1 evaluation summary; returns ``qualified`` boolean."""
+    """Render a human-readable summary; return qualified flag."""
     W = 70
-    print("\n")
-    print("=" * W)
-    print(f"PACK EVALUATION SUMMARY")
-    print(f"  source:           {source}")
-    print(f"  pack hash:        {pack_hash[:16]}...")
-    print(f"  sandbox version:  {sandbox_version}")
-    print(f"  scoring version:  {scoring_version}")
-    print(f"  scenario:         {result.scenario_name}")
+    sr = result.session_result
+    print("\n" + "=" * W)
+    print("PACK EVALUATION SUMMARY")
+    print(f"Source:          {source}")
+    print(f"Pack hash:       {pack_hash[:16]}...")
+    print(f"Sandbox version: {sandbox_version}")
+    print(f"Scoring version: {scoring_version}")
+    print(f"Scenario:        {result.scenario_name}")
     print("=" * W)
 
-    sr = result.session_result
     print(f"\n  {'Episode':<12} {'Quality':>8}")
     print(f"  {'-' * 22}")
     for ep in sr.episodes:
@@ -134,26 +137,35 @@ def print_summary(
     return qualified
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+async def run_evaluation(args) -> int:
+    _setup_logging(args.log_level)
 
-async def run(args) -> int:
-    # --- 1. Load pack ----------------------------------------------------
+    # Redirect cache + logs to a temp dir BEFORE from_env runs, so
+    # ValidatorConfig.__post_init__ doesn't try to mkdir under
+    # /var/lib/trajectoryrl (which the CLI lacks permission for).
+    tmp_dir = Path(tempfile.mkdtemp(prefix="eval_pack_"))
+    os.environ.setdefault("PACK_CACHE_DIR", str(tmp_dir / "packs"))
+    os.environ.setdefault("LOG_DIR", str(tmp_dir / "logs"))
+
+    config = ValidatorConfig.from_env(dotenv_path=PROJECT_ROOT / ".env.validator")
+
+    if not config.llm_api_key:
+        logger.error("No LLM API key configured. Set LLM_API_KEY in .env.validator")
+        return 1
+
     if args.pack:
         logger.info("Loading pack: %s", args.pack)
-        pack = load_pack(args.pack)
+        pack = _load_pack(args.pack)
         source = args.pack
     else:
         logger.info("Building pack from: %s", args.skill_md)
-        pack = pack_from_skill_md(args.skill_md)
+        pack = _pack_from_skill_md(args.skill_md)
         source = args.skill_md
 
-    pack_hash = compute_pack_hash(pack)
+    pack_hash = _compute_pack_hash(pack)
     logger.info("Pack hash: %s...", pack_hash[:16])
     logger.info("Files:     %s", list(pack.get("files", {}).keys()))
 
-    # --- 2. S1 schema validation ----------------------------------------
     issues = TrajectoryMiner.validate_s1(pack)
     if issues:
         for issue in issues:
@@ -177,71 +189,33 @@ async def run(args) -> int:
 
     logger.info("SKILL.md: %d chars", len(skill_md))
 
-    # --- 3. Build harness via ValidatorConfig ---------------------------
-    model = (
-        args.model
-        or os.getenv("LLM_MODEL")
-        or os.getenv("CLAWBENCH_DEFAULT_MODEL", "glm-5.1")
-    )
-    api_key = (
-        args.api_key
-        or os.getenv("LLM_API_KEY")
-        or os.getenv("CLAWBENCH_LLM_API_KEY", "")
-    )
-    base_url = (
-        args.base_url
-        or os.getenv("LLM_BASE_URL")
-        or os.getenv("CLAWBENCH_LLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
-    )
-
-    if not api_key:
-        logger.error("No LLM API key configured. Set LLM_API_KEY or --api-key")
-        return 1
-
-    tmp_dir = Path(tempfile.mkdtemp(prefix="eval_pack_"))
-    config = ValidatorConfig(
-        netuid=args.netuid,
-        network="local",
-        llm_model=model,
-        llm_api_key=api_key,
-        llm_base_url=base_url,
-        sandbox_num_episodes=args.num_episodes,
-        pack_cache_dir=tmp_dir / "packs",
-        log_dir=tmp_dir / "logs",
-    )
-
     harness = TrajectorySandboxHarness(config)
-
-    logger.info("Model:           %s", model)
-    logger.info("Base URL:        %s", base_url)
+    logger.info("Model:           %s", config.llm_model)
+    logger.info("Base URL:        %s", config.llm_base_url)
     logger.info("Sandbox image:   %s", config.sandbox_image)
     logger.info("Harness image:   %s", config.harness_image)
     logger.info("Episodes:        %d", config.sandbox_num_episodes)
     logger.info("Timeout/episode: %ds", config.sandbox_timeout_per_episode)
 
-    # --- 4. Pull latest sandbox + harness images ------------------------
-    if not args.no_pull:
-        logger.info("Pulling latest images...")
-        await harness.pull_latest()
-    else:
+    if args.no_pull:
         logger.info("Skipping image pull (--no-pull)")
+    else:
+        logger.info("Pulling latest sandbox + harness images...")
+        await harness.pull_latest()
     logger.info(
-        "Sandbox version: %s, scoring_version: %d",
+        "Sandbox %s, scoring_version %d, scenarios=%s",
         harness.sandbox_version, harness.scoring_version,
+        harness.sandbox_scenarios or "?",
     )
-    if harness.sandbox_scenarios:
-        logger.info("Available scenarios: %s", harness.sandbox_scenarios)
 
-    # --- 5. Compute epoch seed + salt -----------------------------------
     epoch_seed = (
         args.seed if args.seed is not None
         else int(hashlib.sha256(pack_hash.encode()).hexdigest()[:8], 16)
     )
-    validator_salt = compute_local_salt(pack_hash)
+    validator_salt = _compute_local_salt(pack_hash)
     logger.info("Epoch seed:    %d", epoch_seed)
     logger.info("Validator salt: %s", validator_salt)
 
-    # --- 6. Run S1 sandbox evaluation -----------------------------------
     logger.info("Starting S1 sandbox evaluation...")
     try:
         result = await harness.evaluate_miner(
@@ -274,8 +248,7 @@ async def run(args) -> int:
         result.episode_qualities, result.scenario_name,
     )
 
-    # --- 7. Summary -----------------------------------------------------
-    qualified = print_summary(
+    qualified = _print_summary(
         source=source,
         pack_hash=pack_hash,
         result=result,
@@ -283,17 +256,16 @@ async def run(args) -> int:
         scoring_version=harness.scoring_version,
     )
 
-    # --- 8. Eval artifacts ----------------------------------------------
     if args.output:
         out_dir = Path(args.output)
         out_dir.mkdir(parents=True, exist_ok=True)
         result.write_artifacts(out_dir)
+        logger.info("Artifacts written to %s", out_dir)
         print(f"\nEval artifacts written to: {out_dir}")
 
-    # --- 9. JSON summary ------------------------------------------------
     if args.json_output:
         sr = result.session_result
-        output = {
+        payload = {
             "source": source,
             "pack_hash": pack_hash,
             "epoch_seed": epoch_seed,
@@ -301,7 +273,7 @@ async def run(args) -> int:
             "sandbox_version": harness.sandbox_version,
             "scoring_version": harness.scoring_version,
             "scenario": result.scenario_name,
-            "model": model,
+            "model": config.llm_model,
             "evaluation": {
                 "final_score": round(sr.final_score, 4),
                 "mean_quality": round(sr.mean_quality, 4),
@@ -317,28 +289,19 @@ async def run(args) -> int:
         }
         Path(args.json_output).parent.mkdir(parents=True, exist_ok=True)
         with open(args.json_output, "w") as f:
-            json.dump(output, f, indent=2, ensure_ascii=False)
+            json.dump(payload, f, indent=2, ensure_ascii=False)
         print(f"\nJSON results written to: {args.json_output}")
 
     return 0 if qualified else 1
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate a local pack against the Season 1 trajrl-bench sandbox. "
-            "No chain connection required."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "examples:\n"
-            "  python scripts/eval_pack.py --pack pack.json\n"
-            "  python scripts/eval_pack.py --skill-md SKILL.md --num-episodes 2\n"
-            "  python scripts/eval_pack.py --pack pack.json -o ./eval_output\n"
+            "Evaluate a local pack against the Season 1 trajrl-bench "
+            "sandbox. No chain connection required. All configuration "
+            "(LLM, episodes, images, ...) is taken from .env.validator; "
+            "override via env vars when running."
         ),
     )
 
@@ -350,14 +313,6 @@ def main():
     )
 
     parser.add_argument(
-        "--netuid", type=int, default=None,
-        help="Subnet UID for default-salt computation (default: from env or 11)",
-    )
-    parser.add_argument(
-        "--num-episodes", type=int, default=None,
-        help="Number of episodes per evaluation (default: 4)",
-    )
-    parser.add_argument(
         "--seed", type=int, default=None,
         help="Override epoch seed (default: derived from pack hash)",
     )
@@ -365,58 +320,27 @@ def main():
         "--no-pull", action="store_true",
         help="Skip docker pull of sandbox + harness images",
     )
-
-    # LLM config
-    parser.add_argument("--model", type=str, default=None,
-                        help="LLM model (e.g. glm-5.1)")
-    parser.add_argument("--api-key", type=str, default=None,
-                        help="API key for the LLM provider")
-    parser.add_argument("--base-url", type=str, default=None,
-                        help="Base URL for the LLM API")
-
-    # Output
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Continue even if S1 schema validation fails",
+    )
     parser.add_argument(
         "--output", "-o", type=str, default=None,
-        help="Write eval artifacts (transcripts, evaluation.json) to directory",
+        help="Write eval artifacts (transcripts, evaluation.json) to this directory",
     )
     parser.add_argument(
         "--json", dest="json_output", type=str, default=None,
-        help="Write summary results to JSON file",
+        help="Write summary results to a JSON file",
     )
-    parser.add_argument("--verbose", "-v", action="store_true",
-                        help="Show detailed episode logs")
-    parser.add_argument("--force", action="store_true",
-                        help="Continue even if schema validation fails")
     parser.add_argument(
         "--log-level", type=str, default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
 
-    # Load .env.validator before parsing args so env defaults work
-    env_path = PROJECT_ROOT / ".env.validator"
-    if env_path.exists():
-        try:
-            from dotenv import load_dotenv
-            load_dotenv(env_path)
-            print(f"Loaded config from {env_path}")
-        except ImportError:
-            pass
-
     args = parser.parse_args()
 
-    if args.netuid is None:
-        args.netuid = int(os.getenv("NETUID", "11"))
-    if args.num_episodes is None:
-        args.num_episodes = int(os.getenv("SANDBOX_NUM_EPISODES", "4"))
-
-    log_level = getattr(logging, args.log_level)
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s | %(levelname)-8s | %(message)s",
-    )
-
     try:
-        exit_code = asyncio.run(run(args))
+        exit_code = asyncio.run(run_evaluation(args))
     except Exception as e:
         print(f"FATAL: {e}", file=sys.stderr)
         import traceback
