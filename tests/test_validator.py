@@ -1897,13 +1897,17 @@ class TestConsensusAggregation:
         assert scores["m1"] == pytest.approx(0.5)
 
     def test_different_miners_per_validator(self):
+        # v2 omits m2 from its payload — that counts as a 0-score vote
+        # with v2's full stake weight.
         subs = [
             self._make_validated("v1", 100.0, {"m1": 0.4, "m2": 0.6}),
             self._make_validated("v2", 100.0, {"m1": 0.8}),
         ]
         scores, _ = compute_consensus_scores(subs)
+        # m1: (100*0.4 + 100*0.8) / 200 = 0.6
         assert scores["m1"] == pytest.approx(0.6)
-        assert scores["m2"] == pytest.approx(0.6)
+        # m2: (100*0.6 + 100*0.0) / 200 = 0.3
+        assert scores["m2"] == pytest.approx(0.3)
 
     def test_disqualification_equal_stake_split_not_disqualified(self):
         """50/50 stake split: disq_ratio = 0.5, NOT > 0.5, so NOT disqualified."""
