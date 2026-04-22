@@ -136,11 +136,17 @@ def filter_scoring_version(
 
 def filter_zero_signal(
     submissions: List[Tuple[ConsensusPointer, ConsensusPayload]],
+    zero_threshold: float = 1.0,
 ) -> Tuple[List[Tuple[ConsensusPointer, ConsensusPayload]], int]:
-    """Layer 7: discard all-zero score submissions when non-zero signals exist.
+    """Layer 7: discard near-zero-signal submissions when real signal exists.
 
-    Prevents free-riding validators from diluting legitimate signals.
-    If ALL submissions are zero, they all pass (bootstrap scenario).
+    A submission is dropped when the fraction of zero scores meets or exceeds
+    ``zero_threshold``.  Default 1.0 keeps the legacy behaviour (drop only
+    strictly all-zero payloads).  Lower values (e.g. 0.95) treat free-rider
+    payloads that sprinkle one or two nonzero scores as all-zero.
+
+    If no submission has any nonzero scores, all pass through (bootstrap
+    scenario — nothing to compare against).
     """
     has_nonzero = any(
         any(s != 0.0 for s in payload.scores.values())
@@ -153,10 +159,21 @@ def filter_zero_signal(
     passed = []
     skipped = 0
     for ptr, payload in submissions:
-        if not payload.scores or all(s == 0.0 for s in payload.scores.values()):
+        scores = payload.scores
+        if not scores:
             logger.debug(
-                "Filter[zero-signal]: skip %s (all-zero scores)",
+                "Filter[zero-signal]: skip %s (empty scores)",
                 ptr.validator_hotkey[:8],
+            )
+            skipped += 1
+            continue
+        zero_count = sum(1 for s in scores.values() if s == 0.0)
+        zero_ratio = zero_count / len(scores)
+        if zero_ratio >= zero_threshold:
+            logger.debug(
+                "Filter[zero-signal]: skip %s (%d/%d = %.1f%% zero >= %.1f%%)",
+                ptr.validator_hotkey[:8],
+                zero_count, len(scores), 100 * zero_ratio, 100 * zero_threshold,
             )
             skipped += 1
         else:
@@ -171,6 +188,7 @@ def run_filter_pipeline(
     min_stake: float,
     expected_protocol: int = CONSENSUS_PROTOCOL_VERSION,
     expected_scoring_version: Optional[int] = None,
+    zero_signal_threshold: float = 1.0,
 ) -> Tuple[List[ValidatedSubmission], FilterStats]:
     """Run the full 5-layer filter pipeline.
 
@@ -194,7 +212,7 @@ def run_filter_pipeline(
     current, n = filter_scoring_version(current, expected_scoring_version)
     stats.skipped_scoring_version = n
 
-    current, n = filter_zero_signal(current)
+    current, n = filter_zero_signal(current, zero_threshold=zero_signal_threshold)
     stats.skipped_zero_signal = n
 
     validated = []
