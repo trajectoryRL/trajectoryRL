@@ -70,17 +70,41 @@ def select_winner_with_protection(
         logger.warning("No miners with scores in consensus — no winner")
         return None, state
 
-    sorted_miners = sorted(consensus_scores.items(), key=lambda x: x[1], reverse=True)
+    # Restrict candidates to miners still registered on-chain. A hotkey that
+    # was deregistered (UID slot reassigned) can linger in consensus_scores
+    # via stale per-validator caches; picking it as winner would route weight
+    # to a UID held by a different miner. When hk_to_uid is empty (legacy
+    # test path), fall back to consensus_scores as-is.
+    if hk_to_uid:
+        eligible = {
+            hk: s for hk, s in consensus_scores.items() if hk in hk_to_uid
+        }
+    else:
+        eligible = consensus_scores
+
+    if not eligible:
+        logger.warning(
+            "No eligible miners (all %d scored hotkeys absent from metagraph) "
+            "— no winner", len(consensus_scores),
+        )
+        return None, state
+
+    sorted_miners = sorted(eligible.items(), key=lambda x: x[1], reverse=True)
     best_hk, best_score = sorted_miners[0]
 
     if (
         disable_winner_protection
         or state.winner_hotkey is None
-        or state.winner_hotkey not in consensus_scores
+        or state.winner_hotkey not in eligible
     ):
-        reason = "no previous winner" if state.winner_hotkey is None else (
-            f"previous winner {state.winner_hotkey[:8]} absent from scores"
-        )
+        if state.winner_hotkey is None:
+            reason = "no previous winner"
+        elif hk_to_uid and state.winner_hotkey not in hk_to_uid:
+            reason = f"previous winner {state.winner_hotkey[:8]} deregistered"
+        else:
+            reason = (
+                f"previous winner {state.winner_hotkey[:8]} absent from scores"
+            )
         new_state = WinnerState(
             winner_hotkey=best_hk,
             winner_pack_hash=pack_hashes.get(best_hk),
