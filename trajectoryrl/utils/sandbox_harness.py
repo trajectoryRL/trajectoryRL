@@ -905,6 +905,18 @@ class TrajectorySandboxHarness:
         if not scenario_files:
             return
 
+        # Loosen /workspace perms from the Dockerfile default
+        # (``root:agent 0750``) to 0770 so the agent group — which the
+        # agent user is in — can create NEW files at the top level.
+        # codebase_fix ep3's ticket asks the agent to write
+        # /workspace/POSTMORTEM.md; without this, open("...", "w") in
+        # the agent session returns EACCES (write on the containing
+        # directory is required to create a file, not just write on
+        # the file). Existing root-owned files (SKILL.md, ENVIRONMENT.md
+        # at 0440) keep their per-file perms — only directory-entry
+        # operations gain permission.
+        sandbox.exec_run(["chmod", "0770", "/workspace"])
+
         logger.info("Installing %d scenario file(s) into /workspace/",
                     len(scenario_files))
         for rel_path, body in scenario_files.items():
