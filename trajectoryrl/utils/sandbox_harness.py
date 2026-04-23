@@ -503,13 +503,26 @@ class TrajectorySandboxHarness:
 
         # -----------------------------------------------------------
         # Step 1: Generate fixtures via docker run
+        #
+        # The bench CLI (``trajrl_bench.cli generate``) defaults
+        # ``--scenario`` to ``incident_response`` when the flag is
+        # omitted. That default made morning_brief / codebase_fix
+        # effectively unreachable from the validator loop: the CLI
+        # advertised them in ``scenarios_available`` but the harness
+        # always generated incident_response fixtures. Pass the
+        # validator's configured scenario explicitly so ops can pick
+        # a non-default scenario via ``SANDBOX_SCENARIO``.
         # -----------------------------------------------------------
-        logger.info("[%s] Generating fixtures via sandbox image...", session_id)
+        logger.info(
+            "[%s] Generating fixtures via sandbox image (scenario=%s)...",
+            session_id, self.config.sandbox_scenario,
+        )
         gen_data = _docker_run_json(
             self.client, self._sandbox_image,
             command=["python", "-m", "trajrl_bench.cli", "generate",
                      "--seed", str(epoch_seed), "--salt", salt,
-                     "--episodes", str(num_episodes)],
+                     "--episodes", str(num_episodes),
+                     "--scenario", self.config.sandbox_scenario],
         )
 
         scenario = gen_data["scenario"]
@@ -595,6 +608,19 @@ class TrajectorySandboxHarness:
                 _put_file(sandbox, "/workspace/ENVIRONMENT.md", environment_md)
                 sandbox.exec_run(["chown", "root:agent", "/workspace/ENVIRONMENT.md"])
                 sandbox.exec_run(["chmod", "440", "/workspace/ENVIRONMENT.md"])
+
+            # Install scenario_files (e.g. codebase_fix repo template) into
+            # the sandbox once per session. Scenarios that don't emit
+            # scenario_files (incident_response, morning_brief) leave the
+            # dict empty and this is a no-op.
+            #
+            # Note: the current bench CLI drops scenario_files from the
+            # generate JSON (``EpisodeFixtures.to_dict`` omits the field),
+            # so this path only activates once the bench side starts
+            # forwarding them. The validator reads from
+            # ``ep_data["fixtures"]["scenario_files"]`` defensively — if
+            # the key is absent we fall through without error.
+            self._install_scenario_files(sandbox, episodes_data)
 
             # Run each episode
             for i, ep_data in enumerate(episodes_data):
@@ -788,6 +814,23 @@ class TrajectorySandboxHarness:
             logger.info("[%s] ep%d STAGE mock_state_capture: %.1fs",
                         session_id, episode_index, time.time() - t_state)
 
+            # Inject hidden tests and run them against the agent's work
+            # BEFORE the judge starts. This path is only exercised by
+            # scenarios that ship ``hidden_tests`` in the episode payload
+            # (currently: codebase_fix). Writes a per-episode result
+            # summary to /workspace/test_results/ep<N>.json so the judge
+            # can cite it and so later episodes can read the ground
+            # truth of whether a prior fix held. The injected files are
+            # removed after pytest runs so the testee never sees them.
+            t_hidden = time.time()
+            self._run_hidden_tests(
+                sandbox=sandbox,
+                ep_data=ep_data,
+                episode_index=episode_index,
+            )
+            logger.info("[%s] ep%d STAGE hidden_tests: %.1fs",
+                        session_id, episode_index, time.time() - t_hidden)
+
             t_judge = time.time()
             self._score_episode_agent(
                 session_id=session_id,
@@ -814,6 +857,188 @@ class TrajectorySandboxHarness:
 
         episode.duration_s = time.time() - t0
         return episode
+
+    # ------------------------------------------------------------------
+    # Scenario-file / hidden-test plumbing
+    #
+    # These helpers exist because the bench CLI at time of writing does
+    # not forward ``EpisodeFixtures.scenario_files`` or
+    # ``EpisodeFixtures.hidden_tests`` through its JSON stdout — both
+    # fields are populated inside the sandbox image by the fixture
+    # factory (notably for codebase_fix) but are dropped by
+    # ``EpisodeFixtures.to_dict``. The helpers below read those dicts
+    # defensively from the episode payload so the validator becomes
+    # correct as soon as the bench CLI starts forwarding them, with no
+    # further validator change required. Scenarios that don't populate
+    # these fields (incident_response, morning_brief) stay no-op.
+    # ------------------------------------------------------------------
+
+    def _install_scenario_files(
+        self, sandbox: Container, episodes_data: list[dict],
+    ) -> None:
+        """Install ``scenario_files`` from the first episode into
+        /workspace/ in the sandbox. Scenario files are session-scoped
+        (shared across all episodes), so only the first episode's dict
+        is read — the bench guarantees per-episode copies are identical
+        for any file that survives across episodes.
+
+        Paths in ``scenario_files`` are relative to /workspace/ (e.g.
+        ``"repo/src/rate_limiter.py"``). Files are written agent-owned
+        so the testee can modify them (unlike SKILL.md / ENVIRONMENT.md
+        which are root-owned mode 440).
+
+        If /workspace/repo is created, a ``git init`` runs so the agent
+        can commit its work — JUDGE.md criteria frequently check commit
+        history for change_minimality and fix_transfer signals.
+        """
+        if not episodes_data:
+            return
+        fixtures = (episodes_data[0].get("fixtures") or {})
+        scenario_files = fixtures.get("scenario_files") or {}
+        if not scenario_files:
+            return
+
+        logger.info("Installing %d scenario file(s) into /workspace/",
+                    len(scenario_files))
+        for rel_path, body in scenario_files.items():
+            # Guard against path traversal — scenario_files come from
+            # the fixture factory but we normalise defensively.
+            if rel_path.startswith("/") or ".." in rel_path.split("/"):
+                logger.warning("Skipping unsafe scenario_file path: %r",
+                               rel_path)
+                continue
+            abs_path = f"/workspace/{rel_path}"
+            sandbox.exec_run(
+                ["sh", "-c", f"mkdir -p \"$(dirname {abs_path})\""]
+            )
+            _put_file(sandbox, abs_path, body)
+            sandbox.exec_run(["chown", "agent:agent", abs_path])
+
+        # If the scenario created a /workspace/repo/, initialise it as
+        # a git repository so the agent can branch + commit. Identity
+        # is set to a sandbox-local value; the real commit author is
+        # whatever the agent's SKILL.md configures.
+        code, _ = sandbox.exec_run(["test", "-d", "/workspace/repo"])
+        if code == 0:
+            sandbox.exec_run(
+                ["sh", "-c",
+                 "cd /workspace/repo && "
+                 "chown -R agent:agent /workspace/repo && "
+                 "chmod -R u+w /workspace/repo && "
+                 "sudo -u agent git -c init.defaultBranch=main init >/dev/null 2>&1 && "
+                 "sudo -u agent git -c user.email=agent@sandbox.local "
+                 "-c user.name=Agent add -A >/dev/null 2>&1 && "
+                 "sudo -u agent git -c user.email=agent@sandbox.local "
+                 "-c user.name=Agent commit --allow-empty -m initial "
+                 ">/dev/null 2>&1 || true"]
+            )
+
+    def _run_hidden_tests(
+        self, sandbox: Container, ep_data: dict, episode_index: int,
+    ) -> None:
+        """Inject hidden tests from the episode payload, run pytest
+        against them inside the sandbox, and write the summary to
+        /workspace/test_results/ep<N>.json. Removes the injected files
+        afterwards so the next episode's testee never sees them.
+
+        No-op when the episode carries no ``hidden_tests`` dict.
+        """
+        fixtures = (ep_data.get("fixtures") or {})
+        hidden_tests = fixtures.get("hidden_tests") or {}
+        if not hidden_tests:
+            return
+
+        # Inject into /workspace/repo/tests/_hidden_runtime/ — a name
+        # distinct from any path the agent could have created so we can
+        # clean up unambiguously.
+        hidden_dir = "/workspace/repo/tests/_hidden_runtime"
+        sandbox.exec_run(["sh", "-c", f"mkdir -p {hidden_dir}"])
+        sandbox.exec_run(["sh", "-c", f"touch {hidden_dir}/__init__.py"])
+        for rel, body in hidden_tests.items():
+            if rel.startswith("/") or ".." in rel.split("/"):
+                logger.warning("Skipping unsafe hidden_test path: %r", rel)
+                continue
+            abs_path = f"{hidden_dir}/{rel}"
+            sandbox.exec_run(
+                ["sh", "-c", f"mkdir -p \"$(dirname {abs_path})\""]
+            )
+            _put_file(sandbox, abs_path, body)
+
+        sandbox.exec_run(["sh", "-c", "mkdir -p /workspace/test_results && "
+                          "chown agent:agent /workspace/test_results"])
+
+        junit_path = f"/workspace/test_results/ep{episode_index}.xml"
+        json_path = f"/workspace/test_results/ep{episode_index}.json"
+        pytest_cmd = (
+            f"cd /workspace/repo && "
+            f"python -m pytest -q --tb=no --junitxml={junit_path} "
+            f"tests/ 2>&1 | tail -50 || true"
+        )
+        code, out = sandbox.exec_run(["sh", "-c", pytest_cmd])
+        stdout_tail = out.decode(errors="replace") if out else ""
+
+        # Parse junit XML into a compact JSON summary (fallback to
+        # exit code if XML is missing for any reason).
+        summary = self._parse_junit_xml(sandbox, junit_path,
+                                        exit_code=code,
+                                        stdout_tail=stdout_tail)
+        summary_json = json.dumps(summary, indent=2)
+        _put_file(sandbox, json_path, summary_json)
+        sandbox.exec_run(["chown", "agent:agent", json_path])
+
+        # Scrub the injected tests so the testee for the next episode
+        # never sees them — hidden tests are, by contract, hidden.
+        sandbox.exec_run(["sh", "-c", f"rm -rf {hidden_dir} {junit_path}"])
+
+    def _parse_junit_xml(
+        self, sandbox: Container, junit_path: str,
+        exit_code: int, stdout_tail: str,
+    ) -> dict:
+        """Read a junit XML file from the sandbox and build a compact
+        summary dict. Robust to the file being missing (returns a
+        summary with exit_code + stdout_tail only).
+        """
+        code, raw = sandbox.exec_run(["cat", junit_path])
+        if code != 0 or not raw:
+            return {
+                "pytest_exit_code": exit_code,
+                "stdout_tail": stdout_tail[-2000:],
+                "tests": [], "total": 0, "passed": 0, "failed": 0,
+                "note": "junit xml missing",
+            }
+        try:
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(raw.decode(errors="replace"))
+        except Exception as e:
+            return {
+                "pytest_exit_code": exit_code,
+                "stdout_tail": stdout_tail[-2000:],
+                "tests": [], "total": 0, "passed": 0, "failed": 0,
+                "note": f"junit parse error: {e}",
+            }
+
+        tests = []
+        passed = failed = 0
+        for tc in root.iter("testcase"):
+            classname = tc.attrib.get("classname", "")
+            name = tc.attrib.get("name", "")
+            ok = not any(True for _ in tc.iter("failure")) and \
+                 not any(True for _ in tc.iter("error"))
+            tests.append({
+                "id": f"{classname}::{name}" if classname else name,
+                "passed": ok,
+            })
+            if ok:
+                passed += 1
+            else:
+                failed += 1
+        return {
+            "pytest_exit_code": exit_code,
+            "total": len(tests),
+            "passed": passed,
+            "failed": failed,
+            "tests": tests,
+        }
 
     def _score_episode_agent(
         self, session_id: str, episode_index: int,

@@ -134,6 +134,14 @@ class ValidatorConfig:
     harness_image: str = ""
     sandbox_timeout_per_episode: int = 180  # 3 min per episode
     sandbox_num_episodes: int = 4
+    # Scenario the sandbox CLI should generate fixtures for. The CLI
+    # supports incident_response, morning_brief, and codebase_fix (see
+    # trajrl_bench.fixture_factory.SCENARIOS). Previously the validator
+    # never passed --scenario so the CLI silently defaulted to
+    # incident_response regardless of the bench image's advertised
+    # catalog — making morning_brief and codebase_fix unreachable from
+    # the validator path.
+    sandbox_scenario: str = "incident_response"
 
     # Evaluation state persistence
     eval_state_path: Path = field(
@@ -223,6 +231,7 @@ class ValidatorConfig:
             image_channel=os.getenv("IMAGE_CHANNEL", DEFAULT_IMAGE_CHANNEL),
             sandbox_timeout_per_episode=int(os.getenv("SANDBOX_TIMEOUT_PER_EPISODE", "180")),
             sandbox_num_episodes=int(os.getenv("SANDBOX_NUM_EPISODES", "4")),
+            sandbox_scenario=os.getenv("SANDBOX_SCENARIO", "incident_response"),
             # --- Startup aggregation ---
             aggregate_when_start=os.getenv("AGGREGATE_WHEN_START", "1") == "1",
             full_cycle_on_startup=os.getenv("FULL_CYCLE_ON_STARTUP", "0") == "1",
