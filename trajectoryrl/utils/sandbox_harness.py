@@ -893,8 +893,15 @@ class TrajectorySandboxHarness:
         """
         if not episodes_data:
             return
-        fixtures = (episodes_data[0].get("fixtures") or {})
-        scenario_files = fixtures.get("scenario_files") or {}
+        ep0 = episodes_data[0]
+        # ``scenario_files`` is emitted by the CLI as a sibling of
+        # ``fixtures`` (see ``trajrl_bench.cli.cmd_generate``). Older CLI
+        # builds may have put it inside ``fixtures`` — tolerate both.
+        scenario_files = (
+            ep0.get("scenario_files")
+            or (ep0.get("fixtures") or {}).get("scenario_files")
+            or {}
+        )
         if not scenario_files:
             return
 
@@ -917,18 +924,21 @@ class TrajectorySandboxHarness:
         # If the scenario created a /workspace/repo/, initialise it as
         # a git repository so the agent can branch + commit. Identity
         # is set to a sandbox-local value; the real commit author is
-        # whatever the agent's SKILL.md configures.
+        # whatever the agent's SKILL.md configures. Use ``gosu`` to
+        # drop privileges — the sandbox image ships gosu (not sudo) so
+        # ``sudo -u agent ...`` would silently fail and leave the
+        # directory chowned but un-initialised.
         code, _ = sandbox.exec_run(["test", "-d", "/workspace/repo"])
         if code == 0:
             sandbox.exec_run(
                 ["sh", "-c",
-                 "cd /workspace/repo && "
                  "chown -R agent:agent /workspace/repo && "
                  "chmod -R u+w /workspace/repo && "
-                 "sudo -u agent git -c init.defaultBranch=main init >/dev/null 2>&1 && "
-                 "sudo -u agent git -c user.email=agent@sandbox.local "
+                 "cd /workspace/repo && "
+                 "gosu agent git -c init.defaultBranch=main init >/dev/null 2>&1 && "
+                 "gosu agent git -c user.email=agent@sandbox.local "
                  "-c user.name=Agent add -A >/dev/null 2>&1 && "
-                 "sudo -u agent git -c user.email=agent@sandbox.local "
+                 "gosu agent git -c user.email=agent@sandbox.local "
                  "-c user.name=Agent commit --allow-empty -m initial "
                  ">/dev/null 2>&1 || true"]
             )
@@ -943,8 +953,13 @@ class TrajectorySandboxHarness:
 
         No-op when the episode carries no ``hidden_tests`` dict.
         """
-        fixtures = (ep_data.get("fixtures") or {})
-        hidden_tests = fixtures.get("hidden_tests") or {}
+        # ``hidden_tests`` is emitted by the CLI as a sibling of
+        # ``fixtures``. Tolerate older CLI builds that may have nested it.
+        hidden_tests = (
+            ep_data.get("hidden_tests")
+            or (ep_data.get("fixtures") or {}).get("hidden_tests")
+            or {}
+        )
         if not hidden_tests:
             return
 
@@ -969,10 +984,13 @@ class TrajectorySandboxHarness:
 
         junit_path = f"/workspace/test_results/ep{episode_index}.xml"
         json_path = f"/workspace/test_results/ep{episode_index}.json"
+        # ``set -o pipefail`` ensures the returned exit code is pytest's
+        # (not tail's) — otherwise the shell pipe always reports 0 and
+        # the ``pytest_exit_code`` we surface to the judge is misleading.
         pytest_cmd = (
-            f"cd /workspace/repo && "
+            f"set -o pipefail; cd /workspace/repo && "
             f"python -m pytest -q --tb=no --junitxml={junit_path} "
-            f"tests/ 2>&1 | tail -50 || true"
+            f"tests/ 2>&1 | tail -50"
         )
         code, out = sandbox.exec_run(["sh", "-c", pytest_cmd])
         stdout_tail = out.decode(errors="replace") if out else ""
