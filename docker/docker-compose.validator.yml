@@ -24,6 +24,11 @@ services:
     restart: unless-stopped
     env_file:
       - ../.env.validator
+    environment:
+      # Pin sandbox/harness images to the stable channel. Hard-coded here
+      # rather than in .env.validator so that running prod and staging side
+      # by side cannot accidentally cross-wire the channels.
+      - IMAGE_CHANNEL=latest
     volumes:
       - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
       - trajectoryrl_data:/var/lib/trajectoryrl

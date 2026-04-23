@@ -121,6 +121,7 @@ class TestConfigWiring:
 
     def test_season1_config_fields_exist(self):
         assert hasattr(ValidatorConfig, "evaluation_harness")
+        assert hasattr(ValidatorConfig, "image_channel")
         assert hasattr(ValidatorConfig, "sandbox_image")
         assert hasattr(ValidatorConfig, "harness_image")
         assert hasattr(ValidatorConfig, "sandbox_timeout_per_episode")
@@ -129,6 +130,53 @@ class TestConfigWiring:
     def test_season1_defaults(self):
         assert ValidatorConfig.sandbox_num_episodes == 4
         assert ValidatorConfig.sandbox_timeout_per_episode == 180
+
+
+# ---------------------------------------------------------------------------
+# Tests: image channel resolution
+# ---------------------------------------------------------------------------
+
+class TestImageChannel:
+    def test_default_channel_derives_latest(self):
+        cfg = ValidatorConfig()
+        assert cfg.image_channel == "latest"
+        assert cfg.sandbox_image == "ghcr.io/trajectoryrl/trajrl-bench:latest"
+        assert cfg.harness_image == "ghcr.io/trajectoryrl/hermes-agent:latest"
+
+    def test_staging_channel_derives_staging_tag(self):
+        cfg = ValidatorConfig(image_channel="staging")
+        assert cfg.sandbox_image == "ghcr.io/trajectoryrl/trajrl-bench:staging"
+        assert cfg.harness_image == "ghcr.io/trajectoryrl/hermes-agent:staging"
+
+    def test_arbitrary_channel_derives_matching_tag(self):
+        cfg = ValidatorConfig(image_channel="v1.2.0-rc.1")
+        assert cfg.sandbox_image == "ghcr.io/trajectoryrl/trajrl-bench:v1.2.0-rc.1"
+        assert cfg.harness_image == "ghcr.io/trajectoryrl/hermes-agent:v1.2.0-rc.1"
+
+    def test_explicit_sandbox_image_overrides_channel(self):
+        cfg = ValidatorConfig(
+            image_channel="staging",
+            sandbox_image="ghcr.io/custom/sandbox:debug",
+        )
+        assert cfg.sandbox_image == "ghcr.io/custom/sandbox:debug"
+        assert cfg.harness_image == "ghcr.io/trajectoryrl/hermes-agent:staging"
+
+    def test_explicit_harness_image_overrides_channel(self):
+        cfg = ValidatorConfig(
+            image_channel="staging",
+            harness_image="ghcr.io/custom/hermes:debug",
+        )
+        assert cfg.sandbox_image == "ghcr.io/trajectoryrl/trajrl-bench:staging"
+        assert cfg.harness_image == "ghcr.io/custom/hermes:debug"
+
+    def test_both_overrides_bypass_channel(self):
+        cfg = ValidatorConfig(
+            image_channel="staging",
+            sandbox_image="trajrl-bench:local",
+            harness_image="hermes-agent:local",
+        )
+        assert cfg.sandbox_image == "trajrl-bench:local"
+        assert cfg.harness_image == "hermes-agent:local"
 
 
 # ---------------------------------------------------------------------------

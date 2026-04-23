@@ -15,6 +15,10 @@ services:
     restart: unless-stopped
     env_file:
       - ../.env.validator
+    environment:
+      # Pin sandbox/harness images to the staging channel so this validator
+      # always tracks pre-release builds, regardless of .env.validator.
+      - IMAGE_CHANNEL=staging
     volumes:
       - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
       - trajectoryrl_data_staging:/var/lib/trajectoryrl

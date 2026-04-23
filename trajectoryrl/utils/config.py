@@ -11,6 +11,13 @@ logger = logging.getLogger(__name__)
 DEFAULT_LLM_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
 DEFAULT_LLM_MODEL = "glm-5.1"
 
+# Image channel drives the tag of sandbox/harness images pulled by the
+# validator at runtime. Compose files set this per-channel (latest, staging,
+# etc.). Full overrides via SANDBOX_IMAGE / HARNESS_IMAGE take precedence.
+DEFAULT_IMAGE_CHANNEL = "latest"
+SANDBOX_IMAGE_REPO = "ghcr.io/trajectoryrl/trajrl-bench"
+HARNESS_IMAGE_REPO = "ghcr.io/trajectoryrl/hermes-agent"
+
 
 @dataclass
 class ValidatorConfig:
@@ -118,8 +125,13 @@ class ValidatorConfig:
     judge_base_url: str = ""
 
     # trajrl-bench sandbox evaluation
-    sandbox_image: str = "ghcr.io/trajectoryrl/trajrl-bench:latest"
-    harness_image: str = "ghcr.io/trajectoryrl/hermes-agent:latest"
+    # image_channel is the canonical knob: it selects the tag (e.g. "latest",
+    # "staging", "v1.2.0-rc.1") used to construct sandbox_image / harness_image
+    # when those are left empty. Direct programmatic assignment to
+    # sandbox_image / harness_image (e.g. tests) still wins.
+    image_channel: str = DEFAULT_IMAGE_CHANNEL
+    sandbox_image: str = ""
+    harness_image: str = ""
     sandbox_timeout_per_episode: int = 180  # 3 min per episode
     sandbox_num_episodes: int = 4
 
@@ -146,9 +158,14 @@ class ValidatorConfig:
     )
 
     def __post_init__(self):
-        """Create required directories."""
+        """Create required directories and derive image refs from channel."""
         self.pack_cache_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
+
+        if not self.sandbox_image:
+            self.sandbox_image = f"{SANDBOX_IMAGE_REPO}:{self.image_channel}"
+        if not self.harness_image:
+            self.harness_image = f"{HARNESS_IMAGE_REPO}:{self.image_channel}"
 
     @classmethod
     def from_env(cls, dotenv_path: Optional[Path] = None) -> "ValidatorConfig":
@@ -200,8 +217,10 @@ class ValidatorConfig:
             ],
             consensus_api_url=os.getenv("CONSENSUS_API_URL", "https://trajrl.com"),
             # --- trajrl-bench ---
-            sandbox_image=os.getenv("SANDBOX_IMAGE", "ghcr.io/trajectoryrl/trajrl-bench:latest"),
-            harness_image=os.getenv("HARNESS_IMAGE", "ghcr.io/trajectoryrl/hermes-agent:latest"),
+            # IMAGE_CHANNEL is the only env-driven knob: it selects the tag
+            # for both sandbox and harness images. Programmatic callers can
+            # still pass sandbox_image / harness_image directly to bypass it.
+            image_channel=os.getenv("IMAGE_CHANNEL", DEFAULT_IMAGE_CHANNEL),
             sandbox_timeout_per_episode=int(os.getenv("SANDBOX_TIMEOUT_PER_EPISODE", "180")),
             sandbox_num_episodes=int(os.getenv("SANDBOX_NUM_EPISODES", "4")),
             # --- Startup aggregation ---

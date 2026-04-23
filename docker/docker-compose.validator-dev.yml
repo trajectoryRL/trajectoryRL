@@ -21,6 +21,9 @@ services:
       - EVAL_INTERVAL_BLOCKS=${EVAL_INTERVAL_BLOCKS:-100}
       - WEIGHT_INTERVAL_BLOCKS=${WEIGHT_INTERVAL_BLOCKS:-360}
       - INACTIVITY_BLOCKS=${INACTIVITY_BLOCKS:-14400}
+      # Default dev environment to the stable channel; override to "staging"
+      # to test pre-release sandbox/harness images locally.
+      - IMAGE_CHANNEL=${IMAGE_CHANNEL:-latest}
     volumes:
       - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
       - ../neurons:/app/neurons
