@@ -1641,6 +1641,11 @@ class TrajectoryValidator:
                     f"{elapsed_str} "
                     f"(pack fetch/integrity failed)"
                 )
+                # Drop any stale cached scores so a future successful eval
+                # starts from a clean slate rather than re-surfacing old data
+                # under a potentially-stale pack_hash.
+                self.scenario_scores.pop(hotkey, None)
+                self._eval_pack_hash.pop(hotkey, None)
 
             # Mid-eval tempo refresh: re-assert the current winner's weights
             # to keep the validator active on-chain without recomputing.
