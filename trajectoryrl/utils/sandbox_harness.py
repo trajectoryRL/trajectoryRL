@@ -995,11 +995,14 @@ class TrajectorySandboxHarness:
         code, out = sandbox.exec_run(["sh", "-c", pytest_cmd])
         stdout_tail = out.decode(errors="replace") if out else ""
 
-        # Parse junit XML into a compact JSON summary (fallback to
-        # exit code if XML is missing for any reason).
-        summary = self._parse_junit_xml(sandbox, junit_path,
-                                        exit_code=code,
-                                        stdout_tail=stdout_tail)
+        # Parse junit XML into the canonical
+        # ``EpisodeResult.test_results`` shape.
+        summary = self._parse_junit_xml(
+            sandbox, junit_path,
+            episode_index=episode_index,
+            exit_code=code,
+            stdout_tail=stdout_tail,
+        )
         summary_json = json.dumps(summary, indent=2)
         _put_file(sandbox, json_path, summary_json)
         sandbox.exec_run(["chown", "agent:agent", json_path])
@@ -1010,53 +1013,77 @@ class TrajectorySandboxHarness:
 
     def _parse_junit_xml(
         self, sandbox: Container, junit_path: str,
-        exit_code: int, stdout_tail: str,
+        episode_index: int, exit_code: int, stdout_tail: str,
     ) -> dict:
-        """Read a junit XML file from the sandbox and build a compact
-        summary dict. Robust to the file being missing (returns a
-        summary with exit_code + stdout_tail only).
+        """Read a junit XML from the sandbox and build the test-results
+        summary documented by ``trajrl_bench.types.EpisodeResult.test_results``:
+
+            {episode, total, passed, failed, errors, skipped,
+             failed_tests: [file::test_name, ...], runtime_s}
+
+        Matches the shape emitted by the bench's own in-repo harness at
+        ``trajrl_bench.containers._parse_junit_xml`` so any downstream
+        judge or agent reading /workspace/test_results/ep<N>.json gets a
+        consistent contract regardless of which harness produced it.
+
+        Robust to a missing / malformed XML file — falls back to
+        ``pytest_stdout`` when pytest crashed before writing.
         """
+        result = {
+            "episode": episode_index,
+            "total": 0,
+            "passed": 0,
+            "failed": 0,
+            "errors": 0,
+            "skipped": 0,
+            "failed_tests": [],
+            "runtime_s": 0.0,
+        }
         code, raw = sandbox.exec_run(["cat", junit_path])
-        if code != 0 or not raw:
-            return {
-                "pytest_exit_code": exit_code,
-                "stdout_tail": stdout_tail[-2000:],
-                "tests": [], "total": 0, "passed": 0, "failed": 0,
-                "note": "junit xml missing",
-            }
+        xml_text = raw.decode(errors="replace") if raw else ""
+        if code != 0 or "<testsuite" not in xml_text:
+            result["pytest_stdout"] = stdout_tail[-2000:]
+            return result
+
         try:
             import xml.etree.ElementTree as ET
-            root = ET.fromstring(raw.decode(errors="replace"))
+            root = ET.fromstring(xml_text)
         except Exception as e:
-            return {
-                "pytest_exit_code": exit_code,
-                "stdout_tail": stdout_tail[-2000:],
-                "tests": [], "total": 0, "passed": 0, "failed": 0,
-                "note": f"junit parse error: {e}",
-            }
+            result["parse_error"] = str(e)
+            result["pytest_stdout"] = stdout_tail[-2000:]
+            return result
 
-        tests = []
-        passed = failed = 0
-        for tc in root.iter("testcase"):
-            classname = tc.attrib.get("classname", "")
-            name = tc.attrib.get("name", "")
-            ok = not any(True for _ in tc.iter("failure")) and \
-                 not any(True for _ in tc.iter("error"))
-            tests.append({
-                "id": f"{classname}::{name}" if classname else name,
-                "passed": ok,
-            })
-            if ok:
-                passed += 1
-            else:
-                failed += 1
-        return {
-            "pytest_exit_code": exit_code,
-            "total": len(tests),
-            "passed": passed,
-            "failed": failed,
-            "tests": tests,
-        }
+        suites = (
+            root.findall("testsuite") if root.tag == "testsuites" else [root]
+        )
+        total_runtime = 0.0
+        for suite in suites:
+            result["total"] += int(suite.get("tests", 0) or 0)
+            result["errors"] += int(suite.get("errors", 0) or 0)
+            result["failed"] += int(suite.get("failures", 0) or 0)
+            result["skipped"] += int(suite.get("skipped", 0) or 0)
+            try:
+                total_runtime += float(suite.get("time", 0.0) or 0.0)
+            except ValueError:
+                pass
+            for case in suite.findall("testcase"):
+                if case.find("failure") is None and case.find("error") is None:
+                    continue
+                classname = case.get("classname", "")
+                name = case.get("name", "")
+                file_attr = case.get("file", "")
+                test_id = (
+                    f"{file_attr}::{name}" if file_attr
+                    else f"{classname}::{name}"
+                )
+                result["failed_tests"].append(test_id)
+
+        result["passed"] = max(
+            0, result["total"] - result["failed"]
+            - result["errors"] - result["skipped"]
+        )
+        result["runtime_s"] = round(total_runtime, 3)
+        return result
 
     def _score_episode_agent(
         self, session_id: str, episode_index: int,
