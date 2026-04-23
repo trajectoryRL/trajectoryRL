@@ -738,6 +738,7 @@ class TrajectoryValidator:
                 validator_stakes[hotkey] = stake
 
         min_stake = getattr(self.config, "min_validator_stake", 0.0)
+        zero_threshold = getattr(self.config, "zero_signal_threshold", 1.0)
         validated, stats = run_filter_pipeline(
             submissions=submissions,
             expected_window=window.window_number,
@@ -745,6 +746,7 @@ class TrajectoryValidator:
             min_stake=min_stake,
             expected_protocol=self.config.consensus_protocol_version,
             expected_scoring_version=_scoring_version(),
+            zero_signal_threshold=zero_threshold,
         )
 
         if not validated:

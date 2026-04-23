@@ -1818,6 +1818,34 @@ class TestConsensusFilter:
         assert len(passed) == 2
         assert skipped == 0
 
+    def test_filter_zero_signal_threshold_drops_near_zero(self):
+        # val_b has 41/42 zero scores (97.6%) — a single token-nonzero — and
+        # should be dropped when zero_threshold < 0.976. val_a has real signal.
+        big_all_zero = {f"m{i}": 0.0 for i in range(41)}
+        big_near_zero = {**big_all_zero, "m_winner": 0.02}
+        big_real = {f"m{i}": 0.5 for i in range(5)}
+        subs = [
+            self._make_submission(hotkey="val_a", scores=big_real),
+            self._make_submission(hotkey="val_b", scores=big_near_zero),
+        ]
+        passed, skipped = filter_zero_signal(subs, zero_threshold=0.95)
+        assert len(passed) == 1
+        assert skipped == 1
+        assert passed[0][0].validator_hotkey == "val_a"
+
+    def test_filter_zero_signal_default_threshold_keeps_near_zero(self):
+        # Same near-zero payload passes under the legacy default (1.0) —
+        # only strictly all-zero payloads are dropped.
+        big_all_zero = {f"m{i}": 0.0 for i in range(41)}
+        big_near_zero = {**big_all_zero, "m_winner": 0.02}
+        subs = [
+            self._make_submission(hotkey="val_a", scores={"m": 0.85}),
+            self._make_submission(hotkey="val_b", scores=big_near_zero),
+        ]
+        passed, skipped = filter_zero_signal(subs)
+        assert len(passed) == 2
+        assert skipped == 0
+
     def test_full_pipeline_cascading_filters(self):
         subs = [
             self._make_submission(hotkey="good", window=42, protocol=1, version="0.1.0", scores={"m": 0.85}),

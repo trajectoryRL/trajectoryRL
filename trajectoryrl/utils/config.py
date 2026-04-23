@@ -74,6 +74,11 @@ class ValidatorConfig:
     consensus_api_url: str = "https://trajrl.com"
     min_validator_stake: float = 10000.0  # minimum stake weight (α) for consensus participation
 
+    # Fraction of zero scores above which a submission is treated as a
+    # free-rider / near-zero-signal payload and dropped from consensus.
+    # 1.0 = only all-zero payloads dropped (legacy behaviour).
+    zero_signal_threshold: float = 0.95
+
     # Bootstrap config (graduated rewards until enough miners join)
     bootstrap_threshold: int = 10
 
