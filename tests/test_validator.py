@@ -2134,14 +2134,17 @@ class TestConsensusFilter:
         assert skipped == 1
         assert passed[0][0].validator_hotkey == "val_a"
 
-    def test_filter_zero_signal_all_zero_passes(self):
+    def test_filter_zero_signal_all_zero_dropped(self):
+        # Fleet-wide all-zero (e.g. LLM outage) used to pass via a bootstrap
+        # bypass. That gave the lex-first hotkey a free win on a 0.0 consensus
+        # score. Now every all-zero submission is dropped individually.
         subs = [
             self._make_submission(hotkey="val_a", scores={"m": 0.0}),
             self._make_submission(hotkey="val_b", scores={"m": 0.0}),
         ]
         passed, skipped = filter_zero_signal(subs)
-        assert len(passed) == 2
-        assert skipped == 0
+        assert len(passed) == 0
+        assert skipped == 2
 
     def test_filter_zero_signal_threshold_drops_near_zero(self):
         # val_b has 41/42 zero scores (97.6%) — a single token-nonzero — and
