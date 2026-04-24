@@ -14,25 +14,26 @@ import os
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
-from . import consensus as _consensus_mod
-
 logger = logging.getLogger(__name__)
-
-
-def _scoring_version() -> int:
-    """Read the current SCORING_VERSION dynamically from the consensus module."""
-    return _consensus_mod.SCORING_VERSION
 
 
 @dataclass
 class WinnerState:
-    """Persisted state for Winner Protection."""
+    """Persisted state for Winner Protection.
+
+    ``spec_number`` is purely an audit field — it records which scoring
+    spec the current winner was selected under. It does NOT trigger a state
+    reset on its own. The new winner naturally replaces the old one once
+    the chain-derived target spec_number flips and a new aggregation round
+    produces a different best score (see consensus_filter.
+    select_target_spec_number).
+    """
 
     winner_hotkey: Optional[str] = None
     winner_pack_hash: Optional[str] = None
     winner_score: Optional[float] = None
     winner_uid: Optional[int] = None
-    scoring_version: int = 1
+    spec_number: int = 1
 
 
 def select_winner_with_protection(
@@ -159,8 +160,12 @@ def select_winner_with_protection(
 
 def save_winner_state(state: WinnerState, path: str):
     """Persist winner state to JSON file."""
+    # Emit both `spec_number` (current) and `scoring_version` (legacy mirror)
+    # so older validator binaries still in the rollout pool can read the
+    # value back without misclassifying it as "missing" (default 1).
     data = {
-        "scoring_version": state.scoring_version,
+        "scoring_version": state.spec_number,
+        "spec_number": state.spec_number,
         "winner_hotkey": state.winner_hotkey,
         "winner_pack_hash": state.winner_pack_hash,
         "winner_score": state.winner_score,
@@ -175,31 +180,26 @@ def save_winner_state(state: WinnerState, path: str):
 def load_winner_state(path: str) -> WinnerState:
     """Load winner state from JSON file, or return fresh state.
 
-    Returns an empty ``WinnerState`` when the persisted
-    ``scoring_version`` does not match the running ``SCORING_VERSION``,
-    so that an obsolete winner cannot block elections under the new
-    evaluation criteria.
+    The persisted ``spec_number`` is restored as an audit field; it does NOT
+    trigger a reset, even when it differs from the running ``SPEC_NUMBER``.
+    The new winner takes over naturally once the chain-derived target spec
+    flips (see consensus_filter.select_target_spec_number).
+
+    Accepts either ``spec_number`` (current) or ``scoring_version`` (legacy)
+    JSON keys for backward compatibility.
     """
     try:
         with open(path) as f:
             data = json.load(f)
 
-        file_sv = data.get("scoring_version", 1)
-        current_sv = _scoring_version()
-        if file_sv != current_sv:
-            logger.warning(
-                "Winner state scoring_version mismatch (%d != %d), "
-                "resetting winner protection",
-                file_sv, current_sv,
-            )
-            return WinnerState()
+        spec_number = data.get("spec_number", data.get("scoring_version", 1))
 
         return WinnerState(
             winner_hotkey=data.get("winner_hotkey"),
             winner_pack_hash=data.get("winner_pack_hash"),
             winner_score=data.get("winner_score", data.get("winner_cost")),
             winner_uid=data.get("winner_uid"),
-            scoring_version=file_sv,
+            spec_number=spec_number,
         )
     except (FileNotFoundError, json.JSONDecodeError):
         return WinnerState()

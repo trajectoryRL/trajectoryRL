@@ -8,21 +8,37 @@ Pipeline order:
   1. Protocol version  — discard mismatched protocol versions
   2. Window number     — discard submissions from wrong window
   3. Trust threshold   — discard validators below min stake
-  4. Scoring version   — discard mismatched evaluation criteria versions
+  4. spec_number       — discard submissions whose payload spec_number
+                          differs from the chain-derived target spec
   5. Zero-signal       — discard all-zero score submissions (free-riders)
+
+The target spec_number used by layer 4 is not read from a static local
+constant. Instead, ``select_target_spec_number`` derives it from the
+on-chain stake distribution of the surviving submissions: the
+stake-weighted dominant spec_number wins if it holds more than 50% of
+participating stake; otherwise the validator falls back to its locally
+configured ``SPEC_NUMBER``. This keeps SPEC_NUMBER bumps self-coordinating
+across validators (the previous winner keeps receiving emissions until
+stake-weighted majority migrates to the new spec).
 """
 
 import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from . import consensus as _consensus_mod
+from .config import SPEC_NUMBER
 from .consensus import (
     ConsensusPayload, ConsensusPointer,
     CONSENSUS_PROTOCOL_VERSION,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Stake-share threshold for adopting an on-chain dominant spec_number as
+# this round's target. Reuses the disqualify_stake_threshold semantic from
+# scoring (>50% stake-weighted majority).
+SPEC_MAJORITY_THRESHOLD = 0.5
 
 
 @dataclass
@@ -32,8 +48,10 @@ class FilterStats:
     skipped_protocol: int = 0
     skipped_window: int = 0
     skipped_stake: int = 0
-    skipped_scoring_version: int = 0
+    skipped_spec_number: int = 0
     skipped_zero_signal: int = 0
+    target_spec_number: int = 0
+    target_spec_source: str = ""  # "chain_majority" | "local_fallback"
     passed: int = 0
 
     def summary(self) -> str:
@@ -41,7 +59,8 @@ class FilterStats:
             f"Filter: {self.total_input} in → {self.passed} passed | "
             f"protocol={self.skipped_protocol} window={self.skipped_window} "
             f"stake={self.skipped_stake} "
-            f"scoring={self.skipped_scoring_version} "
+            f"spec={self.skipped_spec_number} (target={self.target_spec_number} "
+            f"via {self.target_spec_source}) "
             f"zero={self.skipped_zero_signal}"
         )
 
@@ -113,20 +132,75 @@ def filter_trust_threshold(
     return passed, skipped
 
 
-def filter_scoring_version(
+def select_target_spec_number(
     submissions: List[Tuple[ConsensusPointer, ConsensusPayload]],
-    expected_version: Optional[int] = None,
+    validator_stakes: Dict[str, float],
+    local_spec: int,
+    threshold: float = SPEC_MAJORITY_THRESHOLD,
+) -> Tuple[int, str]:
+    """Choose this round's target spec_number from on-chain data.
+
+    Algorithm:
+      1. Group submissions by ``payload.spec_number``.
+      2. Sum validator stake per group.
+      3. dominant = group with the largest total stake.
+      4. If ``dominant.stake / total_stake > threshold`` → use dominant.spec_number.
+         Otherwise fall back to ``local_spec``.
+
+    A tied-for-max set of groups always fails the strict ``> threshold``
+    check (since two groups summing > 100% is impossible), and the function
+    falls back to ``local_spec`` — no explicit tiebreak is needed.
+
+    Args:
+        submissions: Surviving submissions after basic (protocol / window /
+            stake) filters. The ``payload.spec_number`` field is the spec
+            label this validator self-attested to.
+        validator_stakes: ``{validator_hotkey: stake}`` snapshot from the
+            metagraph. Missing hotkeys are treated as zero stake.
+        local_spec: Validator's locally configured ``SPEC_NUMBER``, used as
+            the fallback target when no group reaches majority.
+        threshold: Stake-share required for adoption (default 0.5).
+
+    Returns:
+        ``(target_spec_number, source)`` where ``source`` is
+        ``"chain_majority"`` or ``"local_fallback"``.
+    """
+    if not submissions:
+        return local_spec, "local_fallback"
+
+    stake_by_spec: Dict[int, float] = {}
+    for ptr, payload in submissions:
+        stake = validator_stakes.get(ptr.validator_hotkey, 0.0)
+        if stake <= 0:
+            continue
+        stake_by_spec[payload.spec_number] = (
+            stake_by_spec.get(payload.spec_number, 0.0) + stake
+        )
+
+    total_stake = sum(stake_by_spec.values())
+    if total_stake <= 0:
+        return local_spec, "local_fallback"
+
+    dominant_spec = max(stake_by_spec, key=lambda s: stake_by_spec[s])
+    dominant_share = stake_by_spec[dominant_spec] / total_stake
+
+    if dominant_share > threshold:
+        return dominant_spec, "chain_majority"
+    return local_spec, "local_fallback"
+
+
+def filter_spec_number(
+    submissions: List[Tuple[ConsensusPointer, ConsensusPayload]],
+    target_spec_number: int,
 ) -> Tuple[List[Tuple[ConsensusPointer, ConsensusPayload]], int]:
-    """Layer 6: discard submissions with mismatched scoring version."""
-    if expected_version is None:
-        expected_version = _consensus_mod.SCORING_VERSION
+    """Layer 4: discard submissions whose spec_number != target."""
     passed = []
     skipped = 0
     for ptr, payload in submissions:
-        if payload.scoring_version != expected_version:
+        if payload.spec_number != target_spec_number:
             logger.debug(
-                "Filter[scoring_version]: skip %s (sv%d != sv%d)",
-                ptr.validator_hotkey[:8], payload.scoring_version, expected_version,
+                "Filter[spec_number]: skip %s (spec=%d != target=%d)",
+                ptr.validator_hotkey[:8], payload.spec_number, target_spec_number,
             )
             skipped += 1
         else:
@@ -138,7 +212,7 @@ def filter_zero_signal(
     submissions: List[Tuple[ConsensusPointer, ConsensusPayload]],
     zero_threshold: float = 1.0,
 ) -> Tuple[List[Tuple[ConsensusPointer, ConsensusPayload]], int]:
-    """Layer 7: discard near-zero-signal submissions when real signal exists.
+    """Layer 5: discard near-zero-signal submissions when real signal exists.
 
     A submission is dropped when the fraction of zero scores meets or exceeds
     ``zero_threshold``.  Default 1.0 keeps the legacy behaviour (drop only
@@ -186,15 +260,24 @@ def run_filter_pipeline(
     expected_window: int,
     validator_stakes: Dict[str, float],
     min_stake: float,
+    local_spec_number: int = SPEC_NUMBER,
     expected_protocol: int = CONSENSUS_PROTOCOL_VERSION,
-    expected_scoring_version: Optional[int] = None,
     zero_signal_threshold: float = 1.0,
+    spec_majority_threshold: float = SPEC_MAJORITY_THRESHOLD,
 ) -> Tuple[List[ValidatedSubmission], FilterStats]:
     """Run the full 5-layer filter pipeline.
 
+    Layers run in order: protocol → window → stake → spec_number → zero-signal.
+
+    The spec_number target is derived from the surviving submissions after
+    the first three layers — see :func:`select_target_spec_number`. Callers
+    provide their ``local_spec_number`` only as the fallback target when no
+    on-chain group reaches majority; it is not used to pre-filter.
+
     Returns:
         - List of ValidatedSubmission that passed all layers
-        - FilterStats with per-layer skip counts
+        - FilterStats with per-layer skip counts and the target spec_number
+          used (plus its source).
     """
     stats = FilterStats(total_input=len(submissions))
 
@@ -209,8 +292,15 @@ def run_filter_pipeline(
     current, n = filter_trust_threshold(current, validator_stakes, min_stake)
     stats.skipped_stake = n
 
-    current, n = filter_scoring_version(current, expected_scoring_version)
-    stats.skipped_scoring_version = n
+    target_spec, source = select_target_spec_number(
+        current, validator_stakes, local_spec_number,
+        threshold=spec_majority_threshold,
+    )
+    stats.target_spec_number = target_spec
+    stats.target_spec_source = source
+
+    current, n = filter_spec_number(current, target_spec)
+    stats.skipped_spec_number = n
 
     current, n = filter_zero_signal(current, zero_threshold=zero_signal_threshold)
     stats.skipped_zero_signal = n

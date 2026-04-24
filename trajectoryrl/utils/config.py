@@ -18,6 +18,30 @@ DEFAULT_IMAGE_CHANNEL = "latest"
 SANDBOX_IMAGE_REPO = "ghcr.io/trajectoryrl/trajrl-bench"
 HARNESS_IMAGE_REPO = "ghcr.io/trajectoryrl/hermes-agent"
 
+# SPEC_NUMBER identifies a "scoring specification": the combination of
+# scenario set, scoring methodology, and judge prompt that determines whether
+# two evaluations produce comparable scores.
+#
+# Bump SPEC_NUMBER whenever a change makes new scores incomparable with old
+# ones (adding/removing scenarios, changing weights, modifying judge prompts,
+# changing the aggregation rule). Bench-image patch releases that preserve
+# scoring semantics do NOT bump it.
+#
+# This constant ships with the validator binary; it is decoupled from the
+# trajrl-bench image version (now used purely for audit / log purposes).
+#
+# Aggregation derives its target spec number from on-chain stake distribution
+# rather than reading this constant directly — see
+# ``consensus_filter.select_target_spec_number`` for details. SPEC_NUMBER is
+# consulted only as the fallback target when no on-chain spec_number group
+# reaches >50% stake, and as the value written into outgoing commitments /
+# payloads.
+SPEC_NUMBER = 4
+
+# Backwards-compatible alias for legacy callers / persisted state. Will be
+# removed after one validator release cycle.
+SCORING_VERSION = SPEC_NUMBER
+
 
 @dataclass
 class ValidatorConfig:

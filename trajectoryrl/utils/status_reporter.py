@@ -381,7 +381,7 @@ async def submit_eval(
     rejected: Optional[bool] = None,
     rejection_stage: Optional[str] = None,
     rejection_detail: Optional[str] = None,
-    scoring_version: Optional[int] = None,
+    spec_number: Optional[int] = None,
     bench_image_hash: Optional[str] = None,
     harness_image_hash: Optional[str] = None,
     bench_version: Optional[str] = None,
@@ -437,8 +437,11 @@ async def submit_eval(
         payload["rejection_stage"] = rejection_stage
     if rejection_detail is not None:
         payload["rejection_detail"] = rejection_detail
-    if scoring_version is not None:
-        payload["scoring_version"] = scoring_version
+    if spec_number is not None:
+        # Emit both keys for backward compatibility with the central status
+        # service while it migrates to the new column name.
+        payload["scoring_version"] = spec_number
+        payload["spec_number"] = spec_number
     if bench_image_hash is not None:
         payload["bench_image_hash"] = bench_image_hash
     if harness_image_hash is not None:
