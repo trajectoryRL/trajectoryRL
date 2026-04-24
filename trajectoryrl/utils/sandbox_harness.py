@@ -520,6 +520,7 @@ class TrajectorySandboxHarness:
         gen_data = _docker_run_json(
             self.client, self._sandbox_image,
             command=["python", "-m", "trajrl_bench.cli", "generate",
+                     "--scenario", "codebase_fix",
                      "--seed", str(epoch_seed), "--salt", salt,
                      "--episodes", str(num_episodes),
                      "--scenario", self.config.sandbox_scenario],
