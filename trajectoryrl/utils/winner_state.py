@@ -21,12 +21,14 @@ logger = logging.getLogger(__name__)
 class WinnerState:
     """Persisted state for Winner Protection.
 
-    ``spec_number`` is purely an audit field — it records which scoring
-    spec the current winner was selected under. It does NOT trigger a state
-    reset on its own. The new winner naturally replaces the old one once
-    the chain-derived target spec_number flips and a new aggregation round
-    produces a different best score (see consensus_filter.
-    select_target_spec_number).
+    ``spec_number`` records which scoring spec the current winner was
+    selected under. It does NOT trigger a state reset on its own, but it
+    gates Winner Protection: ``select_winner_with_protection`` bypasses
+    the δ threshold whenever ``state.spec_number`` differs from the
+    chain-derived ``target_spec_number`` for the round, so cross-spec
+    score comparisons never happen. After such a bypass the field is
+    overwritten to the new target_spec_number, restoring normal
+    protection on subsequent rounds.
     """
 
     winner_hotkey: Optional[str] = None
@@ -43,12 +45,22 @@ def select_winner_with_protection(
     pack_hashes: Optional[Dict[str, str]] = None,
     hk_to_uid: Optional[Dict[str, int]] = None,
     disable_winner_protection: bool = False,
+    target_spec_number: Optional[int] = None,
 ) -> Tuple[Optional[str], WinnerState]:
     """Select winner using Winner Protection (highest score wins).
 
     The current winner defends with their winning score (frozen at time of
     winning).  A new winner is elected only if the highest-scoring miner's
     score exceeds winner_score × (1 + score_delta).
+
+    Winner Protection only compares scores within a single ``spec_number``.
+    When ``target_spec_number`` is provided and differs from
+    ``state.spec_number`` (i.e. the chain-derived target spec just flipped
+    relative to the persisted winner), the δ threshold is bypassed for
+    this round and the highest-scoring eligible miner is elected
+    immediately. The returned ``WinnerState`` is then stamped with
+    ``spec_number = target_spec_number`` so subsequent rounds resume
+    normal protection within the new spec.
 
     Args:
         consensus_scores: miner_hotkey -> stake-weighted consensus score
@@ -59,6 +71,12 @@ def select_winner_with_protection(
             recording the winner's pack hash
         hk_to_uid: optional miner_hotkey -> on-chain UID mapping,
             stored in WinnerState so set_weights can skip metagraph lookup
+        disable_winner_protection: if True, bypass the δ threshold
+            unconditionally (operator override)
+        target_spec_number: chain-derived target spec for this round; when
+            set, drives the cross-spec bypass and is stamped onto the
+            returned state. If None, behaviour is unchanged from the
+            single-spec era and ``state.spec_number`` is preserved.
 
     Returns:
         (winner_hotkey, updated_state)
@@ -93,13 +111,33 @@ def select_winner_with_protection(
     sorted_miners = sorted(eligible.items(), key=lambda x: x[1], reverse=True)
     best_hk, best_score = sorted_miners[0]
 
+    # spec_number stamped onto any newly constructed WinnerState. Falls back
+    # to state.spec_number when the caller did not pass a target (legacy /
+    # single-spec test paths) so persistence stays stable.
+    new_spec_number = (
+        target_spec_number if target_spec_number is not None
+        else state.spec_number
+    )
+
+    cross_spec_transition = (
+        target_spec_number is not None
+        and state.winner_hotkey is not None
+        and state.spec_number != target_spec_number
+    )
+
     if (
         disable_winner_protection
         or state.winner_hotkey is None
         or state.winner_hotkey not in eligible
+        or cross_spec_transition
     ):
         if state.winner_hotkey is None:
             reason = "no previous winner"
+        elif cross_spec_transition:
+            reason = (
+                f"cross-spec transition (state.spec={state.spec_number}, "
+                f"target={target_spec_number})"
+            )
         elif hk_to_uid and state.winner_hotkey not in hk_to_uid:
             reason = f"previous winner {state.winner_hotkey[:8]} deregistered"
         else:
@@ -111,6 +149,7 @@ def select_winner_with_protection(
             winner_pack_hash=pack_hashes.get(best_hk),
             winner_score=best_score,
             winner_uid=hk_to_uid.get(best_hk),
+            spec_number=new_spec_number,
         )
         logger.info(
             "Winner elected (%s): %s UID %s (consensus score %.4f)",
@@ -127,6 +166,7 @@ def select_winner_with_protection(
                 winner_pack_hash=pack_hashes.get(best_hk, state.winner_pack_hash),
                 winner_score=best_score,
                 winner_uid=hk_to_uid.get(best_hk, state.winner_uid),
+                spec_number=new_spec_number,
             )
             logger.info(
                 "Winner %s self-updated: %.4f → %.4f (cleared δ threshold %.4f)",
@@ -138,6 +178,7 @@ def select_winner_with_protection(
                 winner_pack_hash=pack_hashes.get(best_hk),
                 winner_score=best_score,
                 winner_uid=hk_to_uid.get(best_hk),
+                spec_number=new_spec_number,
             )
             logger.info(
                 "Winner overtake: %s UID %s (%.4f) dethrones %s "
@@ -149,6 +190,11 @@ def select_winner_with_protection(
 
     if state.winner_hotkey in hk_to_uid:
         state.winner_uid = hk_to_uid[state.winner_hotkey]
+    # Retain branch is only reachable when state.spec_number == target (the
+    # cross-spec branch above would otherwise have re-elected). Stamping
+    # explicitly keeps the field in lock-step with the target even in the
+    # legacy single-spec path.
+    state.spec_number = new_spec_number
     logger.info(
         "Winner %s retains (winner_score %.4f): best challenger %s (%.4f) "
         "does not clear δ threshold (%.4f)",

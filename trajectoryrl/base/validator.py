@@ -67,6 +67,12 @@ from ..utils.winner_state import (
     WinnerState, select_winner_with_protection,
     save_winner_state, load_winner_state,
 )
+from ..utils.pack_ownership import (
+    claim_owner, evict_orphans,
+    save_pack_first_seen, load_pack_first_seen,
+    EVICTION_GRACE_WINDOWS,
+    _decode_table as _decode_pack_first_seen_table,
+)
 from ..utils.miner_eval import (
     evaluate_miner_s1,
     SKIP_PACK_VERIFY,
@@ -77,7 +83,6 @@ from ..utils.commitments import (
     format_consensus_commitment, decode_dual_address,
     is_consensus_commitment, parse_consensus_commitment,
 )
-from ..utils.ncd import deduplicate_packs
 from ..utils.status_reporter import (
     heartbeat, pre_eval, submit_eval, upload_eval_logs, upload_cycle_logs,
 )
@@ -199,11 +204,21 @@ class TrajectoryValidator:
         # debugging restart / cross-epoch reuse behavior.
         self.last_eval_window: Dict[str, int] = {}
 
-        # Pack content cache: pack_hash -> pack dict
-        self._pack_by_hash: Dict[str, dict] = {}
+        # Per-validator ownership lock for exact pack_hash dedup.
+        # pack_hash -> (first_observed_hotkey, first_observed_block).
+        # Set once via setdefault, never updated. No succession: if the
+        # original owner goes inactive, no other miner inherits — copies
+        # always receive weight 0 until eviction (see end-of-cycle sweep
+        # in _execute_evaluation_cycle).
+        self.pack_first_seen: Dict[str, Tuple[str, int]] = {}
 
-        # Packs by hotkey (populated during evaluation for NCD dedup)
-        self._hotkey_packs: Dict[str, dict] = {}
+        # pack_hash -> last window number we observed it in any active
+        # commitment. Updated by `evict_orphans` at the end of each
+        # evaluation cycle. Drives the grace-windowed eviction policy:
+        # a pack_first_seen entry is dropped only after its hash has
+        # been absent for `EVICTION_GRACE_WINDOWS` consecutive
+        # wall-clock windows (any re-activation resets the clock).
+        self.pack_last_seen_window: Dict[str, int] = {}
 
         # Tracks which UID each hotkey was last evaluated at for re-registration detection.
         self._hotkey_uid_map: Dict[str, int] = {}
@@ -365,7 +380,25 @@ class TrajectoryValidator:
         matches the running ``SPEC_NUMBER`` — any spec bump implies cached
         scores are incomparable with new ones. Accepts either ``spec_number``
         (current) or ``scoring_version`` (legacy) JSON keys.
+
+        ``pack_first_seen`` is loaded from its own file
+        (``self.config.pack_first_seen_path``); for backward compatibility
+        with earlier internal layouts where the table lived inside
+        ``eval_state.json``, the legacy key is migrated on first load and
+        immediately persisted to the new path so subsequent restarts read
+        from the dedicated file.
         """
+        # pack_first_seen lives in its own file. Load it first so we can
+        # detect whether legacy migration is needed regardless of the
+        # eval_state.json outcome (spec_number mismatch must NOT wipe
+        # ownership locks — those are spec-agnostic). The companion
+        # last-seen-window dict drives the grace-period eviction logic;
+        # v1 files yield an empty side dict and the clock starts on the
+        # next eviction sweep.
+        self.pack_first_seen, self.pack_last_seen_window = load_pack_first_seen(
+            self.config.pack_first_seen_path
+        )
+
         path = self.config.eval_state_path
         if not path.exists():
             logger.debug("No persisted eval state found, starting fresh")
@@ -380,6 +413,7 @@ class TrajectoryValidator:
                     "invalidating all eval state",
                     file_spec, _spec_number(),
                 )
+                self._migrate_legacy_pack_first_seen(data)
                 return
 
             self.scenario_scores = data.get("scenario_scores", {})
@@ -391,6 +425,8 @@ class TrajectoryValidator:
                 k: int(v) for k, v in data.get("last_eval_window_per_hotkey", {}).items()
             }
             self._last_eval_window = data.get("last_eval_window", -1)
+
+            self._migrate_legacy_pack_first_seen(data)
 
             self._consensus_window = data.get("consensus_window", -1)
 
@@ -404,8 +440,56 @@ class TrajectoryValidator:
         except Exception as e:
             logger.warning(f"Failed to load eval state: {e}, starting fresh")
 
+    def _migrate_legacy_pack_first_seen(self, eval_state_data: dict) -> None:
+        """One-time migration of legacy ``pack_first_seen`` from eval_state.json.
+
+        Earlier internal builds wrote the ownership table into the same
+        file as eval state. New code reads from a dedicated path; if
+        that file is empty but the legacy key carries entries, decode
+        them and immediately rewrite to the new path. After this, the
+        legacy key stops being written by ``_save_eval_state`` so
+        future restarts see only the new file.
+        """
+        if self.pack_first_seen:
+            return
+        legacy = eval_state_data.get("pack_first_seen")
+        if not legacy:
+            return
+        migrated = _decode_pack_first_seen_table(legacy)
+        if not migrated:
+            return
+        self.pack_first_seen = migrated
+        # Legacy files predate the grace-window tracker; start every
+        # entry's clock on the next eviction sweep so we don't surprise
+        # operators with mass evictions immediately after the upgrade.
+        self.pack_last_seen_window = {}
+        try:
+            save_pack_first_seen(
+                self.pack_first_seen,
+                self.pack_last_seen_window,
+                self.config.pack_first_seen_path,
+            )
+            logger.info(
+                "Migrated %d pack_first_seen entries from eval_state.json "
+                "to %s",
+                len(self.pack_first_seen),
+                self.config.pack_first_seen_path,
+            )
+        except Exception as e:
+            logger.warning(
+                "pack_first_seen legacy migration: failed to persist new "
+                "file (%s); will retry on next save",
+                e,
+            )
+
     def _save_eval_state(self):
-        """Persist evaluation state to disk for restart recovery."""
+        """Persist evaluation state to disk for restart recovery.
+
+        ``pack_first_seen`` is persisted to its own file (see
+        ``self.config.pack_first_seen_path``); failures there are
+        independent of the main eval-state write so a single bad disk
+        does not lose both.
+        """
         # Emit both keys for backward-compat with older validator binaries.
         spec = _spec_number()
         data = {
@@ -426,6 +510,15 @@ class TrajectoryValidator:
             )
         except Exception as e:
             logger.warning(f"Failed to save eval state: {e}")
+
+        try:
+            save_pack_first_seen(
+                self.pack_first_seen,
+                self.pack_last_seen_window,
+                self.config.pack_first_seen_path,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to save pack_first_seen: {e}")
 
     def _drop_miner_eval_state(self, hotkey: str):
         """Remove all per-miner eval state and persist.
@@ -860,13 +953,17 @@ class TrajectoryValidator:
         }
 
         # Apply Winner Protection (stores winner_uid so set_weights
-        # can skip the metagraph lookup later)
+        # can skip the metagraph lookup later). target_spec_number gates
+        # the cross-spec bypass: when the chain-derived target spec
+        # differs from the persisted winner's spec, the δ threshold is
+        # skipped and the new spec's best miner takes over immediately.
         winner_hk, updated_state = select_winner_with_protection(
             consensus_scores=eligible_scores,
             state=self._winner_state,
             score_delta=self.config.score_delta,
             hk_to_uid=hk_to_uid,
             disable_winner_protection=self.config.disable_winner_protection,
+            target_spec_number=stats.target_spec_number,
         )
         self._winner_state = updated_state
         save_winner_state(updated_state, self._winner_state_path)
@@ -1254,57 +1351,33 @@ class TrajectoryValidator:
         """Return True if an LLM API key is configured."""
         return bool(self.config.llm_api_key)
 
-    async def _prefetch_packs_and_ncd_gate(
+    async def _prefetch_packs(
         self,
         active_commitments: Dict[int, MinerCommitment],
-        skip_uids: set,
-    ) -> Dict[str, str]:
-        """Fetch packs for eligible miners, run NCD dedup, cache packs for eval.
+    ) -> None:
+        """Warm PackFetcher's disk cache for every unique pack_hash.
 
-        Miners marked as copiers (values map to originals) are rejected in the
-        main loop like integrity failures. Non-copiers with a successful fetch
-        get _hotkey_packs / _pack_by_hash populated so _evaluate_miner hits
-        verify_submission cache.
-
-        Miners whose fetch fails are omitted from this NCD round but may still
-        be evaluated later if _evaluate_miner can fetch them.
+        Each unique `pack_hash` triggers a single `verify_submission` call;
+        the fetched content is dropped on the floor — it lives in
+        PackFetcher's per-hash disk cache so the later `_evaluate_miner`
+        path hits a cached entry instead of re-downloading. Failed fetches
+        are logged and skipped; they will surface again during
+        `_evaluate_miner`.
         """
-        pack_info: Dict[str, Tuple[dict, int, str]] = {}
+        seen: set = set()
         for uid, commitment in active_commitments.items():
-            if uid in skip_uids:
+            ph = commitment.pack_hash
+            if ph in seen:
                 continue
-            hk = commitment.hotkey
+            seen.add(ph)
             result = await self.pack_fetcher.verify_submission(
-                commitment.pack_url,
-                commitment.pack_hash,
+                commitment.pack_url, ph,
             )
             if not result.valid or result.pack_content is None:
                 logger.warning(
-                    f"NCD prefetch: uid={uid} ({hk[:8]}…): "
-                    f"{result.error or 'unknown'}"
+                    f"Pack prefetch failed: uid={uid} "
+                    f"({commitment.hotkey[:8]}…): {result.error or 'unknown'}"
                 )
-                continue
-            pack_info[hk] = (
-                result.pack_content,
-                commitment.block_number,
-                commitment.pack_hash,
-            )
-
-        ncd_excluded = deduplicate_packs(
-            pack_info, self.config.similarity_threshold
-        )
-
-        for hk, (pack, _bn, ph) in pack_info.items():
-            if hk in ncd_excluded:
-                continue
-            self._hotkey_packs[hk] = pack
-            self._pack_by_hash[ph] = pack
-
-        if ncd_excluded:
-            logger.info(
-                f"NCD pre-eval gate: {len(ncd_excluded)} miner(s) flagged as copies"
-            )
-        return ncd_excluded
 
     # ------------------------------------------------------------------
     # Evaluation cycle
@@ -1387,12 +1460,7 @@ class TrajectoryValidator:
             f"Eval cycle: block={current_block}, seed={epoch_seed}"
         )
 
-        # 1. Clear per-cycle pack caches to prevent stale entries from
-        # deregistered miners affecting NCD comparisons in the weight phase.
-        self._hotkey_packs.clear()
-        self._pack_by_hash.clear()
-
-        # 2. Sync metagraph (with retries + reconnect)
+        # 1. Sync metagraph (with retries + reconnect)
         logger.debug("Syncing metagraph...")
         mg_healthy = self._sync_metagraph(caller="eval_cycle")
         logger.info(
@@ -1409,13 +1477,13 @@ class TrajectoryValidator:
             )
             return
 
-        # 3. Read on-chain commitments
+        # 2. Read on-chain commitments
         logger.debug("Reading on-chain commitments...")
         commitments = fetch_all_commitments(
             self.subtensor, self.config.netuid, self.metagraph
         )
 
-        # 4. Filter to active non-validator miners (drops stale submissions)
+        # 3. Filter to active non-validator miners (drops stale submissions)
         active_commitments = self._filter_active_commitments(
             commitments, current_block,
         )
@@ -1429,62 +1497,45 @@ class TrajectoryValidator:
             await self._set_fallback_weights()
             return
 
-        # 5. Pack-hash pre-dedup: for miners with identical pack_hash,
-        # only evaluate the first mover (lowest block_number).
-        # Saves LLM API calls. Paraphrase copies are caught by NCD next
-        # (_prefetch_packs_and_ncd_gate); weight phase re-runs NCD as a safety net.
-        # Skipped miners will have no entries in scores/costs/qualified
-        # and receive weight 0 — this is intentional since their pack is
-        # identical to the evaluated first mover.
-        hash_earliest: Dict[str, Tuple[int, int]] = {}
-        for uid, commitment in active_commitments.items():
-            ph = commitment.pack_hash
-            if ph not in hash_earliest or commitment.block_number < hash_earliest[ph][1]:
-                hash_earliest[ph] = (uid, commitment.block_number)
-
-        skip_uids: set = set()
-        for uid, commitment in active_commitments.items():
-            earliest_uid, _ = hash_earliest[commitment.pack_hash]
-            if uid != earliest_uid:
-                skip_uids.add(uid)
-                self._get_miner_logger(commitment.hotkey).info(
-                    f"Skipping eval (duplicate pack_hash={commitment.pack_hash[:12]})"
-                )
-
-        # 6. Evaluate miners (scenarios selected by sandbox image)
+        # 4. Evaluate miners (scenarios selected by sandbox image).
+        # Pack-hash dedup is handled inside the loop via `pack_first_seen`
+        # ownership lock: the first hotkey to register a given pack_hash
+        # owns it permanently (for this validator instance). Subsequent
+        # submitters of the same pack_hash are treated as copies, get
+        # weight 0, and skip the LLM eval entirely.
         eval_scenarios: List[str] = []  # not used in S1 — sandbox picks scenario
         evaluated_count = 0
         attempted_count = 0
         skipped_interval_count = 0
         rejected_pre_eval_count = 0
-        ncd_rejected_count = 0
-        total_eligible = len(active_commitments) - len(skip_uids)
+        copy_rejected_count = 0
+        total_eligible = len(active_commitments)
         logger.info(
             f"=== Eval cycle: {total_eligible} eligible miners ==="
         )
 
-        ncd_excluded = await self._prefetch_packs_and_ncd_gate(
-            active_commitments, skip_uids
-        )
+        await self._prefetch_packs(active_commitments)
 
         miner_idx = 0
         for uid, commitment in active_commitments.items():
             hotkey = commitment.hotkey
-
-            if uid in skip_uids:
-                self._drop_miner_eval_state(hotkey)
-                continue
-
             miner_idx += 1
 
-            if hotkey in ncd_excluded:
-                ncd_rejected_count += 1
-                original_hk = ncd_excluded[hotkey]
+            # Ownership lock: first observer of this pack_hash owns it.
+            # `claim_owner` is the only place pack_first_seen entries
+            # are created — once locked, ownership never transfers (see
+            # trajectoryrl.utils.pack_ownership).
+            ph = commitment.pack_hash
+            owner_hk, _owner_blk = claim_owner(
+                self.pack_first_seen, ph, hotkey, current_block,
+            )
+            if owner_hk != hotkey:
+                copy_rejected_count += 1
                 detail = (
-                    f"NCD: policy too similar to earlier commitment "
-                    f"(original hotkey {original_hk[:8]}…)"
+                    f"pack_hash {ph[:12]} owned by {owner_hk[:8]}; "
+                    f"treating as copy"
                 )
-                logger.info(
+                self._get_miner_logger(hotkey).info(
                     f"[{miner_idx}/{total_eligible}] Miner {uid} ({hotkey[:8]}): "
                     f"{detail} — skipping eval"
                 )
@@ -1507,6 +1558,9 @@ class TrajectoryValidator:
                         spec_number=_spec_number(),
                         **self._harness_metadata(),
                     )
+                )
+                self._disqualified_miners[hotkey] = (
+                    f"copy_of:{owner_hk}"
                 )
                 self._drop_miner_eval_state(hotkey)
                 continue
@@ -1675,11 +1729,31 @@ class TrajectoryValidator:
                 await self._set_winner_weights()
                 self.last_weight_block = mid_block
 
+        # End-of-cycle eviction: drop pack_first_seen entries whose
+        # pack_hash has been absent from every active commitment for
+        # `EVICTION_GRACE_WINDOWS` consecutive wall-clock windows.
+        # This bounds the table's growth and enables a "resurrection"
+        # path for long-orphaned packs while shielding original authors
+        # from a single short outage costing them ownership (see
+        # trajectoryrl.utils.pack_ownership).
+        active_hashes = {c.pack_hash for c in active_commitments.values()}
+        evicted = evict_orphans(
+            self.pack_first_seen,
+            self.pack_last_seen_window,
+            active_hashes,
+            current_window=window_number,
+        )
+        if evicted:
+            logger.info(
+                f"pack_first_seen eviction: {len(evicted)} orphaned entries removed "
+                f"after {EVICTION_GRACE_WINDOWS}-window grace at window {window_number}"
+            )
+
         parts = [f"{evaluated_count} evaluated"]
         if rejected_pre_eval_count:
             parts.append(f"{rejected_pre_eval_count} pre-eval rejected")
-        if ncd_rejected_count:
-            parts.append(f"{ncd_rejected_count} NCD rejected")
+        if copy_rejected_count:
+            parts.append(f"{copy_rejected_count} copy rejected")
         if skipped_interval_count:
             parts.append(f"{skipped_interval_count} skipped (interval)")
         failed_count = attempted_count - evaluated_count

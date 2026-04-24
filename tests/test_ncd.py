@@ -1,13 +1,15 @@
-"""Tests for NCD pairwise dedup (trajectoryrl.utils.ncd)."""
+"""Tests for NCD pairwise dedup library (trajectoryrl.utils.ncd).
 
-import asyncio
+The validator no longer gates evaluation on NCD as of v5.1 — paraphrase
+defense is delegated to Winner Protection's δ threshold. These tests
+cover the library helpers, which are kept for tooling and possible
+future re-introduction.
+"""
+
 import sys
-from pathlib import Path
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import MagicMock
 
-import pytest
-
-# Mock bittensor before importing trajectoryrl modules (validator needs it)
+# Mock bittensor before importing trajectoryrl modules (some imports trigger it)
 if "bittensor" not in sys.modules:
     _mock_bt = MagicMock()
     class _MockSynapse:
@@ -232,104 +234,3 @@ class TestPRTestPlan:
         }
         result = deduplicate_packs(info)
         assert result == {"hk_b": "hk_a"}
-
-    def test_plan_3_cache_clearing(self):
-        """PR test plan #3: deregistered miner from previous cycle
-        doesn't appear in NCD comparisons.
-
-        Simulates: cycle 1 populates _hotkey_packs with a miner,
-        cycle 2 starts and that miner is no longer in commitments.
-        The cache should be cleared so the stale entry doesn't leak
-        into the weight-phase NCD dedup."""
-        from trajectoryrl.base.validator import TrajectoryValidator
-        from trajectoryrl.utils.commitments import MinerCommitment
-
-        config = MagicMock()
-        config.netuid = 11
-        config.eval_interval_blocks = 1200
-        config.similarity_threshold = 0.80
-        config.log_level = "WARNING"
-        config.scenarios = ["client_escalation"]
-        config.scenarios_path = Path("/tmp/test_scenarios")
-        config.inactivity_blocks = 14400
-        config.weight_interval_blocks = 360
-        config.cost_delta = 0.10
-        config.required_categories = ["safety", "correctness"]
-        config.eval_state_path = Path("/tmp/test_eval_state.json")
-        config.pack_cache_dir = Path("/tmp/test_packs")
-        config.pack_cache_max_size = 100
-        config.delta_threshold = 0.05
-
-        mock_subtensor = MagicMock()
-        mock_subtensor.get_current_block.return_value = 100000
-
-        mock_metagraph = MagicMock()
-        mock_metagraph.n = 2
-        mock_metagraph.hotkeys = ["hk_0", "hk_1"]
-        mock_metagraph.validator_permit = [False, False]
-        mock_metagraph.S = [100.0, 100.0]
-        mock_metagraph.stake = [100.0, 100.0]
-        mock_subtensor.metagraph.return_value = mock_metagraph
-
-        v = TrajectoryValidator.__new__(TrajectoryValidator)
-        v.config = config
-        v.metagraph = mock_metagraph
-        v.subtensor = mock_subtensor
-        v.eval_scores = {}
-        v.scenario_scores = {}
-        v._eval_pack_hash = {}
-        v.last_eval_block = {}
-        v.last_eval_window = {}
-        v._hotkey_uid_map = {}
-        v.scenarios = {"client_escalation": {"weight": 1.0}}
-        v.wallet = MagicMock()
-        v.last_weight_block = 0
-        v._sandbox_harness = None
-        v._disqualified_miners = {}
-
-        # Winner state (used by _set_winner_weights, called in _execute_evaluation_cycle)
-        from trajectoryrl.utils.winner_state import WinnerState
-        v._winner_state = WinnerState()
-        v._winner_state_path = "/tmp/test_winner_state.json"
-
-        # Simulate stale data from a previous cycle: a deregistered miner
-        stale_pack = _pack("# Stale miner policy that should be cleared")
-        v._hotkey_packs = {"hk_deregistered": stale_pack}
-        v._pack_by_hash = {"stale_hash_abc": stale_pack}
-        v._cycle_eval_id = None
-        v._cycle_log_offset = 0
-        v._cycle_log_block = 0
-
-        assert len(v._hotkey_packs) == 1
-        assert len(v._pack_by_hash) == 1
-
-        # Run _run_evaluation_cycle — it should clear caches as step 1.
-        # We mock everything after the cache clear to return early
-        # (no active commitments → falls through to fallback weights).
-        with patch.object(
-            TrajectoryValidator, "_check_llm_keys", return_value=True
-        ), patch.object(
-            TrajectoryValidator, "_get_validator_log_offset", return_value=0,
-        ), patch.object(
-            v, "_set_winner_weights", new_callable=AsyncMock,
-        ), patch(
-            "trajectoryrl.base.validator.fetch_all_commitments",
-            return_value={},
-        ), patch.object(
-            v, "_filter_active_commitments", return_value={},
-        ), patch.object(
-            v, "_set_fallback_weights", new_callable=AsyncMock,
-        ):
-            loop = asyncio.new_event_loop()
-            try:
-                loop.run_until_complete(v._run_evaluation_cycle(100000, window_number=0))
-            finally:
-                loop.close()
-
-        # After cycle, stale entries must be gone
-        assert v._hotkey_packs == {}, (
-            "Stale _hotkey_packs should be cleared at cycle start"
-        )
-        assert v._pack_by_hash == {}, (
-            "Stale _pack_by_hash should be cleared at cycle start"
-        )

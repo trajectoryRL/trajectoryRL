@@ -257,14 +257,26 @@ async def run(args):
         if hk not in consensus_disqualified
     }
 
+    # The prev winner is treated as belonging to the round's target spec by
+    # default so the simulation reflects normal Winner Protection. Pass
+    # --prev-winner-spec-number explicitly to model a cross-spec transition,
+    # in which case the analyzer will bypass the δ threshold to mirror the
+    # validator's runtime behaviour.
+    prev_spec = (
+        args.prev_winner_spec_number
+        if args.prev_winner_spec_number is not None
+        else stats.target_spec_number
+    )
     prev_state = WinnerState(
         winner_hotkey=args.prev_winner,
         winner_score=args.prev_winner_score,
+        spec_number=prev_spec,
     )
     winner_hk, updated_state = select_winner_with_protection(
         consensus_scores=eligible_scores,
         state=prev_state,
         score_delta=args.score_delta,
+        target_spec_number=stats.target_spec_number,
     )
 
     # ---- 8. Print results ---------------------------------------------------
@@ -324,6 +336,15 @@ def main():
     parser.add_argument("--netuid", type=int, default=NETUID)
     parser.add_argument("--prev-winner", type=str, default=None)
     parser.add_argument("--prev-winner-score", type=float, default=None)
+    parser.add_argument(
+        "--prev-winner-spec-number", type=int, default=None,
+        help=(
+            "spec_number under which the previous winner was selected. "
+            "Defaults to the round's target spec_number (no cross-spec "
+            "transition); set this to a different value to simulate the "
+            "cross-spec bypass that disables the δ threshold."
+        ),
+    )
     parser.add_argument("--score-delta", type=float, default=0.10)
     parser.add_argument(
         "--spec-number", "--scoring-version", type=int, default=None,
