@@ -42,7 +42,6 @@ from trajectoryrl.scoring import compute_consensus_scores
 from trajectoryrl.utils.winner_state import (
     WinnerState, select_winner_with_protection,
 )
-from trajectoryrl.utils.status_reporter import pre_eval
 
 NETUID = 11
 NETWORK = "finney"
@@ -228,15 +227,40 @@ async def run(args):
             validator_stakes[hotkey] = stake
 
     # ---- 5. Run filter pipeline ---------------------------------------------
+    # Mirror the validator's defaults so offline analysis matches what the
+    # validator actually fed to compute_consensus_scores. zero_signal_threshold
+    # in particular is decisive: any payload whose zero-score ratio sits in
+    # (zero_signal_threshold, 1.0) is dropped by the validator but kept by the
+    # legacy analyzer default of 1.0, producing a different leaderboard.
+    print(
+        f"\n  Filter config: min_validator_stake={args.min_validator_stake}, "
+        f"zero_signal_threshold={args.zero_signal_threshold}"
+    )
     validated, stats = run_filter_pipeline(
         submissions=submissions,
         expected_window=target_window,
         validator_stakes=validator_stakes,
-        min_stake=0.0,
+        min_stake=args.min_validator_stake,
         local_spec_number=local_spec,
         expected_protocol=CONSENSUS_PROTOCOL_VERSION,
+        zero_signal_threshold=args.zero_signal_threshold,
     )
-    print(f"\n  Filter pipeline: {stats.summary()}")
+    print(f"  Filter pipeline: {stats.summary()}")
+
+    # Per-payload zero-ratio audit so we can see exactly which payloads are
+    # being dropped (or are close to being dropped) by zero_signal_threshold.
+    print("\n  Per-payload zero-ratio audit:")
+    print(f"    {'val_uid':>7}  {'#scored':>7}  {'#zero':>5}  {'zero_ratio':>10}  "
+          f"{'dropped@0.95':>12}  {'dropped@1.00':>12}")
+    for sub_ptr, sub_payload in submissions:
+        val_uid = hk_to_uid.get(sub_ptr.validator_hotkey, -1)
+        n = len(sub_payload.scores)
+        n_zero = sum(1 for s in sub_payload.scores.values() if s == 0.0)
+        ratio = (n_zero / n) if n else 0.0
+        d095 = "YES" if (n and ratio >= 0.95) else "no"
+        d100 = "YES" if (n and ratio >= 1.0) else "no"
+        print(f"    {val_uid:>7}  {n:>7}  {n_zero:>5}  {ratio:>10.4f}  "
+              f"{d095:>12}  {d100:>12}")
 
     if not validated:
         print("\nAll submissions filtered out!")
@@ -276,6 +300,7 @@ async def run(args):
         consensus_scores=eligible_scores,
         state=prev_state,
         score_delta=args.score_delta,
+        hk_to_uid=hk_to_uid,
         target_spec_number=stats.target_spec_number,
     )
 
@@ -346,6 +371,33 @@ def main():
         ),
     )
     parser.add_argument("--score-delta", type=float, default=0.10)
+    # Mirror validator defaults from trajectoryrl.utils.config so offline
+    # aggregation matches runtime aggregation. Operators can override on
+    # the CLI to explore sensitivity.
+    try:
+        from trajectoryrl.utils.config import Config as _Config
+        _default_min_stake = float(_Config.min_validator_stake)
+        _default_zero_threshold = float(_Config.zero_signal_threshold)
+    except Exception:
+        _default_min_stake = 10000.0
+        _default_zero_threshold = 0.95
+    parser.add_argument(
+        "--min-validator-stake", type=float, default=_default_min_stake,
+        help=(
+            "Minimum validator stake to include a submission (Layer 3 of the "
+            f"filter pipeline). Defaults to validator's Config value "
+            f"({_default_min_stake})."
+        ),
+    )
+    parser.add_argument(
+        "--zero-signal-threshold", type=float, default=_default_zero_threshold,
+        help=(
+            "Drop payloads whose zero-score ratio is >= this value (Layer 5). "
+            f"Defaults to validator's Config value ({_default_zero_threshold}); "
+            "the legacy analyzer default of 1.0 dropped only strictly all-zero "
+            "payloads, which differs from production."
+        ),
+    )
     parser.add_argument(
         "--spec-number", "--scoring-version", type=int, default=None,
         dest="spec_number",
@@ -355,10 +407,6 @@ def main():
             f"trajectoryrl.utils.config.SPEC_NUMBER, or "
             f"{SPEC_NUMBER_FALLBACK} if unavailable)."
         ),
-    )
-    parser.add_argument(
-        "--skip-pre-eval", action="store_true",
-        help="Skip pre-eval API checks",
     )
     args = parser.parse_args()
 
