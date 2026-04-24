@@ -67,7 +67,7 @@ class ValidatorConsensusCommitment:
     validator_hotkey: str
     block_number: int
     raw: str
-    scoring_version: int = 1
+    spec_number: int = 1
 
 
 def encode_dual_address(
@@ -120,14 +120,17 @@ def parse_consensus_commitment(raw: str) -> Optional[Tuple[int, int, str, int]]:
 
     Supports two formats:
         Old (3-field): ``consensus:{pv}|{window}|{content_address}``
-        New (4-field): ``consensus:{pv}|{window}|{scoring_version}|{content_address}``
+        New (4-field): ``consensus:{pv}|{window}|{spec_number}|{content_address}``
 
-    Old-format commitments (missing scoring_version) default to
-    ``scoring_version=1``.
+    The integer at field 3 is the scoring spec identifier. Older commitments
+    written under the legacy ``scoring_version`` name parse to the same int
+    (the on-chain wire format is positional, so the rename does not break
+    backward compatibility). Old 3-field commitments default to
+    ``spec_number=1``.
 
     Returns:
         Tuple of (protocol_version, window_number, content_address,
-        scoring_version) or None if unparseable.
+        spec_number) or None if unparseable.
     """
     if not raw or not isinstance(raw, str):
         return None
@@ -154,13 +157,13 @@ def parse_consensus_commitment(raw: str) -> Optional[Tuple[int, int, str, int]]:
         try:
             protocol_version = int(parts[0].strip())
             window_number = int(parts[1].strip())
-            scoring_version = int(parts[2].strip())
+            spec_number = int(parts[2].strip())
         except (ValueError, TypeError):
             return None
         content_address = parts[3].strip()
         if not content_address:
             return None
-        return protocol_version, window_number, content_address, scoring_version
+        return protocol_version, window_number, content_address, spec_number
 
     return None
 
@@ -169,17 +172,17 @@ def format_consensus_commitment(
     protocol_version: int,
     window_number: int,
     content_address: str,
-    scoring_version: int = 1,
+    spec_number: int = 1,
 ) -> str:
     """Build a consensus commitment string for ``set_commitment``.
 
     Returns:
         Formatted string:
-        ``consensus:{protocol_version}|{window_number}|{scoring_version}|{content_address}``
+        ``consensus:{protocol_version}|{window_number}|{spec_number}|{content_address}``
     """
     return (
         f"{_CONSENSUS_PREFIX}{protocol_version}|{window_number}"
-        f"|{scoring_version}|{content_address}"
+        f"|{spec_number}|{content_address}"
     )
 
 
@@ -356,7 +359,7 @@ def fetch_validator_consensus_commitments(
             )
             continue
 
-        protocol_version, window_number, content_address, scoring_version = parsed
+        protocol_version, window_number, content_address, spec_number = parsed
         block_number = _get_commitment_block(subtensor, netuid, hotkey)
 
         results.append(ValidatorConsensusCommitment(
@@ -366,12 +369,12 @@ def fetch_validator_consensus_commitments(
             validator_hotkey=hotkey,
             block_number=block_number,
             raw=raw,
-            scoring_version=scoring_version,
+            spec_number=spec_number,
         ))
         logger.debug(
-            "Validator %s: consensus commitment — v%d window=%d sv=%d addr=%s",
+            "Validator %s: consensus commitment — v%d window=%d spec=%d addr=%s",
             hotkey[:8], protocol_version, window_number,
-            scoring_version, content_address[:24],
+            spec_number, content_address[:24],
         )
 
     if skipped_non_validator:

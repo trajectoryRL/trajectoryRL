@@ -145,7 +145,7 @@ Where:
 - `winner_hotkey` — current winner's hotkey
 - `winner_pack_hash` — the pack hash when they won
 - `winner_score` — the consensus score when they won
-- `scoring_version` — the `SCORING_VERSION` when they won (state resets on version change)
+- `spec_number` — the `SPEC_NUMBER` under which they won (audit field; state is **not** reset on `SPEC_NUMBER` change — see "SPEC_NUMBER and target spec selection")
 
 
 ---
@@ -248,11 +248,33 @@ set_weights:  every tempo (360 blocks), independent of epoch
 
 ### Benchmark Stability
 
-Every evaluation runs the **full benchmark set** defined by the season. No subset selection or rotation. The benchmark is fixed within a `scoring_version`: same scenarios, same criteria, same evaluation method. This ensures scores are directly comparable across validators and across time.
+Every evaluation runs the **full benchmark set** defined by the season. No subset selection or rotation. The benchmark is fixed within a `spec_number`: same scenarios, same criteria, same evaluation method. This ensures scores are directly comparable across validators and across time.
 
-**Anti-stagnation** comes from **growing the benchmark** over time (new scenarios, harder criteria, new domains). When the benchmark changes, it's coordinated via a validator software update and a `scoring_version` bump. Packs are re-evaluated fresh on the new set.
+**Anti-stagnation** comes from **growing the benchmark** over time (new scenarios, harder criteria, new domains). When the benchmark changes, it's coordinated via a validator software update and a `SPEC_NUMBER` bump (see "SPEC_NUMBER and target spec selection"). Packs are re-evaluated fresh on the new set.
 
 **State persistence**: Winner state (hotkey, pack_hash, score) persists across validator restarts (serialized to disk as JSON). Cached evaluation results persist across restarts where applicable.
+
+### SPEC_NUMBER and target spec selection
+
+`SPEC_NUMBER` is an integer constant in validator code (`trajectoryrl/utils/config.py`). It identifies a "scoring specification" — the combination of scenario set, scoring methodology, and judge prompt that determines whether two evaluations produce comparable scores. Maintainers bump it whenever a change makes new scores incomparable with old ones (adding/removing scenarios, changing weights, modifying judge prompts). Bench-image patch releases that preserve scoring semantics do **not** bump it. The constant is decoupled from the `trajrl-bench` image version (now used purely for audit / log fields).
+
+A validator always **writes** its commitments using its locally configured `SPEC_NUMBER`. During aggregation, the **target spec_number used to filter incoming commitments** is derived from on-chain stake distribution:
+
+```
+1. Read all consensus commitments
+2. Apply basic filters (protocol / window / per-validator min stake)
+3. Group survivors by spec_number, sum validator stake per group
+4. dominant = group with the largest total stake
+5. if dominant.stake > 0.5 * total_participating_stake:
+       target_spec_number = dominant.spec_number
+   else:
+       target_spec_number = local SPEC_NUMBER
+6. Filter pipeline keeps only commitments whose payload spec_number == target
+```
+
+This makes upgrades self-coordinating. While stake-weighted majority remains on the previous spec, every validator (upgraded or not) computes weights against that spec, so the previous winner keeps receiving emissions instead of getting burned. Once stake-weighted majority migrates to the new spec, target flips automatically and the new winner takes over. When no group reaches majority (split network, partial outage), validators fall back to their local `SPEC_NUMBER` and proceed with whatever data they have, again avoiding burn. The 50% threshold reuses the existing `disqualify_stake_threshold` semantic; no new parameter.
+
+`WinnerState.spec_number` is purely audit (which spec the current winner was selected under). It does **not** trigger a state reset on its own — the new winner naturally replaces the old one once target_spec_number flips and a new aggregation round produces a different best score.
 
 ---
 
@@ -412,11 +434,11 @@ Evaluation payloads are too large for direct on-chain storage.
 **Solution**: Two-layer storage with on-chain pointer registration.
 
 1. **Content-Addressed Storage (CAS)**: Upload the full evaluation payload. IPFS is the primary backend; GCS proxy fallback stores payload and returns a public URL. The content address (IPFS CID or sha256 hash) serves as an integrity proof.
-2. **On-chain pointer**: Write a lightweight commitment via `subtensor.set_commitment()` with format: `consensus:{protocol_version}|{epoch_number}|{scoring_version}|{content_address}`.
+2. **On-chain pointer**: Write a lightweight commitment via `subtensor.set_commitment()` with format: `consensus:{protocol_version}|{epoch_number}|{spec_number}|{content_address}`.
 
 Validator consensus commitments share the same commitment channel as miner pack commitments (`pack_hash|pack_url`). They are distinguished by the `consensus:` prefix. During aggregation, each validator reads `get_all_commitments(netuid)` and filters for entries starting with `consensus:`.
 
-**Backward compatibility**: Old-format commitments (`consensus:{pv}|{epoch}|{content_address}`, 3 fields) are parsed with `scoring_version` defaulting to 1.
+**Backward compatibility**: The on-chain commitment string is positional, so the integer at field 3 is read whether it was written as `scoring_version` or `spec_number`. Older 3-field commitments (`consensus:{pv}|{epoch}|{content_address}`) parse with `spec_number` defaulting to 1. Inside CAS payloads, JSON deserialization accepts either `spec_number` or the legacy `scoring_version` key.
 
 **Verification**: Any validator can independently verify a submission: read on-chain pointer → decode address → download payload from CAS (try IPFS, fall back to GCS) → verify content hash matches.
 
@@ -492,7 +514,7 @@ If winner exists and is not disqualified:
 - Self-update follows the same δ rule — winner must beat their own winning score by δ to update
 - No automatic season reset — winner persists until beaten or disqualified. Manual reset available for operational control.
 
-**Validator local state** (`WinnerState`): Each validator persists `winner_hotkey`, `winner_pack_hash`, `winner_score`, and `scoring_version` to a local JSON file. When `SCORING_VERSION` changes (new benchmark set), the winner state resets automatically. Since all validators process the same consensus data with the same deterministic algorithm, they converge on the same winner.
+**Validator local state** (`WinnerState`): Each validator persists `winner_hotkey`, `winner_pack_hash`, `winner_score`, and `spec_number` to a local JSON file. The `spec_number` is an audit field (records the spec under which the winner was selected) and does **not** reset state on its own; the new winner naturally takes over once the chain-derived target spec flips (see "SPEC_NUMBER and target spec selection"). Since all validators process the same consensus data with the same deterministic algorithm, they converge on the same winner.
 
 **Rate-limiting**: At most one evaluation per miner per `eval_interval`, regardless of how often the miner updates their commitment.
 
@@ -533,9 +555,9 @@ disqualified[hotkey] = reason                 # miners that failed (pre-eval, sc
 
 # ── Propagation window (80% → 90%) ──
 
-payload = { scores, disqualified, scoring_version, metadata }
+payload = { scores, disqualified, spec_number, metadata }
 content_address = cas_upload(payload)
-subtensor.set_commitment("consensus:{version}|{epoch}|{scoring_version}|{content_address}")
+subtensor.set_commitment("consensus:{version}|{epoch}|{spec_number}|{content_address}")
 
 # ── Aggregation window (90% → 100%) ──
 

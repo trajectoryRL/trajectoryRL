@@ -12,13 +12,6 @@ from typing import Dict
 
 CONSENSUS_PROTOCOL_VERSION = 2
 
-# Scoring version = major version of trajrl-bench (e.g. v3.0.1 → 3).
-# Overwritten at runtime by TrajectorySandboxHarness.scoring_version after
-# pulling the sandbox image.  This default is only used before the first pull.
-# Results from different scoring versions are never mixed during aggregation,
-# cached-result lookup, or winner selection.
-SCORING_VERSION = 1
-
 
 @dataclass
 class ConsensusPayload:
@@ -31,6 +24,7 @@ class ConsensusPayload:
       - scores: miner hotkey -> quality score (0.0–1.0)
       - bench_version: trajrl-bench version string
       - disqualified: miner hotkey -> reason
+      - spec_number: scoring spec identifier (see ``config.SPEC_NUMBER``)
     """
     protocol_version: int
     window_number: int
@@ -38,16 +32,20 @@ class ConsensusPayload:
     bench_version: str
     scores: Dict[str, float]        # miner hotkey -> quality score (0.0–1.0)
     timestamp: int                   # unix seconds when payload was built
-    scoring_version: int = 1         # major version of trajrl-bench
+    spec_number: int = 1
     disqualified: Dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
+        # Emit both `spec_number` (canonical) and `scoring_version` (legacy
+        # mirror) so older validators that still read the legacy key can
+        # filter incoming payloads correctly during the rollout window.
         return {
             "bench_version": self.bench_version,
             "disqualified": self.disqualified,
             "protocol_version": self.protocol_version,
             "scores": self.scores,
-            "scoring_version": self.scoring_version,
+            "scoring_version": self.spec_number,
+            "spec_number": self.spec_number,
             "timestamp": self.timestamp,
             "validator_hotkey": self.validator_hotkey,
             "window_number": self.window_number,
@@ -64,19 +62,12 @@ class ConsensusPayload:
     @classmethod
     def deserialize(cls, data: bytes) -> "ConsensusPayload":
         d = json.loads(data.decode("utf-8"))
-        return cls(
-            protocol_version=d["protocol_version"],
-            window_number=d["window_number"],
-            validator_hotkey=d["validator_hotkey"],
-            bench_version=d.get("bench_version", ""),
-            scores=d.get("scores", {}),
-            timestamp=d["timestamp"],
-            scoring_version=d.get("scoring_version", 1),
-            disqualified=d.get("disqualified", {}),
-        )
+        return cls.from_dict(d)
 
     @classmethod
     def from_dict(cls, d: dict) -> "ConsensusPayload":
+        # Accept either spec_number (current) or scoring_version (legacy).
+        spec_number = d.get("spec_number", d.get("scoring_version", 1))
         return cls(
             protocol_version=d["protocol_version"],
             window_number=d["window_number"],
@@ -84,7 +75,7 @@ class ConsensusPayload:
             bench_version=d.get("bench_version", ""),
             scores=d.get("scores", {}),
             timestamp=d["timestamp"],
-            scoring_version=d.get("scoring_version", 1),
+            spec_number=spec_number,
             disqualified=d.get("disqualified", {}),
         )
 

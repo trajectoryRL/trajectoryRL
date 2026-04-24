@@ -34,7 +34,7 @@ from typing import Dict, List, Optional
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from trajectoryrl.utils.config import ValidatorConfig
+from trajectoryrl.utils.config import SPEC_NUMBER, ValidatorConfig
 from trajectoryrl.utils.commitments import MinerCommitment, parse_commitment
 from trajectoryrl.utils.github import PackFetcher
 from trajectoryrl.utils.miner_eval import evaluate_miner_s1
@@ -218,8 +218,8 @@ async def run_evaluation(args) -> int:
     logger.info("Pulling latest sandbox + harness images...")
     await harness.pull_latest()
     logger.info(
-        "Sandbox %s, scoring_version %d, scenarios=%s",
-        harness.sandbox_version, harness.scoring_version,
+        "Sandbox %s, spec_number %d, scenarios=%s",
+        harness.sandbox_version, SPEC_NUMBER,
         harness.sandbox_scenarios or "?",
     )
 
@@ -280,7 +280,7 @@ async def run_evaluation(args) -> int:
             "eval_block": current_block,
             "epoch_seed": epoch_seed,
             "sandbox_version": harness.sandbox_version,
-            "scoring_version": harness.scoring_version,
+            "spec_number": SPEC_NUMBER,
             "scenario": result.scenario_name,
             "evaluation": {
                 "final_score": round(sr.final_score, 4),

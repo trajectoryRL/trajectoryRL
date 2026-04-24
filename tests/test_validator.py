@@ -43,14 +43,16 @@ from trajectoryrl.utils.eval_window import (
     compute_window, is_new_window, should_submit, should_aggregate,
     can_evaluate, window_progress_pct,
 )
+from trajectoryrl.utils.config import SPEC_NUMBER
 from trajectoryrl.utils.consensus import (
     ConsensusPayload, ConsensusPointer,
-    verify_payload_integrity, CONSENSUS_PROTOCOL_VERSION, SCORING_VERSION,
+    verify_payload_integrity, CONSENSUS_PROTOCOL_VERSION,
 )
 from trajectoryrl.utils.consensus_filter import (
     run_filter_pipeline, FilterStats, ValidatedSubmission,
     filter_protocol_version, filter_window_number,
     filter_trust_threshold, filter_zero_signal,
+    filter_spec_number, select_target_spec_number,
 )
 from trajectoryrl.scoring import compute_consensus_scores
 from trajectoryrl.utils.winner_state import (
@@ -1028,11 +1030,12 @@ class TestPerScenarioEvalState:
             validator.subtensor = mock_subtensor
             validator._eval_pack_hash = {}
             validator.last_eval_block = {}
+            validator.last_eval_window = {}
+            validator.scenario_scores = {}
             validator._hotkey_uid_map = {}
             validator._hotkey_packs = {}
             validator._pack_by_hash = {}
             validator._eval_counts = {}
-            validator._scenario_config_hash = ""
             validator._last_eval_window = -1
             validator.latest_token_usage = {}
             validator.latest_model_usage = {}
@@ -1061,36 +1064,46 @@ class TestPerScenarioEvalState:
     def test_needs_evaluation_new_miner(self):
         """New miner (never evaluated) needs evaluation."""
         v = self._make_validator()
-        assert v._needs_evaluation("hk_new", "hash_a", 100000) is True
+        assert v._needs_evaluation("hk_new", "hash_a", current_window=42) is True
 
     def test_needs_evaluation_pack_changed(self):
         """Pack hash change triggers re-evaluation."""
         v = self._make_validator()
         v._eval_pack_hash["hk_0"] = "hash_a"
-        v.last_eval_block["hk_0"] = 99999
-        assert v._needs_evaluation("hk_0", "hash_b", 100000) is True
+        v.scenario_scores["hk_0"] = {"client_escalation": 0.85}
+        v.last_eval_window["hk_0"] = 41
+        assert v._needs_evaluation("hk_0", "hash_b", current_window=42) is True
 
-    def test_needs_evaluation_within_interval(self):
-        """Within eval interval and same pack → no re-evaluation."""
+    def test_needs_evaluation_same_pack_skips(self):
+        """Same pack_hash with cached scores → skip eval."""
         v = self._make_validator()
         v._eval_pack_hash["hk_0"] = "hash_a"
-        v.last_eval_block["hk_0"] = 99500  # 500 blocks ago < 1200
-        assert v._needs_evaluation("hk_0", "hash_a", 100000) is False
+        v.scenario_scores["hk_0"] = {"client_escalation": 0.85}
+        v.last_eval_window["hk_0"] = 42
+        assert v._needs_evaluation("hk_0", "hash_a", current_window=42) is False
 
-    def test_needs_evaluation_interval_exceeded(self):
-        """Past eval interval → needs re-evaluation."""
+    def test_needs_evaluation_skips_across_epochs(self):
+        """Same pack_hash across windows → still skip (reuse cached scores)."""
         v = self._make_validator()
         v._eval_pack_hash["hk_0"] = "hash_a"
-        v.last_eval_block["hk_0"] = 92000  # 8000 blocks ago > 7200
-        assert v._needs_evaluation("hk_0", "hash_a", 100000) is True
+        v.scenario_scores["hk_0"] = {"client_escalation": 0.85}
+        v.last_eval_window["hk_0"] = 40
+        assert v._needs_evaluation("hk_0", "hash_a", current_window=45) is False
+
+    def test_needs_evaluation_no_scores_cached(self):
+        """pack_hash recorded but no scenario_scores → re-eval (defensive)."""
+        v = self._make_validator()
+        v._eval_pack_hash["hk_0"] = "hash_a"
+        v.scenario_scores["hk_0"] = {}
+        assert v._needs_evaluation("hk_0", "hash_a", current_window=42) is True
 
     def test_eval_state_persistence_roundtrip(self):
         """Eval state can be saved and loaded."""
         v = self._make_validator()
-        v._scenario_config_hash = "test_hash"
         v.scenario_scores = {"hk_0": {"client_escalation": 0.85}}
         v._eval_pack_hash = {"hk_0": "hash_a"}
         v.last_eval_block = {"hk_0": 99000}
+        v.last_eval_window = {"hk_0": 13}
 
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
             v.config.eval_state_path = Path(f.name)
@@ -1100,12 +1113,12 @@ class TestPerScenarioEvalState:
 
             v2 = self._make_validator()
             v2.config.eval_state_path = v.config.eval_state_path
-            v2._scenario_config_hash = "test_hash"
             v2._load_eval_state()
 
             assert v2.scenario_scores == {"hk_0": {"client_escalation": 0.85}}
             assert v2._eval_pack_hash == {"hk_0": "hash_a"}
             assert v2.last_eval_block == {"hk_0": 99000}
+            assert v2.last_eval_window == {"hk_0": 13}
         finally:
             v.config.eval_state_path.unlink(missing_ok=True)
 
@@ -1148,10 +1161,10 @@ class TestPerScenarioEvalState:
         v._track_uid_change(5, "hk_0")
         assert v._hotkey_uid_map["hk_0"] == 5
 
-    def test_eval_state_invalidated_on_scenario_pool_change(self):
-        """Loading eval state with different scenario config invalidates all state."""
+    def test_eval_state_invalidated_on_spec_number_change(self):
+        """Loading eval state under a different SPEC_NUMBER invalidates state."""
+        import json as _json
         v = self._make_validator()
-        v._scenario_config_hash = "old_hash"
         v.scenario_scores = {"hk_0": {"client_escalation": 0.85}}
         v._eval_pack_hash = {"hk_0": "hash_a"}
 
@@ -1161,13 +1174,47 @@ class TestPerScenarioEvalState:
         try:
             v._save_eval_state()
 
+            data = _json.loads(v.config.eval_state_path.read_text())
+            data["spec_number"] = data.get("spec_number", 1) + 100
+            data["scoring_version"] = data["spec_number"]
+            v.config.eval_state_path.write_text(_json.dumps(data))
+
             v2 = self._make_validator()
             v2.config.eval_state_path = v.config.eval_state_path
-            v2._scenario_config_hash = "new_hash"
             v2._load_eval_state()
 
             assert v2.scenario_scores == {}
             assert v2._eval_pack_hash == {}
+        finally:
+            v.config.eval_state_path.unlink(missing_ok=True)
+
+    def test_eval_state_load_accepts_legacy_scoring_version_key(self):
+        """Old eval_state.json with `scoring_version` key still loads."""
+        import json as _json
+
+        v = self._make_validator()
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            v.config.eval_state_path = Path(f.name)
+
+        try:
+            legacy = {
+                "scoring_version": SPEC_NUMBER,  # legacy key only
+                "scenario_scores": {"hk_0": {"client_escalation": 0.7}},
+                "eval_pack_hash": {"hk_0": "hash_legacy"},
+                "last_eval_block": {"hk_0": 1234},
+                "last_eval_window": -1,
+                "last_eval_window_per_hotkey": {"hk_0": 9},
+                "consensus_window": -1,
+                "integrity_cache": {},
+            }
+            v.config.eval_state_path.write_text(_json.dumps(legacy))
+
+            v2 = self._make_validator()
+            v2.config.eval_state_path = v.config.eval_state_path
+            v2._load_eval_state()
+
+            assert v2.scenario_scores == {"hk_0": {"client_escalation": 0.7}}
+            assert v2._eval_pack_hash == {"hk_0": "hash_legacy"}
         finally:
             v.config.eval_state_path.unlink(missing_ok=True)
 
@@ -1228,6 +1275,8 @@ class TestInactivityBlocks:
             validator.subtensor = mock_subtensor
             validator._eval_pack_hash = {}
             validator.last_eval_block = {}
+            validator.last_eval_window = {}
+            validator.scenario_scores = {}
             validator._hotkey_uid_map = {}
             validator._hotkey_packs = {}
             validator._pack_by_hash = {}
@@ -1726,8 +1775,8 @@ class TestConsensusFilter:
     """Tests for the 6-layer submission filter pipeline."""
 
     def _make_submission(
-        self, hotkey="val_a", window=42, protocol=1, version="0.1.0",
-        scores=None, scoring_version=SCORING_VERSION,
+        self, hotkey="val_a", window=42, protocol=CONSENSUS_PROTOCOL_VERSION,
+        version="0.1.0", scores=None, spec_number=SPEC_NUMBER,
     ):
         if scores is None:
             scores = {"miner_x": 0.85}
@@ -1738,7 +1787,7 @@ class TestConsensusFilter:
             bench_version=version,
             scores=scores,
             timestamp=1000,
-            scoring_version=scoring_version,
+            spec_number=spec_number,
         )
         pointer = ConsensusPointer(
             protocol_version=protocol,
@@ -1848,11 +1897,11 @@ class TestConsensusFilter:
 
     def test_full_pipeline_cascading_filters(self):
         subs = [
-            self._make_submission(hotkey="good", window=42, protocol=1, version="0.1.0", scores={"m": 0.85}),
-            self._make_submission(hotkey="bad_proto", window=42, protocol=2, version="0.1.0"),
-            self._make_submission(hotkey="bad_window", window=41, protocol=1, version="0.1.0"),
-            self._make_submission(hotkey="low_stake", window=42, protocol=1, version="0.1.0"),
-            self._make_submission(hotkey="zero_score", window=42, protocol=1, version="0.1.0", scores={"m": 0.0}),
+            self._make_submission(hotkey="good", window=42, version="0.1.0", scores={"m": 0.85}),
+            self._make_submission(hotkey="bad_proto", window=42, protocol=CONSENSUS_PROTOCOL_VERSION + 1, version="0.1.0"),
+            self._make_submission(hotkey="bad_window", window=41, version="0.1.0"),
+            self._make_submission(hotkey="low_stake", window=42, version="0.1.0"),
+            self._make_submission(hotkey="zero_score", window=42, version="0.1.0", scores={"m": 0.0}),
         ]
         stakes = {"good": 100.0, "bad_proto": 100.0, "bad_window": 100.0,
                   "low_stake": 1.0, "zero_score": 100.0}
@@ -1874,6 +1923,122 @@ class TestConsensusFilter:
         )
         assert stats.passed == 0
         assert len(validated) == 0
+
+    def test_select_target_spec_majority_wins(self):
+        """Stake-weighted majority spec_number is adopted as target."""
+        subs = [
+            self._make_submission(hotkey="val_a", spec_number=2),
+            self._make_submission(hotkey="val_b", spec_number=2),
+            self._make_submission(hotkey="val_c", spec_number=3),
+        ]
+        stakes = {"val_a": 100.0, "val_b": 200.0, "val_c": 50.0}
+        target, source = select_target_spec_number(subs, stakes, local_spec=99)
+        assert target == 2
+        assert source == "chain_majority"
+
+    def test_select_target_spec_no_majority_falls_back_to_local(self):
+        """Without a >50% group the local SPEC_NUMBER is used."""
+        subs = [
+            self._make_submission(hotkey="val_a", spec_number=2),
+            self._make_submission(hotkey="val_b", spec_number=3),
+        ]
+        stakes = {"val_a": 100.0, "val_b": 100.0}  # 50/50 split
+        target, source = select_target_spec_number(subs, stakes, local_spec=7)
+        assert target == 7
+        assert source == "local_fallback"
+
+    def test_select_target_spec_no_stake_falls_back_to_local(self):
+        subs = [self._make_submission(hotkey="val_a", spec_number=4)]
+        stakes = {}  # zero stake everywhere
+        target, source = select_target_spec_number(subs, stakes, local_spec=11)
+        assert target == 11
+        assert source == "local_fallback"
+
+    def test_filter_spec_number_drops_mismatched_payloads(self):
+        subs = [
+            self._make_submission(hotkey="val_a", spec_number=2),
+            self._make_submission(hotkey="val_b", spec_number=3),
+        ]
+        passed, skipped = filter_spec_number(subs, target_spec_number=2)
+        assert len(passed) == 1
+        assert skipped == 1
+        assert passed[0][1].spec_number == 2
+
+    def test_pipeline_uses_chain_derived_target_spec(self):
+        """Pipeline filters by majority spec_number, not local."""
+        subs = [
+            self._make_submission(hotkey="val_a", spec_number=2, scores={"m": 0.8}),
+            self._make_submission(hotkey="val_b", spec_number=2, scores={"m": 0.7}),
+            self._make_submission(hotkey="val_c", spec_number=3, scores={"m": 0.6}),
+        ]
+        stakes = {"val_a": 200.0, "val_b": 200.0, "val_c": 50.0}
+        validated, stats = run_filter_pipeline(
+            subs, expected_window=42, validator_stakes=stakes,
+            min_stake=10.0, local_spec_number=99,  # local doesn't match anything
+        )
+        assert stats.target_spec_number == 2
+        assert stats.target_spec_source == "chain_majority"
+        assert stats.skipped_spec_number == 1
+        assert stats.passed == 2
+
+    def test_pipeline_falls_back_to_local_spec_when_no_majority(self):
+        subs = [
+            self._make_submission(hotkey="val_a", spec_number=2, scores={"m": 0.8}),
+            self._make_submission(hotkey="val_b", spec_number=3, scores={"m": 0.7}),
+        ]
+        stakes = {"val_a": 100.0, "val_b": 100.0}  # 50/50 -> no >50% majority
+        validated, stats = run_filter_pipeline(
+            subs, expected_window=42, validator_stakes=stakes,
+            min_stake=10.0, local_spec_number=2,
+        )
+        assert stats.target_spec_source == "local_fallback"
+        assert stats.target_spec_number == 2
+        assert stats.passed == 1
+        assert validated[0].pointer.validator_hotkey == "val_a"
+
+
+# ---------------------------------------------------------------------------
+# Consensus payload back-compat tests
+# ---------------------------------------------------------------------------
+
+class TestConsensusPayloadBackCompat:
+    """ConsensusPayload reads both spec_number and legacy scoring_version keys."""
+
+    def test_from_dict_prefers_spec_number(self):
+        d = {
+            "protocol_version": 2,
+            "window_number": 1,
+            "validator_hotkey": "v",
+            "bench_version": "x",
+            "scores": {},
+            "timestamp": 0,
+            "spec_number": 7,
+            "scoring_version": 1,  # legacy mirror, ignored when spec_number present
+        }
+        p = ConsensusPayload.from_dict(d)
+        assert p.spec_number == 7
+
+    def test_from_dict_falls_back_to_legacy_scoring_version(self):
+        d = {
+            "protocol_version": 2,
+            "window_number": 1,
+            "validator_hotkey": "v",
+            "bench_version": "x",
+            "scores": {},
+            "timestamp": 0,
+            "scoring_version": 5,  # only legacy key present (old payload)
+        }
+        p = ConsensusPayload.from_dict(d)
+        assert p.spec_number == 5
+
+    def test_to_dict_emits_both_keys(self):
+        p = ConsensusPayload(
+            protocol_version=2, window_number=1, validator_hotkey="v",
+            bench_version="x", scores={}, timestamp=0, spec_number=4,
+        )
+        d = p.to_dict()
+        assert d["spec_number"] == 4
+        assert d["scoring_version"] == 4
 
 
 # ---------------------------------------------------------------------------
@@ -2152,6 +2317,53 @@ class TestWinnerProtection:
         loaded = load_winner_state(str(tmp_path / "nonexistent.json"))
         assert loaded.winner_hotkey is None
         assert loaded.winner_cost is None
+
+    def test_load_accepts_legacy_scoring_version_key(self, tmp_path):
+        """Old winner_state.json with `scoring_version` key still loads."""
+        import json as _json
+        path = tmp_path / "winner.json"
+        path.write_text(_json.dumps({
+            "scoring_version": 7,  # legacy key only
+            "winner_hotkey": "hk_legacy",
+            "winner_pack_hash": "pack_legacy",
+            "winner_score": 0.42,
+        }))
+        loaded = load_winner_state(str(path))
+        assert loaded.winner_hotkey == "hk_legacy"
+        assert loaded.winner_pack_hash == "pack_legacy"
+        assert loaded.winner_score == 0.42
+        assert loaded.spec_number == 7
+
+    def test_load_does_not_reset_on_spec_number_mismatch(self, tmp_path):
+        """spec_number is audit-only; mismatch must NOT clear winner state."""
+        import json as _json
+
+        path = tmp_path / "winner.json"
+        path.write_text(_json.dumps({
+            "spec_number": SPEC_NUMBER + 99,
+            "winner_hotkey": "hk_should_persist",
+            "winner_pack_hash": "ph",
+            "winner_score": 0.6,
+        }))
+        loaded = load_winner_state(str(path))
+        assert loaded.winner_hotkey == "hk_should_persist"
+        assert loaded.winner_score == 0.6
+
+    def test_save_emits_both_spec_number_and_legacy_key(self, tmp_path):
+        """save_winner_state writes both spec_number and scoring_version."""
+        import json as _json
+
+        state = WinnerState(
+            winner_hotkey="hk",
+            winner_pack_hash="ph",
+            winner_score=0.5,
+            spec_number=11,
+        )
+        path = str(tmp_path / "winner.json")
+        save_winner_state(state, path)
+        data = _json.loads(open(path).read())
+        assert data["spec_number"] == 11
+        assert data["scoring_version"] == 11
 
     def test_challenger_beats_winner_self_update(self):
         """When both challenger and winner beat margin, lowest cost wins."""

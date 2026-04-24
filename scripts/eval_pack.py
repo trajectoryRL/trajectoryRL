@@ -42,7 +42,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from trajectoryrl.utils.config import ValidatorConfig
+from trajectoryrl.utils.config import SPEC_NUMBER, ValidatorConfig
 from trajectoryrl.utils.sandbox_harness import (
     SandboxEvaluationResult,
     TrajectorySandboxHarness,
@@ -100,7 +100,7 @@ def _print_summary(
     pack_hash: str,
     result: SandboxEvaluationResult,
     sandbox_version: str,
-    scoring_version: int,
+    spec_number: int,
 ) -> bool:
     """Render a human-readable summary; return qualified flag."""
     W = 70
@@ -110,7 +110,7 @@ def _print_summary(
     print(f"Source:          {source}")
     print(f"Pack hash:       {pack_hash[:16]}...")
     print(f"Sandbox version: {sandbox_version}")
-    print(f"Scoring version: {scoring_version}")
+    print(f"Spec number:     {spec_number}")
     print(f"Scenario:        {result.scenario_name}")
     print("=" * W)
 
@@ -203,8 +203,8 @@ async def run_evaluation(args) -> int:
         logger.info("Pulling latest sandbox + harness images...")
         await harness.pull_latest()
     logger.info(
-        "Sandbox %s, scoring_version %d, scenarios=%s",
-        harness.sandbox_version, harness.scoring_version,
+        "Sandbox %s, spec_number %d, scenarios=%s",
+        harness.sandbox_version, SPEC_NUMBER,
         harness.sandbox_scenarios or "?",
     )
 
@@ -253,7 +253,7 @@ async def run_evaluation(args) -> int:
         pack_hash=pack_hash,
         result=result,
         sandbox_version=harness.sandbox_version,
-        scoring_version=harness.scoring_version,
+        spec_number=SPEC_NUMBER,
     )
 
     if args.output:
@@ -271,7 +271,7 @@ async def run_evaluation(args) -> int:
             "epoch_seed": epoch_seed,
             "validator_salt": validator_salt,
             "sandbox_version": harness.sandbox_version,
-            "scoring_version": harness.scoring_version,
+            "spec_number": SPEC_NUMBER,
             "scenario": result.scenario_name,
             "model": config.llm_model,
             "evaluation": {

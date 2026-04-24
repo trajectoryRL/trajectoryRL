@@ -38,16 +38,24 @@ from ..utils.eval_window import (
     compute_window, is_new_window, can_evaluate,
     should_submit, should_aggregate,
 )
-from ..utils import consensus as _consensus_mod
+from ..utils import config as _config_mod
 from ..utils.consensus import (
     ConsensusPayload, ConsensusPointer,
     CONSENSUS_PROTOCOL_VERSION,
 )
 
-def _scoring_version() -> int:
-    """Current scoring version — major version of trajrl-bench (e.g. v3.0.1 → 3).
-    Set dynamically after pulling the sandbox image at each eval cycle."""
-    return _consensus_mod.SCORING_VERSION
+
+def _spec_number() -> int:
+    """Current scoring spec identifier (validator-side constant).
+
+    See ``trajectoryrl/utils/config.py::SPEC_NUMBER`` for bump policy.
+    Used as the value written into outgoing commitments / payloads and as
+    the fallback target when no on-chain spec_number group reaches
+    stake-weighted majority.
+    """
+    return _config_mod.SPEC_NUMBER
+
+
 from ..utils.consensus_store import (
     ConsensusStore, IPFSBackend, TrajRLAPIBackend,
 )
@@ -182,8 +190,14 @@ class TrajectoryValidator:
         # Track the pack_hash that each hotkey was last evaluated with.
         self._eval_pack_hash: Dict[str, str] = {}
 
-        # Last eval block for each hotkey (for rate-limiting and inactivity)
+        # Last eval block for each hotkey (telemetry only — eval gating is
+        # by pack_hash, see _needs_evaluation).
         self.last_eval_block: Dict[str, int] = {}
+
+        # Last eval window for each hotkey. Used by _needs_evaluation logging
+        # and surfaces "which window did we last score this miner in" for
+        # debugging restart / cross-epoch reuse behavior.
+        self.last_eval_window: Dict[str, int] = {}
 
         # Pack content cache: pack_hash -> pack dict
         self._pack_by_hash: Dict[str, dict] = {}
@@ -252,11 +266,10 @@ class TrajectoryValidator:
         self._winner_state_path = str(config.winner_state_path)
         self._winner_state = load_winner_state(self._winner_state_path)
 
-
-        # Scenario config hash for state invalidation — driven by bench version
-        self._scenario_config_hash = "trajrl-bench"
-
-        # Load persisted evaluation state
+        # Load persisted evaluation state. Eval state is invalidated when the
+        # persisted spec_number disagrees with the current SPEC_NUMBER (any
+        # bump in scenario set or scoring methodology renders cached scores
+        # incomparable).
         self._load_eval_state()
 
         logger.info("Validator initialization complete!")
@@ -345,16 +358,13 @@ class TrajectoryValidator:
     # Evaluation state persistence
     # ------------------------------------------------------------------
 
-    def _compute_scenario_config_hash(self) -> str:
-        """Hash the bench version for detecting configuration changes."""
-        config_str = f"trajrl-bench:{self._sandbox_harness.sandbox_version}"
-        return hashlib.sha256(config_str.encode()).hexdigest()[:16]
-
     def _load_eval_state(self):
         """Load persisted evaluation state from disk.
 
-        Invalidates all state when either ``scoring_version`` or
-        ``scenario_config_hash`` no longer matches the running code.
+        Invalidates all state when the persisted ``spec_number`` no longer
+        matches the running ``SPEC_NUMBER`` — any spec bump implies cached
+        scores are incomparable with new ones. Accepts either ``spec_number``
+        (current) or ``scoring_version`` (legacy) JSON keys.
         """
         path = self.config.eval_state_path
         if not path.exists():
@@ -363,18 +373,12 @@ class TrajectoryValidator:
         try:
             data = json.loads(path.read_text())
 
-            file_sv = data.get("scoring_version", 1)
-            if file_sv != _scoring_version():
+            file_spec = data.get("spec_number", data.get("scoring_version", 1))
+            if file_spec != _spec_number():
                 logger.info(
-                    "Eval state scoring_version mismatch (%d != %d), "
+                    "Eval state spec_number mismatch (%d != %d), "
                     "invalidating all eval state",
-                    file_sv, _scoring_version(),
-                )
-                return
-
-            if data.get("scenario_config_hash") != self._scenario_config_hash:
-                logger.debug(
-                    "Scenario pool changed, invalidating all eval state"
+                    file_spec, _spec_number(),
                 )
                 return
 
@@ -382,6 +386,9 @@ class TrajectoryValidator:
             self._eval_pack_hash = data.get("eval_pack_hash", {})
             self.last_eval_block = {
                 k: int(v) for k, v in data.get("last_eval_block", {}).items()
+            }
+            self.last_eval_window = {
+                k: int(v) for k, v in data.get("last_eval_window_per_hotkey", {}).items()
             }
             self._last_eval_window = data.get("last_eval_window", -1)
 
@@ -399,13 +406,16 @@ class TrajectoryValidator:
 
     def _save_eval_state(self):
         """Persist evaluation state to disk for restart recovery."""
+        # Emit both keys for backward-compat with older validator binaries.
+        spec = _spec_number()
         data = {
-            "scoring_version": _scoring_version(),
-            "scenario_config_hash": self._scenario_config_hash,
+            "scoring_version": spec,
+            "spec_number": spec,
             "scenario_scores": self.scenario_scores,
             "eval_pack_hash": self._eval_pack_hash,
             "last_eval_block": self.last_eval_block,
             "last_eval_window": self._last_eval_window,
+            "last_eval_window_per_hotkey": self.last_eval_window,
             "consensus_window": self._consensus_window,
             "integrity_cache": self.integrity_judge.dump_cache(),
         }
@@ -432,6 +442,7 @@ class TrajectoryValidator:
             self.scenario_scores,
             self._eval_pack_hash,
             self.last_eval_block,
+            self.last_eval_window,
             self._eval_counts,
             self.latest_token_usage,
             self.latest_model_usage,
@@ -598,7 +609,7 @@ class TrajectoryValidator:
             protocol_version=self.config.consensus_protocol_version,
             window_number=window.window_number,
             content_address=content_address,
-            scoring_version=_scoring_version(),
+            spec_number=_spec_number(),
         )
 
         if len(commitment_str.encode("utf-8")) > MAX_COMMITMENT_BYTES:
@@ -608,7 +619,7 @@ class TrajectoryValidator:
                 protocol_version=self.config.consensus_protocol_version,
                 window_number=window.window_number,
                 content_address=fallback_address,
-                scoring_version=_scoring_version(),
+                spec_number=_spec_number(),
             )
             logger.warning(
                 "Window %d: commitment too long with dual address, "
@@ -670,12 +681,18 @@ class TrajectoryValidator:
             bench_version=bench_ver,
             scores=scores_by_hotkey,
             timestamp=int(time.time()),
-            scoring_version=_scoring_version(),
+            spec_number=_spec_number(),
             disqualified=disqualified_by_hotkey,
         )
 
     async def _run_consensus_aggregation(self, window: EvaluationWindow):
-        """Read on-chain consensus pointers, download payloads, filter, aggregate."""
+        """Read on-chain consensus pointers, download payloads, filter, aggregate.
+
+        All on-chain commitments are downloaded regardless of their
+        ``spec_number`` value; the target spec_number for filtering is
+        derived from the on-chain stake distribution by the filter pipeline
+        (see ``consensus_filter.select_target_spec_number``).
+        """
         if not self._is_metagraph_healthy():
             logger.warning(
                 "Window %d: metagraph unhealthy (n=%d) before consensus "
@@ -695,12 +712,8 @@ class TrajectoryValidator:
             return
 
         submissions = []
-        skipped_sv = 0
         download_failed = 0
         for vc in chain_commitments:
-            if vc.scoring_version != _scoring_version():
-                skipped_sv += 1
-                continue
             pointer = ConsensusPointer(
                 protocol_version=vc.protocol_version,
                 window_number=vc.window_number,
@@ -714,12 +727,6 @@ class TrajectoryValidator:
                 submissions.append((pointer, payload))
             else:
                 download_failed += 1
-        if skipped_sv:
-            logger.info(
-                "Window %d: skipped %d commitments with mismatched "
-                "scoring_version (expected %d)",
-                window.window_number, skipped_sv, _scoring_version(),
-            )
 
         my_hotkey = self.wallet.hotkey.ss58_address
         own_found = any(
@@ -734,20 +741,11 @@ class TrajectoryValidator:
 
         if not submissions:
             total = len(chain_commitments)
-            if skipped_sv == total:
-                logger.warning(
-                    "Window %d: no usable commitments — all %d filtered out "
-                    "due to scoring_version mismatch (local=%d), "
-                    "using local results",
-                    window.window_number, total, _scoring_version(),
-                )
-            else:
-                logger.warning(
-                    "Window %d: no usable submissions from %d commitments "
-                    "(%d version-filtered, %d download-failed), "
-                    "using local results",
-                    window.window_number, total, skipped_sv, download_failed,
-                )
+            logger.warning(
+                "Window %d: no usable submissions from %d commitments "
+                "(%d download-failed), using local results",
+                window.window_number, total, download_failed,
+            )
             return
 
         validator_stakes: Dict[str, float] = {}
@@ -764,8 +762,8 @@ class TrajectoryValidator:
             expected_window=window.window_number,
             validator_stakes=validator_stakes,
             min_stake=min_stake,
+            local_spec_number=_spec_number(),
             expected_protocol=self.config.consensus_protocol_version,
-            expected_scoring_version=_scoring_version(),
             zero_signal_threshold=zero_threshold,
         )
 
@@ -843,7 +841,7 @@ class TrajectoryValidator:
                                 rejected=True,
                                 rejection_stage=_stage,
                                 rejection_detail=_detail,
-                                scoring_version=_scoring_version(),
+                                spec_number=_spec_number(),
                                 **self._harness_metadata(),
                             )
                         )
@@ -1082,28 +1080,22 @@ class TrajectoryValidator:
             f"(~{self.config.weight_interval_blocks * 12 // 60}min)"
         )
 
-        # Pull sandbox image early so SCORING_VERSION is correct for
-        # startup aggregation (otherwise it stays at the default=1).
+        # Pull sandbox image early so audit logs (bench_version) are accurate
+        # for startup aggregation. SPEC_NUMBER is a code-level constant and
+        # no longer derived from the bench image.
         if self.config.full_cycle_on_startup or self.config.aggregate_when_start:
             try:
                 await self._sandbox_harness.pull_latest()
-                _consensus_mod.SCORING_VERSION = (
-                    self._sandbox_harness.scoring_version
-                )
                 logger.info(
-                    "scoring_version=%d (bench_version=%s) — set before "
+                    "spec_number=%d (bench_version=%s) — pulled before "
                     "startup aggregation",
-                    self._sandbox_harness.scoring_version,
+                    _spec_number(),
                     self._sandbox_harness.sandbox_version,
                 )
-                # Reload: __init__ loaded with stale SCORING_VERSION=1,
-                # which invalidated the saved state. Now that the real
-                # version is known, reload to recover _eval_pack_hash etc.
-                self._load_eval_state()
             except Exception as e:
                 logger.warning(
                     "Failed to pull sandbox image before startup aggregation: "
-                    "%s — scoring_version may be stale", e,
+                    "%s — bench_version audit field may be stale", e,
                 )
 
         if self.config.full_cycle_on_startup:
@@ -1336,12 +1328,13 @@ class TrajectoryValidator:
         self._cycle_log_block = current_block
 
         await self._execute_evaluation_cycle(
-            current_block, cycle_eval_id, cycle_start,
+            current_block, window_number, cycle_eval_id, cycle_start,
         )
 
     async def _execute_evaluation_cycle(
         self,
         current_block: int,
+        window_number: int,
         cycle_eval_id: str,
         cycle_start: float,
     ):
@@ -1381,11 +1374,10 @@ class TrajectoryValidator:
                 "Skipping this eval cycle. Error: %s", e,
             )
             return
-        # scoring_version = trajrl-bench major version (v3.0.1 → 3)
-        import trajectoryrl.utils.consensus as _consensus
-        _consensus_mod.SCORING_VERSION = self._sandbox_harness.scoring_version
-        logger.info("scoring_version=%d (bench_version=%s)",
-                    self._sandbox_harness.scoring_version,
+        # spec_number is a validator-side constant (see config.SPEC_NUMBER);
+        # bench_version is logged purely for audit.
+        logger.info("spec_number=%d (bench_version=%s)",
+                    _spec_number(),
                     self._sandbox_harness.sandbox_version)
 
         # Epoch seed for context variation
@@ -1512,7 +1504,7 @@ class TrajectoryValidator:
                         rejected=True,
                         rejection_stage="integrity_check",
                         rejection_detail=detail,
-                        scoring_version=_scoring_version(),
+                        spec_number=_spec_number(),
                         **self._harness_metadata(),
                     )
                 )
@@ -1562,7 +1554,7 @@ class TrajectoryValidator:
                             rejected=True,
                             rejection_stage=_stage,
                             rejection_detail=_detail,
-                            scoring_version=_scoring_version(),
+                            spec_number=_spec_number(),
                             **self._harness_metadata(),
                         )
                     )
@@ -1571,12 +1563,15 @@ class TrajectoryValidator:
                     continue
 
             needs_eval = self._needs_evaluation(
-                hotkey, commitment.pack_hash, current_block
+                hotkey, commitment.pack_hash, window_number
             )
             if not needs_eval:
                 skipped_interval_count += 1
+                last_w = self.last_eval_window.get(hotkey)
                 self._get_miner_logger(hotkey).info(
-                    f"[{miner_idx}/{total_eligible}] Skipping, within eval interval"
+                    f"[{miner_idx}/{total_eligible}] Skipping, "
+                    f"pack_hash unchanged "
+                    f"(last evaluated in window {last_w})"
                 )
                 continue
 
@@ -1629,6 +1624,7 @@ class TrajectoryValidator:
                     scenario_scores=scenario_scores_map,
                 )
                 self.last_eval_block[hotkey] = current_block
+                self.last_eval_window[hotkey] = window_number
                 evaluated_count += 1
                 q = eval_result.get("qualified", {})
                 passed = sum(1 for v in q.values() if v)
@@ -1713,27 +1709,28 @@ class TrajectoryValidator:
         await self._set_winner_weights()
 
     def _needs_evaluation(
-        self, hotkey: str, pack_hash: str, current_block: int
+        self, hotkey: str, pack_hash: str, current_window: int
     ) -> bool:
-        """Check if a miner needs re-evaluation.
+        """Return True iff the miner needs (re-)evaluation in this window.
 
-        Returns True if:
-        - pack_hash changed since last eval
-        - Time since last eval >= eval_interval
-        - Never evaluated before
+        Dedup is keyed purely on ``pack_hash``. Since
+        ``_filter_active_commitments`` drops commitments older than
+        ``inactivity_blocks`` (~2 windows), an unchanged ``pack_hash``
+        transitively means the miner is still actively re-submitting the
+        same pack — safe to reuse cached scenario scores.
+
+        ``current_window`` is accepted for symmetry / future use; it is
+        not part of the gating decision.
         """
+        del current_window  # signature only; kept for caller clarity
+
         if self._eval_pack_hash.get(hotkey) != pack_hash:
             self._get_miner_logger(hotkey).info(
                 f"pack_hash changed, marking for eval"
             )
             return True
 
-        last_block = self.last_eval_block.get(hotkey)
-        if last_block is None:
-            return True
-
-        blocks_since = current_block - last_block
-        if blocks_since >= self.config.eval_interval_blocks:
+        if not self.scenario_scores.get(hotkey):
             return True
 
         return False
@@ -1995,7 +1992,7 @@ class TrajectoryValidator:
             scenario_results=scenario_results,
             llm_base_url=self._judge_base_url,
             llm_model=self._judge_model,
-            scoring_version=_scoring_version(),
+            spec_number=_spec_number(),
             **self._harness_metadata(),
         )
 

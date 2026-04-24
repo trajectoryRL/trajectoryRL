@@ -123,7 +123,7 @@ For the reference miner implementation and local testing, see [MINER_OPERATIONS.
 
 ## Evaluation Dataset
 
-The current evaluation benchmark is defined by the **sandbox image version** (`scoring_version`). Scenarios live in [trajrl-bench](https://github.com/trajectoryRL/trajrl-bench) and include:
+The current evaluation benchmark is defined by **trajrl-bench** image plus a manually maintained `spec_number` constant in the validator code (`trajectoryrl/utils/config.py::SPEC_NUMBER`). Scenarios live in [trajrl-bench](https://github.com/trajectoryRL/trajrl-bench) and include:
 
 - Natural-language `JUDGE.md` per scenario (scoring rubric)
 - Fixture logic (mock services, data generation)
@@ -131,7 +131,7 @@ The current evaluation benchmark is defined by the **sandbox image version** (`s
 
 Adding a new scenario means writing a new JUDGE.md + fixture logic in trajrl-bench — no validator code change required.
 
-All scenarios run every evaluation cycle. No subset selection or rotation. When the scenario pool changes, the sandbox image version bumps (`scoring_version` increment), triggering a winner state reset.
+All scenarios run every evaluation cycle. No subset selection or rotation. Whenever the scenario set, scoring methodology, or judge prompt changes in a way that breaks score comparability, validator maintainers bump `SPEC_NUMBER` in the next validator release. Bench bug fixes that preserve scoring semantics do **not** bump it. Aggregation picks the target `spec_number` from on-chain commitments themselves (stake-weighted majority), so the upgrade is self-coordinating: while most validators are still on the old `spec_number`, weights continue to flow to the previous winner; once majority stake migrates to the new `spec_number`, the new winner takes over automatically.
 
 See [seasons/self_learning_s1.md](seasons/self_learning_s1.md) for the full Season 1 design, scenario list, and learning-signal architecture.
 

@@ -439,7 +439,7 @@ Season 1 closes this gap by planting two structural elements:
   "miner_uid": 42,
   "pack_hash": "abc123...",
   "scenario": "incident_response",
-  "scoring_version": 3,
+  "spec_number": 3,
   "episodes": [
     {"rep": 1, "quality": 0.45, "criteria": {...}, "summary": "..."},
     {"rep": 2, "quality": 0.55, "criteria": {...}, "summary": "..."},
@@ -510,18 +510,15 @@ WTA, NCD threshold 0.80, consensus aggregation, inactivity 14400 blocks, evaluat
 
 ## Versioning
 
-Sandbox major version = scoring version for consensus. Validators running different major versions do not mix results during consensus aggregation.
+Score comparability across validators is governed by a manually maintained `SPEC_NUMBER` constant in validator code (`trajectoryrl/utils/config.py`), decoupled from the `trajrl-bench` image version. Aggregation derives the active `spec_number` from on-chain stake distribution: the stake-weighted dominant `spec_number` wins if it holds more than 50% stake; otherwise validators fall back to their local `SPEC_NUMBER` for that round (see [INCENTIVE_MECHANISM.md](../INCENTIVE_MECHANISM.md#spec_number-and-target-spec-selection)).
 
-```
-trajrl-bench v3.0.0 → scoring_version = 3  (S1 default)
-trajrl-bench v4.0.0 → scoring_version = 4
-```
-
-| Change | Bump | scoring_version |
-|--------|------|-----------------|
-| New scenario added | Minor (v3.1.0) | Unchanged (3) |
-| JUDGE.md criteria changed | **Major (v4.0.0)** | Bumps to 4 |
-| Bug fix or infra | Patch (v3.0.1) | Unchanged |
+| Change | Bench image bump | `SPEC_NUMBER` bump? |
+|--------|-------------------|---------------------|
+| New scenario added | Minor (v3.1.0) | **Yes** — new scenario set produces incomparable scores |
+| JUDGE.md criteria changed | Minor or major | **Yes** |
+| Scoring weight / aggregation rule changed | n/a (validator-side) | **Yes** |
+| Fixture / infra bug fix that preserves scoring | Patch (v3.0.1) | No |
+| Sandbox runtime upgrade with same scenarios | Major (v4.0.0) | No |
 
 ---
 
@@ -677,7 +674,7 @@ Future skill packs may include additional files (data, examples, reference docs)
 
 **Scoring:** Each contest produces an independent `final_score`. Weight allocation across contests is governance-configured.
 
-**On-chain:** Commitment format unchanged (`{pack_hash}|{pack_url}`). One commitment per contest. `scoring_version` (from sandbox major) ensures validators with different scenario sets don't mix results.
+**On-chain:** Commitment format unchanged (`{pack_hash}|{pack_url}`). One commitment per contest. `spec_number` (validator-side constant; see [versioning](#versioning)) drives the data-driven target spec used by aggregation, so validators on different scenario sets don't mix results during the rollout window.
 
 ---
 

@@ -46,7 +46,10 @@ from trajectoryrl.utils.status_reporter import pre_eval
 
 NETUID = 11
 NETWORK = "finney"
-SCORING_VERSION = 3
+# Local fallback spec_number when no on-chain stake-weighted majority emerges.
+# When --spec-number / --scoring-version is unset, the analyzer mirrors the
+# validator and uses the trajectoryrl.utils.config.SPEC_NUMBER constant.
+SPEC_NUMBER_FALLBACK = 3
 IPFS_API_URL = "http://ipfs.metahash73.com:5001/api/v0"
 IPFS_GATEWAYS = [
     "https://ipfs.io",
@@ -166,20 +169,26 @@ async def run(args):
     print(f"\n  Target window: {target_window}")
 
     # ---- 3. Download payloads (with per-source JSON validation) -------------
-    scoring_ver = args.scoring_version if args.scoring_version is not None else SCORING_VERSION
+    # Resolve the local spec_number fallback. Mirror the production validator:
+    # prefer the SPEC_NUMBER from trajectoryrl.utils.config, allow CLI
+    # override via --spec-number / --scoring-version.
+    if args.spec_number is not None:
+        local_spec = args.spec_number
+    else:
+        try:
+            from trajectoryrl.utils.config import SPEC_NUMBER as _CONFIGURED_SPEC
+            local_spec = _CONFIGURED_SPEC
+        except ImportError:
+            local_spec = SPEC_NUMBER_FALLBACK
     max_retries = 3
     submissions = []
-    skipped_sv = 0
     for vc in chain_commitments:
         if vc.window_number != target_window:
-            continue
-        if vc.scoring_version != scoring_ver:
-            skipped_sv += 1
             continue
         uid = hk_to_uid.get(vc.validator_hotkey, -1)
         ipfs_cid, gcs_url = decode_dual_address(vc.content_address)
         addr_summary = f"ipfs={ipfs_cid or '(none)'}, gcs={(gcs_url or '(none)')[:40]}"
-        print(f"  UID {uid} ({vc.validator_hotkey[:12]}...) {addr_summary}")
+        print(f"  UID {uid} ({vc.validator_hotkey[:12]}...) spec={vc.spec_number} {addr_summary}")
 
         pointer = ConsensusPointer(
             protocol_version=vc.protocol_version,
@@ -204,9 +213,7 @@ async def run(args):
             print(f"    FAILED after {max_retries} attempts")
 
     total_target = sum(1 for vc in chain_commitments if vc.window_number == target_window)
-    if skipped_sv:
-        print(f"\n  Skipped {skipped_sv} commitments with mismatched scoring_version (expected {scoring_ver})")
-    print(f"\n  Downloaded {len(submissions)}/{total_target - skipped_sv} payloads")
+    print(f"\n  Downloaded {len(submissions)}/{total_target} payloads")
 
     if not submissions:
         print("\nFailed to download any payloads!")
@@ -226,8 +233,8 @@ async def run(args):
         expected_window=target_window,
         validator_stakes=validator_stakes,
         min_stake=0.0,
+        local_spec_number=local_spec,
         expected_protocol=CONSENSUS_PROTOCOL_VERSION,
-        expected_scoring_version=scoring_ver,
     )
     print(f"\n  Filter pipeline: {stats.summary()}")
 
@@ -319,8 +326,14 @@ def main():
     parser.add_argument("--prev-winner-score", type=float, default=None)
     parser.add_argument("--score-delta", type=float, default=0.10)
     parser.add_argument(
-        "--scoring-version", type=int, default=None,
-        help=f"Override scoring version filter (default: {SCORING_VERSION})",
+        "--spec-number", "--scoring-version", type=int, default=None,
+        dest="spec_number",
+        help=(
+            "Override the local spec_number fallback used when no on-chain "
+            f"stake-weighted majority emerges (default: validator's "
+            f"trajectoryrl.utils.config.SPEC_NUMBER, or "
+            f"{SPEC_NUMBER_FALLBACK} if unavailable)."
+        ),
     )
     parser.add_argument(
         "--skip-pre-eval", action="store_true",

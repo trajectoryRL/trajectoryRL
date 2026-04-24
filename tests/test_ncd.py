@@ -279,6 +279,7 @@ class TestPRTestPlan:
         v.scenario_scores = {}
         v._eval_pack_hash = {}
         v.last_eval_block = {}
+        v.last_eval_window = {}
         v._hotkey_uid_map = {}
         v.scenarios = {"client_escalation": {"weight": 1.0}}
         v.wallet = MagicMock()

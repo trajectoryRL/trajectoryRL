@@ -354,7 +354,9 @@ class TrajectorySandboxHarness:
         _model = config.judge_model or config.llm_model
         self._llm_model = _strip_provider_prefix(_model)
 
-        # Sandbox version — queried at pull time, drives scoring_version
+        # Sandbox version — queried at pull time, used purely for audit and
+        # logging. The scoring spec identifier (SPEC_NUMBER) is now a
+        # validator-side constant, decoupled from the bench image version.
         self.sandbox_version: str = "unknown"
         self.sandbox_scenarios: list[str] = []
 
@@ -372,27 +374,6 @@ class TrajectorySandboxHarness:
         if self._docker_client is None:
             self._docker_client = docker.from_env()
         return self._docker_client
-
-    @property
-    def scoring_version(self) -> int:
-        """Major version of bench_version (trajrl-bench version).
-
-        v3.0.1 → 3, v1.0.0 → 1, etc. Falls back to 1 if unparseable.
-        Validators with different bench major versions will not mix
-        results during consensus aggregation.
-        """
-        try:
-            major = self.sandbox_version.lstrip("v").split(".")[0]
-            return int(major)
-        except (ValueError, IndexError):
-            return 1
-
-        logger.info(
-            "TrajectorySandboxHarness initialized "
-            "(sandbox=%s, harness=%s, episodes=%d, timeout=%ds)",
-            self._sandbox_image, self._harness_image,
-            config.sandbox_num_episodes, config.sandbox_timeout_per_episode,
-        )
 
     async def pull_latest(self) -> None:
         """Pull latest images and query sandbox version. Gets new scenarios."""

@@ -138,20 +138,19 @@ class TestS1UnitMath:
         lower_pack = {"schema_version": 1, "files": {"skill.md": "# test"}}
         assert TrajectorySandboxHarness.extract_skill_md(lower_pack) == "# test"
 
-    def test_scoring_version_from_sandbox(self):
-        """Scoring version derived from sandbox major version."""
+    def test_spec_number_constant(self):
+        """SPEC_NUMBER is a validator-side constant decoupled from sandbox version."""
         _skip_if_no_docker()
         from trajectoryrl.utils.sandbox_harness import TrajectorySandboxHarness
+        from trajectoryrl.utils.config import SPEC_NUMBER
+
+        # The harness no longer exposes a derived scoring_version property.
+        # sandbox_version remains as an audit / log field only.
         harness = TrajectorySandboxHarness(_make_config())
+        assert not hasattr(harness, "scoring_version")
 
-        harness.sandbox_version = "3.1.0"
-        assert harness.scoring_version == 3
-
-        harness.sandbox_version = "4.0.0"
-        assert harness.scoring_version == 4
-
-        harness.sandbox_version = "unknown"
-        assert harness.scoring_version == 1
+        harness.sandbox_version = "3.1.0"  # bench bumps must not move SPEC_NUMBER
+        assert isinstance(SPEC_NUMBER, int) and SPEC_NUMBER >= 1
 
     def test_write_artifacts(self):
         """SandboxEvaluationResult.write_artifacts() creates correct dir layout."""
