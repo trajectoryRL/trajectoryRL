@@ -1176,7 +1176,13 @@ class TrajectorySandboxHarness:
             t_judge_wait = time.time()
             judge_timed_out = False
             try:
-                judge.wait(timeout=180)  # 3 min max for judging
+                # 5 min max for judging. 3 min (180s) was too tight on
+                # codebase_fix episodes where the judge walks git
+                # history + diffs + test_results/ep*.json across
+                # episodes; multiple judge containers timed out and
+                # produced quality=0.0 because evaluation.json was
+                # never written.
+                judge.wait(timeout=300)
             except Exception:
                 judge_timed_out = True
                 logger.warning("[%s] Episode %d judge agent timed out",
