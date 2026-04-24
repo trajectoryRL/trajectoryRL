@@ -35,6 +35,7 @@ from .sandbox_harness import SandboxEvaluationResult, TrajectorySandboxHarness
 # Skip-reason taxonomy — kept stable for callers that branch on these values
 # (e.g. validator's ``_disqualified_miners``).
 SKIP_PACK_VERIFY = "pack_verify"          # silent skip in validator (pre-eval reject)
+SKIP_INVALID_PACK = "invalid_pack_structure"  # pack JSON parsed but root / files not an object
 SKIP_MISSING_SKILL_MD = "missing_skill_md"
 SKIP_EMPTY_SKILL_MD = "empty_skill_md"
 SKIP_S1_EVAL_ERROR = "s1_eval_error"
@@ -103,7 +104,31 @@ async def evaluate_miner_s1(
         )
 
     pack = verification.pack_content
-    files = pack.get("files", {})
+    if not isinstance(pack, dict):
+        # Hash check passes for any well-formed JSON, including arrays /
+        # scalars / null. Without this guard, ``pack.get(...)`` below would
+        # raise AttributeError and propagate out of the whole eval cycle.
+        log.warning(
+            "Pack root is %s, expected JSON object", type(pack).__name__
+        )
+        return MinerEvalOutcome(
+            success=False,
+            skip_reason=SKIP_INVALID_PACK,
+            skip_detail=f"pack root is {type(pack).__name__}, expected object",
+        )
+
+    files = pack.get("files")
+    if not isinstance(files, dict):
+        log.warning(
+            "Pack 'files' is %s, expected JSON object",
+            type(files).__name__,
+        )
+        return MinerEvalOutcome(
+            success=False,
+            skip_reason=SKIP_INVALID_PACK,
+            skip_detail=f"'files' is {type(files).__name__}, expected object",
+        )
+
     if "SKILL.md" not in files:
         log.warning("Pack missing SKILL.md in files")
         return MinerEvalOutcome(
@@ -115,9 +140,12 @@ async def evaluate_miner_s1(
     if extra_files:
         log.warning("S1 pack contains unexpected files: %s", extra_files)
 
-    skill_md = files["SKILL.md"]
-    if not skill_md or not skill_md.strip():
-        log.warning("Empty SKILL.md submission")
+    skill_md = files.get("SKILL.md")
+    if not isinstance(skill_md, str) or not skill_md.strip():
+        log.warning(
+            "SKILL.md is %s or empty",
+            type(skill_md).__name__,
+        )
         return MinerEvalOutcome(
             success=False,
             skip_reason=SKIP_EMPTY_SKILL_MD,
