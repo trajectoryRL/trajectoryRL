@@ -198,10 +198,7 @@ class ValidatorConfig:
             netuid=int(os.getenv("NETUID", "11")),
             network=os.getenv("NETWORK", "finney"),
             # --- Paths ---
-            eval_state_path=Path(os.getenv(
-                "EVAL_STATE_PATH",
-                os.getenv("EMA_STATE_PATH", "/var/lib/trajectoryrl/eval_state.json"),
-            )),
+            eval_state_path=Path(os.getenv("EVAL_STATE_PATH", "/var/lib/trajectoryrl/eval_state.json")),
             winner_state_path=Path(os.getenv("WINNER_STATE_PATH", "/var/lib/trajectoryrl/winner_state.json")),
             pack_cache_dir=Path(os.getenv("PACK_CACHE_DIR", "/var/lib/trajectoryrl/packs")),
             log_dir=Path(os.getenv("LOG_DIR", "./logs")),

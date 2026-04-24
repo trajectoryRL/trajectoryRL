@@ -358,13 +358,8 @@ class TrajectoryValidator:
         """
         path = self.config.eval_state_path
         if not path.exists():
-            legacy = path.parent / "ema_state.json"
-            if legacy.exists():
-                logger.info("Migrating legacy ema_state.json → %s", path.name)
-                path = legacy
-            else:
-                logger.debug("No persisted eval state found, starting fresh")
-                return
+            logger.debug("No persisted eval state found, starting fresh")
+            return
         try:
             data = json.loads(path.read_text())
 
@@ -384,7 +379,7 @@ class TrajectoryValidator:
                 return
 
             self.scenario_scores = data.get("scenario_scores", {})
-            self._eval_pack_hash = data.get("eval_pack_hash", data.get("ema_pack_hash", {}))
+            self._eval_pack_hash = data.get("eval_pack_hash", {})
             self.last_eval_block = {
                 k: int(v) for k, v in data.get("last_eval_block", {}).items()
             }
@@ -421,6 +416,31 @@ class TrajectoryValidator:
             )
         except Exception as e:
             logger.warning(f"Failed to save eval state: {e}")
+
+    def _drop_miner_eval_state(self, hotkey: str):
+        """Remove all per-miner eval state and persist.
+
+        Invariant: eval_state only contains miners that successfully
+        completed an evaluation. Any pre-evaluation gate failure
+        (duplicate pack_hash, NCD copy, pre-eval rejection, pack
+        fetch / integrity failure, ...) must wipe the hotkey here so
+        stale data from a previous cycle cannot leak into scoring or
+        survive across restarts.
+        """
+        changed = False
+        for store in (
+            self.scenario_scores,
+            self._eval_pack_hash,
+            self.last_eval_block,
+            self._eval_counts,
+            self.latest_token_usage,
+            self.latest_model_usage,
+        ):
+            if hotkey in store:
+                store.pop(hotkey, None)
+                changed = True
+        if changed:
+            self._save_eval_state()
 
     # ------------------------------------------------------------------
     # Eval state update
@@ -1460,6 +1480,7 @@ class TrajectoryValidator:
             hotkey = commitment.hotkey
 
             if uid in skip_uids:
+                self._drop_miner_eval_state(hotkey)
                 continue
 
             miner_idx += 1
@@ -1495,8 +1516,7 @@ class TrajectoryValidator:
                         **self._harness_metadata(),
                     )
                 )
-                self.scenario_scores.pop(hotkey, None)
-                self._eval_pack_hash.pop(hotkey, None)
+                self._drop_miner_eval_state(hotkey)
                 continue
 
             # Pre-eval gate: ask the server whether this miner's submission
@@ -1547,8 +1567,7 @@ class TrajectoryValidator:
                         )
                     )
                     self._disqualified_miners[hotkey] = f"pre_eval_rejected:{reason}"
-                    self.scenario_scores.pop(hotkey, None)
-                    self._eval_pack_hash.pop(hotkey, None)
+                    self._drop_miner_eval_state(hotkey)
                     continue
 
             needs_eval = self._needs_evaluation(
@@ -1636,6 +1655,10 @@ class TrajectoryValidator:
 
                 self._track_uid_change(uid, hotkey)
 
+                # Persist per-miner so a crash mid-cycle doesn't lose
+                # work already paid for in LLM tokens.
+                self._save_eval_state()
+
             else:
                 elapsed_str = f" ({eval_elapsed:.1f}s)" if eval_elapsed else ""
                 logger.info(
@@ -1643,11 +1666,7 @@ class TrajectoryValidator:
                     f"{elapsed_str} "
                     f"(pack fetch/integrity failed)"
                 )
-                # Drop any stale cached scores so a future successful eval
-                # starts from a clean slate rather than re-surfacing old data
-                # under a potentially-stale pack_hash.
-                self.scenario_scores.pop(hotkey, None)
-                self._eval_pack_hash.pop(hotkey, None)
+                self._drop_miner_eval_state(hotkey)
 
             # Mid-eval tempo refresh: re-assert the current winner's weights
             # to keep the validator active on-chain without recomputing.
@@ -1823,9 +1842,14 @@ class TrajectoryValidator:
                 self._disqualified_miners[commitment.hotkey] = outcome.skip_reason
             return None
 
+        # Defensive: judge_details is built in-place by evaluate_miner_s1 today
+        # so this normally cannot raise, but a future contract drift (renamed
+        # field, missing scenario, None outcome) must not crash the whole cycle
+        # — that would silently kill all subsequent miners until restart.
         scenario_qualified = {
-            sn: d["qualification_gate"]
-            for sn, d in outcome.judge_details.items()
+            sn: bool((d or {}).get("qualification_gate", False))
+            for sn, d in (outcome.judge_details or {}).items()
+            if isinstance(d, dict)
         }
 
         return {
