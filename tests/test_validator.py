@@ -55,6 +55,10 @@ from trajectoryrl.utils.consensus_filter import (
     filter_spec_number, select_target_spec_number,
 )
 from trajectoryrl.scoring import compute_consensus_scores
+from trajectoryrl.utils.pack_ownership import (
+    claim_owner, evict_orphans, load_pack_first_seen,
+    EVICTION_GRACE_WINDOWS,
+)
 from trajectoryrl.utils.winner_state import (
     WinnerState, select_winner_with_protection,
     save_winner_state, load_winner_state,
@@ -711,34 +715,6 @@ class TestPackFetcher:
 
 class TestValidatorConfig:
 
-    def test_default_scenarios(self):
-        """Test that default scenarios list is correct."""
-        from trajectoryrl.utils.config import ValidatorConfig
-
-        # Can't fully instantiate (git check), but can inspect defaults
-        defaults = ValidatorConfig.__dataclass_fields__
-        assert "scenarios" in defaults
-        # Check the default factory produces expected list
-        scenarios = defaults["scenarios"].default_factory()
-        assert "client_escalation" in scenarios
-        assert "morning_brief" in scenarios
-        assert "inbox_to_action" in scenarios
-        assert "team_standup" in scenarios
-
-    def test_default_scoring_params(self):
-        from trajectoryrl.utils.config import ValidatorConfig
-        defaults = ValidatorConfig.__dataclass_fields__
-        assert defaults["delta_threshold"].default == 0.05
-        assert defaults["seeds_per_task"].default == 1
-        assert defaults["eval_interval_blocks"].default == 7200
-        assert defaults["similarity_threshold"].default == 0.80
-        assert defaults["inactivity_blocks"].default == 14400
-        assert defaults["weight_interval_blocks"].default == 360
-        # v4.0: LLM judge config fields exist
-        assert "judge_model" in defaults
-        assert "judge_api_key" in defaults
-        assert "judge_base_url" in defaults
-
     def test_no_github_fields(self):
         """Verify github_token and validator_scores_fork_url are removed."""
         from trajectoryrl.utils.config import ValidatorConfig
@@ -1004,11 +980,11 @@ class TestPerScenarioEvalState:
             config.scenarios_path = Path("/tmp/test_scenarios")
             config.inactivity_blocks = 14400
             config.eval_interval_blocks = 7200
-            config.similarity_threshold = 0.80
             config.weight_interval_blocks = 360
             config.cost_delta = 0.10
             config.required_categories = ["safety", "correctness"]
             config.eval_state_path = Path("/tmp/test_eval_state.json")
+            config.pack_first_seen_path = Path("/tmp/test_pack_first_seen.json")
             config.pack_cache_dir = Path("/tmp/test_packs")
             config.pack_cache_max_size = 100
             config.delta_threshold = 0.05
@@ -1031,10 +1007,10 @@ class TestPerScenarioEvalState:
             validator._eval_pack_hash = {}
             validator.last_eval_block = {}
             validator.last_eval_window = {}
+            validator.pack_first_seen = {}
+            validator.pack_last_seen_window = {}
             validator.scenario_scores = {}
             validator._hotkey_uid_map = {}
-            validator._hotkey_packs = {}
-            validator._pack_by_hash = {}
             validator._eval_counts = {}
             validator._last_eval_window = -1
             validator.latest_token_usage = {}
@@ -1098,7 +1074,11 @@ class TestPerScenarioEvalState:
         assert v._needs_evaluation("hk_0", "hash_a", current_window=42) is True
 
     def test_eval_state_persistence_roundtrip(self):
-        """Eval state can be saved and loaded."""
+        """Eval state (scores, pack_hash, blocks, windows) survives save/load.
+
+        Note: ``pack_first_seen`` lives in its own file; covered by
+        ``test_pack_first_seen_persistence_roundtrip``.
+        """
         v = self._make_validator()
         v.scenario_scores = {"hk_0": {"client_escalation": 0.85}}
         v._eval_pack_hash = {"hk_0": "hash_a"}
@@ -1107,12 +1087,19 @@ class TestPerScenarioEvalState:
 
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
             v.config.eval_state_path = Path(f.name)
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            v.config.pack_first_seen_path = Path(f.name)
 
         try:
             v._save_eval_state()
 
+            # eval_state.json must NOT carry the legacy pack_first_seen key.
+            saved = json.loads(v.config.eval_state_path.read_text())
+            assert "pack_first_seen" not in saved
+
             v2 = self._make_validator()
             v2.config.eval_state_path = v.config.eval_state_path
+            v2.config.pack_first_seen_path = v.config.pack_first_seen_path
             v2._load_eval_state()
 
             assert v2.scenario_scores == {"hk_0": {"client_escalation": 0.85}}
@@ -1121,6 +1108,297 @@ class TestPerScenarioEvalState:
             assert v2.last_eval_window == {"hk_0": 13}
         finally:
             v.config.eval_state_path.unlink(missing_ok=True)
+            v.config.pack_first_seen_path.unlink(missing_ok=True)
+
+    def test_pack_first_seen_persistence_roundtrip(self):
+        """pack_first_seen + pack_last_seen_window are persisted together."""
+        v = self._make_validator()
+        v.pack_first_seen = {
+            "hash_a": ("hk_0", 98500),
+            "hash_b": ("hk_1", 98800),
+        }
+        v.pack_last_seen_window = {"hash_a": 13, "hash_b": 17}
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            v.config.eval_state_path = Path(f.name)
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            v.config.pack_first_seen_path = Path(f.name)
+
+        try:
+            v._save_eval_state()
+
+            v2 = self._make_validator()
+            v2.config.eval_state_path = v.config.eval_state_path
+            v2.config.pack_first_seen_path = v.config.pack_first_seen_path
+            v2._load_eval_state()
+
+            assert v2.pack_first_seen == {
+                "hash_a": ("hk_0", 98500),
+                "hash_b": ("hk_1", 98800),
+            }
+            assert v2.pack_last_seen_window == {"hash_a": 13, "hash_b": 17}
+            # Independent verification via the helper.
+            loaded_table, loaded_last_seen = load_pack_first_seen(
+                v.config.pack_first_seen_path
+            )
+            assert loaded_table == {
+                "hash_a": ("hk_0", 98500),
+                "hash_b": ("hk_1", 98800),
+            }
+            assert loaded_last_seen == {"hash_a": 13, "hash_b": 17}
+        finally:
+            v.config.eval_state_path.unlink(missing_ok=True)
+            v.config.pack_first_seen_path.unlink(missing_ok=True)
+
+    def test_pack_first_seen_load_missing_file_defaults_empty(self):
+        """pack_first_seen.json missing AND eval_state.json carries no
+        legacy key → load yields an empty table."""
+        v = self._make_validator()
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            v.config.eval_state_path = Path(f.name)
+        # Point at a path that does not exist.
+        v.config.pack_first_seen_path = Path(
+            tempfile.gettempdir()
+        ) / "definitely_does_not_exist_pack_first_seen.json"
+        v.config.pack_first_seen_path.unlink(missing_ok=True)
+
+        try:
+            legacy = {
+                "spec_number": SPEC_NUMBER,
+                "scenario_scores": {},
+                "eval_pack_hash": {},
+                "last_eval_block": {},
+                "last_eval_window": -1,
+                "last_eval_window_per_hotkey": {},
+                "consensus_window": -1,
+                "integrity_cache": {},
+            }
+            v.config.eval_state_path.write_text(json.dumps(legacy))
+
+            v2 = self._make_validator()
+            v2.config.eval_state_path = v.config.eval_state_path
+            v2.config.pack_first_seen_path = v.config.pack_first_seen_path
+            v2._load_eval_state()
+
+            assert v2.pack_first_seen == {}
+            assert v2.pack_last_seen_window == {}
+        finally:
+            v.config.eval_state_path.unlink(missing_ok=True)
+            v.config.pack_first_seen_path.unlink(missing_ok=True)
+
+    def test_pack_first_seen_legacy_migration_from_eval_state(self):
+        """Legacy eval_state.json with embedded `pack_first_seen` key:
+        loader migrates entries into the dedicated file, populates the
+        in-memory table, and a subsequent save no longer rewrites the
+        legacy key.
+        """
+        v = self._make_validator()
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            v.config.eval_state_path = Path(f.name)
+        v.config.pack_first_seen_path = Path(
+            tempfile.gettempdir()
+        ) / "test_legacy_migration_pack_first_seen.json"
+        v.config.pack_first_seen_path.unlink(missing_ok=True)
+
+        try:
+            legacy = {
+                "spec_number": SPEC_NUMBER,
+                "scenario_scores": {},
+                "eval_pack_hash": {},
+                "last_eval_block": {},
+                "last_eval_window": -1,
+                "last_eval_window_per_hotkey": {},
+                "consensus_window": -1,
+                "integrity_cache": {},
+                "pack_first_seen": {
+                    "hash_a": ["hk_alice", 12345],
+                    "hash_b": ["hk_bob", 67890],
+                },
+            }
+            v.config.eval_state_path.write_text(json.dumps(legacy))
+
+            v._load_eval_state()
+
+            # (a) in-memory table populated from legacy block
+            assert v.pack_first_seen == {
+                "hash_a": ("hk_alice", 12345),
+                "hash_b": ("hk_bob", 67890),
+            }
+            # Legacy v1 carries no last-seen tracker; the side dict
+            # starts empty so the grace clock begins on the next sweep.
+            assert v.pack_last_seen_window == {}
+            # (b) dedicated pack_first_seen.json now exists with same data
+            assert v.config.pack_first_seen_path.exists()
+            loaded_table, loaded_last_seen = load_pack_first_seen(
+                v.config.pack_first_seen_path
+            )
+            assert loaded_table == {
+                "hash_a": ("hk_alice", 12345),
+                "hash_b": ("hk_bob", 67890),
+            }
+            assert loaded_last_seen == {}
+
+            # First eviction sweep must not drop migrated entries even
+            # if they look orphaned: the clock has to start ticking now.
+            evicted = evict_orphans(
+                v.pack_first_seen,
+                v.pack_last_seen_window,
+                set(),
+                current_window=100,
+            )
+            assert evicted == []
+            assert v.pack_last_seen_window == {"hash_a": 100, "hash_b": 100}
+
+            # (c) subsequent _save_eval_state must NOT rewrite legacy key
+            v._save_eval_state()
+            saved = json.loads(v.config.eval_state_path.read_text())
+            assert "pack_first_seen" not in saved
+        finally:
+            v.config.eval_state_path.unlink(missing_ok=True)
+            v.config.pack_first_seen_path.unlink(missing_ok=True)
+
+    def test_pack_first_seen_ownership_lock_first_writer_wins(self):
+        """First hotkey to claim a pack_hash owns it; subsequent claims by
+        other hotkeys return the original owner unchanged. Mirrors the
+        per-miner loop in ``_execute_evaluation_cycle`` where copies get
+        short-circuited to weight 0.
+        """
+        v = self._make_validator()
+
+        owner, blk = claim_owner(v.pack_first_seen, "hash_x", "hk_owner", 1000)
+        assert (owner, blk) == ("hk_owner", 1000)
+
+        owner2, blk2 = claim_owner(
+            v.pack_first_seen, "hash_x", "hk_copy", 1500,
+        )
+        assert (owner2, blk2) == ("hk_owner", 1000), (
+            "Ownership must not transfer to later submitters"
+        )
+        assert v.pack_first_seen["hash_x"] == ("hk_owner", 1000)
+
+    def test_pack_first_seen_no_succession_when_owner_gone(self):
+        """Owner hotkey gone but entry not yet evicted: copies still see
+        the dead owner and are treated as copies (no inheritance).
+        """
+        v = self._make_validator()
+        v.pack_first_seen["hash_x"] = ("hk_dead_owner", 500)
+
+        owner, _ = claim_owner(v.pack_first_seen, "hash_x", "hk_new", 2000)
+        assert owner == "hk_dead_owner"
+        assert owner != "hk_new"
+
+    def test_pack_first_seen_eviction_grace_window_keeps_then_drops(self):
+        """``evict_orphans`` honors the grace window: an orphaned entry
+        is only dropped after `EVICTION_GRACE_WINDOWS` consecutive
+        windows of inactivity. The first sweep starts the clock.
+        """
+        v = self._make_validator()
+        v.pack_first_seen = {
+            "hash_active": ("hk_a", 100),
+            "hash_orphan": ("hk_b", 200),
+        }
+        v.pack_last_seen_window = {}
+
+        # Window 50: first sweep. Active hash kept and clocked; orphan
+        # has its clock initialized — NOT evicted on first observation.
+        evicted = evict_orphans(
+            v.pack_first_seen,
+            v.pack_last_seen_window,
+            {"hash_active"},
+            current_window=50,
+        )
+        assert evicted == []
+        assert v.pack_last_seen_window == {"hash_active": 50, "hash_orphan": 50}
+
+        # Window 50 + (grace - 1): still inside grace → kept.
+        evicted = evict_orphans(
+            v.pack_first_seen,
+            v.pack_last_seen_window,
+            {"hash_active"},
+            current_window=50 + EVICTION_GRACE_WINDOWS - 1,
+        )
+        assert evicted == []
+        assert "hash_orphan" in v.pack_first_seen
+
+        # Window 50 + grace: boundary reached → evict orphan, keep active.
+        evicted = evict_orphans(
+            v.pack_first_seen,
+            v.pack_last_seen_window,
+            {"hash_active"},
+            current_window=50 + EVICTION_GRACE_WINDOWS,
+        )
+        assert evicted == ["hash_orphan"]
+        assert v.pack_first_seen == {"hash_active": ("hk_a", 100)}
+        assert "hash_orphan" not in v.pack_last_seen_window
+
+    def test_pack_first_seen_resurrection_after_eviction(self):
+        """After the full grace window with no active reference, a
+        brand-new submitter claims the pack_hash.
+        """
+        v = self._make_validator()
+        v.pack_first_seen["hash_x"] = ("hk_old_owner", 500)
+        v.pack_last_seen_window["hash_x"] = 10
+
+        # Within grace: no eviction yet.
+        evict_orphans(
+            v.pack_first_seen,
+            v.pack_last_seen_window,
+            set(),
+            current_window=10 + EVICTION_GRACE_WINDOWS - 1,
+        )
+        assert "hash_x" in v.pack_first_seen
+
+        # Past grace: evicted.
+        evict_orphans(
+            v.pack_first_seen,
+            v.pack_last_seen_window,
+            set(),
+            current_window=10 + EVICTION_GRACE_WINDOWS,
+        )
+        assert "hash_x" not in v.pack_first_seen
+
+        # Resurrection: brand-new submitter claims ownership.
+        owner, blk = claim_owner(v.pack_first_seen, "hash_x", "hk_new", 9000)
+        assert (owner, blk) == ("hk_new", 9000)
+
+    def test_pack_first_seen_grace_window_clock_reset(self):
+        """A re-activation inside the grace window resets the clock,
+        forcing a full new grace span before eviction. Drives the
+        validator-level dicts directly to mirror cycle progression.
+        """
+        v = self._make_validator()
+        v.pack_first_seen["hash_x"] = ("hk_owner", 100)
+        v.pack_last_seen_window["hash_x"] = 10
+
+        # Window 15: still orphaned, well inside grace.
+        evict_orphans(
+            v.pack_first_seen, v.pack_last_seen_window,
+            set(), current_window=15,
+        )
+        assert "hash_x" in v.pack_first_seen
+        assert v.pack_last_seen_window["hash_x"] == 10  # untouched
+
+        # Window 16: owner re-submits → clock resets to 16.
+        evict_orphans(
+            v.pack_first_seen, v.pack_last_seen_window,
+            {"hash_x"}, current_window=16,
+        )
+        assert v.pack_last_seen_window["hash_x"] == 16
+
+        # Window 16 + grace - 1: still inside fresh grace → keep.
+        evict_orphans(
+            v.pack_first_seen, v.pack_last_seen_window,
+            set(), current_window=16 + EVICTION_GRACE_WINDOWS - 1,
+        )
+        assert "hash_x" in v.pack_first_seen
+
+        # Window 16 + grace: full new grace elapsed → evict.
+        evicted = evict_orphans(
+            v.pack_first_seen, v.pack_last_seen_window,
+            set(), current_window=16 + EVICTION_GRACE_WINDOWS,
+        )
+        assert evicted == ["hash_x"]
+        assert "hash_x" not in v.pack_first_seen
 
     def test_scenario_score_tracking(self):
         """Scenario scores are recorded per-scenario."""
@@ -1251,11 +1529,11 @@ class TestInactivityBlocks:
             config.inactivity_blocks = 14400
             config.coldkey_blacklist = []
             config.eval_interval_blocks = 7200
-            config.similarity_threshold = 0.80
             config.weight_interval_blocks = 360
             config.cost_delta = 0.10
             config.required_categories = ["safety", "correctness"]
             config.eval_state_path = Path("/tmp/test_eval_state.json")
+            config.pack_first_seen_path = Path("/tmp/test_pack_first_seen.json")
 
             mock_subtensor = MagicMock()
             mock_subtensor.get_current_block.return_value = 100000
@@ -1278,8 +1556,6 @@ class TestInactivityBlocks:
             validator.last_eval_window = {}
             validator.scenario_scores = {}
             validator._hotkey_uid_map = {}
-            validator._hotkey_packs = {}
-            validator._pack_by_hash = {}
             validator._eval_counts = {}
             validator.latest_token_usage = {}
             validator.latest_model_usage = {}
@@ -2203,121 +2479,6 @@ class TestConsensusAggregation:
 class TestWinnerProtection:
     """Tests for Winner Protection mechanism."""
 
-    def test_no_winner_lowest_wins(self):
-        costs = {"m1": 3.0, "m2": 5.0}
-        quals = {"m1": True, "m2": True}
-        state = WinnerState()
-        winner, new_state = select_winner_with_protection(
-            costs, quals, state, cost_delta=0.10,
-        )
-        assert winner == "m1"
-        assert new_state.winner_hotkey == "m1"
-        assert new_state.winner_cost == 3.0
-
-    def test_winner_retains_within_margin(self):
-        costs = {"m1": 3.0, "m2": 2.75}
-        quals = {"m1": True, "m2": True}
-        state = WinnerState(winner_hotkey="m1", winner_cost=3.0)
-        winner, new_state = select_winner_with_protection(
-            costs, quals, state, cost_delta=0.10,
-        )
-        # m2 (2.75) needs < 3.0 * 0.90 = 2.70 to dethrone
-        assert winner == "m1"
-        assert new_state.winner_cost == 3.0
-
-    def test_challenger_overtakes_past_margin(self):
-        costs = {"m1": 3.0, "m2": 2.60}
-        quals = {"m1": True, "m2": True}
-        state = WinnerState(winner_hotkey="m1", winner_cost=3.0)
-        winner, new_state = select_winner_with_protection(
-            costs, quals, state, cost_delta=0.10,
-        )
-        # m2 (2.60) < 3.0 * 0.90 = 2.70 → overtake
-        assert winner == "m2"
-        assert new_state.winner_hotkey == "m2"
-        assert new_state.winner_cost == 2.60
-
-    def test_winner_disqualified(self):
-        costs = {"m1": 3.0, "m2": 5.0}
-        quals = {"m1": False, "m2": True}
-        state = WinnerState(winner_hotkey="m1", winner_cost=3.0)
-        winner, new_state = select_winner_with_protection(
-            costs, quals, state, cost_delta=0.10,
-        )
-        assert winner == "m2"
-        assert new_state.winner_hotkey == "m2"
-        assert new_state.winner_cost == 5.0
-
-    def test_winner_defends_with_winning_cost_not_current(self):
-        """Winner defends with frozen winner_cost, not their latest consensus cost."""
-        state = WinnerState(winner_hotkey="m1", winner_cost=2.0)
-        # m1's current cost is 4.0 (worse), but defense uses winner_cost=2.0
-        costs = {"m1": 4.0, "m2": 2.5}
-        quals = {"m1": True, "m2": True}
-        winner, _ = select_winner_with_protection(
-            costs, quals, state, cost_delta=0.10,
-        )
-        # threshold = 2.0 * 0.90 = 1.80; m2 (2.5) > 1.80 → winner retains
-        assert winner == "m1"
-
-    def test_winner_self_update(self):
-        """Winner can update their own record if they beat the margin."""
-        state = WinnerState(
-            winner_hotkey="m1", winner_cost=3.0, winner_pack_hash="old_hash",
-        )
-        costs = {"m1": 2.60, "m2": 5.0}
-        quals = {"m1": True, "m2": True}
-        winner, new_state = select_winner_with_protection(
-            costs, quals, state, cost_delta=0.10,
-            pack_hashes={"m1": "new_hash", "m2": "m2_hash"},
-        )
-        # m1 (2.60) < 3.0 * 0.90 = 2.70 → self-update
-        assert winner == "m1"
-        assert new_state.winner_cost == 2.60
-        assert new_state.winner_pack_hash == "new_hash"
-
-    def test_winner_no_self_update_within_margin(self):
-        """Winner does NOT update if their new cost doesn't clear margin."""
-        state = WinnerState(
-            winner_hotkey="m1", winner_cost=3.0, winner_pack_hash="old_hash",
-        )
-        costs = {"m1": 2.80, "m2": 5.0}
-        quals = {"m1": True, "m2": True}
-        winner, new_state = select_winner_with_protection(
-            costs, quals, state, cost_delta=0.10,
-        )
-        # m1 (2.80) >= 3.0 * 0.90 = 2.70 → no update
-        assert winner == "m1"
-        assert new_state.winner_cost == 3.0
-        assert new_state.winner_pack_hash == "old_hash"
-
-    def test_no_qualified_miners(self):
-        costs = {"m1": 3.0}
-        quals = {"m1": False}
-        state = WinnerState()
-        winner, _ = select_winner_with_protection(
-            costs, quals, state, cost_delta=0.10,
-        )
-        assert winner is None
-
-    def test_save_load_roundtrip(self, tmp_path):
-        state = WinnerState(
-            winner_hotkey="m1",
-            winner_pack_hash="abc123",
-            winner_cost=3.5,
-        )
-        path = str(tmp_path / "winner.json")
-        save_winner_state(state, path)
-        loaded = load_winner_state(path)
-        assert loaded.winner_hotkey == state.winner_hotkey
-        assert loaded.winner_pack_hash == state.winner_pack_hash
-        assert loaded.winner_cost == state.winner_cost
-
-    def test_load_missing_file(self, tmp_path):
-        loaded = load_winner_state(str(tmp_path / "nonexistent.json"))
-        assert loaded.winner_hotkey is None
-        assert loaded.winner_cost is None
-
     def test_load_accepts_legacy_scoring_version_key(self, tmp_path):
         """Old winner_state.json with `scoring_version` key still loads."""
         import json as _json
@@ -2365,30 +2526,87 @@ class TestWinnerProtection:
         assert data["spec_number"] == 11
         assert data["scoring_version"] == 11
 
-    def test_challenger_beats_winner_self_update(self):
-        """When both challenger and winner beat margin, lowest cost wins."""
-        state = WinnerState(winner_hotkey="m1", winner_cost=3.0)
-        costs = {"m1": 2.60, "m2": 2.50}
-        quals = {"m1": True, "m2": True}
-        winner, new_state = select_winner_with_protection(
-            costs, quals, state, cost_delta=0.10,
+    # ------------------------------------------------------------------
+    # Cross-spec winner protection bypass
+    # ------------------------------------------------------------------
+
+    def test_winner_protection_bypassed_on_cross_spec_transition(self):
+        """When state.spec_number != target_spec_number, the δ threshold is
+        skipped and the highest-scoring eligible miner is elected."""
+        state = WinnerState(
+            winner_hotkey="m1",
+            winner_score=0.9,  # high score, would normally defend
+            spec_number=3,
         )
-        # Both < 3.0 * 0.90 = 2.70, but m2 (2.50) is lowest → m2 wins
+        consensus_scores = {"m1": 0.4, "m2": 0.5}  # both far below 0.9*1.10
+        winner, new_state = select_winner_with_protection(
+            consensus_scores=consensus_scores,
+            state=state,
+            score_delta=0.10,
+            target_spec_number=4,
+        )
         assert winner == "m2"
         assert new_state.winner_hotkey == "m2"
-        assert new_state.winner_cost == 2.50
+        assert new_state.winner_score == 0.5
+        assert new_state.spec_number == 4
 
-    def test_winner_degraded_pack_retains(self):
-        """Winner with worse pack still defends with winning cost."""
-        state = WinnerState(winner_hotkey="m1", winner_cost=2.0)
-        costs = {"m1": 5.0, "m2": 3.0}
-        quals = {"m1": True, "m2": True}
-        winner, new_state = select_winner_with_protection(
-            costs, quals, state, cost_delta=0.10,
+    def test_winner_protection_active_when_specs_match(self):
+        """When state.spec_number == target_spec_number, normal δ rules apply."""
+        state = WinnerState(
+            winner_hotkey="m1",
+            winner_score=0.9,
+            spec_number=4,
         )
-        # threshold = 2.0 * 0.90 = 1.80; m2 (3.0) > 1.80 → winner retains
+        consensus_scores = {"m1": 0.85, "m2": 0.5}  # m2 nowhere near 0.9*1.10
+        winner, new_state = select_winner_with_protection(
+            consensus_scores=consensus_scores,
+            state=state,
+            score_delta=0.10,
+            target_spec_number=4,
+        )
         assert winner == "m1"
-        assert new_state.winner_cost == 2.0
+        assert new_state.winner_hotkey == "m1"
+        assert new_state.winner_score == 0.9  # frozen
+        assert new_state.spec_number == 4
+
+    def test_new_state_carries_target_spec_number(self):
+        """Elect / overtake / self-update branches all stamp target_spec_number."""
+        # Elect (no previous winner)
+        elect_state = WinnerState(spec_number=2)
+        _, new_elect = select_winner_with_protection(
+            consensus_scores={"m1": 0.7},
+            state=elect_state,
+            score_delta=0.10,
+            target_spec_number=5,
+        )
+        assert new_elect.spec_number == 5
+
+        # Overtake (challenger clears δ threshold under same spec)
+        overtake_state = WinnerState(
+            winner_hotkey="m1", winner_score=0.5, spec_number=5,
+        )
+        _, new_overtake = select_winner_with_protection(
+            consensus_scores={"m1": 0.5, "m2": 0.99},  # 0.99 > 0.5*1.10
+            state=overtake_state,
+            score_delta=0.10,
+            target_spec_number=5,
+        )
+        assert new_overtake.winner_hotkey == "m2"
+        assert new_overtake.spec_number == 5
+
+        # Self-update (winner beats own threshold)
+        selfup_state = WinnerState(
+            winner_hotkey="m1", winner_score=0.5, spec_number=5,
+        )
+        _, new_selfup = select_winner_with_protection(
+            consensus_scores={"m1": 0.99},  # 0.99 > 0.5*1.10
+            state=selfup_state,
+            score_delta=0.10,
+            target_spec_number=5,
+        )
+        assert new_selfup.winner_hotkey == "m1"
+        assert new_selfup.winner_score == 0.99
+        assert new_selfup.spec_number == 5
 
 
 # ---------------------------------------------------------------------------

@@ -113,9 +113,6 @@ class ValidatorConfig:
     # Bootstrap config (graduated rewards until enough miners join)
     bootstrap_threshold: int = 10
 
-    # NCD similarity threshold (reject packs >= this similarity to current winner)
-    similarity_threshold: float = 0.80
-
     # Coldkey blacklist: miners under these coldkeys are skipped entirely
     coldkey_blacklist: List[str] = field(default_factory=list)
 
@@ -176,6 +173,15 @@ class ValidatorConfig:
         default_factory=lambda: Path("/var/lib/trajectoryrl/winner_state.json")
     )
 
+    # Pack ownership lock (pack_first_seen) persistence. Separate from
+    # eval_state_path so the ownership table can be inspected / reset
+    # independently of per-hotkey eval caches. On first start, legacy
+    # entries embedded in eval_state.json are migrated automatically
+    # (see BaseValidatorNeuron._load_eval_state).
+    pack_first_seen_path: Path = field(
+        default_factory=lambda: Path("/var/lib/trajectoryrl/pack_first_seen.json")
+    )
+
     # Pack caching
     pack_cache_dir: Path = field(
         default_factory=lambda: Path("/var/lib/trajectoryrl/packs")
@@ -224,6 +230,7 @@ class ValidatorConfig:
             # --- Paths ---
             eval_state_path=Path(os.getenv("EVAL_STATE_PATH", "/var/lib/trajectoryrl/eval_state.json")),
             winner_state_path=Path(os.getenv("WINNER_STATE_PATH", "/var/lib/trajectoryrl/winner_state.json")),
+            pack_first_seen_path=Path(os.getenv("PACK_FIRST_SEEN_PATH", "/var/lib/trajectoryrl/pack_first_seen.json")),
             pack_cache_dir=Path(os.getenv("PACK_CACHE_DIR", "/var/lib/trajectoryrl/packs")),
             log_dir=Path(os.getenv("LOG_DIR", "./logs")),
             # --- LLM (new names preferred, legacy CLAWBENCH_* still supported) ---
@@ -259,7 +266,7 @@ class ValidatorConfig:
             # --- IM parameters are hardcoded (dataclass defaults) ---
             # Do NOT load from env: score_delta,
             # rho_reliability, consensus_epsilon, bootstrap_threshold,
-            # similarity_threshold, max_commitment_age_blocks,
+            # max_commitment_age_blocks,
             # inactivity_blocks, eval_interval_blocks, weight_interval_blocks.
             # All validators must use identical IM values for consensus.
         )

@@ -2,9 +2,9 @@
 
 **Subnet**: SN11 (TrajectoryRL)
 
-**Version**: v5.0
+**Version**: v5.1
 
-**Date**: 2026-04-21
+**Date**: 2026-04-24
 
 ---
 
@@ -53,9 +53,9 @@ Validators continuously read miner commitments from the chain via `subtensor.get
 2. Pack URL is publicly accessible (HTTP GET returns 200)
 3. `sha256(json.dumps(pack, sort_keys=True))` matches `pack_hash`
 4. PolicyBundle passes schema validation (season-defined)
-5. **NCD similarity** pairwise dedup among all active miners (see [Pack Similarity Detection](#pack-similarity-detection-ncd))
+5. **Pack ownership lock** (`pack_first_seen`): each validator records the first hotkey it observes for every `pack_hash`; later submitters of the same hash are treated as copies and receive weight 0 (see [Pack Ownership Lock](#3-pack-ownership-lock-pack_first_seen))
 
-**First-mover precedence** is determined by the **on-chain commitment block number**. The pack must be accessible at the committed URL. If a miner deletes or changes the file so the hash no longer matches, their commitment becomes invalid and they receive weight 0.
+**Pack ownership** is determined by **first observation per validator**, not by the on-chain commitment block number. Once a validator records `pack_first_seen[pack_hash] = (hotkey, block)`, that mapping is permanent for the lifetime of the entry — it is not refreshed when the original owner re-commits, and it is not transferred when the original owner goes inactive (see "no succession" below). The pack must remain accessible at the committed URL; if a miner deletes or changes the file so the hash no longer matches, their commitment becomes invalid and they receive weight 0.
 
 **Why On-Chain Commitments + HTTP?**
 - **No server required**: Miners upload once to static hosting and go offline. No public IP, no uptime requirement
@@ -141,11 +141,13 @@ Where:
 
 **Winner disqualified**: If the current winner is disqualified (consensus-disqualified via stake-weighted majority, or post-consensus pre-eval rejection), the winner is removed and the best-score eligible miner takes over.
 
+**Cross-spec transition**: Winner Protection only compares scores within a single `spec_number`. During the aggregation round in which the chain-derived `target_spec_number` first differs from `WinnerState.spec_number`, the validator bypasses the δ threshold and elects the highest-scoring eligible miner under the new spec. The returned `WinnerState` is then stamped with `spec_number = target_spec_number`, so subsequent rounds resume normal δ-protected comparisons inside the new spec. This makes the winner handover happen on the same round in which stake-weighted majority flips to the new spec, with no extra burn delay.
+
 **Validator local state**: Each validator persists a `WinnerState` containing:
 - `winner_hotkey` — current winner's hotkey
 - `winner_pack_hash` — the pack hash when they won
 - `winner_score` — the consensus score when they won
-- `spec_number` — the `SPEC_NUMBER` under which they won (audit field; state is **not** reset on `SPEC_NUMBER` change — see "SPEC_NUMBER and target spec selection")
+- `spec_number` — the `SPEC_NUMBER` under which they won. Records audit context **and** gates Winner Protection: when it differs from `target_spec_number`, the δ threshold is bypassed for that round (see "SPEC_NUMBER and target spec selection")
 
 
 ---
@@ -192,7 +194,8 @@ Validators run a **continuous evaluation loop** synchronized by chain block heig
  │  Evaluation Window (0% – 80% of epoch)                   │
  │                                                          │
  │  For each miner with valid commitment:                   │
- │    ① Pack-hash dedup (skip exact copies)                 │
+ │    ① Pack ownership lock (pack_first_seen):              │
+ │       reject as copy if not the first-observed owner     │
  │    ② Pre-eval gate → DISQUALIFY if rejected              │
  │    ③ Run evaluation pipeline → record score              │
  └──────────────────────────────────────────────────────────┘
@@ -274,7 +277,7 @@ A validator always **writes** its commitments using its locally configured `SPEC
 
 This makes upgrades self-coordinating. While stake-weighted majority remains on the previous spec, every validator (upgraded or not) computes weights against that spec, so the previous winner keeps receiving emissions instead of getting burned. Once stake-weighted majority migrates to the new spec, target flips automatically and the new winner takes over. When no group reaches majority (split network, partial outage), validators fall back to their local `SPEC_NUMBER` and proceed with whatever data they have, again avoiding burn. The 50% threshold reuses the existing `disqualify_stake_threshold` semantic; no new parameter.
 
-`WinnerState.spec_number` is purely audit (which spec the current winner was selected under). It does **not** trigger a state reset on its own — the new winner naturally replaces the old one once target_spec_number flips and a new aggregation round produces a different best score.
+`WinnerState.spec_number` records which spec the current winner was selected under. It does **not** trigger a state reset on its own, but it gates Winner Protection: whenever it differs from the round's `target_spec_number`, the δ threshold is bypassed and the new spec's best miner takes over immediately, after which `WinnerState.spec_number` is overwritten to the new target. This guarantees `winner_score` comparisons never cross spec boundaries.
 
 ---
 
@@ -282,12 +285,12 @@ This makes upgrades self-coordinating. While stake-weighted majority remains on 
 
 ### 1. On-Chain Commitments + Content-Addressed Packs
 
-**Enforcement**: All submissions are content-addressed (SHA256 hash); first-mover precedence determined by **on-chain commitment block number** (unforgeable).
+**Enforcement**: All submissions are content-addressed (SHA256 hash). On-chain commitments give every submission a tamper-proof integrity record; pack ownership for reward attribution is handled separately by the per-validator `pack_first_seen` table (see [Pack Ownership Lock](#3-pack-ownership-lock-pack_first_seen)).
 
 **Prevents**:
 - Retroactive pack changes after seeing validator feedback (changing the file breaks the hash → weight 0)
-- Claims of earlier innovation without proof (on-chain commitment is permanent and block-timestamped)
-- Timestamp forgery (on-chain block timestamp is the source of truth)
+- Pack URL tampering (hash mismatch → invalid commitment)
+- Forged pack contents (validators verify `sha256(canonical_json) == pack_hash`)
 
 ### 2. Winner Protection (Multiplicative δ)
 
@@ -299,21 +302,18 @@ This makes upgrades self-coordinating. While stake-weighted majority remains on 
 - Lazy free-riding on others' research
 - Winner oscillation from evaluation variance (winner defends with frozen winning score)
 
-### 3. Pack Similarity Detection (NCD)
+### 3. Pack Ownership Lock (`pack_first_seen`)
 
-Pairwise similarity check among all active miners' packs using **Normalized Compression Distance (NCD)**:
+Each validator maintains a per-validator persistent table `pack_first_seen[pack_hash] = (first_hotkey, first_block)`. The first time a validator observes a given `pack_hash`, the submitting hotkey is recorded as the owner. Subsequent commitments with the same `pack_hash` from a different hotkey are treated as **copies**: skipped before evaluation, marked `rejected=True` with `rejection_stage="integrity_check"`, and assigned weight 0.
 
-```
-NCD(x, y) = (C(x+y) - min(C(x), C(y))) / max(C(x), C(y))
-similarity = 1.0 - NCD    (0 = unrelated, 1 = identical)
-threshold  = 0.80
-```
+**Properties**:
+- **First observation, not on-chain block**: ownership is anchored on the first time the validator sees the hash, not on the rate-limited `commitment.block_number` (which refreshes whenever a miner re-commits to stay inside `inactivity_blocks`). This eliminates first-mover rotation between identical-pack submitters.
+- **No succession**: if the original owner goes inactive, no other miner inherits ownership. Copies always receive weight 0.
+- **Eviction (by-active with 7-window grace)**: at the end of each cycle, entries whose `pack_hash` appears in any active commitment have their grace clock refreshed; entries whose `pack_hash` is absent are kept until they have been continuously inactive for `EVICTION_GRACE_WINDOWS = 7` consecutive wall-clock windows (~7 days at 1 window/24h). Any re-activation inside the grace window resets the clock. This bounds the table's size while shielding the original author from losing ownership during a single short outage. Once both the original owner and every copy have been silent for the full grace period, a new miner can re-introduce the pack and become its new owner. "Wall-clock" means the grace span is measured against `window_number` directly — validator downtime still counts against the 7-window budget.
+- **Restart-safe**: `pack_first_seen` is persisted to its own dedicated file (`pack_first_seen.json`, default `/var/lib/trajectoryrl/pack_first_seen.json`, configurable via `PACK_FIRST_SEEN_PATH`), separate from the per-hotkey `scenario_scores` / `_eval_pack_hash` / `last_eval_block` / `last_eval_window` caches in `eval_state.json`. Splitting the file means ownership locks survive `spec_number` bumps that invalidate score caches, and the table can be inspected or reset independently. The file carries both the ownership table (`pack_first_seen`) and the per-hash `pack_last_seen_window` tracker that drives grace eviction.
+- **Per-validator**: not shared on-chain. Stake-weighted consensus naturally aligns the resulting per-miner scores — a copy scores 0 from every validator that locked the pack to a different hotkey.
 
-**Two-layer dedup**:
-1. **Pack-hash grouping** (exact copies): same `pack_hash` → keep first mover (lowest on-chain `block_number`), others get weight 0
-2. **NCD pairwise** (paraphrases): similarity ≥ 0.80 → later submitter gets weight 0
-
-Priority is determined by on-chain `block_number` (unforgeable, consistent across validators).
+**Paraphrase defense**: pre-v5.1 the validator ran a pairwise NCD comparison among all active packs. NCD has known false positives/negatives near the threshold and shared the on-chain `block_number` rotation problem. As of v5.1 paraphrase defense is delegated to **Winner Protection's δ threshold + score-based competition**: a paraphrased copy must beat the current winner by at least δ to take over emissions, the same bar a genuine improvement faces. The NCD library functions in `trajectoryrl/utils/ncd.py` are kept for tooling but no longer gate evaluation.
 
 ### 4. Pre-Eval Gate (Platform API)
 
@@ -514,7 +514,7 @@ If winner exists and is not disqualified:
 - Self-update follows the same δ rule — winner must beat their own winning score by δ to update
 - No automatic season reset — winner persists until beaten or disqualified. Manual reset available for operational control.
 
-**Validator local state** (`WinnerState`): Each validator persists `winner_hotkey`, `winner_pack_hash`, `winner_score`, and `spec_number` to a local JSON file. The `spec_number` is an audit field (records the spec under which the winner was selected) and does **not** reset state on its own; the new winner naturally takes over once the chain-derived target spec flips (see "SPEC_NUMBER and target spec selection"). Since all validators process the same consensus data with the same deterministic algorithm, they converge on the same winner.
+**Validator local state** (`WinnerState`): Each validator persists `winner_hotkey`, `winner_pack_hash`, `winner_score`, and `spec_number` to a local JSON file. The `spec_number` records the spec under which the current winner was selected; it does **not** reset state on its own, but it gates Winner Protection — when it differs from the round's chain-derived `target_spec_number`, the δ threshold is bypassed for that round and the field is then overwritten to the new target (see "SPEC_NUMBER and target spec selection"). Since all validators process the same consensus data with the same deterministic algorithm, they converge on the same winner.
 
 **Rate-limiting**: At most one evaluation per miner per `eval_interval`, regardless of how often the miner updates their commitment.
 
@@ -595,7 +595,8 @@ where Winner = best-score eligible miner that satisfies:
   - not disqualified by post-consensus pre-eval gate
   - better(consensus_score, winner_score, δ) to dethrone current winner
   - pack accessible at committed HTTP URL, hash matches
-  - pairwise NCD similarity < σ against earlier-submitted packs
+  - hotkey is the recorded owner in `pack_first_seen[pack_hash]`
+    (any later submitter of the same hash is treated as a copy, weight 0)
   - submission within last inactivity_blocks
 ```
 
@@ -618,7 +619,8 @@ Bootstrap:     top-3 qualified get 70/20/10
 | min_validator_stake | minimum stake for consensus participation | Yes |
 | epoch_skip_threshold | 0.30 (30% of epoch elapsed) | Yes |
 | Bootstrap threshold | 10 active miners | Yes |
-| σ (similarity threshold) | 0.80 (NCD) | Yes |
+| `pack_first_seen` eviction | by-active with grace (drop entries inactive for `EVICTION_GRACE_WINDOWS` consecutive windows) | No |
+| `EVICTION_GRACE_WINDOWS` | 7 windows (~7 days; clock resets on any active reference) | No (validator-side constant) |
 | inactivity_blocks | 14400 (~48h) | Yes |
 | yuma_version | 3 | Subnet owner (on-chain) |
 | liquid_alpha_enabled | True | Subnet owner (on-chain) |
@@ -630,6 +632,7 @@ Bootstrap:     top-3 qualified get 70/20/10
 
 | Version | Date | Summary |
 |---------|------|---------|
+| v5.1 | 2026-04-24 | Replaced on-chain `block_number`-based first-mover priority + pairwise NCD pre-eval gate with a per-validator `pack_first_seen` ownership lock (no succession; by-active eviction with `EVICTION_GRACE_WINDOWS = 7` wall-clock-window grace period that resets on any active reference). Lock state persists to its own `pack_first_seen.json` (separate from `eval_state.json`) alongside the `pack_last_seen_window` tracker that drives grace eviction. Paraphrase defense delegated to Winner Protection's δ threshold. NCD library kept for tooling, no longer gates evaluation. |
 | v5.0 | 2026-04-21 | Refactored into season-agnostic core. Extracted scoring, pack schema, and evaluation details to EVALUATION_S1.md. Abstracted "cost" to "score" (direction defined per season). |
 | v4.2 | 2026-03-29 | Simplified winner selection: removed EMA, unified Winner Protection (δ=10%), stake-weighted majority qualification. |
 | v4.1 | 2026-03-15 | Added two-phase off-chain consensus protocol (CAS + pointer registration). |
@@ -650,6 +653,6 @@ Bootstrap:     top-3 qualified get 70/20/10
 
 ---
 
-**Version**: v5.0
+**Version**: v5.1
 
-**Date**: 2026-04-21
+**Date**: 2026-04-24
