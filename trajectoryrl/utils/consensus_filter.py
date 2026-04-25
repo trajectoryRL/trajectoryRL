@@ -95,36 +95,15 @@ def filter_protocol_version(
 def filter_window_number(
     submissions: List[Tuple[ConsensusPointer, ConsensusPayload]],
     expected_window: int,
-    accept_newer: bool = False,
 ) -> Tuple[List[Tuple[ConsensusPointer, ConsensusPayload]], int]:
-    """Layer 2: discard submissions from a different evaluation window.
-
-    Default (``accept_newer=False``) requires strict equality
-    (``payload.window_number == expected_window``).
-
-    When ``accept_newer=True``, payloads with
-    ``payload.window_number >= expected_window`` are kept. This is used by
-    startup aggregation: validators that have already moved past the
-    "ripe" window have their newer commitment treated as a stand-in vote,
-    because Bittensor's ``get_all_commitments`` only returns each
-    validator's *latest* commitment (older ones are overwritten and
-    cannot be retrieved). Older-than-expected payloads are still
-    rejected in both modes.
-    """
+    """Layer 2: discard submissions from a different evaluation window."""
     passed = []
     skipped = 0
     for ptr, payload in submissions:
-        if accept_newer:
-            keep = payload.window_number >= expected_window
-            cmp = ">="
-        else:
-            keep = payload.window_number == expected_window
-            cmp = "=="
-        if not keep:
+        if payload.window_number != expected_window:
             logger.debug(
-                "Filter[window]: skip %s (window %d not %s %d)",
-                ptr.validator_hotkey[:8], payload.window_number,
-                cmp, expected_window,
+                "Filter[window]: skip %s (window %d != %d)",
+                ptr.validator_hotkey[:8], payload.window_number, expected_window,
             )
             skipped += 1
         else:
@@ -285,7 +264,6 @@ def run_filter_pipeline(
     expected_protocol: int = CONSENSUS_PROTOCOL_VERSION,
     zero_signal_threshold: float = 1.0,
     spec_majority_threshold: float = SPEC_MAJORITY_THRESHOLD,
-    accept_newer_windows: bool = False,
 ) -> Tuple[List[ValidatedSubmission], FilterStats]:
     """Run the full 5-layer filter pipeline.
 
@@ -295,10 +273,6 @@ def run_filter_pipeline(
     the first three layers — see :func:`select_target_spec_number`. Callers
     provide their ``local_spec_number`` only as the fallback target when no
     on-chain group reaches majority; it is not used to pre-filter.
-
-    ``accept_newer_windows`` relaxes layer 2 to ``payload.window_number >=
-    expected_window`` (see :func:`filter_window_number`). Used by startup
-    aggregation only — main-loop aggregation must keep the strict default.
 
     Returns:
         - List of ValidatedSubmission that passed all layers
@@ -312,9 +286,7 @@ def run_filter_pipeline(
     current, n = filter_protocol_version(current, expected_protocol)
     stats.skipped_protocol = n
 
-    current, n = filter_window_number(
-        current, expected_window, accept_newer=accept_newer_windows,
-    )
+    current, n = filter_window_number(current, expected_window)
     stats.skipped_window = n
 
     current, n = filter_trust_threshold(current, validator_stakes, min_stake)
