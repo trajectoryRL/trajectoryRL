@@ -254,6 +254,7 @@ class TrajectoryValidator:
         self._cycle_eval_id: Optional[str] = None
         self._cycle_log_offset: int = 0
         self._cycle_log_block: int = 0
+        self._cycle_window_number: int = 0
 
         # Consensus CAS store (IPFS + API)
         def _sign_consensus_msg(msg: str) -> str:
@@ -1051,6 +1052,7 @@ class TrajectoryValidator:
                                 rejection_stage=_stage,
                                 rejection_detail=_detail,
                                 spec_number=_spec_number(),
+                                epoch_number=window.window_number,
                                 **self._harness_metadata(),
                             )
                         )
@@ -1412,6 +1414,7 @@ class TrajectoryValidator:
                                 self._cycle_eval_id,
                                 self._cycle_log_offset,
                                 self._cycle_log_block,
+                                self._cycle_window_number,
                             )
                         )
 
@@ -1436,6 +1439,7 @@ class TrajectoryValidator:
                                 self._cycle_eval_id,
                                 self._cycle_log_offset,
                                 self._cycle_log_block,
+                                self._cycle_window_number,
                             )
                         )
 
@@ -1458,6 +1462,7 @@ class TrajectoryValidator:
                                 self._cycle_eval_id,
                                 self._cycle_log_offset,
                                 self._cycle_log_block,
+                                self._cycle_window_number,
                             )
                         )
                         self._cycle_eval_id = None
@@ -1484,6 +1489,7 @@ class TrajectoryValidator:
                         self._cycle_eval_id,
                         self._cycle_log_offset,
                         self._cycle_log_block,
+                        self._cycle_window_number,
                     )
                     self._cycle_eval_id = None
                 break
@@ -1548,6 +1554,7 @@ class TrajectoryValidator:
         self._cycle_eval_id = cycle_eval_id
         self._cycle_log_offset = self._get_validator_log_offset()
         self._cycle_log_block = current_block
+        self._cycle_window_number = window_number
 
         await self._execute_evaluation_cycle(
             current_block, window_number, cycle_eval_id, cycle_start,
@@ -1705,6 +1712,7 @@ class TrajectoryValidator:
                         rejection_stage="integrity_check",
                         rejection_detail=detail,
                         spec_number=_spec_number(),
+                        epoch_number=window_number,
                         **self._harness_metadata(),
                     )
                 )
@@ -1758,6 +1766,7 @@ class TrajectoryValidator:
                             rejection_stage=_stage,
                             rejection_detail=_detail,
                             spec_number=_spec_number(),
+                            epoch_number=window_number,
                             **self._harness_metadata(),
                         )
                     )
@@ -1796,6 +1805,7 @@ class TrajectoryValidator:
                 self._fire_upload_eval_logs(
                     cycle_eval_id, uid, commitment, eval_scenarios, eval_result,
                     eval_dir, vlog_offset, mlog_offset, current_block,
+                    window_number,
                 )
             )
 
@@ -1848,7 +1858,8 @@ class TrajectoryValidator:
                 # Submit eval result to dashboard (fire-and-forget)
                 asyncio.ensure_future(
                     self._fire_submit_eval(
-                        uid, commitment, eval_result, eval_count, pack_changed, current_block
+                        uid, commitment, eval_result, eval_count, pack_changed,
+                        current_block, window_number,
                     )
                 )
 
@@ -2114,6 +2125,7 @@ class TrajectoryValidator:
         eval_count: int,
         pack_changed: bool,
         block_height: int,
+        window_number: int,
     ) -> None:
         """Build and fire the /api/scores/submit payload for one miner eval.
 
@@ -2216,6 +2228,7 @@ class TrajectoryValidator:
             llm_base_url=self._judge_base_url,
             llm_model=self._judge_model,
             spec_number=_spec_number(),
+            epoch_number=window_number,
             **self._harness_metadata(),
         )
 
@@ -2350,6 +2363,7 @@ class TrajectoryValidator:
         validator_log_offset: int,
         miner_log_offset: int,
         block_height: int,
+        window_number: int,
     ) -> None:
         """Collect and upload eval logs. Fire-and-forget."""
 
@@ -2370,7 +2384,7 @@ class TrajectoryValidator:
         if log_archive:
             meta = {
                 "eval_id": eval_id,
-                "window_number": int(eval_id.rsplit("_w", 1)[-1]) if "_w" in eval_id else None,
+                "window_number": window_number,
                 "miner_hotkey": commitment.hotkey,
                 "miner_uid": uid,
                 "block_height": block_height,
@@ -2393,6 +2407,7 @@ class TrajectoryValidator:
                 block_height=block_height,
                 pack_hash=commitment.pack_hash,
                 log_archive=log_archive,
+                epoch_number=window_number,
             )
             if ok:
                 try:
@@ -2405,6 +2420,7 @@ class TrajectoryValidator:
         eval_id: str,
         cycle_log_offset: int,
         block_height: int,
+        window_number: int,
     ) -> None:
         """Upload the full eval cycle validator log. Fire-and-forget."""
         import io
@@ -2439,7 +2455,7 @@ class TrajectoryValidator:
 
             meta = {
                 "eval_id": eval_id,
-                "window_number": int(eval_id.rsplit("_w", 1)[-1]) if "_w" in eval_id else None,
+                "window_number": window_number,
                 "block_height": block_height,
                 "type": "cycle",
             }
@@ -2456,6 +2472,7 @@ class TrajectoryValidator:
                 eval_id=eval_id,
                 block_height=block_height,
                 log_archive=archive,
+                epoch_number=window_number,
             )
             if ok:
                 try:
@@ -2516,6 +2533,7 @@ class TrajectoryValidator:
                     block_height=meta.get("block_height", 0),
                     pack_hash=meta.get("pack_hash", "unknown"),
                     log_archive=archive_path.read_bytes(),
+                    epoch_number=meta.get("window_number"),
                 )
                 if ok:
                     eval_uploaded += 1
@@ -2542,6 +2560,7 @@ class TrajectoryValidator:
                 eval_id=meta.get("eval_id", eval_id),
                 block_height=meta.get("block_height", 0),
                 log_archive=cycle_archive_path.read_bytes(),
+                epoch_number=meta.get("window_number"),
             )
             if ok:
                 cycle_uploaded += 1

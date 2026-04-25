@@ -223,6 +223,7 @@ async def upload_eval_logs(
     block_height: int,
     pack_hash: str,
     log_archive: bytes,
+    epoch_number: Optional[int] = None,
     upload_url: str = DEFAULT_LOGS_UPLOAD_URL,
 ) -> bool:
     """Upload eval log archive to the dashboard API.
@@ -238,6 +239,9 @@ async def upload_eval_logs(
         block_height: Block height of this eval.
         pack_hash: SHA-256 hash of the pack being evaluated.
         log_archive: Gzipped tar archive bytes containing eval log files.
+        epoch_number: Optional eval window number. Sent as a string in the
+            multipart form so the server can store it on the eval_logs row
+            without depending on its own block_height -> epoch derivation.
         upload_url: Dashboard log upload endpoint.
 
     Returns:
@@ -255,20 +259,24 @@ async def upload_eval_logs(
     sig = hotkey_kp.sign(message.encode())
     signature = "0x" + (sig if isinstance(sig, bytes) else bytes(sig)).hex()
 
+    form_data: Dict[str, str] = {
+        "validator_hotkey": hotkey_addr,
+        "eval_id": eval_id,
+        "miner_hotkey": miner_hotkey,
+        "miner_uid": str(miner_uid),
+        "block_height": str(block_height),
+        "pack_hash": pack_hash,
+        "timestamp": str(timestamp),
+        "signature": signature,
+    }
+    if epoch_number is not None:
+        form_data["epoch_number"] = str(epoch_number)
+
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 upload_url,
-                data={
-                    "validator_hotkey": hotkey_addr,
-                    "eval_id": eval_id,
-                    "miner_hotkey": miner_hotkey,
-                    "miner_uid": str(miner_uid),
-                    "block_height": str(block_height),
-                    "pack_hash": pack_hash,
-                    "timestamp": str(timestamp),
-                    "signature": signature,
-                },
+                data=form_data,
                 files={
                     "log_archive": (
                         "logs.tar.gz",
@@ -300,6 +308,7 @@ async def upload_cycle_logs(
     eval_id: str,
     block_height: int,
     log_archive: bytes,
+    epoch_number: Optional[int] = None,
     upload_url: str = DEFAULT_CYCLE_LOGS_URL,
 ) -> bool:
     """Upload eval cycle log archive to the dashboard API.
@@ -312,6 +321,9 @@ async def upload_cycle_logs(
         eval_id: Eval cycle identifier (e.g. "20260329_1430_w42").
         block_height: Block height at cycle start.
         log_archive: Gzipped tar archive bytes containing the cycle log.
+        epoch_number: Optional eval window number. Sent as a string in the
+            multipart form so the server can store it on the eval_logs row
+            without depending on its own block_height -> epoch derivation.
         upload_url: Dashboard cycle log upload endpoint.
 
     Returns:
@@ -329,17 +341,21 @@ async def upload_cycle_logs(
     sig = hotkey_kp.sign(message.encode())
     signature = "0x" + (sig if isinstance(sig, bytes) else bytes(sig)).hex()
 
+    form_data: Dict[str, str] = {
+        "validator_hotkey": hotkey_addr,
+        "eval_id": eval_id,
+        "block_height": str(block_height),
+        "timestamp": str(timestamp),
+        "signature": signature,
+    }
+    if epoch_number is not None:
+        form_data["epoch_number"] = str(epoch_number)
+
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 upload_url,
-                data={
-                    "validator_hotkey": hotkey_addr,
-                    "eval_id": eval_id,
-                    "block_height": str(block_height),
-                    "timestamp": str(timestamp),
-                    "signature": signature,
-                },
+                data=form_data,
                 files={
                     "log_archive": (
                         "cycle.tar.gz",
@@ -385,6 +401,7 @@ async def submit_eval(
     bench_image_hash: Optional[str] = None,
     harness_image_hash: Optional[str] = None,
     bench_version: Optional[str] = None,
+    epoch_number: Optional[int] = None,
     submit_url: str = DEFAULT_SUBMIT_URL,
 ) -> bool:
     """Submit a single miner eval result to the dashboard API.
@@ -448,6 +465,8 @@ async def submit_eval(
         payload["harness_image_hash"] = harness_image_hash
     if bench_version is not None:
         payload["bench_version"] = bench_version
+    if epoch_number is not None:
+        payload["epoch_number"] = epoch_number
 
     try:
         async with httpx.AsyncClient() as client:
