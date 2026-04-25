@@ -1408,6 +1408,33 @@ class TrajectoryValidator:
                     )
                     self._save_eval_state()
 
+                    # Immediate post-eval submit: upload payload to CAS and
+                    # write on-chain commitment as soon as eval finishes,
+                    # without waiting for the PROPAGATION phase. The
+                    # propagation branch below remains unchanged and will
+                    # short-circuit via _check_own_commitment_on_chain when
+                    # this submit succeeded, or act as automatic retry
+                    # otherwise.
+                    try:
+                        ok = await self._submit_consensus_payload(window)
+                        if ok:
+                            logger.info(
+                                "Window %d: payload submitted immediately after eval",
+                                window.window_number,
+                            )
+                        else:
+                            logger.warning(
+                                "Window %d: immediate post-eval submit failed; "
+                                "propagation branch will retry",
+                                window.window_number,
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "Window %d: immediate post-eval submit raised: %s; "
+                            "propagation branch will retry",
+                            window.window_number, e, exc_info=True,
+                        )
+
                     if self._cycle_eval_id is not None:
                         asyncio.ensure_future(
                             self._fire_upload_cycle_logs(
