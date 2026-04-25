@@ -54,20 +54,51 @@ def claim_owner(
     table: PackOwnershipTable,
     pack_hash: str,
     hotkey: str,
-    block: int,
+    commit_block: int,
 ) -> Tuple[str, int]:
-    """Record ownership of ``pack_hash`` if not already recorded.
+    """Record ownership of ``pack_hash`` keyed on chain commit block.
 
-    First-writer-wins: subsequent calls with a different hotkey return
-    the originally claimed ``(owner_hotkey, owner_block)`` tuple. The
-    table is mutated in place via ``setdefault`` so callers can compare
-    the returned hotkey with their own to detect copies.
+    Semantics — earliest-on-chain-commit wins, deterministic across
+    validators (Issue 4 anti-snipe):
+
+    * No existing entry → claim with ``(hotkey, commit_block)``.
+    * Existing entry, same hotkey, smaller ``commit_block`` → update
+      the recorded block downward. This handles migration from the
+      legacy "current_block at first observation" semantics: the
+      first time a known owner is re-observed against the chain, its
+      block falls to the true on-chain commit block, which restores
+      ordering correctness for any later disputes.
+    * Existing entry, different hotkey:
+        - smaller ``commit_block`` → take ownership;
+        - equal ``commit_block`` → tie-break by lexicographically
+          smaller hotkey, so two validators converge to the same
+          owner regardless of iteration order.
+
+    The function mutates ``table`` in place. The caller should sort
+    its iteration by ``(commit_block, hotkey)`` to keep the post-call
+    state observable in a single pass — but the function is correct
+    under any iteration order.
 
     Returns:
-        ``(owner_hotkey, owner_block)`` — the recorded owner after this
-        call (either pre-existing or just claimed).
+        ``(owner_hotkey, owner_block)`` — the recorded owner after
+        this call.
     """
-    return table.setdefault(pack_hash, (hotkey, block))
+    existing = table.get(pack_hash)
+    if existing is None:
+        table[pack_hash] = (hotkey, commit_block)
+        return table[pack_hash]
+
+    existing_hotkey, existing_block = existing
+    if existing_hotkey == hotkey:
+        if commit_block < existing_block:
+            table[pack_hash] = (hotkey, commit_block)
+        return table[pack_hash]
+
+    if commit_block < existing_block:
+        table[pack_hash] = (hotkey, commit_block)
+    elif commit_block == existing_block and hotkey < existing_hotkey:
+        table[pack_hash] = (hotkey, commit_block)
+    return table[pack_hash]
 
 
 def is_owner(

@@ -83,6 +83,9 @@ from ..utils.commitments import (
     format_consensus_commitment, decode_dual_address,
     is_consensus_commitment, parse_consensus_commitment,
 )
+from ..utils.eval_snapshot import (
+    EvalSnapshot, take_snapshot, load_snapshot, save_snapshot,
+)
 from ..utils.status_reporter import (
     heartbeat, pre_eval, submit_eval, upload_eval_logs, upload_cycle_logs,
 )
@@ -1484,19 +1487,35 @@ class TrajectoryValidator:
             )
             return
 
-        # 2. Read on-chain commitments
-        logger.debug("Reading on-chain commitments...")
-        commitments = fetch_all_commitments(
-            self.subtensor, self.config.netuid, self.metagraph
-        )
+        # 2. Acquire the window-N active-set snapshot.
+        #
+        # Each window has exactly one snapshot
+        # (``active_set_window_{N}.json``) freezing the deterministic
+        # commitment subset for that window (commit_block < window_start
+        # and not stale). The snapshot is the source of truth for the
+        # remainder of the cycle: cross-validator consistency comes
+        # from chain commit_block, restart consistency from the file.
+        #
+        # On the first cycle inside a window the file is absent, so we
+        # build it from a fresh chain query and persist immediately.
+        # On subsequent cycles (same window) the file hits and we
+        # avoid the chain round-trip entirely.
+        window = compute_window(current_block, self._window_config)
+        snapshot = self._acquire_window_snapshot(window, current_block)
+        if snapshot is None:
+            return
 
-        # 3. Filter to active non-validator miners (drops stale submissions)
-        active_commitments = self._filter_active_commitments(
-            commitments, current_block,
+        # Per-validator runtime filters (validator_permit, blacklist)
+        # are dynamic and applied on top of the frozen snapshot every
+        # cycle so that permit / blacklist changes take effect without
+        # invalidating the snapshot itself.
+        active_commitments = self._filter_active_commitments_runtime(
+            snapshot.commitments,
         )
         logger.info(
-            f"Commitments: {len(commitments)} total, "
-            f"{len(active_commitments)} active miners"
+            f"Window {window.window_number} snapshot: "
+            f"{len(snapshot.commitments)} eligible, "
+            f"{len(active_commitments)} after runtime filter"
         )
 
         if not active_commitments:
@@ -1523,18 +1542,30 @@ class TrajectoryValidator:
 
         await self._prefetch_packs(active_commitments)
 
+        # Iterate by chain commit_block ascending so the earliest
+        # committer of a duplicated pack_hash is processed first and
+        # claim_owner records them as the canonical owner. Even if a
+        # later iteration order would observe the same final state
+        # (claim_owner is order-independent under the new semantics),
+        # ascending order also avoids wasting an eval round-trip on a
+        # copy that is about to be demoted in the same cycle.
+        eval_order = sorted(
+            active_commitments.items(),
+            key=lambda item: (item[1].block_number, item[1].hotkey),
+        )
+
         miner_idx = 0
-        for uid, commitment in active_commitments.items():
+        for uid, commitment in eval_order:
             hotkey = commitment.hotkey
             miner_idx += 1
 
-            # Ownership lock: first observer of this pack_hash owns it.
-            # `claim_owner` is the only place pack_first_seen entries
-            # are created — once locked, ownership never transfers (see
-            # trajectoryrl.utils.pack_ownership).
+            # Ownership lock: earliest chain commit_block wins (Issue 4
+            # anti-snipe). Passing the on-chain block keeps the recorded
+            # ordering deterministic across validators rather than
+            # tied to local observation time.
             ph = commitment.pack_hash
             owner_hk, _owner_blk = claim_owner(
-                self.pack_first_seen, ph, hotkey, current_block,
+                self.pack_first_seen, ph, hotkey, commitment.block_number,
             )
             if owner_hk != hotkey:
                 copy_rejected_count += 1
@@ -1854,6 +1885,81 @@ class TrajectoryValidator:
                 continue
             active[uid] = commitment
         return active
+
+    def _filter_active_commitments_runtime(
+        self,
+        commitments: Dict[int, MinerCommitment],
+    ) -> Dict[int, MinerCommitment]:
+        """Apply per-validator runtime filters on top of a snapshot.
+
+        The snapshot already enforces the deterministic filters
+        (``commit_block < window_start`` and stale-age vs window_start).
+        This method layers on the per-validator dynamic filters that
+        intentionally do NOT participate in cross-validator consistency:
+
+        * ``validator_permit`` — current metagraph state (a permit can
+          appear or disappear mid-window).
+        * coldkey blacklist — operator-local policy.
+        """
+        blacklist = set(self.config.coldkey_blacklist)
+        active: Dict[int, MinerCommitment] = {}
+        for uid, commitment in commitments.items():
+            if uid < len(self.metagraph.validator_permit) and self.metagraph.validator_permit[uid]:
+                continue
+            if blacklist:
+                coldkey = (
+                    self.metagraph.coldkeys[uid]
+                    if uid < len(self.metagraph.coldkeys) else None
+                )
+                if coldkey in blacklist:
+                    self._get_miner_logger(commitment.hotkey).info(
+                        f"Skipping eval (coldkey {coldkey} is blacklisted)"
+                    )
+                    continue
+            active[uid] = commitment
+        return active
+
+    def _acquire_window_snapshot(
+        self,
+        window: EvaluationWindow,
+        current_block: int,
+    ) -> Optional[EvalSnapshot]:
+        """Load or build the active-set snapshot for ``window``.
+
+        Order of operations:
+
+        1. Try to load ``active_set_window_{N}.json``. A successful
+           load is the fast path for any non-first cycle in window N
+           (and for restart recovery within the same window).
+        2. On miss, query the chain once and apply the deterministic
+           filters (``commit_block < window_start`` plus stale-age vs
+           window_start). Persist the result so subsequent cycles in
+           the same window hit the cache.
+
+        Returns the snapshot, or None if there are no eligible
+        commitments at all (caller should fall back to owner weights).
+        """
+        snapshot = load_snapshot(self.config.active_set_dir, window.window_number)
+        if snapshot is not None:
+            return snapshot
+
+        logger.info(
+            "Window %d: building active-set snapshot from chain "
+            "(window_start=%d, current_block=%d)",
+            window.window_number, window.window_start, current_block,
+        )
+        raw = fetch_all_commitments(
+            self.subtensor, self.config.netuid, self.metagraph,
+        )
+        snapshot = take_snapshot(
+            raw,
+            window_number=window.window_number,
+            window_start=window.window_start,
+            snapshot_block=current_block,
+            inactivity_blocks=self.config.inactivity_blocks,
+        )
+        save_snapshot(snapshot, self.config.active_set_dir)
+        return snapshot
 
     # ------------------------------------------------------------------
     # UID re-registration tracking
