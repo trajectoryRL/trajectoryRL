@@ -36,6 +36,24 @@ class TestClaimOwner:
         owner, blk = claim_owner(table, "hash_x", "hk_alice", 9999)
         assert (owner, blk) == ("hk_alice", 100)
 
+    def test_same_hotkey_smaller_block_updates_record(self):
+        table = {"hash_x": ("hk_alice", 100)}
+        owner, blk = claim_owner(table, "hash_x", "hk_alice", 90)
+        assert (owner, blk) == ("hk_alice", 90)
+        assert table["hash_x"] == ("hk_alice", 90)
+
+    def test_earlier_block_replaces_owner(self):
+        table = {"hash_x": ("hk_alice", 100)}
+        owner, blk = claim_owner(table, "hash_x", "hk_bob", 80)
+        assert (owner, blk) == ("hk_bob", 80)
+        assert table["hash_x"] == ("hk_bob", 80)
+
+    def test_equal_block_tie_breaks_by_hotkey(self):
+        table = {"hash_x": ("hk_bob", 100)}
+        owner, blk = claim_owner(table, "hash_x", "hk_alice", 100)
+        assert (owner, blk) == ("hk_alice", 100)
+        assert table["hash_x"] == ("hk_alice", 100)
+
 
 # ── is_owner ──────────────────────────────────────────────────────────────
 

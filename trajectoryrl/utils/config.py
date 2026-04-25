@@ -182,6 +182,14 @@ class ValidatorConfig:
         default_factory=lambda: Path("/var/lib/trajectoryrl/pack_first_seen.json")
     )
 
+    # Per-window active-set snapshot directory. One file per window
+    # (``active_set_window_{N}.json``) freezes the deterministic
+    # commitment subset for that window so that mid-window restarts
+    # rehydrate the same eval set instead of re-querying the chain.
+    active_set_dir: Path = field(
+        default_factory=lambda: Path("/var/lib/trajectoryrl/active_sets")
+    )
+
     # Pack caching
     pack_cache_dir: Path = field(
         default_factory=lambda: Path("/var/lib/trajectoryrl/packs")
@@ -231,6 +239,7 @@ class ValidatorConfig:
             eval_state_path=Path(os.getenv("EVAL_STATE_PATH", "/var/lib/trajectoryrl/eval_state.json")),
             winner_state_path=Path(os.getenv("WINNER_STATE_PATH", "/var/lib/trajectoryrl/winner_state.json")),
             pack_first_seen_path=Path(os.getenv("PACK_FIRST_SEEN_PATH", "/var/lib/trajectoryrl/pack_first_seen.json")),
+            active_set_dir=Path(os.getenv("ACTIVE_SET_DIR", "/var/lib/trajectoryrl/active_sets")),
             pack_cache_dir=Path(os.getenv("PACK_CACHE_DIR", "/var/lib/trajectoryrl/packs")),
             log_dir=Path(os.getenv("LOG_DIR", "./logs")),
             # --- LLM (new names preferred, legacy CLAWBENCH_* still supported) ---
