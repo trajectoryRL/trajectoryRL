@@ -742,122 +742,6 @@ class TrajectoryValidator:
             )
             return False
 
-    def _synthetic_eval_window(
-        self, window_number: int, phase: WindowPhase,
-    ) -> EvaluationWindow:
-        """Build an EvaluationWindow pinned to a past window_number.
-
-        Used by ``_catchup_previous_window`` to retroactively call
-        submit / aggregate against a window the clock has already
-        moved past. The ``block_offset`` is placed at the *start* of
-        the requested phase so the struct is internally consistent
-        with ``compute_window``'s phase rule
-        (``EVALUATION`` ⊂ [0, publish), ``PROPAGATION`` ⊂ [publish,
-        aggregate), ``AGGREGATION`` ⊂ [aggregate, window_length)).
-        Submit calls expect a propagation-phase struct; aggregate
-        calls expect an aggregation-phase struct.
-        """
-        wc = self._window_config
-        if phase == WindowPhase.EVALUATION:
-            block_offset = 0
-            blocks_remaining = wc.publish_block
-        elif phase == WindowPhase.PROPAGATION:
-            block_offset = wc.publish_block
-            blocks_remaining = wc.aggregate_block - wc.publish_block
-        else:  # AGGREGATION
-            block_offset = wc.aggregate_block
-            blocks_remaining = wc.window_length - wc.aggregate_block
-
-        return EvaluationWindow(
-            window_number=window_number,
-            window_start=wc.global_anchor + window_number * wc.window_length,
-            block_offset=block_offset,
-            phase=phase,
-            blocks_into_phase=0,
-            blocks_remaining_in_phase=blocks_remaining,
-            publish_offset=wc.publish_block,
-            aggregate_offset=wc.aggregate_block,
-        )
-
-    async def _catchup_previous_window(self) -> None:
-        """Submit + aggregate for the most recently evaluated window if pending.
-
-        Runs at the top of each new evaluation cycle, before kicking
-        off the next ``_run_evaluation_cycle``. If a prior cycle ran
-        long enough that the main loop's stale-window snapshot caused
-        its propagation / aggregation branches to skip, this catches
-        up so the validator never misses publishing a window's vote.
-
-        Both calls are idempotent — guarded by an on-chain commitment
-        lookup and the in-memory ``_consensus_window`` flag — so this
-        is a no-op when the previous window's work has already
-        completed via the normal main-loop branches.
-
-        Caveat 1 (post-propagation submit): publishing after the
-        previous window's propagation phase has closed will not
-        influence other validators' consensus for that window (they
-        have already aggregated). The submit still has audit value,
-        and the aggregation still updates this validator's local
-        winner weights.
-
-        Caveat 2 (in-window AGGREGATION-phase finish): when a long
-        eval cycle finishes within the SAME window's AGGREGATION
-        phase — i.e. eval crossed T_publish but did not cross into
-        the next window — the next main-loop iteration sees
-        ``_should_start_evaluation == False`` (phase != EVALUATION),
-        so this catchup does not run. The main loop's existing
-        aggregation branch fires instead, running local aggregation
-        for window N without our payload. The catchup only triggers
-        when the loop finally enters window N+1's EVALUATION phase,
-        at which point our payload is published on-chain (good for
-        restart recovery via ``aggregate_when_start``) but local
-        consensus for window N has already been computed without it.
-        Acceptable for the first rollout — on-chain commitment is
-        preserved (the primary goal); a follow-up to the
-        ``aggregate_when_start`` selection logic will cover the full
-        recovery path.
-        """
-        prev_window = self._last_eval_window
-        if prev_window < 0:
-            return
-
-        if not self._check_own_commitment_on_chain(prev_window):
-            logger.info(
-                "Pre-eval catchup: submitting payload for window %d",
-                prev_window,
-            )
-            try:
-                await self._submit_consensus_payload(
-                    self._synthetic_eval_window(
-                        prev_window, WindowPhase.PROPAGATION,
-                    )
-                )
-            except Exception as e:
-                logger.warning(
-                    "Pre-eval catchup submit for window %d failed: %s",
-                    prev_window, e, exc_info=True,
-                )
-
-        if self._consensus_window != prev_window:
-            logger.info(
-                "Pre-eval catchup: aggregating consensus for window %d",
-                prev_window,
-            )
-            try:
-                await self._run_consensus_aggregation(
-                    self._synthetic_eval_window(
-                        prev_window, WindowPhase.AGGREGATION,
-                    )
-                )
-                if self._consensus_window == prev_window:
-                    await self._set_winner_weights()
-                    self.last_weight_block = self.subtensor.get_current_block()
-            except Exception as e:
-                logger.warning(
-                    "Pre-eval catchup aggregation for window %d failed: %s",
-                    prev_window, e, exc_info=True,
-                )
-
     def _build_local_consensus_payload(
         self, window: EvaluationWindow,
     ) -> Optional[ConsensusPayload]:
@@ -1125,11 +1009,6 @@ class TrajectoryValidator:
         ``_set_winner_weights`` to compute the winner and set weights
         immediately — without waiting for the normal window lifecycle.
 
-        Before aggregating, this also submits any pending payload from
-        ``self._last_eval_window`` whose on-chain commitment is missing
-        — covers the case where the validator was killed mid-cycle
-        after evaluating but before publishing.
-
         This is a side-effect-free operation with respect to the main loop:
         ``_consensus_window`` is saved and restored so the normal per-window
         aggregation guard is not consumed.
@@ -1139,31 +1018,6 @@ class TrajectoryValidator:
         logger.info("=" * 60)
 
         self._sync_metagraph(caller="aggregate_on_startup")
-
-        # Pre-aggregation submit: if we have eval data for a window
-        # whose payload was never published (e.g. crashed after eval,
-        # before submit), publish it now. Same idempotency guard as
-        # the main loop and ``_catchup_previous_window``. Gated by
-        # CATCHUP_PREVIOUS_WINDOW for a flagged rollout.
-        prev_window = self._last_eval_window
-        if (self.config.catchup_previous_window
-                and prev_window >= 0
-                and not self._check_own_commitment_on_chain(prev_window)):
-            logger.info(
-                "Startup submit: publishing pending payload for window %d",
-                prev_window,
-            )
-            try:
-                await self._submit_consensus_payload(
-                    self._synthetic_eval_window(
-                        prev_window, WindowPhase.PROPAGATION,
-                    )
-                )
-            except Exception as e:
-                logger.warning(
-                    "Startup submit for window %d failed: %s",
-                    prev_window, e, exc_info=True,
-                )
 
         chain_commitments = fetch_validator_consensus_commitments(
             self.subtensor, self.config.netuid, self.metagraph,
@@ -1183,8 +1037,16 @@ class TrajectoryValidator:
             target_window, window_counts[target_window],
         )
 
-        synthetic_window = self._synthetic_eval_window(
-            target_window, WindowPhase.AGGREGATION,
+        synthetic_window = EvaluationWindow(
+            window_number=target_window,
+            window_start=self._window_config.global_anchor
+            + target_window * self._window_config.window_length,
+            block_offset=self._window_config.window_length - 1,
+            phase=WindowPhase.AGGREGATION,
+            blocks_into_phase=0,
+            blocks_remaining_in_phase=1,
+            publish_offset=self._window_config.publish_block,
+            aggregate_offset=self._window_config.aggregate_block,
         )
 
         saved_consensus_window = self._consensus_window
@@ -1378,17 +1240,6 @@ class TrajectoryValidator:
 
                 # --- Window phase: evaluation ---
                 if self._should_start_evaluation(current_block):
-                    # Pre-eval catch-up: a long previous eval may have
-                    # finished after the main loop's stale-window
-                    # snapshot caused the propagation / aggregation
-                    # branches to skip last iteration. Catch up on the
-                    # last evaluated window's submit + aggregate before
-                    # starting a fresh cycle, so we never silently drop
-                    # a window's vote. Gated by CATCHUP_PREVIOUS_WINDOW
-                    # for a flagged rollout.
-                    if self.config.catchup_previous_window:
-                        await self._catchup_previous_window()
-
                     logger.info("=" * 60)
                     logger.info(
                         f"Evaluation window {window.window_number} at block "
