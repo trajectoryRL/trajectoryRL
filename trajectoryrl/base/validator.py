@@ -742,122 +742,6 @@ class TrajectoryValidator:
             )
             return False
 
-    def _synthetic_eval_window(
-        self, window_number: int, phase: WindowPhase,
-    ) -> EvaluationWindow:
-        """Build an EvaluationWindow pinned to a past window_number.
-
-        Used by ``_catchup_previous_window`` to retroactively call
-        submit / aggregate against a window the clock has already
-        moved past. The ``block_offset`` is placed at the *start* of
-        the requested phase so the struct is internally consistent
-        with ``compute_window``'s phase rule
-        (``EVALUATION`` ⊂ [0, publish), ``PROPAGATION`` ⊂ [publish,
-        aggregate), ``AGGREGATION`` ⊂ [aggregate, window_length)).
-        Submit calls expect a propagation-phase struct; aggregate
-        calls expect an aggregation-phase struct.
-        """
-        wc = self._window_config
-        if phase == WindowPhase.EVALUATION:
-            block_offset = 0
-            blocks_remaining = wc.publish_block
-        elif phase == WindowPhase.PROPAGATION:
-            block_offset = wc.publish_block
-            blocks_remaining = wc.aggregate_block - wc.publish_block
-        else:  # AGGREGATION
-            block_offset = wc.aggregate_block
-            blocks_remaining = wc.window_length - wc.aggregate_block
-
-        return EvaluationWindow(
-            window_number=window_number,
-            window_start=wc.global_anchor + window_number * wc.window_length,
-            block_offset=block_offset,
-            phase=phase,
-            blocks_into_phase=0,
-            blocks_remaining_in_phase=blocks_remaining,
-            publish_offset=wc.publish_block,
-            aggregate_offset=wc.aggregate_block,
-        )
-
-    async def _catchup_previous_window(self) -> None:
-        """Submit + aggregate for the most recently evaluated window if pending.
-
-        Runs at the top of each new evaluation cycle, before kicking
-        off the next ``_run_evaluation_cycle``. If a prior cycle ran
-        long enough that the main loop's stale-window snapshot caused
-        its propagation / aggregation branches to skip, this catches
-        up so the validator never misses publishing a window's vote.
-
-        Both calls are idempotent — guarded by an on-chain commitment
-        lookup and the in-memory ``_consensus_window`` flag — so this
-        is a no-op when the previous window's work has already
-        completed via the normal main-loop branches.
-
-        Caveat 1 (post-propagation submit): publishing after the
-        previous window's propagation phase has closed will not
-        influence other validators' consensus for that window (they
-        have already aggregated). The submit still has audit value,
-        and the aggregation still updates this validator's local
-        winner weights.
-
-        Caveat 2 (in-window AGGREGATION-phase finish): when a long
-        eval cycle finishes within the SAME window's AGGREGATION
-        phase — i.e. eval crossed T_publish but did not cross into
-        the next window — the next main-loop iteration sees
-        ``_should_start_evaluation == False`` (phase != EVALUATION),
-        so this catchup does not run. The main loop's existing
-        aggregation branch fires instead, running local aggregation
-        for window N without our payload. The catchup only triggers
-        when the loop finally enters window N+1's EVALUATION phase,
-        at which point our payload is published on-chain (good for
-        restart recovery via ``aggregate_when_start``) but local
-        consensus for window N has already been computed without it.
-        Acceptable for the first rollout — on-chain commitment is
-        preserved (the primary goal); a follow-up to the
-        ``aggregate_when_start`` selection logic will cover the full
-        recovery path.
-        """
-        prev_window = self._last_eval_window
-        if prev_window < 0:
-            return
-
-        if not self._check_own_commitment_on_chain(prev_window):
-            logger.info(
-                "Pre-eval catchup: submitting payload for window %d",
-                prev_window,
-            )
-            try:
-                await self._submit_consensus_payload(
-                    self._synthetic_eval_window(
-                        prev_window, WindowPhase.PROPAGATION,
-                    )
-                )
-            except Exception as e:
-                logger.warning(
-                    "Pre-eval catchup submit for window %d failed: %s",
-                    prev_window, e, exc_info=True,
-                )
-
-        if self._consensus_window != prev_window:
-            logger.info(
-                "Pre-eval catchup: aggregating consensus for window %d",
-                prev_window,
-            )
-            try:
-                await self._run_consensus_aggregation(
-                    self._synthetic_eval_window(
-                        prev_window, WindowPhase.AGGREGATION,
-                    )
-                )
-                if self._consensus_window == prev_window:
-                    await self._set_winner_weights()
-                    self.last_weight_block = self.subtensor.get_current_block()
-            except Exception as e:
-                logger.warning(
-                    "Pre-eval catchup aggregation for window %d failed: %s",
-                    prev_window, e, exc_info=True,
-                )
-
     def _build_local_consensus_payload(
         self, window: EvaluationWindow,
     ) -> Optional[ConsensusPayload]:
@@ -895,24 +779,13 @@ class TrajectoryValidator:
             disqualified=disqualified_by_hotkey,
         )
 
-    async def _run_consensus_aggregation(
-        self,
-        window: EvaluationWindow,
-        accept_newer_windows: bool = False,
-    ):
+    async def _run_consensus_aggregation(self, window: EvaluationWindow):
         """Read on-chain consensus pointers, download payloads, filter, aggregate.
 
         All on-chain commitments are downloaded regardless of their
         ``spec_number`` value; the target spec_number for filtering is
         derived from the on-chain stake distribution by the filter pipeline
         (see ``consensus_filter.select_target_spec_number``).
-
-        ``accept_newer_windows`` relaxes the window-number filter to
-        ``payload.window_number >= window.window_number`` (see
-        ``consensus_filter.filter_window_number``). Used by startup
-        aggregation only — main-loop callers must keep the strict default
-        so a stale older commitment does not leak into the current
-        window's consensus.
         """
         if not self._is_metagraph_healthy():
             logger.warning(
@@ -986,7 +859,6 @@ class TrajectoryValidator:
             local_spec_number=_spec_number(),
             expected_protocol=self.config.consensus_protocol_version,
             zero_signal_threshold=zero_threshold,
-            accept_newer_windows=accept_newer_windows,
         )
 
         if not validated:
@@ -1137,11 +1009,6 @@ class TrajectoryValidator:
         ``_set_winner_weights`` to compute the winner and set weights
         immediately — without waiting for the normal window lifecycle.
 
-        Before aggregating, this also submits any pending payload from
-        ``self._last_eval_window`` whose on-chain commitment is missing
-        — covers the case where the validator was killed mid-cycle
-        after evaluating but before publishing.
-
         This is a side-effect-free operation with respect to the main loop:
         ``_consensus_window`` is saved and restored so the normal per-window
         aggregation guard is not consumed.
@@ -1151,31 +1018,6 @@ class TrajectoryValidator:
         logger.info("=" * 60)
 
         self._sync_metagraph(caller="aggregate_on_startup")
-
-        # Pre-aggregation submit: if we have eval data for a window
-        # whose payload was never published (e.g. crashed after eval,
-        # before submit), publish it now. Same idempotency guard as
-        # the main loop and ``_catchup_previous_window``. Gated by
-        # CATCHUP_PREVIOUS_WINDOW for a flagged rollout.
-        prev_window = self._last_eval_window
-        if (self.config.catchup_previous_window
-                and prev_window >= 0
-                and not self._check_own_commitment_on_chain(prev_window)):
-            logger.info(
-                "Startup submit: publishing pending payload for window %d",
-                prev_window,
-            )
-            try:
-                await self._submit_consensus_payload(
-                    self._synthetic_eval_window(
-                        prev_window, WindowPhase.PROPAGATION,
-                    )
-                )
-            except Exception as e:
-                logger.warning(
-                    "Startup submit for window %d failed: %s",
-                    prev_window, e, exc_info=True,
-                )
 
         chain_commitments = fetch_validator_consensus_commitments(
             self.subtensor, self.config.netuid, self.metagraph,
@@ -1187,59 +1029,28 @@ class TrajectoryValidator:
             return
 
         window_counts = Counter(vc.window_number for vc in chain_commitments)
-
-        # Phase-aware target: anchor startup aggregation on the most
-        # recent "ripe" window (one whose AGGREGATION phase has begun)
-        # rather than the chain-observed max. Ripe rule:
-        #   - current phase == AGGREGATION -> current window is ripe
-        #   - otherwise (EVALUATION / PROPAGATION) -> previous window is
-        #     the latest ripe one (PROPAGATION is intentionally excluded
-        #     because submissions are still arriving).
-        # Validators that have already moved past ripe_window (their
-        # latest on-chain commitment is for a newer window) are still
-        # counted toward this aggregation — see ``accept_newer_windows``
-        # below — because Bittensor's get_all_commitments returns only
-        # each validator's latest commitment, so their ripe_window data
-        # is unrecoverable; using their newer payload as a stand-in vote
-        # is preferable to discarding their stake entirely.
-        current_block = self.subtensor.get_current_block()
-        current_window = compute_window(current_block, self._window_config)
-        if current_window.phase == WindowPhase.AGGREGATION:
-            ripe_window = current_window.window_number
-        else:
-            ripe_window = current_window.window_number - 1
-
-        eligible_count = sum(
-            cnt for w, cnt in window_counts.items() if w >= ripe_window
-        )
-        if eligible_count == 0:
-            logger.warning(
-                "Startup aggregation: all %d on-chain commitments are older "
-                "than ripe window (current=%d phase=%s ripe=%d, observed=%s); "
-                "skipping startup aggregation",
-                len(chain_commitments), current_window.window_number,
-                current_window.phase.value, ripe_window, dict(window_counts),
-            )
-            return
-
-        target_window = ripe_window
+        target_window = max(window_counts.keys())
         logger.info(
-            "Startup aggregation: found %d commitments across windows %s "
-            "(current=%d phase=%s ripe=%d), targeting window %d "
-            "(%d eligible submissions, accept_newer_windows=True)",
+            "Startup aggregation: found %d commitments across windows %s, "
+            "targeting latest window %d (%d submissions)",
             len(chain_commitments), dict(window_counts),
-            current_window.window_number, current_window.phase.value,
-            ripe_window, target_window, eligible_count,
+            target_window, window_counts[target_window],
         )
 
-        synthetic_window = self._synthetic_eval_window(
-            target_window, WindowPhase.AGGREGATION,
+        synthetic_window = EvaluationWindow(
+            window_number=target_window,
+            window_start=self._window_config.global_anchor
+            + target_window * self._window_config.window_length,
+            block_offset=self._window_config.window_length - 1,
+            phase=WindowPhase.AGGREGATION,
+            blocks_into_phase=0,
+            blocks_remaining_in_phase=1,
+            publish_offset=self._window_config.publish_block,
+            aggregate_offset=self._window_config.aggregate_block,
         )
 
         saved_consensus_window = self._consensus_window
-        await self._run_consensus_aggregation(
-            synthetic_window, accept_newer_windows=True,
-        )
+        await self._run_consensus_aggregation(synthetic_window)
         aggregation_succeeded = (self._consensus_window == target_window)
 
         self._consensus_window = saved_consensus_window
@@ -1429,17 +1240,6 @@ class TrajectoryValidator:
 
                 # --- Window phase: evaluation ---
                 if self._should_start_evaluation(current_block):
-                    # Pre-eval catch-up: a long previous eval may have
-                    # finished after the main loop's stale-window
-                    # snapshot caused the propagation / aggregation
-                    # branches to skip last iteration. Catch up on the
-                    # last evaluated window's submit + aggregate before
-                    # starting a fresh cycle, so we never silently drop
-                    # a window's vote. Gated by CATCHUP_PREVIOUS_WINDOW
-                    # for a flagged rollout.
-                    if self.config.catchup_previous_window:
-                        await self._catchup_previous_window()
-
                     logger.info("=" * 60)
                     logger.info(
                         f"Evaluation window {window.window_number} at block "
@@ -1458,33 +1258,6 @@ class TrajectoryValidator:
                         self.config.pack_cache_max_size
                     )
                     self._save_eval_state()
-
-                    # Immediate post-eval submit: upload payload to CAS and
-                    # write on-chain commitment as soon as eval finishes,
-                    # without waiting for the PROPAGATION phase. The
-                    # propagation branch below remains unchanged and will
-                    # short-circuit via _check_own_commitment_on_chain when
-                    # this submit succeeded, or act as automatic retry
-                    # otherwise.
-                    try:
-                        ok = await self._submit_consensus_payload(window)
-                        if ok:
-                            logger.info(
-                                "Window %d: payload submitted immediately after eval",
-                                window.window_number,
-                            )
-                        else:
-                            logger.warning(
-                                "Window %d: immediate post-eval submit failed; "
-                                "propagation branch will retry",
-                                window.window_number,
-                            )
-                    except Exception as e:
-                        logger.warning(
-                            "Window %d: immediate post-eval submit raised: %s; "
-                            "propagation branch will retry",
-                            window.window_number, e, exc_info=True,
-                        )
 
                     if self._cycle_eval_id is not None:
                         asyncio.ensure_future(
