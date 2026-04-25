@@ -792,11 +792,29 @@ class TrajectoryValidator:
         is a no-op when the previous window's work has already
         completed via the normal main-loop branches.
 
-        Caveat: submitting after the previous window's propagation
-        phase has closed will not influence other validators' consensus
-        for that window (they have already aggregated). The submit
-        still has audit value, and the aggregation still updates this
-        validator's local winner weights.
+        Caveat 1 (post-propagation submit): publishing after the
+        previous window's propagation phase has closed will not
+        influence other validators' consensus for that window (they
+        have already aggregated). The submit still has audit value,
+        and the aggregation still updates this validator's local
+        winner weights.
+
+        Caveat 2 (in-window AGGREGATION-phase finish): when a long
+        eval cycle finishes within the SAME window's AGGREGATION
+        phase — i.e. eval crossed T_publish but did not cross into
+        the next window — the next main-loop iteration sees
+        ``_should_start_evaluation == False`` (phase != EVALUATION),
+        so this catchup does not run. The main loop's existing
+        aggregation branch fires instead, running local aggregation
+        for window N without our payload. The catchup only triggers
+        when the loop finally enters window N+1's EVALUATION phase,
+        at which point our payload is published on-chain (good for
+        restart recovery via ``aggregate_when_start``) but local
+        consensus for window N has already been computed without it.
+        Acceptable for the first rollout — on-chain commitment is
+        preserved (the primary goal); a follow-up to the
+        ``aggregate_when_start`` selection logic will cover the full
+        recovery path.
         """
         prev_window = self._last_eval_window
         if prev_window < 0:
@@ -1123,9 +1141,11 @@ class TrajectoryValidator:
         # Pre-aggregation submit: if we have eval data for a window
         # whose payload was never published (e.g. crashed after eval,
         # before submit), publish it now. Same idempotency guard as
-        # the main loop and ``_catchup_previous_window``.
+        # the main loop and ``_catchup_previous_window``. Gated by
+        # CATCHUP_PREVIOUS_WINDOW for a flagged rollout.
         prev_window = self._last_eval_window
-        if (prev_window >= 0
+        if (self.config.catchup_previous_window
+                and prev_window >= 0
                 and not self._check_own_commitment_on_chain(prev_window)):
             logger.info(
                 "Startup submit: publishing pending payload for window %d",
@@ -1362,8 +1382,10 @@ class TrajectoryValidator:
                     # branches to skip last iteration. Catch up on the
                     # last evaluated window's submit + aggregate before
                     # starting a fresh cycle, so we never silently drop
-                    # a window's vote.
-                    await self._catchup_previous_window()
+                    # a window's vote. Gated by CATCHUP_PREVIOUS_WINDOW
+                    # for a flagged rollout.
+                    if self.config.catchup_previous_window:
+                        await self._catchup_previous_window()
 
                     logger.info("=" * 60)
                     logger.info(

@@ -133,6 +133,15 @@ class ValidatorConfig:
     # same lowest-cost winner (use once to clear divergent cached state).
     disable_winner_protection: bool = False
 
+    # When enabled, on startup and at the top of each new eval cycle the
+    # validator publishes any pending payload + runs aggregation for the
+    # most recently evaluated window if it was missed by the main loop's
+    # propagation/aggregation branches (typically because the prior eval
+    # cycle ran past T_publish or rolled over into the next window).
+    # Default OFF for a flagged rollout; flip to True once the rollout
+    # has been validated.
+    catchup_previous_window: bool = False
+
     # LLM configuration (used by sandbox harness and LLM judges).
     # Backward-compatible with legacy CLAWBENCH_LLM_* env vars.
     llm_model: str = DEFAULT_LLM_MODEL
@@ -262,6 +271,7 @@ class ValidatorConfig:
             # --- Startup aggregation ---
             aggregate_when_start=os.getenv("AGGREGATE_WHEN_START", "1") == "1",
             full_cycle_on_startup=os.getenv("FULL_CYCLE_ON_STARTUP", "0") == "1",
+            catchup_previous_window=os.getenv("CATCHUP_PREVIOUS_WINDOW", "1") == "1",
             disable_winner_protection=os.getenv("DISABLE_WINNER_PROTECTION", "1") == "1",
             # --- IM parameters are hardcoded (dataclass defaults) ---
             # Do NOT load from env: score_delta,
