@@ -895,13 +895,24 @@ class TrajectoryValidator:
             disqualified=disqualified_by_hotkey,
         )
 
-    async def _run_consensus_aggregation(self, window: EvaluationWindow):
+    async def _run_consensus_aggregation(
+        self,
+        window: EvaluationWindow,
+        accept_newer_windows: bool = False,
+    ):
         """Read on-chain consensus pointers, download payloads, filter, aggregate.
 
         All on-chain commitments are downloaded regardless of their
         ``spec_number`` value; the target spec_number for filtering is
         derived from the on-chain stake distribution by the filter pipeline
         (see ``consensus_filter.select_target_spec_number``).
+
+        ``accept_newer_windows`` relaxes the window-number filter to
+        ``payload.window_number >= window.window_number`` (see
+        ``consensus_filter.filter_window_number``). Used by startup
+        aggregation only — main-loop callers must keep the strict default
+        so a stale older commitment does not leak into the current
+        window's consensus.
         """
         if not self._is_metagraph_healthy():
             logger.warning(
@@ -975,6 +986,7 @@ class TrajectoryValidator:
             local_spec_number=_spec_number(),
             expected_protocol=self.config.consensus_protocol_version,
             zero_signal_threshold=zero_threshold,
+            accept_newer_windows=accept_newer_windows,
         )
 
         if not validated:
@@ -1175,12 +1187,49 @@ class TrajectoryValidator:
             return
 
         window_counts = Counter(vc.window_number for vc in chain_commitments)
-        target_window = max(window_counts.keys())
+
+        # Phase-aware target: anchor startup aggregation on the most
+        # recent "ripe" window (one whose AGGREGATION phase has begun)
+        # rather than the chain-observed max. Ripe rule:
+        #   - current phase == AGGREGATION -> current window is ripe
+        #   - otherwise (EVALUATION / PROPAGATION) -> previous window is
+        #     the latest ripe one (PROPAGATION is intentionally excluded
+        #     because submissions are still arriving).
+        # Validators that have already moved past ripe_window (their
+        # latest on-chain commitment is for a newer window) are still
+        # counted toward this aggregation — see ``accept_newer_windows``
+        # below — because Bittensor's get_all_commitments returns only
+        # each validator's latest commitment, so their ripe_window data
+        # is unrecoverable; using their newer payload as a stand-in vote
+        # is preferable to discarding their stake entirely.
+        current_block = self.subtensor.get_current_block()
+        current_window = compute_window(current_block, self._window_config)
+        if current_window.phase == WindowPhase.AGGREGATION:
+            ripe_window = current_window.window_number
+        else:
+            ripe_window = current_window.window_number - 1
+
+        eligible_count = sum(
+            cnt for w, cnt in window_counts.items() if w >= ripe_window
+        )
+        if eligible_count == 0:
+            logger.warning(
+                "Startup aggregation: all %d on-chain commitments are older "
+                "than ripe window (current=%d phase=%s ripe=%d, observed=%s); "
+                "skipping startup aggregation",
+                len(chain_commitments), current_window.window_number,
+                current_window.phase.value, ripe_window, dict(window_counts),
+            )
+            return
+
+        target_window = ripe_window
         logger.info(
-            "Startup aggregation: found %d commitments across windows %s, "
-            "targeting latest window %d (%d submissions)",
+            "Startup aggregation: found %d commitments across windows %s "
+            "(current=%d phase=%s ripe=%d), targeting window %d "
+            "(%d eligible submissions, accept_newer_windows=True)",
             len(chain_commitments), dict(window_counts),
-            target_window, window_counts[target_window],
+            current_window.window_number, current_window.phase.value,
+            ripe_window, target_window, eligible_count,
         )
 
         synthetic_window = self._synthetic_eval_window(
@@ -1188,7 +1237,9 @@ class TrajectoryValidator:
         )
 
         saved_consensus_window = self._consensus_window
-        await self._run_consensus_aggregation(synthetic_window)
+        await self._run_consensus_aggregation(
+            synthetic_window, accept_newer_windows=True,
+        )
         aggregation_succeeded = (self._consensus_window == target_window)
 
         self._consensus_window = saved_consensus_window

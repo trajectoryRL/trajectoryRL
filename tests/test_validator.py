@@ -2610,6 +2610,229 @@ class TestWinnerProtection:
 
 
 # ---------------------------------------------------------------------------
+# Phase-aware startup aggregation tests
+# ---------------------------------------------------------------------------
+
+
+class TestStartupAggregationWindowSelection:
+    """Tests for `_aggregate_on_startup` window-selection semantics.
+
+    Anchors target_window on the most recent "ripe" window (one whose
+    AGGREGATION phase has begun) rather than the chain-observed max,
+    while still counting validators that have already moved past
+    ripe_window via `accept_newer_windows=True` on the underlying
+    aggregation call.
+    """
+
+    @staticmethod
+    def _make_window_config():
+        return WindowConfig(
+            window_length=100, global_anchor=0,
+            publish_pct=0.80, aggregate_pct=0.90,
+        )
+
+    @staticmethod
+    def _make_commitment(hotkey: str, window: int):
+        return ValidatorConsensusCommitment(
+            protocol_version=1,
+            window_number=window,
+            content_address=f"addr_{hotkey}_{window}",
+            validator_hotkey=hotkey,
+            block_number=0,
+            raw=f"consensus:1|{window}|1|addr_{hotkey}_{window}",
+            spec_number=SPEC_NUMBER,
+        )
+
+    def _make_validator(self, current_block: int):
+        """Build a stub validator with only what `_aggregate_on_startup` needs."""
+        v = TrajectoryValidator.__new__(TrajectoryValidator)
+        v.config = MagicMock()
+        v.config.netuid = 11
+        v.config.catchup_previous_window = False  # skip pre-aggregation submit branch
+        v._window_config = self._make_window_config()
+        v._consensus_window = -1
+        v._last_eval_window = -1
+        v._winner_state = MagicMock()
+        v._winner_state.winner_hotkey = None
+
+        v.subtensor = MagicMock()
+        v.subtensor.get_current_block.return_value = current_block
+        v.metagraph = MagicMock()
+
+        v._sync_metagraph = MagicMock()
+        v._save_eval_state = MagicMock()
+        v._run_consensus_aggregation = AsyncMock()
+        v._set_winner_weights = AsyncMock()
+        v.last_weight_block = 0
+        return v
+
+    def _run(self, validator, chain_commitments):
+        """Patch `fetch_validator_consensus_commitments` and run startup aggregation."""
+        with patch(
+            "trajectoryrl.base.validator.fetch_validator_consensus_commitments",
+            return_value=chain_commitments,
+        ):
+            asyncio.run(validator._aggregate_on_startup())
+
+    # ------------------------------------------------------------------
+    # ripe_window derivation by phase
+    # ------------------------------------------------------------------
+
+    def test_target_uses_previous_window_during_evaluation_phase(self):
+        """In window N+1's EVALUATION phase, ripe_window = N (not N+1)."""
+        # Window length 100, so window 5 = blocks [500, 600), EVALUATION ends
+        # at block_offset 80. Block 510 = window 5, EVALUATION phase.
+        v = self._make_validator(current_block=510)
+        commitments = [
+            self._make_commitment("v_slow_1", 4),
+            self._make_commitment("v_slow_2", 4),
+            self._make_commitment("v_fast", 5),  # premature
+        ]
+        self._run(v, commitments)
+
+        v._run_consensus_aggregation.assert_awaited_once()
+        synthetic_window, kwargs = (
+            v._run_consensus_aggregation.await_args.args[0],
+            v._run_consensus_aggregation.await_args.kwargs,
+        )
+        assert synthetic_window.window_number == 4  # ripe = current(5) - 1
+        assert synthetic_window.phase == WindowPhase.AGGREGATION
+        assert kwargs.get("accept_newer_windows") is True
+
+    def test_target_uses_previous_window_during_propagation_phase(self):
+        """PROPAGATION phase is intentionally NOT ripe."""
+        # Block offset 85 => PROPAGATION (publish=80, aggregate=90).
+        v = self._make_validator(current_block=585)  # window 5, offset 85
+        commitments = [
+            self._make_commitment("v1", 4),
+            self._make_commitment("v2", 5),
+        ]
+        self._run(v, commitments)
+
+        synthetic_window = v._run_consensus_aggregation.await_args.args[0]
+        assert synthetic_window.window_number == 4
+
+    def test_target_uses_current_window_in_aggregation_phase(self):
+        """AGGREGATION phase => ripe_window = current window."""
+        # Block offset 95 => AGGREGATION.
+        v = self._make_validator(current_block=595)  # window 5, offset 95
+        commitments = [
+            self._make_commitment("v1", 5),
+            self._make_commitment("v2", 5),
+        ]
+        self._run(v, commitments)
+
+        synthetic_window = v._run_consensus_aggregation.await_args.args[0]
+        assert synthetic_window.window_number == 5
+
+    # ------------------------------------------------------------------
+    # Eligibility / skip behavior
+    # ------------------------------------------------------------------
+
+    def test_skips_when_all_commitments_older_than_ripe(self):
+        """If every on-chain commitment is older than ripe, skip with warning."""
+        # ripe = 4 (current window 5, EVALUATION). All commitments for window 2
+        # are strictly older.
+        v = self._make_validator(current_block=510)
+        commitments = [
+            self._make_commitment("v1", 2),
+            self._make_commitment("v2", 3),
+        ]
+        self._run(v, commitments)
+
+        v._run_consensus_aggregation.assert_not_awaited()
+        v._set_winner_weights.assert_not_awaited()
+
+    def test_skips_when_no_commitments_on_chain(self):
+        """Pre-existing 'no commitments at all' early-return preserved."""
+        v = self._make_validator(current_block=510)
+        self._run(v, [])
+
+        v._run_consensus_aggregation.assert_not_awaited()
+        v._set_winner_weights.assert_not_awaited()
+
+    def test_runs_with_only_newer_commitments(self):
+        """Validators that already moved past ripe still trigger aggregation.
+
+        Bittensor's get_all_commitments returns only the latest commitment
+        per validator, so a faster validator's ripe_window data is gone.
+        Their newer commitment should still count toward ripe_window's
+        aggregation via accept_newer_windows=True.
+        """
+        # Current window 5 EVALUATION => ripe = 4. Only commitments are
+        # for windows 5 and 6 (all "newer than ripe"). We should still
+        # aggregate for window 4.
+        v = self._make_validator(current_block=510)
+        commitments = [
+            self._make_commitment("v_fast_1", 5),
+            self._make_commitment("v_fast_2", 6),
+        ]
+        self._run(v, commitments)
+
+        synthetic_window, kwargs = (
+            v._run_consensus_aggregation.await_args.args[0],
+            v._run_consensus_aggregation.await_args.kwargs,
+        )
+        assert synthetic_window.window_number == 4
+        assert kwargs.get("accept_newer_windows") is True
+
+
+class TestFilterWindowNumberAcceptNewer:
+    """Tests for the relaxed `accept_newer` mode on `filter_window_number`."""
+
+    def _make_submission(self, hotkey: str, window: int):
+        payload = ConsensusPayload(
+            protocol_version=1, window_number=window,
+            validator_hotkey=hotkey, bench_version="0.1.0",
+            scores={"m1": 0.5}, timestamp=1000,
+        )
+        pointer = ConsensusPointer(
+            protocol_version=1, window_number=window,
+            content_address=payload.content_hash(),
+            validator_hotkey=hotkey,
+        )
+        return (pointer, payload)
+
+    def test_default_strict_equality(self):
+        """accept_newer=False keeps existing strict-equality semantics."""
+        subs = [
+            self._make_submission("v_old", 41),
+            self._make_submission("v_match", 42),
+            self._make_submission("v_newer", 43),
+        ]
+        passed, skipped = filter_window_number(subs, expected_window=42)
+        assert {p[0].validator_hotkey for p in passed} == {"v_match"}
+        assert skipped == 2
+
+    def test_accept_newer_keeps_equal_and_newer(self):
+        """accept_newer=True keeps payload.window_number >= expected."""
+        subs = [
+            self._make_submission("v_old", 41),
+            self._make_submission("v_match", 42),
+            self._make_submission("v_newer", 43),
+            self._make_submission("v_much_newer", 99),
+        ]
+        passed, skipped = filter_window_number(
+            subs, expected_window=42, accept_newer=True,
+        )
+        kept = {p[0].validator_hotkey for p in passed}
+        assert kept == {"v_match", "v_newer", "v_much_newer"}
+        assert skipped == 1  # only v_old (older) drops
+
+    def test_accept_newer_still_drops_strictly_older(self):
+        """Older-than-expected payloads must always be rejected."""
+        subs = [
+            self._make_submission("v1", 10),
+            self._make_submission("v2", 20),
+        ]
+        passed, skipped = filter_window_number(
+            subs, expected_window=42, accept_newer=True,
+        )
+        assert passed == []
+        assert skipped == 2
+
+
+# ---------------------------------------------------------------------------
 # On-chain consensus commitment tests
 # ---------------------------------------------------------------------------
 
