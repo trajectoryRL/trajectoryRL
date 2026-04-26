@@ -1021,6 +1021,9 @@ class TestPerScenarioEvalState:
             validator._miner_log_dir = Path("/tmp/test_logs/miners")
             validator._miner_log_dir.mkdir(parents=True, exist_ok=True)
             validator._consensus_window = -1
+            validator._target_window = 0
+            validator._target_submit_done = False
+            validator._waiting_for_quorum = False
             validator.scenarios = {
                 "client_escalation": {"weight": 1.5},
                 "morning_brief": {"weight": 1.0},
@@ -1096,6 +1099,10 @@ class TestPerScenarioEvalState:
             # eval_state.json must NOT carry the legacy pack_first_seen key.
             saved = json.loads(v.config.eval_state_path.read_text())
             assert "pack_first_seen" not in saved
+            assert "quorum_wait_cycles" not in saved
+            assert "last_quorum_ratio" not in saved
+            assert "last_submitted_stake" not in saved
+            assert "last_total_validator_stake" not in saved
 
             v2 = self._make_validator()
             v2.config.eval_state_path = v.config.eval_state_path
@@ -2942,3 +2949,188 @@ class TestConsensusWeightSetting:
 
         assert qualified[10] is True
         assert qualified[20] is False
+
+
+class TestIssue1EpochSkipSemantics:
+    """Tests for dual-window orchestration and quorum-gated aggregation."""
+
+    def _make_validator(self):
+        v = TrajectoryValidator.__new__(TrajectoryValidator)
+        v.config = MagicMock()
+        v.config.full_cycle_on_startup = False
+        v.config.aggregate_when_start = False
+        v.config.weight_interval_blocks = 999999
+        v.config.pack_cache_max_size = 100
+        v.config.quorum_threshold = 0.5
+        v.config.netuid = 11
+        v.config.log_level = "WARNING"
+
+        v._window_config = WindowConfig(
+            window_length=100,
+            global_anchor=0,
+            publish_pct=0.8,
+            aggregate_pct=0.9,
+        )
+
+        v._last_eval_window = -1
+        v._consensus_window = -1
+        v._target_window = -1
+        v._target_submit_done = False
+        v._waiting_for_quorum = False
+        v._last_eval_at = None
+        v._last_eval_date = None
+        v.last_weight_block = 0
+
+        v._cycle_eval_id = None
+        v._cycle_log_offset = 0
+        v._cycle_log_block = 0
+        v._cycle_window_number = 0
+
+        v.wallet = MagicMock()
+        v.wallet.hotkey.ss58_address = "validator_hotkey"
+        v.subtensor = MagicMock()
+        v.metagraph = MagicMock()
+        v.metagraph.hotkeys = ["v1", "v2", "v3"]
+        v.metagraph.validator_permit = [True, True, True]
+        v.metagraph.stake = [60.0, 30.0, 10.0]
+        v.metagraph.n = 3
+
+        v.pack_fetcher = MagicMock()
+        v._sandbox_harness = MagicMock()
+        v._sandbox_harness.bench_image_hash = "bench"
+        v._sandbox_harness.harness_image_hash = "harness"
+        v._sandbox_harness.sandbox_version = "vtest"
+
+        v._replay_pending_uploads = AsyncMock()
+        v._run_evaluation_cycle = AsyncMock()
+        v._submit_consensus_payload = AsyncMock(return_value=True)
+        v._run_consensus_aggregation = AsyncMock()
+        v._set_winner_weights = AsyncMock()
+        v._set_burn_weights = AsyncMock()
+        v._set_fallback_weights = AsyncMock()
+        v._save_eval_state = MagicMock()
+        v._check_own_commitment_on_chain = MagicMock(return_value=False)
+        v._is_metagraph_healthy = MagicMock(return_value=True)
+        v._sync_metagraph = MagicMock(return_value=True)
+        v._fire_upload_cycle_logs = AsyncMock()
+        v._heartbeat_loop = AsyncMock()
+        return v
+
+    def test_compute_quorum_status_uses_effective_spec(self):
+        v = self._make_validator()
+        commitments = [
+            ValidatorConsensusCommitment(
+                protocol_version=2,
+                window_number=9,
+                content_address="cid-1",
+                validator_hotkey="v1",
+                block_number=100,
+                raw="r1",
+                spec_number=7,
+            ),
+            ValidatorConsensusCommitment(
+                protocol_version=2,
+                window_number=9,
+                content_address="cid-2",
+                validator_hotkey="v2",
+                block_number=101,
+                raw="r2",
+                spec_number=7,
+            ),
+            ValidatorConsensusCommitment(
+                protocol_version=2,
+                window_number=9,
+                content_address="cid-3",
+                validator_hotkey="v3",
+                block_number=102,
+                raw="r3",
+                spec_number=4,
+            ),
+        ]
+        with patch(
+            "trajectoryrl.base.validator.fetch_validator_consensus_commitments",
+            return_value=commitments,
+        ):
+            meets, ratio, submitted, total = v._compute_quorum_status(9)
+
+        assert meets is True
+        assert ratio == pytest.approx(0.9)
+        assert submitted == pytest.approx(90.0)
+        assert total == pytest.approx(100.0)
+
+    def test_submit_is_phase_decoupled(self):
+        v = self._make_validator()
+        aligned = 7986780 + ((100 - (7986780 % 100)) % 100)
+        block = aligned + 10  # evaluation phase
+        v.subtensor.get_current_block.side_effect = [block, block]
+        target = block // 100
+        v._target_window = target
+        v._last_eval_window = target
+        v._consensus_window = target - 1
+
+        def _close_task(coro):
+            coro.close()
+            return MagicMock()
+
+        with patch("trajectoryrl.base.validator.asyncio.create_task", side_effect=_close_task), \
+             patch("trajectoryrl.base.validator.asyncio.sleep", AsyncMock(side_effect=KeyboardInterrupt())):
+            asyncio.run(v.run())
+
+        assert v._submit_consensus_payload.await_count == 1
+        assert v._target_submit_done is True
+
+    def test_quorum_miss_keeps_target_and_sets_burn_weights(self):
+        v = self._make_validator()
+        aligned = 7986780 + ((100 - (7986780 % 100)) % 100)
+        block = aligned + 3 * 100 + 95  # physical window +3, aggregation phase
+        v.subtensor.get_current_block.side_effect = [block, block]
+        v._target_window = 0
+        v._last_eval_window = 0
+        v._target_submit_done = True
+        v._consensus_window = -1
+        v._compute_quorum_status = MagicMock(
+            return_value=(False, 0.49, 49.0, 100.0)
+        )
+
+        def _close_task(coro):
+            coro.close()
+            return MagicMock()
+
+        with patch("trajectoryrl.base.validator.asyncio.create_task", side_effect=_close_task), \
+             patch("trajectoryrl.base.validator.asyncio.sleep", AsyncMock(side_effect=KeyboardInterrupt())):
+            asyncio.run(v.run())
+
+        assert v._set_burn_weights.await_count >= 1
+        assert v._target_window == 0
+        assert v._waiting_for_quorum is True
+
+    def test_quorum_success_jumps_target_to_physical_window(self):
+        v = self._make_validator()
+        aligned = 7986780 + ((100 - (7986780 % 100)) % 100)
+        block = aligned + 3 * 100 + 95  # physical window +3, aggregation phase
+        v.subtensor.get_current_block.side_effect = [block, block]
+        v._target_window = 0
+        v._last_eval_window = 0
+        v._target_submit_done = True
+        v._consensus_window = -1
+        v._compute_quorum_status = MagicMock(
+            return_value=(True, 0.8, 80.0, 100.0)
+        )
+
+        async def _agg(window):
+            v._consensus_window = window.window_number
+
+        v._run_consensus_aggregation = AsyncMock(side_effect=_agg)
+        v._check_own_commitment_on_chain.return_value = False
+
+        def _close_task(coro):
+            coro.close()
+            return MagicMock()
+
+        with patch("trajectoryrl.base.validator.asyncio.create_task", side_effect=_close_task), \
+             patch("trajectoryrl.base.validator.asyncio.sleep", AsyncMock(side_effect=KeyboardInterrupt())):
+            asyncio.run(v.run())
+
+        assert v._run_consensus_aggregation.await_count == 1
+        assert v._target_window == (block // 100)
+        assert v._waiting_for_quorum is False
