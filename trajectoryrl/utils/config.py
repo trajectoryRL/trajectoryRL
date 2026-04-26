@@ -36,7 +36,7 @@ HARNESS_IMAGE_REPO = "ghcr.io/trajectoryrl/hermes-agent"
 # consulted only as the fallback target when no on-chain spec_number group
 # reaches >50% stake, and as the value written into outgoing commitments /
 # payloads.
-SPEC_NUMBER = 4
+SPEC_NUMBER = 5
 
 # Backwards-compatible alias for legacy callers / persisted state. Will be
 # removed after one validator release cycle.
