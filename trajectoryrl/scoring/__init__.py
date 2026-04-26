@@ -2,7 +2,7 @@
 
 import logging
 import numpy as np
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass, field
 
 from ..utils.consensus_filter import ValidatedSubmission
@@ -554,6 +554,14 @@ def compute_consensus_scores(
     if not validated_submissions:
         return {}, {}
 
+    # Union of miners mentioned in any submission. A validator that omits a
+    # miner from its own payload is treated as a 0-score vote with full stake
+    # weight, rather than being excluded from that miner's denominator.
+    all_miners_global: Set[str] = set()
+    for sub in validated_submissions:
+        all_miners_global.update(sub.payload.scores.keys())
+        all_miners_global.update(sub.payload.disqualified.keys())
+
     miner_weighted_score: Dict[str, float] = {}
     miner_total_stake: Dict[str, float] = {}
 
@@ -568,9 +576,13 @@ def compute_consensus_scores(
             continue
 
         disqualified = sub.payload.disqualified
+        scores = sub.payload.scores
 
-        all_miners = set(sub.payload.scores.keys()) | set(disqualified.keys())
-        for miner_hk in all_miners:
+        # Disqualification ratio stays per-submission: a validator can only
+        # vote to disqualify miners it actually reported on, and the
+        # denominator matches so silence doesn't implicitly vote against.
+        per_sub_miners = set(scores.keys()) | set(disqualified.keys())
+        for miner_hk in per_sub_miners:
             if miner_hk not in miner_reporting_stake:
                 miner_reporting_stake[miner_hk] = 0.0
                 miner_disq_stake[miner_hk] = 0.0
@@ -580,16 +592,17 @@ def compute_consensus_scores(
                 miner_disq_stake[miner_hk] += stake
                 miner_disq_reasons[miner_hk] = disqualified[miner_hk]
 
-        for miner_hk, score in sub.payload.scores.items():
+        # Score aggregation covers every miner seen anywhere. Missing entries
+        # contribute a 0-score with full stake weight so validators that
+        # failed to evaluate a miner drag its consensus score down.
+        for miner_hk in all_miners_global:
             if miner_hk in disqualified:
                 continue
-
             if miner_hk not in miner_total_stake:
                 miner_total_stake[miner_hk] = 0.0
                 miner_weighted_score[miner_hk] = 0.0
-
             miner_total_stake[miner_hk] += stake
-            miner_weighted_score[miner_hk] += stake * score
+            miner_weighted_score[miner_hk] += stake * scores.get(miner_hk, 0.0)
 
     # Compute consensus disqualification via stake-weighted majority
     consensus_disqualified: Dict[str, str] = {}
