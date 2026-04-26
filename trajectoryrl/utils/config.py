@@ -124,7 +124,7 @@ class ValidatorConfig:
     weight_interval_blocks: int = 360  # 1 tempo ≈ 72 min at 12s/block
 
     # Startup aggregation: run consensus aggregation before entering main loop
-    aggregate_when_start: bool = True
+    aggregate_when_start: bool = False
 
     # Startup full cycle: run eval → propagation → aggregation before main loop.
     # When enabled, ``aggregate_when_start`` is ignored (full cycle includes it).
@@ -271,7 +271,7 @@ class ValidatorConfig:
             sandbox_num_episodes=int(os.getenv("SANDBOX_NUM_EPISODES", "4")),
             sandbox_scenario=os.getenv("SANDBOX_SCENARIO", "codebase_fix"),
             # --- Startup aggregation ---
-            aggregate_when_start=os.getenv("AGGREGATE_WHEN_START", "1") == "1",
+            aggregate_when_start=os.getenv("AGGREGATE_WHEN_START", "0") == "1",
             full_cycle_on_startup=os.getenv("FULL_CYCLE_ON_STARTUP", "0") == "1",
             disable_winner_protection=os.getenv("DISABLE_WINNER_PROTECTION", "1") == "1",
             # --- IM parameters are hardcoded (dataclass defaults) ---
