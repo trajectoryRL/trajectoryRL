@@ -2,9 +2,9 @@
 
 **Subnet**: SN11 (TrajectoryRL)
 
-**Version**: v5.1
+**Version**: v5.2
 
-**Date**: 2026-04-24
+**Date**: 2026-04-26
 
 ---
 
@@ -168,9 +168,9 @@ An **epoch** is TrajectoryRL's validation cycle — a fixed-length period (measu
 
 ```
 Epoch (7200 blocks, ~24h)
-├── Evaluation window    (block 0 → 5760, 80%)    Run season benchmark, record raw scores
-├── Propagation window   (block 5760 → 6480, 10%) Upload to CAS at T_publish, wait for others
-└── Aggregation window   (block 6480 → 7200, 10%) Compute consensus, select winner
+├── Evaluation window    (block 0 → 5760, 80%)    Run season benchmark for target_window
+├── Propagation window   (block 5760 → 6480, 10%) Dissemination buffer (not a hard publish gate)
+└── Aggregation window   (block 6480 → 7200, 10%) Quorum-gated consensus for target_window
 ```
 
 Validators run a **continuous evaluation loop** synchronized by chain block height:
@@ -180,49 +180,38 @@ Validators run a **continuous evaluation loop** synchronized by chain block heig
 | `eval_interval` | 7200 blocks (~24h at 12s/block) | Epoch length, block-aligned |
 | `tempo` | 360 blocks (~72 min, chain-determined) | Set weights on-chain via commit-reveal |
 
-### Continuous Validator Loop
+### Continuous Validator Loop (Dual-Window)
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Evaluation Epoch (eval_interval blocks)        │
-│  epoch_number = floor((current_block - anchor) / eval_interval)  │
-├────────────────────────┬──────────────┬──────────────────────────┤
-│   Evaluation (0–80%)   │ Publish (80–90%) │  Aggregation (90–100%) │
-└────────────────────────┴──────────────┴──────────────────────────┘
-
- ┌──────────────────────────────────────────────────────────┐
- │  Evaluation Window (0% – 80% of epoch)                   │
- │                                                          │
- │  For each miner with valid commitment:                   │
- │    ① Pack ownership lock (pack_first_seen):              │
- │       reject as copy if not the first-observed owner     │
- │    ② Pre-eval gate → DISQUALIFY if rejected              │
- │    ③ Run evaluation pipeline → record score              │
- └──────────────────────────────────────────────────────────┘
-                          │
-                          ▼
- ┌──────────────────────────────────────────────────────────┐
- │  Propagation Window (80% – 90%)                          │
- │                                                          │
- │  Upload ConsensusPayload {scores, disqualified} to CAS   │
- │  Write pointer on-chain (set_commitment)                 │
- └──────────────────────────────────────────────────────────┘
-                          │
-                          ▼
- ┌──────────────────────────────────────────────────────────┐
- │  Aggregation Window (90% – 100%)                         │
- │                                                          │
- │  Read all validator submissions from CAS                  │
- │  Filter + stake-weighted aggregation                     │
- │  Pre-eval gate (second pass) → disqualify new rejects    │
- │  Apply Winner Protection → update winner state           │
- └──────────────────────────────────────────────────────────┘
-                          │
-                          ▼
- ┌──────────────────────────────────────────────────────────┐
- │  Every tempo: set_weights (commit-reveal)                │
- └──────────────────────────────────────────────────────────┘
+while running:
+  1. Sync metagraph and compute physical_window from block height
+  2. Ensure persisted target_window (logical consensus window)
+  3. Build/load active-set snapshot for target_window:
+       active_set_window_N = commitments with commitment.block_number < window_start(N)
+       + inactivity filter at window_start reference
+  4. If target_window == physical_window and target not evaluated:
+       evaluate all active miners in snapshot (no hard deadline)
+  5. Once evaluation is complete:
+       submit full payload immediately (phase-decoupled from T_publish)
+  6. At each physical aggregation phase:
+       check quorum = submitted_stake(target_window, effective_spec) / total_validator_stake
+       if quorum > quorum_threshold (default 0.5):
+         aggregate and update winner, then jump target_window to physical_window
+       else:
+         keep target_window anchored and retry next aggregation phase
+  7. Every tempo:
+       always call set_weights; burn weights while waiting for quorum
 ```
+
+### Deterministic Active-Set Snapshot
+
+Each target window persists a frozen miner set as `active_set_window_{N}.json`:
+
+```
+active_set_window_N = { commitment | commitment.block_number < window_start(N) }
+```
+
+This makes evaluation inputs restart-safe and cross-validator consistent (within accepted polling-granularity overwrite races). Runtime-only filters such as validator permit and blacklist are still applied live, outside snapshot materialization.
 
 ### Evaluation Rate-Limiting
 
@@ -423,9 +412,18 @@ latest_consensus persists across epochs and restarts:
   If no consensus ever computed:         set_fallback_weights()
 ```
 
-**Timing rationale**: The 80/10/10 window split gives validators ~19.2 hours for evaluation (sufficient for multi-hour runs across many miners), ~2.4 hours for propagation (submission + wait, ample for IPFS propagation and on-chain commitment finality), and ~2.4 hours for aggregation before the next epoch starts.
+**Timing rationale**: The 80/10/10 split remains useful as a phase rhythm for evaluation, dissemination, and aggregation checkpoints. `T_publish` is no longer a hard submit deadline.
 
-**Partial submission**: If a validator has not finished evaluating all miners by T_publish, it submits results for the miners it has completed. The consensus aggregation handles partial coverage — a miner's consensus score is computed from whichever validators have data for that miner.
+**Submission rule**: Validators submit only after full target-window evaluation is complete (no partial payload at `T_publish`).
+
+**Quorum gate rule**: Aggregation is phase-aligned but stake-gated:
+
+```
+quorum_ratio = submitted_stake(target_window, effective_spec) / total_validator_stake
+aggregate iff quorum_ratio > quorum_threshold  # default 0.5
+```
+
+If quorum is not met, validators keep `target_window` unchanged, retry next physical aggregation phase, and set burn weights while waiting. Once quorum succeeds, `target_window` jumps to current `physical_window`.
 
 ### Payload Externalization + On-Chain Pointer Registration
 
@@ -452,7 +450,7 @@ Before aggregation, each validator filters incoming submissions:
 | 2 | Epoch number | Wrong epoch |
 | 3 | Stake threshold | Below minimum stake |
 | 4 | Data integrity | CAS hash mismatch |
-| 5 | Scoring version | Incompatible evaluation version |
+| 5 | spec_number target | Payload spec_number mismatches chain-derived target spec |
 | 6 | Zero-signal | All-zero scores when others report non-zero |
 
 Valid submissions → stake-weighted aggregation.
@@ -525,8 +523,9 @@ If winner exists and is not disqualified:
 | **CAS upload failure** | Validator skips submission for this epoch; continues using previous epoch's consensus for weight setting. Logged as degraded state. |
 | **CAS download failure** (aggregation) | Skip that validator's submission; aggregate from the remaining valid subset. Log failure statistics. |
 | **Zero valid submissions** | Previous epoch's consensus is retained for weight setting. If no consensus has ever been computed, fallback weights are set. |
-| **Late evaluator** (missed T_publish) | Do not submit this epoch. Still read other validators' consensus at T_aggregate and adopt their result for own weight setting. Allows low-stake validators to "free-ride" on high-stake evaluators. |
-| **Mid-epoch restart** | Compute elapsed epoch fraction. If > skip threshold (default 30%), skip to next epoch boundary. Otherwise resume evaluation. Consensus is loaded from persisted state. |
+| **Slow evaluator** | Continue evaluating without hard deadline and submit only after full target-window coverage. |
+| **Aggregation quorum miss** | Keep `target_window` anchored, retry at each future physical aggregation phase, and burn weights while waiting. |
+| **Mid-window restart** | Reload `active_set_window_{N}.json` and continue the same frozen target set. |
 
 ### Cross-Validator: YC3 On-Chain Consensus
 
@@ -614,13 +613,15 @@ Bootstrap:     top-3 qualified get 70/20/10
 | δ (score_delta) | 0.10 (10%) — Winner Protection threshold | Yes |
 | disqualify_stake_threshold | 0.50 (>50% stake majority to disqualify) | Yes |
 | eval_interval | 7200 blocks (~24h at 12s/block) | Yes |
-| T_publish (propagation window start) | 80% of epoch (block 5760) | Yes |
+| T_publish (propagation window start) | 80% of epoch (block 5760) | Yes (phase boundary only; no hard submit deadline) |
 | T_aggregate (aggregation window start) | 90% of epoch (block 6480) | Yes |
+| quorum_threshold | 0.50 (aggregate only when submitted stake share > threshold) | Yes |
 | min_validator_stake | minimum stake for consensus participation | Yes |
-| epoch_skip_threshold | 0.30 (30% of epoch elapsed) | Yes |
+| `target_window` catch-up policy | On success, jump directly to current `physical_window` | No (protocol behavior) |
 | Bootstrap threshold | 10 active miners | Yes |
 | `pack_first_seen` eviction | by-active with grace (drop entries inactive for `EVICTION_GRACE_WINDOWS` consecutive windows) | No |
 | `EVICTION_GRACE_WINDOWS` | 7 windows (~7 days; clock resets on any active reference) | No (validator-side constant) |
+| active-set snapshot persistence | `active_set_window_{N}.json` | Yes (`ACTIVE_SET_DIR`) |
 | inactivity_blocks | 14400 (~48h) | Yes |
 | yuma_version | 3 | Subnet owner (on-chain) |
 | liquid_alpha_enabled | True | Subnet owner (on-chain) |
@@ -632,6 +633,7 @@ Bootstrap:     top-3 qualified get 70/20/10
 
 | Version | Date | Summary |
 |---------|------|---------|
+| v5.2 | 2026-04-26 | Added deterministic window-start active-set snapshots (`active_set_window_{N}.json`) for restart-safe, cross-validator-stable evaluation sets. Replaced hard `T_publish` cutoff with submit-when-fully-done, introduced stake-quorum-gated aggregation (`quorum_threshold`), dual-window semantics (`physical_window` vs `target_window`), burn-while-waiting on quorum miss, and jump-to-current catch-up after delayed aggregation succeeds. |
 | v5.1 | 2026-04-24 | Replaced on-chain `block_number`-based first-mover priority + pairwise NCD pre-eval gate with a per-validator `pack_first_seen` ownership lock (no succession; by-active eviction with `EVICTION_GRACE_WINDOWS = 7` wall-clock-window grace period that resets on any active reference). Lock state persists to its own `pack_first_seen.json` (separate from `eval_state.json`) alongside the `pack_last_seen_window` tracker that drives grace eviction. Paraphrase defense delegated to Winner Protection's δ threshold. NCD library kept for tooling, no longer gates evaluation. |
 | v5.0 | 2026-04-21 | Refactored into season-agnostic core. Extracted scoring, pack schema, and evaluation details to EVALUATION_S1.md. Abstracted "cost" to "score" (direction defined per season). |
 | v4.2 | 2026-03-29 | Simplified winner selection: removed EMA, unified Winner Protection (δ=10%), stake-weighted majority qualification. |
@@ -653,6 +655,6 @@ Bootstrap:     top-3 qualified get 70/20/10
 
 ---
 
-**Version**: v5.1
+**Version**: v5.2
 
-**Date**: 2026-04-24
+**Date**: 2026-04-26

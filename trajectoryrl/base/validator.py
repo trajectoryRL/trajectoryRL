@@ -252,6 +252,14 @@ class TrajectoryValidator:
         # Which window's aggregation has completed (persisted in eval state).
         # Guards one-shot aggregation per window — survives restarts.
         self._consensus_window: int = -1
+        # Logical consensus anchor (Issue 1): the only window allowed to
+        # progress eval/submit/aggregation state. Decoupled from physical
+        # window derived from current block.
+        self._target_window: int = -1
+        # Submit idempotency marker for the target window.
+        self._target_submit_done: bool = False
+        # Sticky marker: quorum not yet met for current target window.
+        self._waiting_for_quorum: bool = False
 
         # Cycle log state — uploaded after each window phase completes
         self._cycle_eval_id: Optional[str] = None
@@ -433,6 +441,11 @@ class TrajectoryValidator:
             self._migrate_legacy_pack_first_seen(data)
 
             self._consensus_window = data.get("consensus_window", -1)
+            self._target_window = int(
+                data.get("target_window", self._consensus_window + 1)
+            )
+            self._target_submit_done = bool(data.get("target_submit_done", False))
+            self._waiting_for_quorum = bool(data.get("waiting_for_quorum", False))
 
             integrity_cache = data.get("integrity_cache")
             if integrity_cache:
@@ -505,6 +518,9 @@ class TrajectoryValidator:
             "last_eval_window": self._last_eval_window,
             "last_eval_window_per_hotkey": self.last_eval_window,
             "consensus_window": self._consensus_window,
+            "target_window": self._target_window,
+            "target_submit_done": self._target_submit_done,
+            "waiting_for_quorum": self._waiting_for_quorum,
             "integrity_cache": self.integrity_judge.dump_cache(),
         }
         try:
@@ -1144,15 +1160,128 @@ class TrajectoryValidator:
                 window.window_number,
             )
 
-    def _should_start_evaluation(self, current_block: int) -> bool:
-        """Return True if a new evaluation cycle should start.
+    def _ensure_target_window(self, physical_window: EvaluationWindow) -> int:
+        """Initialize target window from persisted state or physical window."""
+        if self._target_window < 0:
+            self._target_window = max(self._consensus_window + 1, 0)
+            if self._target_window < physical_window.window_number:
+                self._target_window = physical_window.window_number
+            self._target_submit_done = False
+            self._save_eval_state()
+        return self._target_window
 
-        Block-based: fires once per window during the evaluation phase.
-        """
-        window = compute_window(current_block, self._window_config)
-        if window.phase != WindowPhase.EVALUATION:
+    def _should_start_target_evaluation(
+        self,
+        physical_window: EvaluationWindow,
+        target_window: int,
+    ) -> bool:
+        """Return True if target window evaluation should start now."""
+        if target_window != physical_window.window_number:
             return False
-        return window.window_number > self._last_eval_window
+        return target_window > self._last_eval_window
+
+    def _make_window_view(
+        self,
+        physical_window: EvaluationWindow,
+        window_number: int,
+    ) -> EvaluationWindow:
+        """Build an EvaluationWindow view for a logical target window."""
+        window_start = (
+            self._window_config.global_anchor
+            + window_number * self._window_config.window_length
+        )
+        return EvaluationWindow(
+            window_number=window_number,
+            window_start=window_start,
+            block_offset=physical_window.block_offset,
+            phase=physical_window.phase,
+            blocks_into_phase=physical_window.blocks_into_phase,
+            blocks_remaining_in_phase=physical_window.blocks_remaining_in_phase,
+            publish_offset=self._window_config.publish_block,
+            aggregate_offset=self._window_config.aggregate_block,
+        )
+
+    def _compute_quorum_status(
+        self, target_window: int
+    ) -> Tuple[bool, float, float, float]:
+        """Return quorum verdict and stake metrics for target window."""
+        chain_commitments = fetch_validator_consensus_commitments(
+            self.subtensor, self.config.netuid, self.metagraph,
+        )
+        # Total validator stake in subnet (permit + positive stake).
+        total_validator_stake = 0.0
+        for uid in range(len(self.metagraph.hotkeys)):
+            permitted = (
+                uid < len(self.metagraph.validator_permit)
+                and self.metagraph.validator_permit[uid]
+            )
+            if not permitted:
+                continue
+            stake = float(self.metagraph.stake[uid])
+            if stake > 0:
+                total_validator_stake += stake
+
+        if total_validator_stake <= 0:
+            return False, 0.0, 0.0, 0.0
+
+        hk_to_stake: Dict[str, float] = {}
+        for uid in range(len(self.metagraph.hotkeys)):
+            hotkey = self.metagraph.hotkeys[uid]
+            stake = float(self.metagraph.stake[uid])
+            permitted = (
+                uid < len(self.metagraph.validator_permit)
+                and self.metagraph.validator_permit[uid]
+            )
+            if permitted and stake > 0:
+                hk_to_stake[hotkey] = stake
+
+        target_commitments: List[ValidatorConsensusCommitment] = []
+        for vc in chain_commitments:
+            if vc.window_number == target_window:
+                target_commitments.append(vc)
+
+        stake_by_spec: Dict[int, float] = {}
+        seen_for_spec: set = set()
+        for vc in target_commitments:
+            if vc.validator_hotkey in seen_for_spec:
+                continue
+            stake = hk_to_stake.get(vc.validator_hotkey, 0.0)
+            if stake <= 0:
+                continue
+            seen_for_spec.add(vc.validator_hotkey)
+            stake_by_spec[vc.spec_number] = stake_by_spec.get(vc.spec_number, 0.0) + stake
+
+        effective_spec = _spec_number()
+        spec_total_stake = sum(stake_by_spec.values())
+        if spec_total_stake > 0 and stake_by_spec:
+            dominant_spec = max(stake_by_spec, key=lambda s: stake_by_spec[s])
+            dominant_share = stake_by_spec[dominant_spec] / spec_total_stake
+            if dominant_share > 0.5:
+                effective_spec = dominant_spec
+
+        submitted_stake = 0.0
+        seen_hotkeys = set()
+        for vc in target_commitments:
+            if vc.spec_number != effective_spec:
+                continue
+            if vc.validator_hotkey in seen_hotkeys:
+                continue
+            stake = hk_to_stake.get(vc.validator_hotkey, 0.0)
+            if stake <= 0:
+                continue
+            seen_hotkeys.add(vc.validator_hotkey)
+            submitted_stake += stake
+
+        ratio = submitted_stake / total_validator_stake
+        meets = ratio > float(getattr(self.config, "quorum_threshold", 0.5))
+        return meets, ratio, submitted_stake, total_validator_stake
+
+    async def _set_burn_weights(self, reason: str) -> None:
+        """Always set burn weights (no copy-owner fallback)."""
+        uids, weights = self._fallback_to_owner()
+        await self._do_set_weights(
+            uids, weights, label=f"[burn: {reason}] ",
+        )
 
     async def run(self):
         """Main validator loop with block-based window phases.
@@ -1241,21 +1370,46 @@ class TrajectoryValidator:
                     await asyncio.sleep(300)
                     continue
 
-                # --- Window phase: evaluation ---
-                if self._should_start_evaluation(current_block):
+                target_window = self._ensure_target_window(window)
+                if target_window > window.window_number:
+                    logger.warning(
+                        "Target window %d is ahead of physical window %d; "
+                        "clamping to physical window",
+                        target_window, window.window_number,
+                    )
+                    self._target_window = window.window_number
+                    self._target_submit_done = self._check_own_commitment_on_chain(
+                        self._target_window
+                    )
+                    self._save_eval_state()
+                    target_window = self._target_window
+
+                if target_window <= self._consensus_window:
+                    self._target_window = self._consensus_window + 1
+                    self._target_submit_done = self._check_own_commitment_on_chain(
+                        self._target_window
+                    )
+                    self._save_eval_state()
+                    target_window = self._target_window
+
+                target_window_view = self._make_window_view(window, target_window)
+
+                # --- Target window: evaluation ---
+                if self._should_start_target_evaluation(window, target_window):
                     logger.info("=" * 60)
                     logger.info(
-                        f"Evaluation window {window.window_number} at block "
+                        f"Evaluation target_window={target_window} at block "
                         f"{current_block} (phase={window.phase.value}, "
                         f"offset={window.block_offset}/{self._window_config.window_length})"
                     )
                     logger.info("=" * 60)
 
-                    await self._run_evaluation_cycle(current_block, window.window_number)
+                    await self._run_evaluation_cycle(current_block, target_window)
                     self._last_eval_at = int(time.time())
-                    self._last_eval_window = window.window_number
+                    self._last_eval_window = target_window
                     self._last_eval_date = datetime.datetime.utcnow().date()
                     self.last_weight_block = self.subtensor.get_current_block()
+                    self._target_submit_done = False
 
                     self.pack_fetcher.cleanup_cache(
                         self.config.pack_cache_max_size
@@ -1272,54 +1426,105 @@ class TrajectoryValidator:
                             )
                         )
 
-                # --- Propagation window: submit results (idempotent — checks on-chain) ---
-                if (window.phase == WindowPhase.PROPAGATION
-                        and not self._check_own_commitment_on_chain(window.window_number)):
+                # --- Submit when target eval is fully done (phase-decoupled) ---
+                if (
+                    self._last_eval_window >= target_window
+                    and not self._target_submit_done
+                ):
+                    if self._check_own_commitment_on_chain(target_window):
+                        self._target_submit_done = True
+                        self._save_eval_state()
+                    else:
+                        logger.info(
+                            "Target window %d: eval complete, submitting payload at block %d",
+                            target_window, current_block,
+                        )
+                        ok = await self._submit_consensus_payload(target_window_view)
+                        if ok:
+                            self._target_submit_done = True
+                            self._save_eval_state()
+                        else:
+                            logger.warning(
+                                "Target window %d: submission attempt failed; "
+                                "will retry next loop iteration",
+                                target_window,
+                            )
+
+                        if self._cycle_eval_id is not None:
+                            asyncio.ensure_future(
+                                self._fire_upload_cycle_logs(
+                                    self._cycle_eval_id,
+                                    self._cycle_log_offset,
+                                    self._cycle_log_block,
+                                    self._cycle_window_number,
+                                )
+                            )
+
+                # --- Aggregation phase: quorum gate on target window ---
+                if (
+                    window.phase == WindowPhase.AGGREGATION
+                    and self._consensus_window < target_window
+                ):
                     logger.info(
-                        "Window %d: submitting evaluation results at block %d",
-                        window.window_number, current_block,
+                        "Physical window %d in aggregation; checking quorum for target window %d",
+                        window.window_number, target_window,
                     )
-                    ok = await self._submit_consensus_payload(window)
-                    if not ok:
+                    meets, ratio, submitted_stake, total_stake = self._compute_quorum_status(
+                        target_window
+                    )
+
+                    if not meets:
+                        self._waiting_for_quorum = True
                         logger.warning(
-                            "Window %d: submission attempt failed, "
-                            "will retry next loop iteration",
-                            window.window_number,
+                            "Target window %d quorum miss: submitted_stake=%.4f total_validator_stake=%.4f "
+                            "ratio=%.4f threshold=%.4f — setting burn weights",
+                            target_window,
+                            submitted_stake,
+                            total_stake,
+                            ratio,
+                            float(getattr(self.config, "quorum_threshold", 0.5)),
                         )
-
-                    if self._cycle_eval_id is not None:
-                        asyncio.ensure_future(
-                            self._fire_upload_cycle_logs(
-                                self._cycle_eval_id,
-                                self._cycle_log_offset,
-                                self._cycle_log_block,
-                                self._cycle_window_number,
+                        await self._set_burn_weights(
+                            reason=(
+                                f"quorum-miss target={target_window} "
+                                f"ratio={ratio:.4f}"
                             )
                         )
-
-                # --- Window phase: aggregation (idempotent — checks _consensus_window) ---
-                if (window.phase == WindowPhase.AGGREGATION
-                        and self._consensus_window != window.window_number):
-                    logger.info(
-                        f"Window {window.window_number}: T_aggregate reached "
-                        f"at block {current_block}, running consensus aggregation"
-                    )
-                    await self._run_consensus_aggregation(window)
-
-                    if self._consensus_window == window.window_number:
-                        await self._set_winner_weights()
                         self.last_weight_block = current_block
-
-                    if self._cycle_eval_id is not None:
-                        asyncio.ensure_future(
-                            self._fire_upload_cycle_logs(
-                                self._cycle_eval_id,
-                                self._cycle_log_offset,
-                                self._cycle_log_block,
-                                self._cycle_window_number,
-                            )
+                        self._save_eval_state()
+                    else:
+                        logger.info(
+                            "Target window %d quorum met: submitted_stake=%.4f total_validator_stake=%.4f "
+                            "ratio=%.4f — running consensus aggregation",
+                            target_window, submitted_stake, total_stake, ratio,
                         )
-                        self._cycle_eval_id = None
+                        await self._run_consensus_aggregation(target_window_view)
+
+                        if self._consensus_window == target_window:
+                            await self._set_winner_weights()
+                            self.last_weight_block = current_block
+                            self._waiting_for_quorum = False
+                            self._target_window = window.window_number
+                            self._target_submit_done = self._check_own_commitment_on_chain(
+                                self._target_window
+                            )
+                            self._save_eval_state()
+                        else:
+                            logger.warning(
+                                "Target window %d aggregation did not produce consensus result",
+                                target_window,
+                            )
+
+                        if self._cycle_eval_id is not None:
+                            asyncio.ensure_future(
+                                self._fire_upload_cycle_logs(
+                                    self._cycle_eval_id,
+                                    self._cycle_log_offset,
+                                    self._cycle_log_block,
+                                    self._cycle_window_number,
+                                )
+                            )
+                            self._cycle_eval_id = None
 
                 # --- Tempo cadence: re-assert winner weights ---
                 current_block = self.subtensor.get_current_block()
@@ -1330,7 +1535,14 @@ class TrajectoryValidator:
                         f"({blocks_since_weights} blocks since last, "
                         f"window={window.window_number} phase={window.phase.value})"
                     )
-                    await self._set_winner_weights()
+                    if self._waiting_for_quorum and self._consensus_window < self._target_window:
+                        await self._set_burn_weights(
+                            reason=(
+                                f"tempo-refresh waiting target={self._target_window}"
+                            )
+                        )
+                    else:
+                        await self._set_winner_weights()
                     self.last_weight_block = current_block
 
                 await asyncio.sleep(300)

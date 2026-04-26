@@ -104,6 +104,7 @@ class ValidatorConfig:
     )
     consensus_api_url: str = "https://trajrl.com"
     min_validator_stake: float = 10000.0  # minimum stake weight (α) for consensus participation
+    quorum_threshold: float = 0.5  # aggregate only when submitted stake share > threshold
 
     # Fraction of zero scores above which a submission is treated as a
     # free-rider / near-zero-signal payload and dropped from consensus.
@@ -260,6 +261,7 @@ class ValidatorConfig:
                 if gw.strip()
             ],
             consensus_api_url=os.getenv("CONSENSUS_API_URL", "https://trajrl.com"),
+            quorum_threshold=float(os.getenv("QUORUM_THRESHOLD", "0.5")),
             # --- trajrl-bench ---
             # IMAGE_CHANNEL is the only env-driven knob: it selects the tag
             # for both sandbox and harness images. Programmatic callers can
