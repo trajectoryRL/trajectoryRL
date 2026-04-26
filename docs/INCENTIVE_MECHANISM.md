@@ -352,7 +352,7 @@ Each season defines additional anti-gaming measures specific to its evaluation m
 
 Evaluation outputs vary between runs even with identical inputs. Two independent validators evaluating the same pack may see different results and thus different scores. Without mitigation, validators disagree on scores and winner selection, causing the winner to oscillate between epochs.
 
-### Solution: Two-Phase Evaluation Consensus + YC3
+### Solution: Two-Phase Evaluation Consensus + Yuma
 
 Variance is managed at two layers:
 
@@ -362,7 +362,7 @@ Layer 1 (cross-validator):    Two-phase off-chain consensus protocol
                                 stake-weighted consensus scores before setting weights
                               → disqualification uses stake-weighted majority (>50% stake)
 
-Layer 2 (on-chain):           YC3 with Liquid Alpha
+Layer 2 (on-chain):           Yuma Consensus
                               → aggregates weight vectors on-chain
                               → handles residual disagreement after off-chain consensus
 ```
@@ -527,14 +527,14 @@ If winner exists and is not disqualified:
 | **Aggregation quorum miss** | Keep `target_window` anchored, retry at each future physical aggregation phase, and burn weights while waiting. |
 | **Mid-window restart** | Reload `active_set_window_{N}.json` and continue the same frozen target set. |
 
-### Cross-Validator: YC3 On-Chain Consensus
+### Cross-Validator: Yuma On-Chain Consensus
 
-After off-chain consensus, each validator sets weights based on consensus scores. **Bittensor YC3 with Liquid Alpha** aggregates these weight vectors on-chain. Because validators converge on scores before setting weights, YC3 sees minimal disagreement.
+After off-chain consensus, each validator sets weights based on consensus scores. **Bittensor Yuma Consensus** aggregates these weight vectors on-chain. Because validators converge on scores before setting weights, the on-chain layer sees minimal disagreement.
 
 ### Validator Incentives
 
 - Validators must set weights every tempo (otherwise deregistered by chain)
-- Validators who submit evaluation results to off-chain consensus produce more accurate weights → stronger YC3 bonds → more rewards
+- Validators who submit evaluation results to off-chain consensus produce more accurate weights → stronger on-chain bonds → more rewards
 - Free-riding validators (no evaluations) are filtered by zero-signal exclusion
 
 ---
@@ -574,9 +574,9 @@ winner = select_winner_with_protection(eligible_scores, winner_state, delta)
 
 weight[uid] = f(eligible_scores, winner)
 
-# ── Cross-validator (YC3 on-chain) ──
+# ── Cross-validator (Yuma on-chain) ──
 
-on_chain_weight = YC3(validator_weights, validator_stakes, bond_history)
+on_chain_weight = yuma(validator_weights, validator_stakes, bond_history)
 ```
 
 ### Weights
@@ -623,8 +623,7 @@ Bootstrap:     top-3 qualified get 70/20/10
 | `EVICTION_GRACE_WINDOWS` | 7 windows (~7 days; clock resets on any active reference) | No (validator-side constant) |
 | active-set snapshot persistence | `active_set_window_{N}.json` | Yes (`ACTIVE_SET_DIR`) |
 | inactivity_blocks | 14400 (~48h) | Yes |
-| yuma_version | 3 | Subnet owner (on-chain) |
-| liquid_alpha_enabled | True | Subnet owner (on-chain) |
+| yuma_version | 2 | Subnet owner (on-chain). Aligns SN11 with the network norm (24+ subnets on Yuma 2 vs. 2 on Yuma 3 as of 2026-04). Yuma 2 has no bond EMA smoothing, so dividend distribution responds faster to score changes — preferred for early-season subnets where the leaderboard is still settling. |
 | commit_reveal_period | 1 tempo | Subnet owner (on-chain) |
 
 ---
@@ -646,8 +645,7 @@ Bootstrap:     top-3 qualified get 70/20/10
 
 - **Bittensor Docs**: https://docs.bittensor.com
 - **Dynamic TAO**: https://docs.bittensor.com/dtao
-- **Yuma Consensus 3**: https://docs.learnbittensor.org/learn/yc3-blog
-- **YC3 Migration Guide**: https://docs.learnbittensor.org/learn/yuma3-migration-guide
+- **Yuma Consensus**: https://docs.learnbittensor.org/learn/yuma-consensus
 - **Current Season Scoring**: [EVALUATION_S1.md](EVALUATION_S1.md) - pack schema, evaluation method, scoring details
 - **Miner Guide**: [MINER_OPERATIONS.md](MINER_OPERATIONS.md) - reference miner, local testing, submission workflow
 - **Validator Guide**: [VALIDATOR_OPERATIONS.md](VALIDATOR_OPERATIONS.md) - cost projections, model alternatives, sustainability
