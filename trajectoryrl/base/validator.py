@@ -1392,6 +1392,31 @@ class TrajectoryValidator:
                     self._save_eval_state()
                     target_window = self._target_window
 
+                # Clear stale waiting flag when target_window's aggregation
+                # phase hasn't started yet on the chain timeline. A freshly
+                # bumped target (or a stale latched flag carried over from a
+                # previous run / spec bump) cannot legitimately be "waiting
+                # for quorum" before the round it points at has even reached
+                # its aggregation block. Without this reset, the main-loop
+                # tempo refresh's burn branch fires through the upcoming
+                # eval phase even though aggregation isn't due yet.
+                target_agg_start_block = (
+                    self._window_config.global_anchor
+                    + target_window * self._window_config.window_length
+                    + self._window_config.aggregate_block
+                )
+                if (
+                    current_block < target_agg_start_block
+                    and self._waiting_for_quorum
+                ):
+                    logger.info(
+                        "Clearing _waiting_for_quorum: target_window=%d "
+                        "aggregation starts at block %d, current_block=%d",
+                        target_window, target_agg_start_block, current_block,
+                    )
+                    self._waiting_for_quorum = False
+                    self._save_eval_state()
+
                 target_window_view = self._make_window_view(window, target_window)
 
                 # --- Target window: evaluation ---

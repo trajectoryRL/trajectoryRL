@@ -3167,3 +3167,34 @@ class TestIssue1EpochSkipSemantics:
         v._compute_quorum_status.assert_not_called()
         assert v._set_burn_weights.await_count == 0
         assert v._waiting_for_quorum is False
+
+    def test_waiting_for_quorum_cleared_when_target_agg_in_future(self):
+        # A validator that boots with _waiting_for_quorum=True latched in
+        # persisted state (e.g. from a pre-fix run, or from an earlier
+        # iteration that spuriously latched) must clear the flag once the
+        # loop notices target_window's aggregation phase hasn't started
+        # yet on the chain timeline. Otherwise the tempo refresh keeps
+        # burning through eval phases even though there is no real quorum
+        # question to be waiting on.
+        v = self._make_validator()
+        aligned = 7986780 + ((100 - (7986780 % 100)) % 100)
+        # Place current_block in target's evaluation phase (well before
+        # target's aggregation start at offset 90).
+        current_block = aligned + 3 * 100 + 5
+        v.subtensor.get_current_block.side_effect = [current_block, current_block]
+        v._target_window = current_block // 100   # target == physical
+        v._last_eval_window = v._target_window
+        v._target_submit_done = False
+        v._consensus_window = v._target_window - 1
+        v._waiting_for_quorum = True   # ← stale latched flag
+
+        def _close_task(coro):
+            coro.close()
+            return MagicMock()
+
+        with patch("trajectoryrl.base.validator.asyncio.create_task", side_effect=_close_task), \
+             patch("trajectoryrl.base.validator.asyncio.sleep", AsyncMock(side_effect=KeyboardInterrupt())):
+            asyncio.run(v.run())
+
+        assert v._waiting_for_quorum is False
+        assert v._set_burn_weights.await_count == 0
