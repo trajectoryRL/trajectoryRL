@@ -5,7 +5,7 @@ Runs the TrajectoryValidator with continuous evaluation loop:
   - Daily eval at UTC eval_utc_hour: evaluate all active packs, score with split-half delta
   - tempo (~72 min): compute weights from eval scores, set_weights on-chain
 
-Each validator operates independently. YC3 aggregates weights on-chain.
+Each validator operates independently. Yuma Consensus aggregates weights on-chain.
 
 Environment variables:
     WALLET_NAME             Bittensor wallet name         (default: validator)

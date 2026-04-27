@@ -11,7 +11,7 @@ Architecture (Season 1 — trajrl-bench):
     6. Compute split-half delta scoring (quality-based)
     7. Set on-chain weights (winner-take-all / bootstrap)
 
-Each validator operates independently — YC3 aggregates on-chain.
+Each validator operates independently — Yuma Consensus aggregates on-chain.
 """
 
 import asyncio

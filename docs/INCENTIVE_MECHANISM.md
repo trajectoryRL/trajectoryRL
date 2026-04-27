@@ -623,7 +623,7 @@ Bootstrap:     top-3 qualified get 70/20/10
 | `EVICTION_GRACE_WINDOWS` | 7 windows (~7 days; clock resets on any active reference) | No (validator-side constant) |
 | active-set snapshot persistence | `active_set_window_{N}.json` | Yes (`ACTIVE_SET_DIR`) |
 | inactivity_blocks | 14400 (~48h) | Yes |
-| yuma_version | 2 | Subnet owner (on-chain). Aligns SN11 with the network norm (24+ subnets on Yuma 2 vs. 2 on Yuma 3 as of 2026-04). Yuma 2 has no bond EMA smoothing, so dividend distribution responds faster to score changes — preferred for early-season subnets where the leaderboard is still settling. |
+| yuma_version | 2 | Subnet owner (on-chain). Flipped from Yuma 3 → Yuma 2 on 2026-04-27 (extrinsic [8058826-21](https://tao.app/extrinsic/8058826-21)) to align SN11 with the network norm (24+ subnets on Yuma 2 vs. 2 on Yuma 3 as of 2026-04). Yuma 2 has no bond EMA smoothing, so dividend distribution responds faster to score changes — preferred for early-season subnets where the leaderboard is still settling. The chain hyperparameter `yuma3_enabled` is the actual on-chain field; `btcli sudo set --param yuma_version` exposes it as a Yuma 3 enable/disable toggle. |
 | commit_reveal_period | 1 tempo | Subnet owner (on-chain) |
 
 ---
