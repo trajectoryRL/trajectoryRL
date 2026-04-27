@@ -447,6 +447,23 @@ class TrajectoryValidator:
             self._target_submit_done = bool(data.get("target_submit_done", False))
             self._waiting_for_quorum = bool(data.get("waiting_for_quorum", False))
 
+            # Heal legacy false-positive from pre-PR197 validator binaries:
+            # the old aggregation-phase gate could latch _waiting_for_quorum
+            # on a freshly-bumped target where the validator had not yet
+            # submitted. That combination is unreachable after the fix, so
+            # treat it as a corrupt carryover and clear it — otherwise the
+            # main-loop tempo refresh would keep burning until the next
+            # quorum success flips the flag back.
+            if self._waiting_for_quorum and not self._target_submit_done:
+                logger.warning(
+                    "Eval state heal: clearing waiting_for_quorum on "
+                    "target_window=%d with target_submit_done=False "
+                    "(legacy pre-PR197 false-positive)",
+                    self._target_window,
+                )
+                self._waiting_for_quorum = False
+                self._save_eval_state()
+
             integrity_cache = data.get("integrity_cache")
             if integrity_cache:
                 self.integrity_judge.load_cache(integrity_cache)

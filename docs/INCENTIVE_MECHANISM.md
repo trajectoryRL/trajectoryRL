@@ -193,12 +193,16 @@ while running:
        evaluate all active miners in snapshot (no hard deadline)
   5. Once evaluation is complete:
        submit full payload immediately (phase-decoupled from T_publish)
-  6. At each physical aggregation phase:
+  6. At each physical aggregation phase, once own target_window commitment is on-chain:
        check quorum = submitted_stake(target_window, effective_spec) / total_validator_stake
        if quorum > quorum_threshold (default 0.5):
          aggregate and update winner, then jump target_window to physical_window
        else:
          keep target_window anchored and retry next aggregation phase
+     (If the validator has not yet submitted for target_window, the quorum
+      check is skipped — a freshly-bumped target where only a tiny fraction
+      of validators have submitted would otherwise trivially miss and latch
+      the burn-while-waiting state.)
   7. Every tempo:
        always call set_weights; burn weights while waiting for quorum
 ```
