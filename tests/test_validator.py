@@ -1117,6 +1117,74 @@ class TestPerScenarioEvalState:
             v.config.eval_state_path.unlink(missing_ok=True)
             v.config.pack_first_seen_path.unlink(missing_ok=True)
 
+    def test_load_heals_legacy_waiting_for_quorum_false_positive(self):
+        """Pre-PR197 binaries could persist waiting_for_quorum=True with
+        target_submit_done=False. Loading such a file must clear the flag
+        so the main loop does not keep burning on a phantom quorum wait.
+        """
+        v = self._make_validator()
+        v._waiting_for_quorum = True
+        v._target_submit_done = False
+        v._target_window = 42
+        v._consensus_window = 41
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            v.config.eval_state_path = Path(f.name)
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            v.config.pack_first_seen_path = Path(f.name)
+
+        try:
+            v._save_eval_state()
+
+            poisoned = json.loads(v.config.eval_state_path.read_text())
+            assert poisoned["waiting_for_quorum"] is True
+            assert poisoned["target_submit_done"] is False
+
+            v2 = self._make_validator()
+            v2.config.eval_state_path = v.config.eval_state_path
+            v2.config.pack_first_seen_path = v.config.pack_first_seen_path
+            v2._load_eval_state()
+
+            assert v2._waiting_for_quorum is False
+            assert v2._target_submit_done is False
+            assert v2._target_window == 42
+            assert v2._consensus_window == 41
+
+            healed = json.loads(v2.config.eval_state_path.read_text())
+            assert healed["waiting_for_quorum"] is False
+        finally:
+            v.config.eval_state_path.unlink(missing_ok=True)
+            v.config.pack_first_seen_path.unlink(missing_ok=True)
+
+    def test_load_preserves_legitimate_waiting_for_quorum(self):
+        """Waiting_for_quorum=True with target_submit_done=True is a real
+        post-submission wait and must NOT be cleared by the legacy heal.
+        """
+        v = self._make_validator()
+        v._waiting_for_quorum = True
+        v._target_submit_done = True
+        v._target_window = 42
+        v._consensus_window = 41
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            v.config.eval_state_path = Path(f.name)
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            v.config.pack_first_seen_path = Path(f.name)
+
+        try:
+            v._save_eval_state()
+
+            v2 = self._make_validator()
+            v2.config.eval_state_path = v.config.eval_state_path
+            v2.config.pack_first_seen_path = v.config.pack_first_seen_path
+            v2._load_eval_state()
+
+            assert v2._waiting_for_quorum is True
+            assert v2._target_submit_done is True
+        finally:
+            v.config.eval_state_path.unlink(missing_ok=True)
+            v.config.pack_first_seen_path.unlink(missing_ok=True)
+
     def test_pack_first_seen_persistence_roundtrip(self):
         """pack_first_seen + pack_last_seen_window are persisted together."""
         v = self._make_validator()
