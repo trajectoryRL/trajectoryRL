@@ -1461,9 +1461,16 @@ class TrajectoryValidator:
                             )
 
                 # --- Aggregation phase: quorum gate on target window ---
+                # Only assess quorum on a target this validator has actually
+                # submitted for. A freshly-bumped target (e.g. consensus+1
+                # right after a successful aggregation) has no own commitment
+                # yet; checking quorum on it would trivially miss and latch
+                # _waiting_for_quorum=True, poisoning the upcoming eval phase
+                # via the main-loop tempo refresh's burn branch.
                 if (
                     window.phase == WindowPhase.AGGREGATION
                     and self._consensus_window < target_window
+                    and self._target_submit_done
                 ):
                     logger.info(
                         "Physical window %d in aggregation; checking quorum for target window %d",
