@@ -3134,3 +3134,36 @@ class TestIssue1EpochSkipSemantics:
         assert v._run_consensus_aggregation.await_count == 1
         assert v._target_window == (block // 100)
         assert v._waiting_for_quorum is False
+
+    def test_quorum_gate_skipped_when_target_not_yet_submitted(self):
+        # After a successful aggregation in window N's agg phase, target
+        # bumps to N+1 on the next iteration but the validator hasn't
+        # evaluated/submitted for N+1 yet. The agg gate must NOT fire on
+        # that freshly-bumped target — otherwise it trivially misses
+        # quorum (zero / tiny stake at N+1) and latches
+        # _waiting_for_quorum=True, which then poisons the next eval phase
+        # via the main-loop tempo refresh's burn branch.
+        v = self._make_validator()
+        aligned = 7986780 + ((100 - (7986780 % 100)) % 100)
+        block = aligned + 3 * 100 + 95  # physical window +3, aggregation phase
+        v.subtensor.get_current_block.side_effect = [block, block]
+        v._target_window = (block // 100) + 1   # bumped past physical
+        v._last_eval_window = block // 100      # evaluated only the prior window
+        v._consensus_window = block // 100      # just succeeded on the prior window
+        v._target_submit_done = False           # ← key: not submitted for the new target
+
+        v._compute_quorum_status = MagicMock(
+            return_value=(False, 0.0, 0.0, 100.0)
+        )
+
+        def _close_task(coro):
+            coro.close()
+            return MagicMock()
+
+        with patch("trajectoryrl.base.validator.asyncio.create_task", side_effect=_close_task), \
+             patch("trajectoryrl.base.validator.asyncio.sleep", AsyncMock(side_effect=KeyboardInterrupt())):
+            asyncio.run(v.run())
+
+        v._compute_quorum_status.assert_not_called()
+        assert v._set_burn_weights.await_count == 0
+        assert v._waiting_for_quorum is False
