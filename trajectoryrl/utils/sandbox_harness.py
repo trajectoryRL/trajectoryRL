@@ -344,6 +344,11 @@ _HERMES_UID = 10000
 # its failure must not mask the chat exit code, since downstream
 # test scoring and judging depend on chat_rc.
 _HERMES_PREENTRY = (
+    # /workspace may not exist in the testee container — only the judge
+    # container sets working_dir="/workspace" which auto-creates it.
+    # mkdir unconditionally so chown + the post-chat export below can
+    # both find the directory.
+    "mkdir -p /workspace; "
     "chown -R hermes:hermes /workspace 2>/dev/null; "
     "chmod 0755 /workspace 2>/dev/null; "
     "/opt/hermes/docker/entrypoint.sh \"$@\"; "
