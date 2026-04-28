@@ -331,12 +331,25 @@ _HERMES_UID = 10000
 # Pre-entrypoint wrapper for Hermes containers: executed as root before
 # the image's own entrypoint gosu-drops to the hermes user. Chowns
 # /workspace so the judge can write /workspace/evaluation.json (Docker
-# creates working_dir= paths as root:root). Then exec's the image's
-# original entrypoint with the original command args intact.
+# creates working_dir= paths as root:root), then runs the image's
+# original entrypoint with the original command args.
+#
+# We deliberately do NOT `exec` the entrypoint: after `hermes chat`
+# returns, we run `hermes sessions export /workspace/turns.jsonl` to
+# capture the structured per-turn session data (every user/assistant
+# message + tool call + tool result + token counts + end_reason),
+# which the bench reads back via get_archive in _read_container_text.
+# Independent of stdout, so it survives --quiet collapsing the docker
+# logs to header + final-message only. The export is best-effort —
+# its failure must not mask the chat exit code, since downstream
+# test scoring and judging depend on chat_rc.
 _HERMES_PREENTRY = (
     "chown -R hermes:hermes /workspace 2>/dev/null; "
     "chmod 0755 /workspace 2>/dev/null; "
-    "exec /opt/hermes/docker/entrypoint.sh \"$@\""
+    "/opt/hermes/docker/entrypoint.sh \"$@\"; "
+    "chat_rc=$?; "
+    "hermes sessions export /workspace/turns.jsonl 2>/tmp/turns_export.err || true; "
+    "exit \"$chat_rc\""
 )
 _HERMES_ENTRYPOINT = ["/bin/sh", "-c", _HERMES_PREENTRY, "--"]
 
