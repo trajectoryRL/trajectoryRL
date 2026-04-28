@@ -62,8 +62,15 @@ class _EpisodeResult:
     episode_index: int
     quality: float = 0.0
     tool_calls: int = 0
-    transcript: str = ""                      # Testee agent's Hermes log
-    judge_transcript: str = ""                # Judge agent's Hermes log
+    transcript: str = ""                      # Testee agent's Hermes log (--quiet stdout)
+    judge_transcript: str = ""                # Judge agent's Hermes log (--quiet stdout)
+    # Structured per-turn JSONL exported by hermes-preentry.sh after
+    # `hermes chat` exits. One JSON object per session containing the
+    # full message history (user/assistant/tool calls/tool results) plus
+    # token counts and end_reason. Independent of stdout — populated
+    # even when --quiet collapses transcript.txt to header-only.
+    turns_log: str = ""                       # Testee /workspace/turns.jsonl
+    judge_turns_log: str = ""                 # Judge /workspace/turns.jsonl
     mock_state: dict = field(default_factory=dict)
     timed_out: bool = False
     error: str | None = None
@@ -155,8 +162,10 @@ class SandboxEvaluationResult:
               metadata.json               # final_score, delta, scenario, etc.
               episodes/
                 episode_0/
-                  testee_transcript.txt
-                  judge_transcript.txt
+                  testee_transcript.txt   # Hermes stdout (--quiet'd)
+                  judge_transcript.txt    # Hermes stdout (--quiet'd)
+                  turns.jsonl             # full per-turn testee session (when image supports export)
+                  judge_turns.jsonl       # full per-turn judge session
                   evaluation.json
                   episode.json            # fixtures + instruction
                 episode_1/ ...
@@ -191,6 +200,14 @@ class SandboxEvaluationResult:
             (ep_dir / "testee_transcript.txt").write_text(ep.transcript or "")
             (ep_dir / "judge_transcript.txt").write_text(
                 ep.judge_transcript or "")
+            # Structured per-turn JSONL — full Hermes session export
+            # (every user/assistant message + tool call + tool result),
+            # populated by hermes-preentry.sh when the harness/judge
+            # image supports it. Skipped silently on older images.
+            if ep.turns_log:
+                (ep_dir / "turns.jsonl").write_text(ep.turns_log)
+            if ep.judge_turns_log:
+                (ep_dir / "judge_turns.jsonl").write_text(ep.judge_turns_log)
             (ep_dir / "evaluation.json").write_text(
                 json.dumps(ep.judge_result, indent=2, default=str))
             (ep_dir / "episode.json").write_text(
@@ -202,6 +219,36 @@ class SandboxEvaluationResult:
 # ---------------------------------------------------------------------------
 # Docker helpers
 # ---------------------------------------------------------------------------
+
+def _read_container_text(container, path: str) -> str:
+    """Read a single text file from a container via get_archive.
+
+    Returns "" on any failure (file missing, container gone, decode error).
+    Used to pull /workspace/turns.jsonl — the structured Hermes session
+    export the harness preentry writes after `hermes chat` exits.
+    """
+    try:
+        archive, _ = container.get_archive(path)
+    except docker.errors.NotFound:
+        return ""
+    except Exception:
+        return ""
+    try:
+        buf = io.BytesIO()
+        for chunk in archive:
+            buf.write(chunk)
+        buf.seek(0)
+        with tarfile.open(fileobj=buf, mode="r") as tar:
+            members = tar.getmembers()
+            if not members:
+                return ""
+            f = tar.extractfile(members[0])
+            if f is None:
+                return ""
+            return f.read().decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
 
 def _docker_run_json(client: docker.DockerClient, image: str,
                      command: list[str], environment: dict | None = None,
@@ -772,6 +819,13 @@ class TrajectorySandboxHarness:
                     len(episode.transcript or ""),
                 )
 
+                # Pull the structured session JSONL the preentry exported
+                # before container teardown. Best-effort: empty string on
+                # any failure (missing file = old image, no harm done).
+                episode.turns_log = _read_container_text(
+                    harness, "/workspace/turns.jsonl",
+                )
+
             finally:
                 t_testee_cleanup = time.time()
                 try:
@@ -1190,6 +1244,13 @@ class TrajectorySandboxHarness:
                 session_id, episode_index,
                 time.time() - t_judge_log,
                 len(episode.judge_transcript or ""),
+            )
+
+            # Structured judge session JSONL — captures the SSH grounding
+            # queries, criterion scoring reasoning, and evaluation.json
+            # write call as discrete turn objects.
+            episode.judge_turns_log = _read_container_text(
+                judge, "/workspace/turns.jsonl",
             )
 
             t_judge_archive = time.time()
