@@ -39,6 +39,7 @@ from trajectoryrl.utils.commitments import (
     fetch_validator_consensus_commitments, decode_dual_address,
 )
 from trajectoryrl.scoring import compute_consensus_scores
+from trajectoryrl.utils.status_reporter import pre_eval
 from trajectoryrl.utils.winner_state import (
     WinnerState, select_winner_with_protection,
 )
@@ -269,6 +270,44 @@ async def run(args):
     # ---- 6. Compute consensus scores -----------------------------------------
     consensus_scores, consensus_disqualified = compute_consensus_scores(validated)
 
+    # ---- 6b. Pre-eval gate (mirrors production aggregation) -----------------
+    # Production calls pre_eval for every miner in consensus_scores after
+    # computing scores and before winner selection (validator.py:919). Off by
+    # default in this analyzer; opt in with --use-pre-eval. Read-only — we
+    # don't replicate the production submit_eval side-effect.
+    if args.use_pre_eval:
+        miners_to_check = list(consensus_scores.keys())
+        print(
+            f"\n  Running pre-eval gate against {len(miners_to_check)} miner(s) "
+            f"(epoch_number={target_window}, unsigned)..."
+        )
+        sem = asyncio.Semaphore(8)
+
+        async def _limited_pre_eval(hk: str):
+            async with sem:
+                return await pre_eval(
+                    hk, epoch_number=target_window, wallet=None,
+                )
+
+        pre_eval_results = await asyncio.gather(*(
+            _limited_pre_eval(hk) for hk in miners_to_check
+        ))
+
+        pre_eval_disqualified = 0
+        pre_eval_unreachable = 0
+        for miner_hk, result in zip(miners_to_check, pre_eval_results):
+            if result is None:
+                pre_eval_unreachable += 1
+                continue
+            if not result.get("allowed", True):
+                reason = result.get("reason", "unknown")
+                consensus_disqualified[miner_hk] = f"pre_eval:{reason}"
+                pre_eval_disqualified += 1
+        print(
+            f"  Pre-eval: {pre_eval_disqualified}/{len(miners_to_check)} "
+            f"disqualified, {pre_eval_unreachable} unreachable (failed open)"
+        )
+
     # Filter disqualified miners from scores before winner selection
     eligible_scores = {
         hk: s for hk, s in consensus_scores.items()
@@ -406,6 +445,15 @@ def main():
             f"stake-weighted majority emerges (default: validator's "
             f"trajectoryrl.utils.config.SPEC_NUMBER, or "
             f"{SPEC_NUMBER_FALLBACK} if unavailable)."
+        ),
+    )
+    parser.add_argument(
+        "--use-pre-eval", action="store_true",
+        help=(
+            "Call the aggregator pre-eval API for every miner in the consensus "
+            "scores (mirrors production aggregation). Miners rejected by the "
+            "server are added to the disqualified set before winner selection. "
+            "Default: off."
         ),
     )
     args = parser.parse_args()
