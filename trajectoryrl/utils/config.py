@@ -36,7 +36,7 @@ HARNESS_IMAGE_REPO = "ghcr.io/trajectoryrl/hermes-agent"
 # consulted only as the fallback target when no on-chain spec_number group
 # reaches >50% stake, and as the value written into outgoing commitments /
 # payloads.
-SPEC_NUMBER = 6
+SPEC_NUMBER = 7
 
 # Backwards-compatible alias for legacy callers / persisted state. Will be
 # removed after one validator release cycle.
@@ -154,7 +154,7 @@ class ValidatorConfig:
     image_channel: str = DEFAULT_IMAGE_CHANNEL
     sandbox_image: str = ""
     harness_image: str = ""
-    sandbox_timeout_per_episode: int = 180  # 3 min per episode
+    sandbox_timeout_per_episode: int = 600  # 10 min per episode (Qwen3-class testees)
     sandbox_num_episodes: int = 4
     # Scenario the sandbox CLI should generate fixtures for. The CLI
     # supports incident_response, morning_brief, and codebase_fix (see
@@ -267,7 +267,7 @@ class ValidatorConfig:
             # for both sandbox and harness images. Programmatic callers can
             # still pass sandbox_image / harness_image directly to bypass it.
             image_channel=os.getenv("IMAGE_CHANNEL", DEFAULT_IMAGE_CHANNEL),
-            sandbox_timeout_per_episode=int(os.getenv("SANDBOX_TIMEOUT_PER_EPISODE", "180")),
+            sandbox_timeout_per_episode=int(os.getenv("SANDBOX_TIMEOUT_PER_EPISODE", "600")),
             sandbox_num_episodes=int(os.getenv("SANDBOX_NUM_EPISODES", "4")),
             sandbox_scenario=os.getenv("SANDBOX_SCENARIO", "codebase_fix"),
             # --- Startup aggregation ---
