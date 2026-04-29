@@ -139,13 +139,23 @@ See [MINER_OPERATIONS.md](docs/MINER_OPERATIONS.md) for full CLI reference (`bui
 
 #### 3. Test locally (optional)
 
+Prereqs: Docker, [uv](https://docs.astral.sh/uv/), an LLM API key, ~6 GB free disk.
+
 ```bash
 git clone https://github.com/trajectoryRL/trajrl-bench.git
 cd trajrl-bench
-pip install -e ".[dev]"
-make build                # build sandbox + agent Docker images
-cp .env.example .env      # add your LLM API key
-make test-hermes          # run one episode with real agent + real judge
+make install                                                # uv sync
+
+# Get the two Docker images (pull from GHCR is fastest):
+docker pull ghcr.io/trajectoryrl/trajrl-bench:latest
+docker pull ghcr.io/trajectoryrl/hermes-agent:latest
+# Or build locally:  make build-sandbox build-hermes
+
+cp .env.example .env                                        # set LLM_API_KEY
+make test-agent-judge                                       # smoke: 1 episode with real testee + real judge
+
+# Real matrix bench (Qwen3.5 testee + GLM-5.1 judge, ~30 min):
+uv run python -m trajrl_bench.bench run --config configs/qwen35_starter.yaml
 ```
 
 See [MINER_GUIDE.md](docs/MINER_GUIDE.md) for the full guide: SKILL.md authoring, sandbox environment, scoring, and tips.
