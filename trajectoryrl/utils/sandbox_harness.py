@@ -448,11 +448,83 @@ class TrajectorySandboxHarness:
         except Exception as e:
             logger.warning("Failed to pull latest images: %s (using cached)", e)
 
+    def _cleanup_orphans(self) -> None:
+        """Remove sandbox/testee/judge containers (and their networks)
+        left behind by prior eval cycles that didn't reach their finally
+        block — typically because the validator was SIGKILL'd mid-cycle
+        by watchtower, OOM, or a host restart. These orphans pin old
+        image versions and prevent ``_pull_sync`` from rmi'ing them.
+
+        Identified by the ``trajectoryrl.role`` label set on every
+        container/network the harness creates.
+        """
+        for role in ("testee", "judge", "sandbox"):
+            try:
+                orphans = self.client.containers.list(
+                    all=True,
+                    filters={"label": f"trajectoryrl.role={role}"},
+                )
+            except Exception as e:
+                logger.warning("Orphan scan failed for role=%s: %s", role, e)
+                continue
+            for c in orphans:
+                try:
+                    c.remove(force=True, v=True)
+                    logger.info("Removed orphan %s container %s", role, c.name)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to remove orphan %s container %s: %s",
+                        role, c.name, e,
+                    )
+        try:
+            for net in self.client.networks.list(
+                filters={"label": "trajectoryrl.role=eval_net"},
+            ):
+                try:
+                    net.remove()
+                    logger.info("Removed orphan eval network %s", net.name)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to remove orphan network %s: %s", net.name, e,
+                    )
+        except Exception as e:
+            logger.warning("Orphan network scan failed: %s", e)
+
     def _pull_sync(self) -> None:
+        # Reap orphans first so they release any image references —
+        # otherwise the rmi-old-image step below fails with "image is
+        # being used by stopped container" and the old version sticks
+        # around until the next ops manual prune.
+        self._cleanup_orphans()
+
         for image in [self._sandbox_image, self._harness_image]:
             try:
+                old_id: str | None = None
+                try:
+                    old_id = self.client.images.get(image).id
+                except docker.errors.ImageNotFound:
+                    pass
                 logger.info("Pulling latest image: %s", image)
                 self.client.images.pull(image)
+                try:
+                    new_id = self.client.images.get(image).id
+                except docker.errors.ImageNotFound:
+                    new_id = None
+                if old_id and new_id and old_id != new_id:
+                    try:
+                        self.client.images.remove(old_id)
+                        logger.info(
+                            "Removed superseded image %s (%s)",
+                            image, old_id[:19],
+                        )
+                    except docker.errors.APIError as e:
+                        # Still referenced by some container we couldn't
+                        # reap (e.g. unrelated user container reusing the
+                        # same hash). Leave it; ops can prune manually.
+                        logger.debug(
+                            "Skip rmi superseded %s (%s): %s",
+                            image, old_id[:19], e,
+                        )
             except Exception as e:
                 logger.warning("Failed to pull %s: %s (using cached)", image, e)
 
@@ -688,7 +760,10 @@ class TrajectorySandboxHarness:
             if sandbox:
                 try:
                     sandbox.stop(timeout=5)
-                    sandbox.remove(force=True)
+                    # v=True deletes anonymous volumes attached to the
+                    # container; without it, every eval leaks volumes
+                    # declared by the image (e.g. hermes-agent's /opt/data).
+                    sandbox.remove(force=True, v=True)
                 except Exception:
                     pass
             if network:
@@ -848,7 +923,7 @@ class TrajectorySandboxHarness:
                 t_testee_cleanup = time.time()
                 try:
                     harness.stop(timeout=3)
-                    harness.remove(force=True)
+                    harness.remove(force=True, v=True)
                 except Exception:
                     pass
                 logger.info(
@@ -1300,7 +1375,7 @@ class TrajectorySandboxHarness:
             t_judge_cleanup = time.time()
             try:
                 judge.stop(timeout=3)
-                judge.remove(force=True)
+                judge.remove(force=True, v=True)
             except Exception:
                 pass
             logger.info("[%s] ep%d STAGE judge_cleanup: %.1fs",
