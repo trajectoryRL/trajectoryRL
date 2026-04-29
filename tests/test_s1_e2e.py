@@ -104,7 +104,6 @@ def _make_config(num_episodes: int = 4, timeout: int = 300):
         wallet_hotkey="test",
         netuid=11,
         network="test",
-        evaluation_harness="trajrl-bench",
         sandbox_image=SANDBOX_IMAGE,
         harness_image=HARNESS_IMAGE,
         llm_api_key=LLM_API_KEY,
