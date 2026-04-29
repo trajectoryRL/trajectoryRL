@@ -152,9 +152,8 @@ docker pull ghcr.io/trajectoryrl/hermes-agent:latest
 # Or build locally:  make build-sandbox build-hermes
 
 cp .env.example .env                                        # set LLM_API_KEY
-make test-agent-judge                                       # smoke: 1 episode with real testee + real judge
 
-# Real matrix bench (Qwen3.5 testee + GLM-5.1 judge, ~30 min):
+# Run the starter bench (Qwen3.5 testee + GLM-5.1 judge, ~30 min):
 uv run python -m trajrl_bench.bench run --config configs/qwen35_starter.yaml
 ```
 
