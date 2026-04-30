@@ -34,8 +34,6 @@ def _generate(
     Prefer ``async_generate`` in async contexts — this function blocks
     the calling thread until the HTTP request completes.
     """
-    if "/" in model:
-        model = model.split("/", 1)[1]
     if not api_key:
         raise ValueError("api_key required (judge LLM credentials must be passed explicitly).")
 
