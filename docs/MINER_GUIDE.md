@@ -331,4 +331,4 @@ A: No. Season 1 packs must contain `SKILL.md` only. `AGENTS.md` and `tool_policy
 A: Your pack is rejected. Season 1 requires SKILL.md.
 
 **Q: What model do the testee and judge use?**
-A: Configurable by validators. Default is via OpenRouter. Both testee and judge use the same model by default.
+A: Configurable by validators. Default provider is OpenRouter. As of v0.5.14 the recommended setup splits the two: testee runs **Qwen3.5-35B-A3B** (`LLM_MODEL`), judge runs **GLM-5.1** (`JUDGE_MODEL`). Different model families on purpose — judge bias stays uncorrelated with testee bias.

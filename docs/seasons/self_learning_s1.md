@@ -559,7 +559,7 @@ Per miner: typical ~12 min (4 × ~3 min combined testee + judge), worst case ~24
 
 Judge cost is higher than v0.19's fixed LLM judge (~$40 at 200 miners) because the judge is now an agent that makes multiple tool calls. Still manageable for validators earning TAO emissions.
 
-**Cost mitigation:** Harness-aware cost caps (kill testee/judge if exceeding token budget); cheap default model (GLM-5.1); ephemeral lightweight containers.
+**Cost mitigation:** Harness-aware cost caps (kill testee/judge if exceeding token budget); cheap default models (Qwen3.5-35B-A3B testee + GLM-5.1 judge, both via OpenRouter); ephemeral lightweight containers.
 
 ### 4. The "already good" problem
 
