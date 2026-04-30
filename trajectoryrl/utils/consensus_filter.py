@@ -212,24 +212,19 @@ def filter_zero_signal(
     submissions: List[Tuple[ConsensusPointer, ConsensusPayload]],
     zero_threshold: float = 1.0,
 ) -> Tuple[List[Tuple[ConsensusPointer, ConsensusPayload]], int]:
-    """Layer 5: discard near-zero-signal submissions when real signal exists.
+    """Layer 5: discard near-zero-signal submissions.
 
     A submission is dropped when the fraction of zero scores meets or exceeds
     ``zero_threshold``.  Default 1.0 keeps the legacy behaviour (drop only
     strictly all-zero payloads).  Lower values (e.g. 0.95) treat free-rider
     payloads that sprinkle one or two nonzero scores as all-zero.
 
-    If no submission has any nonzero scores, all pass through (bootstrap
-    scenario — nothing to compare against).
+    Payloads are evaluated individually — there is no fleet-wide bootstrap
+    bypass.  If every validator submits all-zero (e.g. LLM outage across the
+    whole fleet), every submission is dropped and aggregation falls back to
+    local results rather than letting the lex-first hotkey win deterministically
+    with a 0.0 consensus score.
     """
-    has_nonzero = any(
-        any(s != 0.0 for s in payload.scores.values())
-        for _, payload in submissions
-    )
-
-    if not has_nonzero:
-        return submissions, 0
-
     passed = []
     skipped = 0
     for ptr, payload in submissions:

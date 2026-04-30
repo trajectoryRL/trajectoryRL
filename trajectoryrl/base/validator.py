@@ -887,19 +887,50 @@ class TrajectoryValidator:
 
         min_stake = getattr(self.config, "min_validator_stake", 0.0)
         zero_threshold = getattr(self.config, "zero_signal_threshold", 1.0)
-        validated, stats = run_filter_pipeline(
-            submissions=submissions,
-            expected_window=window.window_number,
-            validator_stakes=validator_stakes,
-            min_stake=min_stake,
-            local_spec_number=_spec_number(),
-            expected_protocol=self.config.consensus_protocol_version,
-            zero_signal_threshold=zero_threshold,
-        )
+
+        def _filter(expected_window: int):
+            return run_filter_pipeline(
+                submissions=submissions,
+                expected_window=expected_window,
+                validator_stakes=validator_stakes,
+                min_stake=min_stake,
+                local_spec_number=_spec_number(),
+                expected_protocol=self.config.consensus_protocol_version,
+                zero_signal_threshold=zero_threshold,
+            )
+
+        validated, stats = _filter(window.window_number)
+        aggregation_window = window.window_number
+
+        # Fall back to the prior window when the current one yields nothing.
+        # Without this, a fleet-wide all-zero round (e.g. simultaneous LLM
+        # outage) leaves every validator pinned to whatever winner_state was
+        # last persisted — including a lex-first hotkey that may have been
+        # elected under the old bootstrap-bypass behaviour. Re-aggregating
+        # against the previous window's still-on-chain commitments lets the
+        # legitimate prior winner be reinstated.
+        if not validated:
+            prior_window = window.window_number - 1
+            logger.warning(
+                "Window %d: all current-window submissions filtered out "
+                "(%s); retrying against window %d",
+                window.window_number, stats.summary(), prior_window,
+            )
+            prior_validated, prior_stats = _filter(prior_window)
+            if prior_validated:
+                validated = prior_validated
+                stats = prior_stats
+                aggregation_window = prior_window
+                logger.info(
+                    "Window %d: aggregating from window %d submissions "
+                    "(%d passed filter)",
+                    window.window_number, prior_window, stats.passed,
+                )
 
         if not validated:
             logger.warning(
-                "Window %d: all submissions filtered out (%s), using local results",
+                "Window %d: no usable submissions in current or prior "
+                "window (%s), using local results",
                 window.window_number, stats.summary(),
             )
             return
@@ -926,7 +957,7 @@ class TrajectoryValidator:
                 async def _limited_pre_eval(hk: str):
                     async with sem:
                         return await pre_eval(
-                            hk, epoch_number=window.window_number,
+                            hk, epoch_number=aggregation_window,
                             wallet=self.wallet,
                         )
 
