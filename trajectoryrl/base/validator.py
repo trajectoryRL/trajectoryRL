@@ -167,7 +167,17 @@ class TrajectoryValidator:
         judge_base_url = config.judge_base_url or config.llm_base_url
         self._judge_model = judge_model
         self._judge_base_url = judge_base_url
-        logger.debug("Initializing LLM judges (model=%s)...", judge_model)
+
+        # Testee model is what runs SKILL.md inside the sandbox. We surface
+        # it as the primary "llm_model" on the validators page (the model
+        # operators most want visibility into); judge model is reported
+        # separately via judge_llm_model in the submit payload.
+        self._testee_model = config.llm_model
+        self._testee_base_url = config.llm_base_url
+        logger.debug(
+            "Initializing LLM judges (testee=%s, judge=%s)...",
+            self._testee_model, judge_model,
+        )
 
         self.integrity_judge = PackIntegrityJudge(
             model=judge_model,
@@ -966,8 +976,10 @@ class TrajectoryValidator:
                                 qualified=False,
                                 pack_url=pre_eval_result.get("pack_url", ""),
                                 pack_hash=pre_eval_result.get("pack_hash", ""),
-                                llm_base_url=self._judge_base_url,
-                                llm_model=self._judge_model,
+                                llm_base_url=self._testee_base_url,
+                                llm_model=self._testee_model,
+                                judge_llm_base_url=self._judge_base_url,
+                                judge_llm_model=self._judge_model,
                                 rejected=True,
                                 rejection_stage=_stage,
                                 rejection_detail=_detail,
@@ -1829,8 +1841,10 @@ class TrajectoryValidator:
                         qualified=False,
                         pack_url=commitment.pack_url,
                         pack_hash=commitment.pack_hash,
-                        llm_base_url=self._judge_base_url,
-                        llm_model=self._judge_model,
+                        llm_base_url=self._testee_base_url,
+                        llm_model=self._testee_model,
+                        judge_llm_base_url=self._judge_base_url,
+                        judge_llm_model=self._judge_model,
                         rejected=True,
                         rejection_stage="integrity_check",
                         rejection_detail=detail,
@@ -1883,8 +1897,10 @@ class TrajectoryValidator:
                             qualified=False,
                             pack_url=commitment.pack_url,
                             pack_hash=commitment.pack_hash,
-                            llm_base_url=self._judge_base_url,
-                            llm_model=self._judge_model,
+                            llm_base_url=self._testee_base_url,
+                            llm_model=self._testee_model,
+                            judge_llm_base_url=self._judge_base_url,
+                            judge_llm_model=self._judge_model,
                             rejected=True,
                             rejection_stage=_stage,
                             rejection_detail=_detail,
@@ -2423,8 +2439,10 @@ class TrajectoryValidator:
             pack_hash=commitment.pack_hash,
             eval_count=eval_count,
             scenario_results=scenario_results,
-            llm_base_url=self._judge_base_url,
-            llm_model=self._judge_model,
+            llm_base_url=self._testee_base_url,
+            llm_model=self._testee_model,
+            judge_llm_base_url=self._judge_base_url,
+            judge_llm_model=self._judge_model,
             spec_number=_spec_number(),
             epoch_number=window_number,
             **self._harness_metadata(),

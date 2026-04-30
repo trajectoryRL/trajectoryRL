@@ -394,6 +394,8 @@ async def submit_eval(
     scenario_results: Optional[Dict[str, Any]] = None,
     llm_base_url: Optional[str] = None,
     llm_model: Optional[str] = None,
+    judge_llm_base_url: Optional[str] = None,
+    judge_llm_model: Optional[str] = None,
     rejected: Optional[bool] = None,
     rejection_stage: Optional[str] = None,
     rejection_detail: Optional[str] = None,
@@ -448,6 +450,10 @@ async def submit_eval(
         payload["llm_base_url"] = llm_base_url
     if llm_model is not None:
         payload["llm_model"] = llm_model
+    if judge_llm_base_url is not None:
+        payload["judge_llm_base_url"] = judge_llm_base_url
+    if judge_llm_model is not None:
+        payload["judge_llm_model"] = judge_llm_model
     if rejected is not None:
         payload["rejected"] = rejected
     if rejection_stage is not None:
