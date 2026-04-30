@@ -3235,3 +3235,82 @@ class TestIssue1EpochSkipSemantics:
         v._compute_quorum_status.assert_not_called()
         assert v._set_burn_weights.await_count == 0
         assert v._waiting_for_quorum is False
+
+
+class TestAggregateOnStartupConsensusWindowPersist:
+    """Regression: startup aggregation must persist _consensus_window on success."""
+
+    def _make_minimal_validator(self):
+        v = TrajectoryValidator.__new__(TrajectoryValidator)
+        v.config = MagicMock(netuid=11)
+        v.subtensor = MagicMock()
+        v.subtensor.get_current_block.return_value = 999
+        v.metagraph = MagicMock(hotkeys=[])
+        v._window_config = WindowConfig(
+            window_length=7200,
+            global_anchor=0,
+            publish_pct=0.8,
+            aggregate_pct=0.9,
+        )
+        v._consensus_window = -1
+        v.last_weight_block = 0
+        v._winner_state = WinnerState(winner_hotkey="5abcd")
+        v._sync_metagraph = MagicMock(return_value=True)
+        v._save_eval_state = MagicMock()
+        v._set_winner_weights = AsyncMock()
+        return v
+
+    def test_aggregate_on_startup_success_keeps_consensus_window(self):
+        v = self._make_minimal_validator()
+        vc = ValidatorConsensusCommitment(
+            protocol_version=2,
+            window_number=1121,
+            content_address="cid",
+            validator_hotkey="vk",
+            block_number=1,
+            raw="raw",
+            spec_number=4,
+        )
+
+        async def fake_agg(window):
+            v._consensus_window = window.window_number
+
+        v._run_consensus_aggregation = AsyncMock(side_effect=fake_agg)
+
+        with patch(
+            "trajectoryrl.base.validator.fetch_validator_consensus_commitments",
+            return_value=[vc],
+        ):
+            asyncio.run(v._aggregate_on_startup())
+
+        assert v._consensus_window == 1121
+        v._save_eval_state.assert_called_once()
+        v._set_winner_weights.assert_awaited_once()
+
+    def test_aggregate_on_startup_failure_restores_prior_consensus_window(self):
+        v = self._make_minimal_validator()
+        v._consensus_window = 1120
+        vc = ValidatorConsensusCommitment(
+            protocol_version=2,
+            window_number=1121,
+            content_address="cid",
+            validator_hotkey="vk",
+            block_number=1,
+            raw="raw",
+            spec_number=4,
+        )
+
+        async def fake_agg(_window):
+            pass
+
+        v._run_consensus_aggregation = AsyncMock(side_effect=fake_agg)
+
+        with patch(
+            "trajectoryrl.base.validator.fetch_validator_consensus_commitments",
+            return_value=[vc],
+        ):
+            asyncio.run(v._aggregate_on_startup())
+
+        assert v._consensus_window == 1120
+        v._save_eval_state.assert_called_once()
+        v._set_winner_weights.assert_not_called()
