@@ -1045,11 +1045,13 @@ class TrajectoryValidator:
         ``_set_winner_weights`` to compute the winner and set weights
         immediately — without waiting for the normal window lifecycle.
 
-        On success we **persist** ``_consensus_window = target_window`` so
-        the main loop's "advance target_window past the just-aggregated
-        window" check ([1404]) actually fires after restart. On failure we
-        restore the saved value so the main loop can retry aggregation
-        normally without poisoning its per-window guard.
+        On **success**, ``_consensus_window`` is left at the aggregated
+        ``target_window`` and persisted — same as a normal main-loop
+        aggregation — so restart cannot leave ``consensus_window=-1`` while
+        ``target_window`` / ``last_eval_window`` point at a completed window
+        (that combination deadlocked publish retries). On **failure**, the
+        pre-call ``_consensus_window`` is restored so a partial run does not
+        advance the guard incorrectly.
         """
         logger.info("=" * 60)
         logger.info("aggregate_when_start enabled — running startup aggregation")
@@ -1091,14 +1093,6 @@ class TrajectoryValidator:
         await self._run_consensus_aggregation(synthetic_window)
         aggregation_succeeded = (self._consensus_window == target_window)
 
-        # Persist _consensus_window = target_window when aggregation succeeded
-        # so the main loop's "target_window <= _consensus_window → advance"
-        # check fires next tick. Restoring the saved value here would leave
-        # _consensus_window stuck at -1 (or the pre-restart value), which
-        # deadlocks the main loop: target_window stays at the just-aggregated
-        # window, _should_start_target_evaluation refuses to start the next
-        # eval cycle (target != physical), and _submit_consensus_payload
-        # retries forever with no local data to submit.
         if not aggregation_succeeded:
             self._consensus_window = saved_consensus_window
         self._save_eval_state()
