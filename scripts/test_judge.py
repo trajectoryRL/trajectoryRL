@@ -169,7 +169,7 @@ def main():
 
     # Create judge
     judge = TrajectoryJudge(
-        model=args.model or os.environ.get("LLM_MODEL") or os.environ.get("CLAWBENCH_DEFAULT_MODEL", ""),
+        model=args.model or os.environ.get("LLM_MODEL", ""),
     )
 
     # Print prompt stats (always)

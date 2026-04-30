@@ -281,10 +281,10 @@ from trajectoryrl.utils.sandbox_harness import _strip_provider_prefix
 async def test_phase1():
     """Test Phase 1: Pack integrity analysis."""
     model = _strip_provider_prefix(
-        os.getenv("JUDGE_MODEL") or os.getenv("LLM_MODEL") or os.getenv("CLAWBENCH_DEFAULT_MODEL", "")
+        os.getenv("JUDGE_MODEL") or os.getenv("LLM_MODEL", "")
     )
-    api_key = os.getenv("JUDGE_API_KEY") or os.getenv("LLM_API_KEY") or os.getenv("CLAWBENCH_LLM_API_KEY", "")
-    base_url = os.getenv("JUDGE_BASE_URL") or os.getenv("LLM_BASE_URL") or os.getenv("CLAWBENCH_LLM_BASE_URL", "")
+    api_key = os.getenv("JUDGE_API_KEY") or os.getenv("LLM_API_KEY", "")
+    base_url = os.getenv("JUDGE_BASE_URL") or os.getenv("LLM_BASE_URL", "")
 
     if not api_key:
         logger.error("No API key set. Export LLM_API_KEY or JUDGE_API_KEY.")
@@ -340,10 +340,10 @@ async def test_phase1():
 async def test_phase2():
     """Test Phase 2: Trajectory judge."""
     model = _strip_provider_prefix(
-        os.getenv("JUDGE_MODEL") or os.getenv("LLM_MODEL") or os.getenv("CLAWBENCH_DEFAULT_MODEL", "")
+        os.getenv("JUDGE_MODEL") or os.getenv("LLM_MODEL", "")
     )
-    api_key = os.getenv("JUDGE_API_KEY") or os.getenv("LLM_API_KEY") or os.getenv("CLAWBENCH_LLM_API_KEY", "")
-    base_url = os.getenv("JUDGE_BASE_URL") or os.getenv("LLM_BASE_URL") or os.getenv("CLAWBENCH_LLM_BASE_URL", "")
+    api_key = os.getenv("JUDGE_API_KEY") or os.getenv("LLM_API_KEY", "")
+    base_url = os.getenv("JUDGE_BASE_URL") or os.getenv("LLM_BASE_URL", "")
 
     if not api_key:
         logger.error("No API key set.")
