@@ -414,10 +414,25 @@ class TrajectorySandboxHarness:
 
         self._sandbox_image = config.sandbox_image
         self._harness_image = config.harness_image
-        self._llm_api_key = config.judge_api_key or config.llm_api_key
-        self._llm_api_url = config.judge_base_url or config.llm_base_url
-        _model = config.judge_model or config.llm_model
-        self._llm_model = _strip_provider_prefix(_model)
+
+        # Testee runs the miner's SKILL.md against the scenario; uses LLM_*.
+        self._testee_model = _strip_provider_prefix(config.llm_model)
+        self._testee_api_key = config.llm_api_key
+        self._testee_api_url = config.llm_base_url
+
+        # Judge scores the testee; can use a different model family (JUDGE_*)
+        # so judge bias is uncorrelated with testee bias. Falls back to LLM_*
+        # when JUDGE_* fields are unset.
+        self._judge_model = _strip_provider_prefix(config.judge_model or config.llm_model)
+        self._judge_api_key = config.judge_api_key or config.llm_api_key
+        self._judge_api_url = config.judge_base_url or config.llm_base_url
+
+        # Backward-compatible aliases for any external reader that still
+        # expects a single _llm_* tuple. Points at the testee model — the
+        # one that actually runs SKILL.md inside the sandbox.
+        self._llm_model = self._testee_model
+        self._llm_api_key = self._testee_api_key
+        self._llm_api_url = self._testee_api_url
 
         # Sandbox version — queried at pull time, used purely for audit and
         # logging. The scoring spec identifier (SPEC_NUMBER) is now a
@@ -830,7 +845,7 @@ class TrajectorySandboxHarness:
                 self._harness_image,
                 entrypoint=_HERMES_ENTRYPOINT,
                 command=["chat", "-q", harness_prompt,
-                         "-m", self._llm_model,
+                         "-m", self._testee_model,
                          "-t", "terminal,file,code_execution,memory",
                          "--quiet", "--yolo", "--max-turns", "15"],
                 name=harness_name,
@@ -840,8 +855,8 @@ class TrajectorySandboxHarness:
                     # env, not from config.yaml's api_key: field. Provide
                     # both common names so whichever routing path the
                     # resolver takes can authenticate.
-                    "OPENROUTER_API_KEY": self._llm_api_key,
-                    "OPENAI_API_KEY":     self._llm_api_key,
+                    "OPENROUTER_API_KEY": self._testee_api_key,
+                    "OPENAI_API_KEY":     self._testee_api_key,
                 },
                 mem_limit="4g", cpu_quota=200000,
                 labels={"trajectoryrl.role": "testee",
@@ -865,7 +880,7 @@ class TrajectorySandboxHarness:
             _put_file(
                 harness, "/opt/data/config.yaml",
                 _hermes_custom_config(
-                    self._llm_model, self._llm_api_url, self._llm_api_key,
+                    self._testee_model, self._testee_api_url, self._testee_api_key,
                 ),
                 mode=0o644, uid=_HERMES_UID, gid=_HERMES_UID,
             )
@@ -1264,7 +1279,7 @@ class TrajectorySandboxHarness:
                          "scenario exposes. "
                          "Write your evaluation to /workspace/evaluation.json. "
                          "You MUST write that file before finishing.",
-                         "-m", self._llm_model,
+                         "-m", self._judge_model,
                          "-t", "terminal,file,code_execution,memory",
                          "--quiet", "--yolo", "--max-turns", "15"],
                 name=judge_name,
@@ -1273,8 +1288,8 @@ class TrajectorySandboxHarness:
                     "HERMES_BUNDLED_SKILLS": "/nonexistent",
                     # See testee container: Hermes' "custom" provider reads
                     # the API key from env, not from config.yaml.
-                    "OPENROUTER_API_KEY": self._llm_api_key,
-                    "OPENAI_API_KEY":     self._llm_api_key,
+                    "OPENROUTER_API_KEY": self._judge_api_key,
+                    "OPENAI_API_KEY":     self._judge_api_key,
                 },
                 mem_limit="4g", cpu_quota=200000,
                 labels={"trajectoryrl.role": "judge",
@@ -1293,7 +1308,7 @@ class TrajectorySandboxHarness:
             _put_file(
                 judge, "/opt/data/config.yaml",
                 _hermes_custom_config(
-                    self._llm_model, self._llm_api_url, self._llm_api_key,
+                    self._judge_model, self._judge_api_url, self._judge_api_key,
                 ),
                 mode=0o644, uid=_HERMES_UID, gid=_HERMES_UID,
             )

@@ -38,6 +38,14 @@ from trajectoryrl.utils.sandbox_harness import _strip_provider_prefix
 _raw_model = os.environ.get("LLM_MODEL") or os.environ.get("CLAWBENCH_DEFAULT_MODEL", "z-ai/glm-5.1")
 LLM_MODEL = _strip_provider_prefix(_raw_model)
 
+# Optional independent judge model — when set, tests exercise the split path
+# (testee uses LLM_*, judge uses JUDGE_*). When empty, judge falls back to LLM_*
+# inside TrajectorySandboxHarness.
+JUDGE_API_KEY = os.environ.get("JUDGE_API_KEY", "")
+JUDGE_BASE_URL = os.environ.get("JUDGE_BASE_URL", "")
+_raw_judge = os.environ.get("JUDGE_MODEL", "")
+JUDGE_MODEL = _strip_provider_prefix(_raw_judge) if _raw_judge else ""
+
 SANDBOX_IMAGE = os.environ.get("SANDBOX_IMAGE", "ghcr.io/trajectoryrl/trajrl-bench:latest")
 HARNESS_IMAGE = os.environ.get("HARNESS_IMAGE", "ghcr.io/trajectoryrl/hermes-agent:latest")
 
@@ -104,12 +112,15 @@ def _make_config(num_episodes: int = 4, timeout: int = 300):
         wallet_hotkey="test",
         netuid=11,
         network="test",
-        evaluation_harness="trajrl-bench",
         sandbox_image=SANDBOX_IMAGE,
         harness_image=HARNESS_IMAGE,
         llm_api_key=LLM_API_KEY,
         llm_base_url=LLM_BASE_URL,
         llm_model=LLM_MODEL,
+        # Judge fields — when set, exercise the split testee/judge path.
+        judge_api_key=JUDGE_API_KEY,
+        judge_base_url=JUDGE_BASE_URL,
+        judge_model=JUDGE_MODEL,
         sandbox_num_episodes=num_episodes,
         sandbox_timeout_per_episode=timeout,
         eval_state_path=Path("/tmp/trajrl-test-eval-state.json"),
