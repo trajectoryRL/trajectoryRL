@@ -96,12 +96,10 @@ def _make_config():
     """Build a minimal ValidatorConfig just for running the sandbox harness."""
     from trajectoryrl.utils.config import ValidatorConfig
 
-    api_key = os.environ.get("LLM_API_KEY") or os.environ["CLAWBENCH_LLM_API_KEY"]
-    base_url = os.environ.get("LLM_BASE_URL") or os.environ.get(
-        "CLAWBENCH_LLM_BASE_URL", "https://openrouter.ai/api/v1")
+    api_key = os.environ["LLM_API_KEY"]
+    base_url = os.environ.get("LLM_BASE_URL", "https://openrouter.ai/api/v1")
     model = _strip_provider_prefix(
-        os.environ.get("LLM_MODEL") or os.environ.get(
-            "CLAWBENCH_DEFAULT_MODEL", "z-ai/glm-5.1"))
+        os.environ.get("LLM_MODEL", "z-ai/glm-5.1"))
 
     return ValidatorConfig(
         wallet_name=os.environ.get("WALLET_NAME", "sn11-owner"),

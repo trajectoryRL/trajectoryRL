@@ -135,7 +135,6 @@ class ValidatorConfig:
     disable_winner_protection: bool = False
 
     # LLM configuration (used by sandbox harness and LLM judges).
-    # Backward-compatible with legacy CLAWBENCH_LLM_* env vars.
     llm_model: str = DEFAULT_LLM_MODEL
     llm_api_key: str = ""
     llm_base_url: str = DEFAULT_LLM_BASE_URL
@@ -243,10 +242,10 @@ class ValidatorConfig:
             active_set_dir=Path(os.getenv("ACTIVE_SET_DIR", "/var/lib/trajectoryrl/active_sets")),
             pack_cache_dir=Path(os.getenv("PACK_CACHE_DIR", "/var/lib/trajectoryrl/packs")),
             log_dir=Path(os.getenv("LOG_DIR", "./logs")),
-            # --- LLM (new names preferred, legacy CLAWBENCH_* still supported) ---
-            llm_model=os.getenv("LLM_MODEL") or os.getenv("CLAWBENCH_DEFAULT_MODEL", DEFAULT_LLM_MODEL),
-            llm_api_key=os.getenv("LLM_API_KEY") or os.getenv("CLAWBENCH_LLM_API_KEY", ""),
-            llm_base_url=os.getenv("LLM_BASE_URL") or os.getenv("CLAWBENCH_LLM_BASE_URL", DEFAULT_LLM_BASE_URL),
+            # --- LLM ---
+            llm_model=os.getenv("LLM_MODEL", DEFAULT_LLM_MODEL),
+            llm_api_key=os.getenv("LLM_API_KEY", ""),
+            llm_base_url=os.getenv("LLM_BASE_URL", DEFAULT_LLM_BASE_URL),
             # --- LLM Judge (optional, falls back to primary LLM if empty) ---
             judge_model=os.getenv("JUDGE_MODEL", ""),
             judge_api_key=os.getenv("JUDGE_API_KEY", ""),

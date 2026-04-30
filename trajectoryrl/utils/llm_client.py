@@ -1,47 +1,23 @@
-"""Unified LLM client using OpenAI-compatible API.
+"""LLM client for the validator's Python-level judges (PackIntegrityJudge +
+TrajectoryJudge).
 
-All providers are accessed through a single OpenAI-compatible endpoint.
-Configure via environment variables:
-
-  LLM_API_KEY      API key for the provider
-  LLM_BASE_URL     Base URL (e.g. https://open.bigmodel.cn/api/paas/v4)
-  LLM_MODEL        Model name (e.g. glm-5.1)
-
-Legacy CLAWBENCH_LLM_* env vars are still supported for backward compatibility.
-
-For Anthropic models, the native SDK is used instead of the OpenAI
-compatibility layer.
+All connection params (model, api_key, base_url) must be supplied
+explicitly by the caller. The validator resolves them from
+``ValidatorConfig.judge_*`` (with ``llm_*`` fallback) before
+constructing the judge.
 """
 
 import asyncio
 import functools
 import logging
-import os
 from typing import Optional
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
 
 # Reasoning models may need more tokens since they spend tokens on
 # thinking before producing the actual answer.
 MAX_REASONING_RETRIES = 1
 REASONING_RETRY_MULTIPLIER = 4
-
-
-def resolve_api_key(api_key: str = "") -> str:
-    """Resolve API key.
-
-    Priority: explicit arg > LLM_API_KEY > CLAWBENCH_LLM_API_KEY (legacy).
-    """
-    if api_key:
-        return api_key
-    return os.environ.get("LLM_API_KEY") or os.environ.get("CLAWBENCH_LLM_API_KEY", "")
-
-
-def has_api_key() -> bool:
-    """Return True if an LLM API key is available."""
-    return bool(os.environ.get("LLM_API_KEY") or os.environ.get("CLAWBENCH_LLM_API_KEY"))
 
 
 def _generate(
@@ -58,17 +34,14 @@ def _generate(
     Prefer ``async_generate`` in async contexts — this function blocks
     the calling thread until the HTTP request completes.
     """
-    model = model or os.environ.get("LLM_MODEL") or os.environ.get("CLAWBENCH_DEFAULT_MODEL", "glm-5.1")
     if "/" in model:
         model = model.split("/", 1)[1]
-    key = resolve_api_key(api_key)
-    if not key:
-        raise ValueError("No API key. Set LLM_API_KEY or pass api_key argument.")
+    if not api_key:
+        raise ValueError("api_key required (judge LLM credentials must be passed explicitly).")
 
-    url = base_url or os.environ.get("LLM_BASE_URL") or os.environ.get("CLAWBENCH_LLM_BASE_URL", DEFAULT_BASE_URL)
-    logger.info("LLM generate: model=%s, base_url=%s", model, url)
+    logger.info("LLM generate: model=%s, base_url=%s", model, base_url)
 
-    return _generate_openai_compat(model, system, user_message, max_tokens, key, url, temperature=temperature)
+    return _generate_openai_compat(model, system, user_message, max_tokens, api_key, base_url, temperature=temperature)
 
 
 LLM_CALL_TIMEOUT = 180  # seconds; prevents a single hung LLM call from
