@@ -367,12 +367,17 @@ _HERMES_PREENTRY = (
     "chmod 0755 /workspace 2>/dev/null; "
     "/opt/hermes/docker/entrypoint.sh \"$@\"; "
     "chat_rc=$?; "
-    # Export the SQLite session store. Stderr lands in /workspace so the
-    # bench reads it back via get_archive — opaque "Trace export failed"
-    # used to be undebuggable when stderr went to /tmp. Always record
-    # the export's exit code, even on success: the JSONL being empty
-    # despite rc=0 is itself a signal we want to surface.
-    "hermes sessions export /workspace/turns.jsonl 2>/workspace/turns_export.err; "
+    # Export the SQLite session store. Use the absolute venv path:
+    # entrypoint.sh's `exec hermes "$@"` activates the venv only inside
+    # its own subprocess, so when control returns to our outer shell
+    # (still root, original PATH) `hermes` is not on PATH and bare
+    # `hermes sessions export` exits with "command not found". That's
+    # why every production turns.jsonl was empty — verified live.
+    # Stderr lands in /workspace so the bench reads it back via
+    # get_archive (opaque failures used to be undebuggable when stderr
+    # went to /tmp). Always record the export's exit code: the JSONL
+    # being empty despite rc=0 is itself a signal we want to surface.
+    "/opt/hermes/.venv/bin/hermes sessions export /workspace/turns.jsonl 2>/workspace/turns_export.err; "
     "export_rc=$?; "
     "echo \"export_rc=$export_rc\" >> /workspace/turns_export.err; "
     "exit \"$chat_rc\""
