@@ -11,6 +11,26 @@ logger = logging.getLogger(__name__)
 DEFAULT_LLM_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
 DEFAULT_LLM_MODEL = "glm-5.1"
 
+# Hardcoded one-shot rescue trigger for the 2026-05-01 SN11 mass-poisoning
+# incident (see ValidatorConfig.rescue_resubmit_window). MUST be set to
+# ``None`` in the release following window 1124, otherwise validators roll
+# back to N-1 every restart.
+_HARDCODED_RESCUE_RESUBMIT_WINDOW: Optional[int] = 1123
+
+
+def _parse_rescue_resubmit_window() -> Optional[int]:
+    """Resolve RESCUE_RESUBMIT_WINDOW from env, falling back to the hardcoded
+    incident-response default. Operators can override by setting the env var
+    to a different window number, or disable with empty / "0" / "none" /
+    "off" / "false".
+    """
+    raw = os.environ.get("RESCUE_RESUBMIT_WINDOW", "").strip()
+    if raw == "":
+        return _HARDCODED_RESCUE_RESUBMIT_WINDOW
+    if raw.lower() in ("0", "none", "off", "false"):
+        return None
+    return int(raw)
+
 # Image channel drives the tag of sandbox/harness images pulled by the
 # validator at runtime. Compose files set this per-channel (latest, staging,
 # etc.). Full overrides via SANDBOX_IMAGE / HARNESS_IMAGE take precedence.
@@ -123,12 +143,27 @@ class ValidatorConfig:
     # Weight cadence (set weights every tempo)
     weight_interval_blocks: int = 360  # 1 tempo ≈ 72 min at 12s/block
 
-    # Startup aggregation: run consensus aggregation before entering main loop
+    # Startup aggregation: run consensus aggregation before entering main loop.
+    # Default off: startup aggregation reads chain commitments and trusts them,
+    # which is unsafe when chain commitments may be stale/poisoned (e.g. from a
+    # prior ws-timeout incident). The main loop's aggregation phase is the
+    # authoritative path; the startup variant is now opt-in only.
     aggregate_when_start: bool = False
 
     # Startup full cycle: run eval → propagation → aggregation before main loop.
     # When enabled, ``aggregate_when_start`` is ignored (full cycle includes it).
     full_cycle_on_startup: bool = False
+
+    # One-shot rescue: when set to a window number N, on startup the validator
+    # rolls back persisted state so it re-evaluates and re-submits window N
+    # (consensus_window=N-1, target_window=N, target_submit_done=False, and
+    # last_eval_window clamped to N-1 if it was at/past N). Per-miner caches
+    # (eval_pack_hash, scenario_scores) are preserved so already-evaluated
+    # miners with unchanged pack_hash skip re-eval. Also disables
+    # ``aggregate_when_start`` and makes ``_check_own_commitment_on_chain(N)``
+    # return False so the stale on-chain pointer is overwritten.
+    # Operators clear this on the next deploy after rescue completes.
+    rescue_resubmit_window: Optional[int] = None
 
     # Disable winner protection to force all validators to converge on the
     # same lowest-cost winner (use once to clear divergent cached state).
@@ -270,9 +305,24 @@ class ValidatorConfig:
             sandbox_num_episodes=int(os.getenv("SANDBOX_NUM_EPISODES", "4")),
             sandbox_scenario=os.getenv("SANDBOX_SCENARIO", "codebase_fix"),
             # --- Startup aggregation ---
-            aggregate_when_start=os.getenv("AGGREGATE_WHEN_START", "1") == "1",
+            aggregate_when_start=os.getenv("AGGREGATE_WHEN_START", "0") == "1",
             full_cycle_on_startup=os.getenv("FULL_CYCLE_ON_STARTUP", "0") == "1",
             disable_winner_protection=os.getenv("DISABLE_WINNER_PROTECTION", "1") == "1",
+            # --- One-shot rescue ---
+            #
+            # HARDCODED for the 2026-05-01 mass-poisoning incident: every SN11
+            # validator that pulls this build will roll back state on startup
+            # and re-eval+resubmit window 1123 over the stale on-chain
+            # pointers (cause: PR #213 wrapper-return regression + chain-query
+            # fragility right after watchtower restart caused empty payloads
+            # to be committed). MUST be reverted to ``None`` in the release
+            # following window 1124 — leaving it at 1123 forever causes a
+            # rollback every restart.
+            #
+            # The env var ``RESCUE_RESUBMIT_WINDOW`` is preserved as an
+            # operator override: set to empty / "0" / "none" / "off" to
+            # disable, or to a different window number for future incidents.
+            rescue_resubmit_window=_parse_rescue_resubmit_window(),
             # --- IM parameters are hardcoded (dataclass defaults) ---
             # Do NOT load from env: score_delta,
             # rho_reliability, consensus_epsilon, bootstrap_threshold,

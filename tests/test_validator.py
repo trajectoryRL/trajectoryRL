@@ -723,6 +723,35 @@ class TestValidatorConfig:
         assert "validator_scores_fork_url" not in defaults
         assert "validator_scores_local_path" not in defaults
 
+    def test_rescue_resubmit_window_hardcoded_default(self, monkeypatch):
+        """Hardcoded rescue trigger for the 2026-05-01 mass-poisoning incident.
+
+        Containers using ``ValidatorConfig.from_env()`` MUST default to
+        rescue_resubmit_window=1123 even when no env var is set, so all
+        validators that pull this build automatically roll back state and
+        re-eval+resubmit window 1123 over the stale on-chain pointers
+        without operator intervention. This default MUST be reverted to
+        ``None`` in the release following window 1124.
+        """
+        from trajectoryrl.utils.config import _parse_rescue_resubmit_window
+        monkeypatch.delenv("RESCUE_RESUBMIT_WINDOW", raising=False)
+        assert _parse_rescue_resubmit_window() == 1123
+
+    def test_rescue_resubmit_window_env_override(self, monkeypatch):
+        """Operators can override the hardcoded default with the env var."""
+        from trajectoryrl.utils.config import _parse_rescue_resubmit_window
+        monkeypatch.setenv("RESCUE_RESUBMIT_WINDOW", "1130")
+        assert _parse_rescue_resubmit_window() == 1130
+
+    def test_rescue_resubmit_window_disable_via_env(self, monkeypatch):
+        """Sentinel values disable the rescue (escape hatch for operators)."""
+        from trajectoryrl.utils.config import _parse_rescue_resubmit_window
+        for val in ("0", "none", "off", "false", "OFF", "None"):
+            monkeypatch.setenv("RESCUE_RESUBMIT_WINDOW", val)
+            assert _parse_rescue_resubmit_window() is None, (
+                f"{val!r} should disable rescue"
+            )
+
 
 # ===================================================================
 # NCD Similarity Tests
@@ -3204,6 +3233,7 @@ class TestIssue1EpochSkipSemantics:
         v.config = MagicMock()
         v.config.full_cycle_on_startup = False
         v.config.aggregate_when_start = False
+        v.config.rescue_resubmit_window = None
         v.config.weight_interval_blocks = 999999
         v.config.pack_cache_max_size = 100
         v.config.quorum_threshold = 0.5
@@ -3303,12 +3333,111 @@ class TestIssue1EpochSkipSemantics:
         assert submitted == pytest.approx(90.0)
         assert total == pytest.approx(100.0)
 
-    def test_submit_is_phase_decoupled(self):
+    def test_submit_blocked_in_evaluation_phase(self):
+        """Submission must NOT fire while we're still in the evaluation phase.
+
+        The old behaviour was "phase-decoupled": as soon as eval completed
+        (set ``_last_eval_window``) the next loop tick committed to chain
+        regardless of phase. This is unsafe — if eval terminates
+        pathologically fast (e.g. chain query returned 0 commitments due
+        to ws timeout) the validator commits stale data immediately and
+        locks itself out of the window. Submission is now gated on
+        ``window.phase != EVALUATION`` so the cycle has time to either
+        produce real data or be retried.
+        """
         v = self._make_validator()
         aligned = 7986780 + ((100 - (7986780 % 100)) % 100)
-        block = aligned + 10  # evaluation phase
+        block = aligned + 10  # evaluation phase (offset 10/100)
         v.subtensor.get_current_block.side_effect = [block, block]
         target = block // 100
+        v._target_window = target
+        v._last_eval_window = target
+        v._consensus_window = target - 1
+
+        def _close_task(coro):
+            coro.close()
+            return MagicMock()
+
+        with patch("trajectoryrl.base.validator.asyncio.create_task", side_effect=_close_task), \
+             patch("trajectoryrl.base.validator.asyncio.sleep", AsyncMock(side_effect=KeyboardInterrupt())):
+            asyncio.run(v.run())
+
+        assert v._submit_consensus_payload.await_count == 0
+        assert v._target_submit_done is False
+
+    def test_submit_fires_in_propagation_phase(self):
+        """Submission fires once we cross into propagation phase (>= 80%)."""
+        v = self._make_validator()
+        aligned = 7986780 + ((100 - (7986780 % 100)) % 100)
+        block = aligned + 85  # propagation phase (offset 85/100, between 80 and 90)
+        v.subtensor.get_current_block.side_effect = [block, block]
+        target = block // 100
+        v._target_window = target
+        v._last_eval_window = target
+        v._consensus_window = target - 1
+
+        def _close_task(coro):
+            coro.close()
+            return MagicMock()
+
+        with patch("trajectoryrl.base.validator.asyncio.create_task", side_effect=_close_task), \
+             patch("trajectoryrl.base.validator.asyncio.sleep", AsyncMock(side_effect=KeyboardInterrupt())):
+            asyncio.run(v.run())
+
+        assert v._submit_consensus_payload.await_count == 1
+        assert v._target_submit_done is True
+
+    def test_phase_gate_rescue_bypass_logic(self):
+        """Unit test for the phase-gate decision: rescue mode for the
+        target window must bypass the EVALUATION-phase block so the
+        rescue payload publishes as soon as eval finishes. Operators
+        explicitly opted into 'rescue ASAP' — the P0 return-propagation
+        fix is what now stops fast-fail eval from triggering submit, so
+        the phase gate's defensive role is already covered.
+        """
+        from trajectoryrl.utils.eval_window import (
+            EvaluationWindow, WindowPhase,
+        )
+
+        def gate(target, physical, phase, rescue):
+            target_already_passed = target < physical
+            in_rescue_for_target = rescue is not None and rescue == target
+            return (
+                target_already_passed
+                or in_rescue_for_target
+                or phase != WindowPhase.EVALUATION
+            )
+
+        # Normal: blocked in evaluation phase
+        assert gate(1123, 1123, WindowPhase.EVALUATION, None) is False
+        # Normal: allowed in propagation phase
+        assert gate(1123, 1123, WindowPhase.PROPAGATION, None) is True
+        # Normal: allowed in aggregation phase
+        assert gate(1123, 1123, WindowPhase.AGGREGATION, None) is True
+        # Cross-window: target already passed → bypass
+        assert gate(1123, 1124, WindowPhase.EVALUATION, None) is True
+        # Rescue for target → bypass even in evaluation phase
+        assert gate(1123, 1123, WindowPhase.EVALUATION, 1123) is True
+        # Rescue for a DIFFERENT window → no bypass
+        assert gate(1123, 1123, WindowPhase.EVALUATION, 1130) is False
+
+    def test_submit_fires_when_target_window_already_passed(self):
+        """Phase gate is bypassed when target_window < physical_window.
+
+        Rescue path: after rollback, eval may complete after the rescue
+        window has rolled into the next window's evaluation phase. The
+        phase gate uses *current* window's phase, so without the bypass
+        we'd be stuck unable to publish the rescue payload. The bypass
+        ensures published-late payloads always go through.
+        """
+        v = self._make_validator()
+        aligned = 7986780 + ((100 - (7986780 % 100)) % 100)
+        # Physical = target+1, offset 10 (next window's evaluation phase).
+        # Without the target_already_passed bypass, the EVALUATION-phase
+        # gate would block submission of the prior-window payload.
+        block = aligned + 1 * 100 + 10
+        v.subtensor.get_current_block.side_effect = [block, block]
+        target = block // 100 - 1   # one window in the past
         v._target_window = target
         v._last_eval_window = target
         v._consensus_window = target - 1
@@ -3419,7 +3548,7 @@ class TestAggregateOnStartupConsensusWindowPersist:
 
     def _make_minimal_validator(self):
         v = TrajectoryValidator.__new__(TrajectoryValidator)
-        v.config = MagicMock(netuid=11)
+        v.config = MagicMock(netuid=11, rescue_resubmit_window=None)
         v.subtensor = MagicMock()
         v.subtensor.get_current_block.return_value = 999
         v.metagraph = MagicMock(hotkeys=[])
@@ -3512,7 +3641,9 @@ class TestRunConsensusAggregationQuorumGate:
 
     def _make_validator(self):
         v = TrajectoryValidator.__new__(TrajectoryValidator)
-        v.config = MagicMock(netuid=11, quorum_threshold=0.5)
+        v.config = MagicMock(
+            netuid=11, quorum_threshold=0.5, rescue_resubmit_window=None,
+        )
         v.subtensor = MagicMock()
         v.metagraph = MagicMock(hotkeys=[], n=10)
         v._consensus_window = 1122
@@ -3562,3 +3693,269 @@ class TestRunConsensusAggregationQuorumGate:
         assert fetch_mock.called, (
             "should proceed to fetch chain commitments when quorum is met"
         )
+
+
+class TestRunEvaluationCycleReturnPropagation:
+    """Regression: ``_run_evaluation_cycle`` must propagate the inner cycle's
+    return value. PR #213 changed ``_execute_evaluation_cycle`` to return
+    ``False`` on snapshot-fetch failure so the caller can skip the
+    ``_last_eval_window`` bump and avoid locking the validator out of the
+    window. The wrapper had ``await self._execute_evaluation_cycle(...)``
+    rather than ``return await ...`` — the False was silently swallowed,
+    the caller's ``if cycle_result is False:`` branch never fired, and
+    every snapshot failure still poisoned the window. This test pins the
+    propagation behaviour."""
+
+    def _make_validator(self):
+        v = TrajectoryValidator.__new__(TrajectoryValidator)
+        v.config = MagicMock(rescue_resubmit_window=None)
+        v._cycle_eval_id = None
+        v._cycle_log_offset = 0
+        v._cycle_log_block = 0
+        v._cycle_window_number = 0
+        v._get_validator_log_offset = MagicMock(return_value=0)
+        return v
+
+    def test_returns_false_when_inner_returns_false(self):
+        v = self._make_validator()
+        v._execute_evaluation_cycle = AsyncMock(return_value=False)
+        result = asyncio.run(v._run_evaluation_cycle(123, 1123))
+        assert result is False, (
+            "wrapper must propagate inner False so caller skips the "
+            "_last_eval_window state update"
+        )
+
+    def test_returns_none_when_inner_returns_none(self):
+        v = self._make_validator()
+        v._execute_evaluation_cycle = AsyncMock(return_value=None)
+        result = asyncio.run(v._run_evaluation_cycle(123, 1123))
+        assert result is None, (
+            "wrapper must propagate inner success (None) unchanged"
+        )
+
+
+class TestCheckOwnCommitmentRescueBypass:
+    """Rescue mode bypass in ``_check_own_commitment_on_chain``.
+
+    When ``RESCUE_RESUBMIT_WINDOW=N`` is set, the check for window N must
+    return False unconditionally so the stale on-chain pointer is
+    overwritten by a fresh submission. Other windows go through the normal
+    chain-query path."""
+
+    def _make_validator(self, rescue_window=None):
+        v = TrajectoryValidator.__new__(TrajectoryValidator)
+        v.config = MagicMock(netuid=11, rescue_resubmit_window=rescue_window)
+        v.subtensor = MagicMock()
+        v.wallet = MagicMock()
+        v.wallet.hotkey.ss58_address = "5ValidatorOwn"
+        return v
+
+    def test_bypasses_chain_query_for_rescue_window(self):
+        v = self._make_validator(rescue_window=1123)
+        # If the bypass is missing, this would be invoked.
+        v.subtensor.get_all_commitments = MagicMock(
+            side_effect=AssertionError("chain must not be queried in rescue")
+        )
+        assert v._check_own_commitment_on_chain(1123) is False
+
+    def test_does_not_bypass_for_other_windows(self):
+        v = self._make_validator(rescue_window=1123)
+        v.subtensor.get_all_commitments = MagicMock(return_value={})
+        assert v._check_own_commitment_on_chain(1124) is False
+        v.subtensor.get_all_commitments.assert_called_once()
+
+    def test_no_bypass_when_rescue_unset(self):
+        v = self._make_validator(rescue_window=None)
+        v.subtensor.get_all_commitments = MagicMock(return_value={})
+        assert v._check_own_commitment_on_chain(1123) is False
+        v.subtensor.get_all_commitments.assert_called_once()
+
+
+class TestRescueRollback:
+    """One-shot rescue rollback restores window-level state without
+    touching per-miner caches.
+
+    Goal: when ``RESCUE_RESUBMIT_WINDOW=N`` is set and persisted state has
+    advanced past N (consensus_window >= N, target_window > N,
+    last_eval_window >= N, or target_submit_done=True), reset the four
+    window-level fields so the main loop treats N as the next thing to do.
+    Per-miner caches survive so already-evaluated miners with unchanged
+    pack_hash short-circuit via ``_needs_evaluation``."""
+
+    def _make_validator(self, tmp_path, rescue_window):
+        v = TrajectoryValidator.__new__(TrajectoryValidator)
+        v.config = MagicMock(rescue_resubmit_window=rescue_window)
+        v.config.eval_state_path = tmp_path / "eval_state.json"
+        v.config.pack_first_seen_path = tmp_path / "pack_first_seen.json"
+        v._consensus_window = 1123
+        v._target_window = 1124
+        v._last_eval_window = 1123
+        v._target_submit_done = True
+        v._waiting_for_quorum = False
+        # Per-miner caches that must survive the rollback.
+        v.scenario_scores = {"hk1": {"s1": 0.7}}
+        v._eval_pack_hash = {"hk1": "deadbeef"}
+        v.last_eval_block = {"hk1": 1000}
+        v.last_eval_window = {"hk1": 1122}
+        v.integrity_judge = MagicMock(dump_cache=MagicMock(return_value={}))
+        v.pack_first_seen = {}
+        v.pack_last_seen_window = {}
+        return v
+
+    def test_rolls_back_state_and_preserves_caches(self, tmp_path):
+        v = self._make_validator(tmp_path, rescue_window=1123)
+        # Pre-existing on-disk state file so backup path runs.
+        v.config.eval_state_path.write_text('{"consensus_window": 1123}')
+
+        with patch(
+            "trajectoryrl.base.validator.save_pack_first_seen"
+        ):
+            v._apply_rescue_rollback()
+
+        assert v._consensus_window == 1122, "consensus rolled back to N-1"
+        assert v._target_window == 1123, "target set to rescue window"
+        assert v._last_eval_window == 1122, "last_eval clamped to N-1"
+        assert v._target_submit_done is False, "submit_done cleared"
+        assert v._waiting_for_quorum is False, "waiting_for_quorum cleared"
+        # Per-miner caches preserved
+        assert v.scenario_scores == {"hk1": {"s1": 0.7}}
+        assert v._eval_pack_hash == {"hk1": "deadbeef"}
+        assert v.last_eval_block == {"hk1": 1000}
+        assert v.last_eval_window == {"hk1": 1122}
+
+        # Backup file written alongside the state file.
+        backups = list(tmp_path.glob("eval_state.json.bak.rescue1123.*"))
+        assert len(backups) == 1, f"expected 1 backup, got {backups}"
+
+    def test_no_op_when_state_already_before_rescue(self, tmp_path):
+        v = self._make_validator(tmp_path, rescue_window=1130)
+        # State is already before the rescue point — no rollback needed.
+        v._consensus_window = 1122
+        v._target_window = 1123
+        v._last_eval_window = 1122
+        v._target_submit_done = False
+
+        with patch(
+            "trajectoryrl.base.validator.save_pack_first_seen"
+        ):
+            v._apply_rescue_rollback()
+
+        # State unchanged
+        assert v._consensus_window == 1122
+        assert v._target_window == 1123
+        assert v._last_eval_window == 1122
+        assert v._target_submit_done is False
+        # No backup written
+        assert not list(tmp_path.glob("eval_state.json.bak.*"))
+
+    def test_no_op_when_rescue_unset(self, tmp_path):
+        v = self._make_validator(tmp_path, rescue_window=None)
+        v._apply_rescue_rollback()
+        # State unchanged
+        assert v._consensus_window == 1123
+        assert v._target_window == 1124
+
+
+class TestRescueDisablesStartupAggregation:
+    """Rescue mode skips ``_aggregate_on_startup`` regardless of the
+    AGGREGATE_WHEN_START / FULL_CYCLE_ON_STARTUP env vars.
+
+    Startup aggregation reads chain commitments and trusts them. If the
+    chain has stale poisoned commitments (which is what triggers a rescue
+    in the first place), startup aggregation would re-poison the state
+    we just rolled back. So rescue mode unconditionally skips it."""
+
+    def _make_validator(self, rescue_window):
+        v = TrajectoryValidator.__new__(TrajectoryValidator)
+        v.config = MagicMock(
+            rescue_resubmit_window=rescue_window,
+            full_cycle_on_startup=False,
+            aggregate_when_start=True,  # ← would normally fire
+            weight_interval_blocks=999999,
+            netuid=11,
+        )
+        v._window_config = WindowConfig(
+            window_length=100, global_anchor=0,
+            publish_pct=0.8, aggregate_pct=0.9,
+        )
+        v._last_eval_window = -1
+        v._consensus_window = -1
+        v._target_window = -1
+        v._target_submit_done = False
+        v._waiting_for_quorum = False
+        v._last_eval_at = None
+        v._last_eval_date = None
+        v.last_weight_block = 0
+        v._cycle_eval_id = None
+        v._cycle_log_offset = 0
+        v._cycle_log_block = 0
+        v._cycle_window_number = 0
+        v.wallet = MagicMock()
+        v.wallet.hotkey.ss58_address = "validator_hotkey"
+        v.subtensor = MagicMock()
+        v.metagraph = MagicMock(hotkeys=[], validator_permit=[], stake=[], n=0)
+        v.pack_fetcher = MagicMock()
+        v._sandbox_harness = MagicMock()
+        v._sandbox_harness.bench_image_hash = "bench"
+        v._sandbox_harness.harness_image_hash = "harness"
+        v._sandbox_harness.sandbox_version = "vtest"
+
+        v._apply_rescue_rollback = MagicMock()
+        v._aggregate_on_startup = AsyncMock()
+        v._full_cycle_on_startup = AsyncMock()
+        v._replay_pending_uploads = AsyncMock()
+        v._heartbeat_loop = AsyncMock()
+        v._run_evaluation_cycle = AsyncMock()
+        v._submit_consensus_payload = AsyncMock(return_value=True)
+        v._run_consensus_aggregation = AsyncMock()
+        v._set_winner_weights = AsyncMock()
+        v._set_burn_weights = AsyncMock()
+        v._set_fallback_weights = AsyncMock()
+        v._save_eval_state = MagicMock()
+        v._check_own_commitment_on_chain = MagicMock(return_value=False)
+        v._is_metagraph_healthy = MagicMock(return_value=True)
+        v._sync_metagraph = MagicMock(return_value=True)
+        v._fire_upload_cycle_logs = AsyncMock()
+        return v
+
+    def test_rescue_skips_aggregate_on_startup(self):
+        v = self._make_validator(rescue_window=1123)
+        block = 7986780 + 50  # arbitrary in-window block
+        v.subtensor.get_current_block.side_effect = [block]
+
+        def _close_task(coro):
+            coro.close()
+            return MagicMock()
+
+        with patch(
+            "trajectoryrl.base.validator.asyncio.create_task",
+            side_effect=_close_task,
+        ), patch(
+            "trajectoryrl.base.validator.asyncio.sleep",
+            AsyncMock(side_effect=KeyboardInterrupt()),
+        ):
+            asyncio.run(v.run())
+
+        v._apply_rescue_rollback.assert_called_once()
+        v._aggregate_on_startup.assert_not_called()
+        v._full_cycle_on_startup.assert_not_called()
+
+    def test_no_rescue_runs_aggregate_on_startup_normally(self):
+        v = self._make_validator(rescue_window=None)
+        block = 7986780 + 50
+        v.subtensor.get_current_block.side_effect = [block]
+
+        def _close_task(coro):
+            coro.close()
+            return MagicMock()
+
+        with patch(
+            "trajectoryrl.base.validator.asyncio.create_task",
+            side_effect=_close_task,
+        ), patch(
+            "trajectoryrl.base.validator.asyncio.sleep",
+            AsyncMock(side_effect=KeyboardInterrupt()),
+        ):
+            asyncio.run(v.run())
+
+        v._aggregate_on_startup.assert_awaited_once()
