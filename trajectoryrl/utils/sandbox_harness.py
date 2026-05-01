@@ -351,6 +351,28 @@ _HERMES_PREENTRY = (
     "mkdir -p /workspace; "
     "chown -R hermes:hermes /workspace 2>/dev/null; "
     "chmod 0755 /workspace 2>/dev/null; "
+    # Pre-write a system-wide SSH config so the agent can use the short
+    # form `ssh sandbox 'CMD'` instead of the noisy explicit form.
+    # Weaker testees (Qwen3.5-class) misinterpret the long
+    # `ssh -o ... -i ... agent@sandbox` example in the prompt as a
+    # one-shot setup command, then run subsequent shell commands LOCALLY
+    # in the harness container — where /workspace is empty — and burn
+    # their turn budget on a fruitless search for SKILL.md. ControlMaster
+    # reuses the TCP+SSH connection across calls, ~150ms per call saved.
+    "mkdir -p /etc/ssh/ssh_config.d; "
+    "cat > /etc/ssh/ssh_config.d/sandbox.conf <<'EOF'\n"
+    "Host sandbox\n"
+    "    HostName sandbox\n"
+    "    User agent\n"
+    "    IdentityFile /tmp/id_ed25519\n"
+    "    StrictHostKeyChecking no\n"
+    "    UserKnownHostsFile /dev/null\n"
+    "    ControlMaster auto\n"
+    "    ControlPath /tmp/ssh-%r@%h:%p\n"
+    "    ControlPersist 600\n"
+    "EOF\n"
+    "grep -q 'Include /etc/ssh/ssh_config.d' /etc/ssh/ssh_config 2>/dev/null "
+    "  || echo 'Include /etc/ssh/ssh_config.d/*.conf' >> /etc/ssh/ssh_config; "
     "/opt/hermes/docker/entrypoint.sh \"$@\"; "
     "chat_rc=$?; "
     "hermes sessions export /workspace/turns.jsonl 2>/tmp/turns_export.err || true; "
@@ -831,13 +853,17 @@ class TrajectorySandboxHarness:
             t_testee_create = time.time()
             harness_name = f"testee_{session_id}_ep{episode_index}"
             harness_prompt = (
-                "SSH into the sandbox: `ssh -o StrictHostKeyChecking=no "
-                "-i /tmp/id_ed25519 agent@sandbox`. "
-                "Everything you need is there: shell, filesystem, tools. "
-                "Read /workspace/SKILL.md for your approach. "
-                "Read /workspace/INSTRUCTION.md for this episode's task. "
-                "Check /workspace/learned/ for notes from prior episodes (you may write there). "
-                "Explore the environment and solve the task. "
+                "The sandbox is a separate machine reachable only via SSH. "
+                "Wrap every shell command with `ssh sandbox` to run it inside:\n"
+                "  ssh sandbox 'cat /workspace/SKILL.md'         # your approach\n"
+                "  ssh sandbox 'cat /workspace/INSTRUCTION.md'   # this episode's task\n"
+                "  ssh sandbox 'ls /workspace/learned/'          # prior-episode notes\n"
+                "\n"
+                "Everything you need — SKILL.md, INSTRUCTION.md, the codebase, "
+                "tests, and any mock services — lives in the sandbox. "
+                "Files in your local /workspace are NOT the sandbox; they are "
+                "the harness container and will appear empty. "
+                "You may write notes to /workspace/learned/ inside the sandbox. "
                 "Do not modify SKILL.md."
             )
 
@@ -1272,12 +1298,12 @@ class TrajectorySandboxHarness:
                 command=["chat", "-q",
                          "Read /workspace/JUDGE.md for your evaluation protocol. "
                          "Read /workspace/JUDGE_TASK.md for this episode's evidence. "
-                         "You can SSH into the sandbox for grounding: "
-                         "`ssh -o StrictHostKeyChecking=no -i /tmp/id_ed25519 agent@sandbox`. "
-                         "Inside the sandbox, query http://localhost:8090/state for the "
-                         "full mock service state, read logs, check outputs — whatever the "
-                         "scenario exposes. "
-                         "Write your evaluation to /workspace/evaluation.json. "
+                         "These two files are LOCAL to your container (file tool reads them directly). "
+                         "For ground-truth evidence about what the testee actually did, "
+                         "SSH into the sandbox by wrapping commands with `ssh sandbox`:\n"
+                         "  ssh sandbox 'curl -s http://localhost:8090/state'   # mock service state\n"
+                         "  ssh sandbox 'cat /workspace/<some-file>'            # files the testee touched\n"
+                         "Write your evaluation to /workspace/evaluation.json (local). "
                          "You MUST write that file before finishing.",
                          "-m", self._judge_model,
                          "-t", "terminal,file,code_execution,memory",
