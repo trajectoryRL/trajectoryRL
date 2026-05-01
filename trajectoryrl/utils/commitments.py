@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -224,7 +224,9 @@ def fetch_all_commitments(
     subtensor,
     netuid: int,
     metagraph,
-) -> Dict[int, MinerCommitment]:
+    *,
+    reconnect: Optional[Callable[[], object]] = None,
+) -> Optional[Dict[int, MinerCommitment]]:
     """Read all miner commitments from the chain.
 
     Calls ``subtensor.get_all_commitments(netuid)`` and parses each entry.
@@ -234,17 +236,38 @@ def fetch_all_commitments(
         subtensor: Bittensor subtensor instance.
         netuid: Subnet UID (11 for TrajectoryRL).
         metagraph: Bittensor metagraph for hotkey/UID mapping.
+        reconnect: Optional callback that rebuilds the subtensor connection
+            and returns the new instance. Invoked once if the chain query
+            raises (typically due to a stale websocket). The retry uses the
+            returned subtensor.
 
     Returns:
-        Dict mapping UID -> MinerCommitment for all valid entries.
+        ``None`` if the chain query failed (caller MUST NOT persist this
+        as an empty active set — see ``_acquire_window_snapshot``).
+        ``{}`` if the chain query succeeded but returned no commitments.
+        A populated dict (UID → MinerCommitment) otherwise.
     """
-    commitments: Dict[int, MinerCommitment] = {}
-
     try:
         raw_commitments = subtensor.get_all_commitments(netuid=netuid)
     except Exception as e:
-        logger.error(f"Failed to read on-chain commitments: {e}")
-        return commitments
+        if reconnect is None:
+            logger.error(
+                f"Failed to read on-chain commitments (no reconnect cb): {e}"
+            )
+            return None
+        logger.warning(
+            f"Failed to read on-chain commitments: {e} — reconnecting and retrying once"
+        )
+        try:
+            subtensor = reconnect()
+            raw_commitments = subtensor.get_all_commitments(netuid=netuid)
+        except Exception as e2:
+            logger.error(
+                f"Failed to read on-chain commitments after reconnect: {e2}"
+            )
+            return None
+
+    commitments: Dict[int, MinerCommitment] = {}
 
     if not raw_commitments:
         return commitments

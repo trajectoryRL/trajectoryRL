@@ -362,19 +362,24 @@ class TrajectoryValidator:
         )
         return False
 
-    def _reconnect_subtensor(self, label: str = "") -> None:
-        """Rebuild the subtensor connection to recover from stale websockets."""
+    def _reconnect_subtensor(self, label: str = ""):
+        """Rebuild the subtensor connection to recover from stale websockets.
+
+        Returns the new ``self.subtensor`` on success, ``None`` on failure.
+        """
         try:
             logger.info("%sReconnecting subtensor (network=%s)...",
                         label, self.config.network)
             self.subtensor = bt.Subtensor(network=self.config.network)
             self.metagraph = self.subtensor.metagraph(self.config.netuid)
             logger.info("%sSubtensor reconnected", label)
+            return self.subtensor
         except Exception as e:
             logger.error(
                 "%sFailed to reconnect subtensor: %s", label, e,
                 exc_info=True,
             )
+            return None
 
     def _is_metagraph_healthy(self) -> bool:
         """Quick check whether the cached metagraph has any neurons."""
@@ -1426,17 +1431,30 @@ class TrajectoryValidator:
                     )
                     logger.info("=" * 60)
 
-                    await self._run_evaluation_cycle(current_block, target_window)
-                    self._last_eval_at = int(time.time())
-                    self._last_eval_window = target_window
-                    self._last_eval_date = datetime.datetime.utcnow().date()
-                    self.last_weight_block = self.subtensor.get_current_block()
-                    self._target_submit_done = False
-
-                    self.pack_fetcher.cleanup_cache(
-                        self.config.pack_cache_max_size
+                    cycle_result = await self._run_evaluation_cycle(
+                        current_block, target_window,
                     )
-                    self._save_eval_state()
+                    if cycle_result is False:
+                        # Infrastructure failure inside the cycle (e.g. chain
+                        # query for commitments unreachable). Do NOT mark the
+                        # window as evaluated; the next loop iteration will
+                        # retry rather than lock us out of this ~24h window.
+                        logger.warning(
+                            "Eval cycle for target_window=%d aborted; "
+                            "leaving window unmarked so it can retry",
+                            target_window,
+                        )
+                    else:
+                        self._last_eval_at = int(time.time())
+                        self._last_eval_window = target_window
+                        self._last_eval_date = datetime.datetime.utcnow().date()
+                        self.last_weight_block = self.subtensor.get_current_block()
+                        self._target_submit_done = False
+
+                        self.pack_fetcher.cleanup_cache(
+                            self.config.pack_cache_max_size
+                        )
+                        self._save_eval_state()
 
                     if self._cycle_eval_id is not None:
                         asyncio.ensure_future(
@@ -1744,7 +1762,11 @@ class TrajectoryValidator:
         window = compute_window(current_block, self._window_config)
         snapshot = self._acquire_window_snapshot(window, current_block)
         if snapshot is None:
-            return
+            # Snapshot acquisition failed (chain query unreachable even after
+            # reconnect retry). Returning False signals the outer loop NOT to
+            # mark this window as evaluated, so the next iteration can retry
+            # instead of locking the validator out of this ~24h window.
+            return False
 
         # Per-validator runtime filters (validator_permit, blacklist)
         # are dynamic and applied on top of the frozen snapshot every
@@ -2190,8 +2212,24 @@ class TrajectoryValidator:
             window.window_number, window.window_start, current_block,
         )
         raw = fetch_all_commitments(
-            self.subtensor, self.config.netuid, self.metagraph,
+            self.subtensor,
+            self.config.netuid,
+            self.metagraph,
+            reconnect=lambda: self._reconnect_subtensor(
+                f"[snapshot window {window.window_number}] "
+            ),
         )
+        if raw is None:
+            # Chain query failed even after reconnect retry. Returning None
+            # without persisting lets the next loop iteration (or restart)
+            # re-attempt the fetch instead of being locked by a poisoned
+            # cache file for the rest of the ~24h window.
+            logger.error(
+                "Window %d: chain query for commitments failed; "
+                "skipping snapshot persistence so the next cycle can retry",
+                window.window_number,
+            )
+            return None
         snapshot = take_snapshot(
             raw,
             window_number=window.window_number,
