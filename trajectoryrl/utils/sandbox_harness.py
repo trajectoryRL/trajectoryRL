@@ -71,6 +71,12 @@ class _EpisodeResult:
     # even when --quiet collapses transcript.txt to header-only.
     turns_log: str = ""                       # Testee /workspace/turns.jsonl
     judge_turns_log: str = ""                 # Judge /workspace/turns.jsonl
+    # Stderr + exit code from `hermes sessions export`, captured so we
+    # can tell apart the failure modes when turns_log is empty (chat
+    # never opened a session vs export errored vs container OOM-killed
+    # before export ran). Empty string on success with non-empty JSONL.
+    turns_export_err: str = ""                # /workspace/turns_export.err (testee)
+    judge_turns_export_err: str = ""          # /workspace/turns_export.err (judge)
     mock_state: dict = field(default_factory=dict)
     timed_out: bool = False
     error: str | None = None
@@ -208,6 +214,14 @@ class SandboxEvaluationResult:
                 (ep_dir / "turns.jsonl").write_text(ep.turns_log)
             if ep.judge_turns_log:
                 (ep_dir / "judge_turns.jsonl").write_text(ep.judge_turns_log)
+            # Stderr from `hermes sessions export` — only useful when the
+            # JSONL is empty, but always cheap to write. Lets the website
+            # show "Trace export failed: <reason>" instead of a blank tab.
+            if ep.turns_export_err:
+                (ep_dir / "turns_export.err").write_text(ep.turns_export_err)
+            if ep.judge_turns_export_err:
+                (ep_dir / "judge_turns_export.err").write_text(
+                    ep.judge_turns_export_err)
             (ep_dir / "evaluation.json").write_text(
                 json.dumps(ep.judge_result, indent=2, default=str))
             (ep_dir / "episode.json").write_text(
@@ -353,7 +367,19 @@ _HERMES_PREENTRY = (
     "chmod 0755 /workspace 2>/dev/null; "
     "/opt/hermes/docker/entrypoint.sh \"$@\"; "
     "chat_rc=$?; "
-    "hermes sessions export /workspace/turns.jsonl 2>/tmp/turns_export.err || true; "
+    # Export the SQLite session store. Use the absolute venv path:
+    # entrypoint.sh's `exec hermes "$@"` activates the venv only inside
+    # its own subprocess, so when control returns to our outer shell
+    # (still root, original PATH) `hermes` is not on PATH and bare
+    # `hermes sessions export` exits with "command not found". That's
+    # why every production turns.jsonl was empty — verified live.
+    # Stderr lands in /workspace so the bench reads it back via
+    # get_archive (opaque failures used to be undebuggable when stderr
+    # went to /tmp). Always record the export's exit code: the JSONL
+    # being empty despite rc=0 is itself a signal we want to surface.
+    "/opt/hermes/.venv/bin/hermes sessions export /workspace/turns.jsonl 2>/workspace/turns_export.err; "
+    "export_rc=$?; "
+    "echo \"export_rc=$export_rc\" >> /workspace/turns_export.err; "
     "exit \"$chat_rc\""
 )
 _HERMES_ENTRYPOINT = ["/bin/sh", "-c", _HERMES_PREENTRY, "--"]
@@ -933,6 +959,12 @@ class TrajectorySandboxHarness:
                 episode.turns_log = _read_container_text(
                     harness, "/workspace/turns.jsonl",
                 )
+                # Stderr from the export step + its rc, recorded by the
+                # preentry. Only meaningful when turns_log is empty —
+                # tells us why instead of a vague "no trace recorded".
+                episode.turns_export_err = _read_container_text(
+                    harness, "/workspace/turns_export.err",
+                )
 
             finally:
                 t_testee_cleanup = time.time()
@@ -1359,6 +1391,9 @@ class TrajectorySandboxHarness:
             # write call as discrete turn objects.
             episode.judge_turns_log = _read_container_text(
                 judge, "/workspace/turns.jsonl",
+            )
+            episode.judge_turns_export_err = _read_container_text(
+                judge, "/workspace/turns_export.err",
             )
 
             t_judge_archive = time.time()
