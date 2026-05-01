@@ -1605,22 +1605,37 @@ class TrajectoryValidator:
                             )
                         )
 
-                # --- Submit when target eval is done AND either (a) we're
-                # past the evaluation phase of the target window or (b) the
-                # target is already in the past relative to physical. The
-                # phase gate prevents the failure mode where eval terminates
-                # pathologically fast (e.g. chain query returns 0 due to ws
-                # timeout) and the validator immediately commits a
-                # stale/empty payload to chain, locking itself out of the
-                # window. Holding submission until propagation phase
-                # (block_offset >= 80%) gives the cycle time to either
-                # produce real data or be retried. The "target in past"
-                # bypass covers the rescue path: after rescue rollback eval
-                # may complete after the rescue window has rolled into the
-                # next window's evaluation phase — we still need to publish.
+                # --- Submit when target eval is done AND we're allowed to
+                # publish in this phase. The phase gate prevents the failure
+                # mode where eval terminates pathologically fast (e.g. chain
+                # query returns 0 due to ws timeout) and the validator
+                # immediately commits a stale/empty payload, locking itself
+                # out of the window. Holding submission until propagation
+                # phase (block_offset >= 80%) gives the cycle time to either
+                # produce real data or be retried.
+                #
+                # Three bypasses:
+                #   * ``target_already_passed`` — payload finished evaluating
+                #     after physical advanced (rescue or generally late
+                #     eval); still need to publish.
+                #   * rescue mode for ``target_window`` — operator
+                #     explicitly opted into "re-eval+resubmit ASAP" for this
+                #     window, so don't add an extra propagation-phase wait
+                #     on top of the eval duration. Rescue eval that
+                #     fast-fails is already blocked from submitting by the
+                #     P0 ``return await`` fix in ``_run_evaluation_cycle``
+                #     (the False propagates and caller skips the
+                #     ``_last_eval_window`` bump), so the phase gate's
+                #     defensive role is already covered.
+                #   * non-evaluation phase — normal path.
                 target_already_passed = target_window < window.window_number
+                in_rescue_for_target = (
+                    self.config.rescue_resubmit_window is not None
+                    and self.config.rescue_resubmit_window == target_window
+                )
                 phase_allows_submit = (
                     target_already_passed
+                    or in_rescue_for_target
                     or window.phase != WindowPhase.EVALUATION
                 )
                 if (

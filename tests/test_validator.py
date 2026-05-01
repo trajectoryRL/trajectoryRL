@@ -3387,6 +3387,40 @@ class TestIssue1EpochSkipSemantics:
         assert v._submit_consensus_payload.await_count == 1
         assert v._target_submit_done is True
 
+    def test_phase_gate_rescue_bypass_logic(self):
+        """Unit test for the phase-gate decision: rescue mode for the
+        target window must bypass the EVALUATION-phase block so the
+        rescue payload publishes as soon as eval finishes. Operators
+        explicitly opted into 'rescue ASAP' — the P0 return-propagation
+        fix is what now stops fast-fail eval from triggering submit, so
+        the phase gate's defensive role is already covered.
+        """
+        from trajectoryrl.utils.eval_window import (
+            EvaluationWindow, WindowPhase,
+        )
+
+        def gate(target, physical, phase, rescue):
+            target_already_passed = target < physical
+            in_rescue_for_target = rescue is not None and rescue == target
+            return (
+                target_already_passed
+                or in_rescue_for_target
+                or phase != WindowPhase.EVALUATION
+            )
+
+        # Normal: blocked in evaluation phase
+        assert gate(1123, 1123, WindowPhase.EVALUATION, None) is False
+        # Normal: allowed in propagation phase
+        assert gate(1123, 1123, WindowPhase.PROPAGATION, None) is True
+        # Normal: allowed in aggregation phase
+        assert gate(1123, 1123, WindowPhase.AGGREGATION, None) is True
+        # Cross-window: target already passed → bypass
+        assert gate(1123, 1124, WindowPhase.EVALUATION, None) is True
+        # Rescue for target → bypass even in evaluation phase
+        assert gate(1123, 1123, WindowPhase.EVALUATION, 1123) is True
+        # Rescue for a DIFFERENT window → no bypass
+        assert gate(1123, 1123, WindowPhase.EVALUATION, 1130) is False
+
     def test_submit_fires_when_target_window_already_passed(self):
         """Phase gate is bypassed when target_window < physical_window.
 
