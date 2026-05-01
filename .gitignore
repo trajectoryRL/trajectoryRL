@@ -1,6 +1,7 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
 CLAUDE.md
+.claude/
 *.py[codz]
 *$py.class
 
