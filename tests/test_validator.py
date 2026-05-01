@@ -949,6 +949,183 @@ class TestGetCommitmentBlock:
         )
 
 
+class TestFetchAllCommitmentsResilience:
+    """Tests for chain-failure handling and reconnect retry in fetch_all_commitments.
+
+    Distinguishes "chain query failed" (returns None — caller MUST NOT persist
+    a snapshot) from "chain query succeeded with no commitments" (returns {} —
+    legitimate empty state).
+    """
+
+    def _hotkey(self) -> str:
+        return "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+
+    def _good_raw(self) -> str:
+        return "a" * 64 + "|https://trajrl.com/samples/pack.json"
+
+    def _metagraph_with(self, hotkey: str):
+        mg = MagicMock()
+        mg.hotkeys = [hotkey]
+        return mg
+
+    def test_returns_none_when_chain_query_fails_and_no_reconnect_cb(self):
+        """Without a reconnect callback, a chain exception → returns None
+        (signals failure so caller skips snapshot persistence)."""
+        from trajectoryrl.utils.commitments import fetch_all_commitments
+
+        mock_subtensor = MagicMock()
+        mock_subtensor.get_all_commitments.side_effect = Exception("ws closed")
+
+        result = fetch_all_commitments(
+            mock_subtensor, netuid=11, metagraph=self._metagraph_with(self._hotkey()),
+        )
+        assert result is None
+
+    def test_returns_empty_dict_when_chain_truly_empty(self):
+        """A successful chain query that returns 0 commitments → returns {} (not None).
+        Distinguishes legit empty state from query failure."""
+        from trajectoryrl.utils.commitments import fetch_all_commitments
+
+        mock_subtensor = MagicMock()
+        mock_subtensor.get_all_commitments.return_value = {}
+
+        result = fetch_all_commitments(
+            mock_subtensor, netuid=11, metagraph=self._metagraph_with(self._hotkey()),
+        )
+        assert result == {}
+
+    def test_retries_via_reconnect_callback_when_first_attempt_fails(self):
+        """When the first chain query raises, the reconnect callback is invoked
+        and the returned subtensor is used for a single retry."""
+        from trajectoryrl.utils.commitments import fetch_all_commitments
+
+        hotkey = self._hotkey()
+
+        broken_subtensor = MagicMock()
+        broken_subtensor.get_all_commitments.side_effect = Exception("ws closed")
+
+        fresh_subtensor = MagicMock()
+        fresh_subtensor.get_all_commitments.return_value = {hotkey: self._good_raw()}
+        fresh_subtensor.get_commitment_metadata.return_value = {"block": 42000}
+
+        reconnect_calls = {"count": 0}
+
+        def reconnect():
+            reconnect_calls["count"] += 1
+            return fresh_subtensor
+
+        result = fetch_all_commitments(
+            broken_subtensor,
+            netuid=11,
+            metagraph=self._metagraph_with(hotkey),
+            reconnect=reconnect,
+        )
+
+        assert reconnect_calls["count"] == 1
+        assert result is not None
+        assert 0 in result
+        assert result[0].hotkey == hotkey
+
+    def test_returns_none_when_reconnected_fetch_also_fails(self):
+        """If the chain query fails after reconnect too, returns None."""
+        from trajectoryrl.utils.commitments import fetch_all_commitments
+
+        broken_subtensor = MagicMock()
+        broken_subtensor.get_all_commitments.side_effect = Exception("ws closed")
+
+        still_broken = MagicMock()
+        still_broken.get_all_commitments.side_effect = Exception("still broken")
+
+        result = fetch_all_commitments(
+            broken_subtensor,
+            netuid=11,
+            metagraph=self._metagraph_with(self._hotkey()),
+            reconnect=lambda: still_broken,
+        )
+        assert result is None
+
+    def test_does_not_invoke_reconnect_when_first_attempt_succeeds(self):
+        """No reconnect call when the chain query succeeds on the first try."""
+        from trajectoryrl.utils.commitments import fetch_all_commitments
+
+        hotkey = self._hotkey()
+
+        mock_subtensor = MagicMock()
+        mock_subtensor.get_all_commitments.return_value = {hotkey: self._good_raw()}
+        mock_subtensor.get_commitment_metadata.return_value = {"block": 1000}
+
+        reconnect_calls = {"count": 0}
+
+        def reconnect():
+            reconnect_calls["count"] += 1
+            return mock_subtensor
+
+        result = fetch_all_commitments(
+            mock_subtensor,
+            netuid=11,
+            metagraph=self._metagraph_with(hotkey),
+            reconnect=reconnect,
+        )
+        assert reconnect_calls["count"] == 0
+        assert result is not None and 0 in result
+
+
+class TestAcquireWindowSnapshotGuard:
+    """Tests for _acquire_window_snapshot's behavior when chain query fails.
+
+    A failed chain query (fetch_all_commitments returns None) MUST NOT be
+    persisted as an "empty active set" snapshot — that locks the validator
+    into a no-eval state for the rest of the ~24h window.
+    """
+
+    def test_does_not_save_snapshot_when_fetch_returns_none(self, tmp_path):
+        """When fetch_all_commitments returns None, _acquire_window_snapshot
+        must return None and must NOT call save_snapshot — so the next loop
+        iteration (or restart) can re-attempt the fetch instead of being
+        locked by a poisoned cache file."""
+        from trajectoryrl.base import validator as validator_module
+        from trajectoryrl.utils.eval_snapshot import EvalSnapshot
+
+        # Build a minimal stub validator that exposes the methods/attrs
+        # _acquire_window_snapshot needs, without going through the full
+        # TrajectoryValidator constructor.
+        validator = MagicMock()
+        validator.config.active_set_dir = str(tmp_path)
+        validator.config.netuid = 11
+        validator.config.inactivity_blocks = 120
+        validator.subtensor = MagicMock()
+        validator.metagraph = MagicMock()
+
+        # Bind the real _acquire_window_snapshot onto our stub.
+        validator._acquire_window_snapshot = (
+            validator_module.TrajectoryValidator._acquire_window_snapshot.__get__(
+                validator
+            )
+        )
+
+        # Build a minimal EvaluationWindow-like object (the method only reads
+        # window_number and window_start from it).
+        window = MagicMock()
+        window.window_number = 1123
+        window.window_start = 8085600
+
+        with patch.object(
+            validator_module, "fetch_all_commitments", return_value=None,
+        ) as fetch_mock, patch.object(
+            validator_module, "save_snapshot",
+        ) as save_mock, patch.object(
+            validator_module, "load_snapshot", return_value=None,
+        ):
+            result = validator._acquire_window_snapshot(window, current_block=8085614)
+
+        assert fetch_mock.called
+        assert result is None, "should return None to signal caller to fall back"
+        assert not save_mock.called, (
+            "must NOT persist a snapshot when chain query failed — "
+            "would poison the cache and block the next ~24h window"
+        )
+
+
 # ===================================================================
 # Per-Scenario Eval State Tests
 # ===================================================================
