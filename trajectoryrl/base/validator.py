@@ -562,6 +562,87 @@ class TrajectoryValidator:
         except Exception as e:
             logger.warning(f"Failed to save pack_first_seen: {e}")
 
+    def _backup_eval_state(self, suffix: str) -> None:
+        """Copy ``eval_state.json`` to a timestamped sibling before mutating.
+
+        Used by the rescue path so the original state can be restored if
+        rollback turns out to be incorrect. Best-effort: a backup failure
+        is logged but does not abort the caller (a corrupt-but-saved state
+        is still recoverable from periodic snapshots).
+        """
+        src = self.config.eval_state_path
+        if not src.exists():
+            return
+        ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        dst = src.with_name(f"{src.name}.bak.{suffix}.{ts}")
+        try:
+            dst.write_bytes(src.read_bytes())
+            logger.info("Backed up eval state to %s", dst)
+        except Exception as e:
+            logger.warning("Failed to back up eval state to %s: %s", dst, e)
+
+    def _apply_rescue_rollback(self) -> None:
+        """One-shot rescue: roll back persisted state to force re-eval+resubmit.
+
+        When ``RESCUE_RESUBMIT_WINDOW=N`` is set and saved state has advanced
+        past N (consensus_window >= N, target_window > N, or last_eval_window
+        >= N), reset the four window-level fields so the main loop runs a
+        fresh evaluation for window N and submits over the (likely stale)
+        on-chain pointer.
+
+        Per-miner caches (``_eval_pack_hash``, ``scenario_scores``,
+        ``last_eval_window``) are intentionally preserved: the dedup logic
+        in ``_needs_evaluation`` skips miners whose pack_hash is unchanged,
+        which keeps the rescue eval fast.
+        """
+        rescue = self.config.rescue_resubmit_window
+        if rescue is None:
+            return
+        if rescue < 0:
+            logger.warning(
+                "RESCUE_RESUBMIT_WINDOW=%d is negative — ignoring", rescue,
+            )
+            return
+
+        needs_rollback = (
+            self._target_window > rescue
+            or self._consensus_window >= rescue
+            or self._last_eval_window >= rescue
+            or self._target_submit_done
+        )
+        if not needs_rollback:
+            logger.info(
+                "RESCUE_RESUBMIT_WINDOW=%d set but state already at or "
+                "before rescue point (consensus=%d, target=%d, last_eval=%d, "
+                "submit_done=%s) — no rollback needed",
+                rescue, self._consensus_window, self._target_window,
+                self._last_eval_window, self._target_submit_done,
+            )
+            return
+
+        self._backup_eval_state(suffix=f"rescue{rescue}")
+
+        new_consensus = rescue - 1
+        new_target = rescue
+        new_last_eval = min(self._last_eval_window, rescue - 1)
+        logger.warning(
+            "RESCUE_RESUBMIT_WINDOW=%d: rolling back state from "
+            "(consensus=%d, target=%d, last_eval=%d, submit_done=%s) to "
+            "(consensus=%d, target=%d, last_eval=%d, submit_done=False). "
+            "Per-miner caches preserved for fast re-eval.",
+            rescue,
+            self._consensus_window, self._target_window,
+            self._last_eval_window, self._target_submit_done,
+            new_consensus, new_target, new_last_eval,
+        )
+
+        self._consensus_window = new_consensus
+        self._target_window = new_target
+        self._last_eval_window = new_last_eval
+        self._target_submit_done = False
+        self._waiting_for_quorum = False
+        self._save_eval_state()
+
     def _drop_miner_eval_state(self, hotkey: str):
         """Remove all per-miner eval state and persist.
 
@@ -691,6 +772,18 @@ class TrajectoryValidator:
 
     def _check_own_commitment_on_chain(self, window_number: int) -> bool:
         """Check if this validator's consensus commitment exists on-chain for the given window."""
+        if (
+            self.config.rescue_resubmit_window is not None
+            and self.config.rescue_resubmit_window == window_number
+        ):
+            logger.info(
+                "Rescue mode for window %d: treating on-chain commitment as "
+                "absent so the stale pointer gets overwritten by a fresh "
+                "submission",
+                window_number,
+            )
+            return False
+
         my_hotkey = self.wallet.hotkey.ss58_address
         try:
             raw_commitments = self.subtensor.get_all_commitments(
@@ -1360,10 +1453,24 @@ class TrajectoryValidator:
             f"(~{self.config.weight_interval_blocks * 12 // 60}min)"
         )
 
+        # Apply one-shot rescue rollback before any startup aggregation runs
+        # — startup aggregation reads chain commitments and can re-poison the
+        # state we're trying to roll back, so it must happen first.
+        self._apply_rescue_rollback()
+
+        # Rescue mode disables startup aggregation regardless of the
+        # AGGREGATE_WHEN_START / FULL_CYCLE_ON_STARTUP env vars. The rescue
+        # restart explicitly does NOT trust on-chain commitments; it wants
+        # the main loop to drive a fresh eval+submit for the rescue window.
+        startup_aggregation_enabled = (
+            self.config.rescue_resubmit_window is None
+            and (self.config.full_cycle_on_startup or self.config.aggregate_when_start)
+        )
+
         # Pull sandbox image early so audit logs (bench_version) are accurate
         # for startup aggregation. SPEC_NUMBER is a code-level constant and
         # no longer derived from the bench image.
-        if self.config.full_cycle_on_startup or self.config.aggregate_when_start:
+        if startup_aggregation_enabled:
             try:
                 await self._sandbox_harness.pull_latest()
                 logger.info(
@@ -1378,7 +1485,17 @@ class TrajectoryValidator:
                     "%s — bench_version audit field may be stale", e,
                 )
 
-        if self.config.full_cycle_on_startup:
+        if self.config.rescue_resubmit_window is not None and (
+            self.config.full_cycle_on_startup or self.config.aggregate_when_start
+        ):
+            logger.info(
+                "Rescue mode (RESCUE_RESUBMIT_WINDOW=%d) — skipping startup "
+                "aggregation regardless of AGGREGATE_WHEN_START / "
+                "FULL_CYCLE_ON_STARTUP",
+                self.config.rescue_resubmit_window,
+            )
+
+        if startup_aggregation_enabled and self.config.full_cycle_on_startup:
             try:
                 await self._full_cycle_on_startup()
             except Exception as e:
@@ -1386,7 +1503,7 @@ class TrajectoryValidator:
                     "Startup full cycle failed: %s — continuing to main loop",
                     e, exc_info=True,
                 )
-        elif self.config.aggregate_when_start:
+        elif startup_aggregation_enabled and self.config.aggregate_when_start:
             try:
                 await self._aggregate_on_startup()
             except Exception as e:
@@ -1488,10 +1605,28 @@ class TrajectoryValidator:
                             )
                         )
 
-                # --- Submit when target eval is fully done (phase-decoupled) ---
+                # --- Submit when target eval is done AND either (a) we're
+                # past the evaluation phase of the target window or (b) the
+                # target is already in the past relative to physical. The
+                # phase gate prevents the failure mode where eval terminates
+                # pathologically fast (e.g. chain query returns 0 due to ws
+                # timeout) and the validator immediately commits a
+                # stale/empty payload to chain, locking itself out of the
+                # window. Holding submission until propagation phase
+                # (block_offset >= 80%) gives the cycle time to either
+                # produce real data or be retried. The "target in past"
+                # bypass covers the rescue path: after rescue rollback eval
+                # may complete after the rescue window has rolled into the
+                # next window's evaluation phase — we still need to publish.
+                target_already_passed = target_window < window.window_number
+                phase_allows_submit = (
+                    target_already_passed
+                    or window.phase != WindowPhase.EVALUATION
+                )
                 if (
                     self._last_eval_window >= target_window
                     and not self._target_submit_done
+                    and phase_allows_submit
                 ):
                     if self._check_own_commitment_on_chain(target_window):
                         self._target_submit_done = True
@@ -1691,7 +1826,7 @@ class TrajectoryValidator:
         self._cycle_log_block = current_block
         self._cycle_window_number = window_number
 
-        await self._execute_evaluation_cycle(
+        return await self._execute_evaluation_cycle(
             current_block, window_number, cycle_eval_id, cycle_start,
         )
 
