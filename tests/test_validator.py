@@ -3491,3 +3491,74 @@ class TestAggregateOnStartupConsensusWindowPersist:
         assert v._consensus_window == 1120
         v._save_eval_state.assert_called_once()
         v._set_winner_weights.assert_not_called()
+
+
+class TestRunConsensusAggregationQuorumGate:
+    """Regression: ``_run_consensus_aggregation`` must respect quorum.
+
+    The main loop checks quorum via ``_compute_quorum_status`` BEFORE invoking
+    ``_run_consensus_aggregation`` (validator.py:1503-1548), so that path is
+    safe. But ``_aggregate_on_startup`` and ``_full_cycle_on_startup`` invoke
+    ``_run_consensus_aggregation`` directly with no upstream gate. Without an
+    internal gate, a single stale on-chain submission (e.g. our own pointer
+    left behind from a prior failed cycle) is enough to bump
+    ``_consensus_window``, which then forces ``target_window`` past the
+    actual physical window and locks the validator out of the real eval.
+
+    This was the second of two bugs that caused the 2026-05-01 window-1123
+    incident on UID 221. The first bug (ws-failure-poisons-snapshot) was
+    fixed in PR #213; this regression locks in the second.
+    """
+
+    def _make_validator(self):
+        v = TrajectoryValidator.__new__(TrajectoryValidator)
+        v.config = MagicMock(netuid=11, quorum_threshold=0.5)
+        v.subtensor = MagicMock()
+        v.metagraph = MagicMock(hotkeys=[], n=10)
+        v._consensus_window = 1122
+        v._is_metagraph_healthy = MagicMock(return_value=True)
+        v._sync_metagraph = MagicMock(return_value=True)
+        v._compute_quorum_status = MagicMock()
+        v._consensus_store = MagicMock()
+        v.wallet = MagicMock()
+        v.wallet.hotkey.ss58_address = "5ValidatorOwn"
+        return v
+
+    def test_aggregation_skipped_when_quorum_not_met(self):
+        """Without quorum, ``_run_consensus_aggregation`` must return early
+        and leave ``_consensus_window`` untouched."""
+        v = self._make_validator()
+        v._compute_quorum_status.return_value = (False, 0.10, 100.0, 1000.0)
+        window = MagicMock(window_number=1123)
+
+        with patch(
+            "trajectoryrl.base.validator.fetch_validator_consensus_commitments"
+        ) as fetch_mock:
+            asyncio.run(v._run_consensus_aggregation(window))
+
+        assert v._consensus_window == 1122, (
+            "consensus_window must NOT advance when quorum is not met "
+            "(otherwise a single stale submission can lock the validator out "
+            "of the real eval cycle for that window)"
+        )
+        assert not fetch_mock.called, (
+            "should bail before fetching commitments when quorum gate fails"
+        )
+        v._compute_quorum_status.assert_called_once_with(1123)
+
+    def test_aggregation_proceeds_when_quorum_met(self):
+        """When quorum is met, the function must proceed past the gate
+        (we verify by observing the chain fetch is called)."""
+        v = self._make_validator()
+        v._compute_quorum_status.return_value = (True, 0.60, 600.0, 1000.0)
+        window = MagicMock(window_number=1123)
+
+        with patch(
+            "trajectoryrl.base.validator.fetch_validator_consensus_commitments",
+            return_value=[],  # empty downstream so the function still bails
+        ) as fetch_mock:
+            asyncio.run(v._run_consensus_aggregation(window))
+
+        assert fetch_mock.called, (
+            "should proceed to fetch chain commitments when quorum is met"
+        )

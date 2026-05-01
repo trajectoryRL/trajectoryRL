@@ -836,6 +836,28 @@ class TrajectoryValidator:
             )
             self._sync_metagraph(caller="consensus_aggregation")
 
+        # Quorum gate: bail if not enough validator stake has committed for
+        # this window. The main loop's aggregation phase enforces this gate
+        # externally (validator.py ~1503-1548), but `_aggregate_on_startup`
+        # and `_full_cycle_on_startup` invoke us directly with no upstream
+        # check — so without this gate, a single stale on-chain submission
+        # (e.g. our own pointer left behind by a prior failed cycle) is
+        # enough to bump _consensus_window, which then forces target_window
+        # past the actual physical window and locks the validator out of
+        # the real eval. See 2026-05-01 window-1123 incident.
+        meets, ratio, submitted_stake, total_stake = self._compute_quorum_status(
+            window.window_number,
+        )
+        if not meets:
+            logger.warning(
+                "Window %d: aggregation skipped — quorum not met "
+                "(submitted_stake=%.4f, total_validator_stake=%.4f, "
+                "ratio=%.4f, threshold=%.4f)",
+                window.window_number, submitted_stake, total_stake, ratio,
+                float(getattr(self.config, "quorum_threshold", 0.5)),
+            )
+            return
+
         chain_commitments = fetch_validator_consensus_commitments(
             self.subtensor, self.config.netuid, self.metagraph,
         )
