@@ -723,6 +723,35 @@ class TestValidatorConfig:
         assert "validator_scores_fork_url" not in defaults
         assert "validator_scores_local_path" not in defaults
 
+    def test_rescue_resubmit_window_hardcoded_default(self, monkeypatch):
+        """Hardcoded rescue trigger for the 2026-05-01 mass-poisoning incident.
+
+        Containers using ``ValidatorConfig.from_env()`` MUST default to
+        rescue_resubmit_window=1123 even when no env var is set, so all
+        validators that pull this build automatically roll back state and
+        re-eval+resubmit window 1123 over the stale on-chain pointers
+        without operator intervention. This default MUST be reverted to
+        ``None`` in the release following window 1124.
+        """
+        from trajectoryrl.utils.config import _parse_rescue_resubmit_window
+        monkeypatch.delenv("RESCUE_RESUBMIT_WINDOW", raising=False)
+        assert _parse_rescue_resubmit_window() == 1123
+
+    def test_rescue_resubmit_window_env_override(self, monkeypatch):
+        """Operators can override the hardcoded default with the env var."""
+        from trajectoryrl.utils.config import _parse_rescue_resubmit_window
+        monkeypatch.setenv("RESCUE_RESUBMIT_WINDOW", "1130")
+        assert _parse_rescue_resubmit_window() == 1130
+
+    def test_rescue_resubmit_window_disable_via_env(self, monkeypatch):
+        """Sentinel values disable the rescue (escape hatch for operators)."""
+        from trajectoryrl.utils.config import _parse_rescue_resubmit_window
+        for val in ("0", "none", "off", "false", "OFF", "None"):
+            monkeypatch.setenv("RESCUE_RESUBMIT_WINDOW", val)
+            assert _parse_rescue_resubmit_window() is None, (
+                f"{val!r} should disable rescue"
+            )
+
 
 # ===================================================================
 # NCD Similarity Tests
