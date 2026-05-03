@@ -1105,15 +1105,47 @@ class TrajectoryValidator:
 
         self._consensus_window = window.window_number
 
-        # Active-set membership gate: only miners present in the eval-window
-        # snapshot are eligible to win. This prunes any miner whose pack survived only
-        # via cached scenario_scores after the eval-time stale gate.
+        # Two-tier stale-pack gate before winner selection:
+        # 1. Active-set membership (snapshot.commitments) — catches miners
+        #    whose commit aged past inactivity_blocks at window_start.
+        # 2. pack_first_seen age — catches a same-hash re-commit that
+        #    refreshes commitment.block_number but leaves a long-cached
+        #    scenario_scores entry intact. pack_first_seen only moves DOWN
+        #    via claim_owner, so re-pinging the same hash cannot refresh it.
         snapshot = load_snapshot(self.config.active_set_dir, window.window_number)
         if snapshot is not None:
-            active_hotkeys = {c.hotkey for c in snapshot.commitments.values()}
+            snap_by_hk = {
+                c.hotkey: c for c in snapshot.commitments.values()
+            }
+            gate_block = self.subtensor.get_current_block()
+            # Mirror the snapshot's stale filter (age vs window_start ≤
+            # inactivity_blocks) projected to current_block: anything the
+            # snapshot allowed in has age ≤ inactivity_blocks +
+            # (gate_block - window_start) at gate time, so use that exact
+            # offset rather than the upper-bound window_length.
+            max_age = (
+                self.config.inactivity_blocks
+                + (gate_block - window.window_start)
+            )
             for hk in list(consensus_scores.keys()):
-                if hk not in active_hotkeys and hk not in disqualified:
+                if hk in disqualified:
+                    continue
+                commitment = snap_by_hk.get(hk)
+                if commitment is None:
                     disqualified[hk] = "stale_pack:not_in_active_set"
+                    continue
+                entry = self.pack_first_seen.get(commitment.pack_hash)
+                if entry is None:
+                    # No ownership entry yet — race where pack just
+                    # appeared and claim_owner has not run for it.
+                    # Lenient: leave the miner alone.
+                    continue
+                first_block = entry[1]
+                age = gate_block - first_block
+                if age > max_age:
+                    disqualified[hk] = (
+                        f"stale_pack:first_seen_age={age}>{max_age}"
+                    )
 
         # Filter disqualified miners from consensus scores before winner selection
         eligible_scores = {
