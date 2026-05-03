@@ -1105,6 +1105,16 @@ class TrajectoryValidator:
 
         self._consensus_window = window.window_number
 
+        # Active-set membership gate: only miners present in the eval-window
+        # snapshot are eligible to win. This prunes any miner whose pack survived only
+        # via cached scenario_scores after the eval-time stale gate.
+        snapshot = load_snapshot(self.config.active_set_dir, window.window_number)
+        if snapshot is not None:
+            active_hotkeys = {c.hotkey for c in snapshot.commitments.values()}
+            for hk in list(consensus_scores.keys()):
+                if hk not in active_hotkeys and hk not in disqualified:
+                    disqualified[hk] = "stale_pack:not_in_active_set"
+
         # Filter disqualified miners from consensus scores before winner selection
         eligible_scores = {
             hk: s for hk, s in consensus_scores.items() if hk not in disqualified
