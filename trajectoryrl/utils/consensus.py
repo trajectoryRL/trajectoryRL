@@ -22,6 +22,7 @@ class ConsensusPayload:
 
     Protocol v2 fields:
       - scores: miner hotkey -> quality score (0.0–1.0)
+      - pack_hashes: miner hotkey -> pack_hash this validator scored
       - bench_version: trajrl-bench version string
       - disqualified: miner hotkey -> reason
       - spec_number: scoring spec identifier (see ``config.SPEC_NUMBER``)
@@ -34,6 +35,7 @@ class ConsensusPayload:
     timestamp: int                   # unix seconds when payload was built
     spec_number: int = 1
     disqualified: Dict[str, str] = field(default_factory=dict)
+    pack_hashes: Dict[str, str] = field(default_factory=dict)  # miner hotkey -> pack_hash scored
 
     def to_dict(self) -> dict:
         # Emit both `spec_number` (canonical) and `scoring_version` (legacy
@@ -42,6 +44,7 @@ class ConsensusPayload:
         return {
             "bench_version": self.bench_version,
             "disqualified": self.disqualified,
+            "pack_hashes": self.pack_hashes,
             "protocol_version": self.protocol_version,
             "scores": self.scores,
             "scoring_version": self.spec_number,
@@ -77,6 +80,7 @@ class ConsensusPayload:
             timestamp=d["timestamp"],
             spec_number=spec_number,
             disqualified=d.get("disqualified", {}),
+            pack_hashes=d.get("pack_hashes", {}),
         )
 
 

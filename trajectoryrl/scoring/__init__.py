@@ -526,6 +526,7 @@ class TrajectoryScorer:
 def compute_consensus_scores(
     validated_submissions: List[ValidatedSubmission],
     disqualify_stake_threshold: float = 0.5,
+    local_pack_hashes: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, float], Dict[str, str]]:
     """Compute stake-weighted consensus scores and disqualification across validators.
 
@@ -539,11 +540,24 @@ def compute_consensus_scores(
     disqualified only when the fraction of reporting stake that flagged it
     exceeds ``disqualify_stake_threshold`` (default 0.5).
 
+    Pack-hash divergence filter: when ``local_pack_hashes`` is provided
+    (miner_hotkey -> the pack_hash this validator currently sees in its
+    own snapshot), any peer score / disqualification stamped with a
+    different pack_hash for the same miner is dropped from accumulation.
+    This prevents a peer that scored an older pack version (because its
+    own eval loop did not reach the miner this window, or because its
+    chain RPC was lagging at snapshot time) from contaminating the
+    consensus average. Peers that did not include ``pack_hashes`` (legacy
+    payloads) are accepted unconditionally for backwards compatibility.
+
     Args:
         validated_submissions: Submissions that passed the filter pipeline,
             each with an attached validator_stake.
         disqualify_stake_threshold: Fraction of reporting stake that must
             vote to disqualify a miner for it to be consensus-disqualified.
+        local_pack_hashes: Optional miner_hotkey -> pack_hash from this
+            validator's window snapshot. When provided, peer votes whose
+            pack_hash disagrees with the local entry are dropped.
 
     Returns:
         Tuple of (consensus_scores, consensus_disqualified):
@@ -554,6 +568,8 @@ def compute_consensus_scores(
     if not validated_submissions:
         return {}, {}
 
+    local_pack_hashes = local_pack_hashes or {}
+
     miner_weighted_score: Dict[str, float] = {}
     miner_total_stake: Dict[str, float] = {}
 
@@ -562,15 +578,31 @@ def compute_consensus_scores(
     miner_reporting_stake: Dict[str, float] = {}
     miner_disq_reasons: Dict[str, str] = {}
 
+    diverged_count = 0
+
     for sub in validated_submissions:
         stake = sub.validator_stake
         if stake <= 0:
             continue
 
         disqualified = sub.payload.disqualified
+        peer_pack_hashes = getattr(sub.payload, "pack_hashes", {}) or {}
+
+        def _accept(miner_hk: str) -> bool:
+            """Drop this peer's vote for miner when pack_hash disagrees with local."""
+            local_ph = local_pack_hashes.get(miner_hk)
+            peer_ph = peer_pack_hashes.get(miner_hk)
+            if not local_ph or not peer_ph:
+                # Either side missing the stamp — fall back to trust (legacy
+                # payloads, miner missing from local snapshot, etc.).
+                return True
+            return local_ph == peer_ph
 
         all_miners = set(sub.payload.scores.keys()) | set(disqualified.keys())
         for miner_hk in all_miners:
+            if not _accept(miner_hk):
+                diverged_count += 1
+                continue
             if miner_hk not in miner_reporting_stake:
                 miner_reporting_stake[miner_hk] = 0.0
                 miner_disq_stake[miner_hk] = 0.0
@@ -582,6 +614,8 @@ def compute_consensus_scores(
 
         for miner_hk, score in sub.payload.scores.items():
             if miner_hk in disqualified:
+                continue
+            if not _accept(miner_hk):
                 continue
 
             if miner_hk not in miner_total_stake:
@@ -612,9 +646,9 @@ def compute_consensus_scores(
 
     logger.info(
         "Consensus computed: %d miners (%d disqualified by stake majority), "
-        "%d validators",
+        "%d validators, %d peer votes dropped on pack_hash divergence",
         len(consensus_scores), len(consensus_disqualified),
-        len(validated_submissions),
+        len(validated_submissions), diverged_count,
     )
 
     return consensus_scores, consensus_disqualified
