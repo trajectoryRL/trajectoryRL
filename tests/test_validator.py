@@ -639,7 +639,10 @@ class TestPackFetcher:
                 MockClient.return_value = mock_client_instance
 
                 result = asyncio.run(
-                    fetcher._fetch_pack("https://trajrl.com/samples/pack.json")
+                    fetcher._fetch_pack(
+                        "https://trajrl.com/samples/pack.json",
+                        "a" * 64,
+                    )
                 )
 
             assert result is None
@@ -666,7 +669,10 @@ class TestPackFetcher:
                 MockClient.return_value = mock_client_instance
 
                 result = asyncio.run(
-                    fetcher._fetch_pack("https://trajrl.com/samples/pack.json")
+                    fetcher._fetch_pack(
+                        "https://trajrl.com/samples/pack.json",
+                        "a" * 64,
+                    )
                 )
 
             assert result == pack_text

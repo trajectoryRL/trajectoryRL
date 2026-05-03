@@ -301,9 +301,12 @@ def fetch_all_commitments(
             block_number=block_number,
             raw=raw,
         )
+        # Do NOT log pack_url — it's reveal-time-protected; logging it would
+        # let other miners curl/clone the pack before the original miner
+        # becomes the unique on-chain claimant.
         logger.debug(
             f"UID {uid}: commitment found — hash={pack_hash[:12]}… "
-            f"url={pack_url} block={block_number}"
+            f"block={block_number}"
         )
 
     if commitments:
