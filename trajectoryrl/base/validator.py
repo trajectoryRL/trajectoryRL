@@ -2463,8 +2463,8 @@ class TrajectoryValidator:
             f"  score={raw_score:.4f} pack_changed={pack_changed}"
         )
         mlog.info(
-            f"  pack_url={commitment.pack_url} "
-            f"pack_hash={commitment.pack_hash}"
+            # Intentionally no pack_url — it's reveal-time-protected.
+            f"  pack_hash={commitment.pack_hash}"
         )
         for sname, sr in scenario_results.items():
             jd = sr.get("judge", {})

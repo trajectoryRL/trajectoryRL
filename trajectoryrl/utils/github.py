@@ -130,7 +130,9 @@ class PackFetcher:
         Returns:
             PackVerificationResult with validation outcome
         """
-        logger.info(f"Verifying submission: {pack_url} (expected hash={pack_hash[:12]}…)")
+        # Identify packs by hash only — pack_url is reveal-time-protected and
+        # must not appear in validator-runtime logs.
+        logger.info(f"Verifying submission: hash={pack_hash[:12]}…")
 
         # Step 1: Check cache
         cached = self._load_from_cache(pack_hash)
@@ -139,11 +141,11 @@ class PackFetcher:
             return PackVerificationResult(valid=True, pack_content=cached)
 
         # Step 2: Fetch pack via HTTP
-        raw_content = await self._fetch_pack(pack_url)
+        raw_content = await self._fetch_pack(pack_url, pack_hash)
         if raw_content is None:
             return PackVerificationResult(
                 valid=False,
-                error=f"Failed to fetch pack from {pack_url}"
+                error=f"Failed to fetch pack {pack_hash[:12]}"
             )
 
         # Step 3: Parse JSON
@@ -152,7 +154,7 @@ class PackFetcher:
         except json.JSONDecodeError as e:
             return PackVerificationResult(
                 valid=False,
-                error=f"Invalid JSON at {pack_url}: {e}"
+                error=f"Invalid JSON in pack {pack_hash[:12]}: {e}"
             )
 
         # Step 4: Verify content hash
@@ -166,7 +168,7 @@ class PackFetcher:
                 error=f"Pack hash mismatch: expected {pack_hash[:8]}, got {computed_hash[:8]}"
             )
 
-        logger.info(f"Verification passed for {pack_url} (hash={pack_hash[:12]}…)")
+        logger.info(f"Verification passed for hash={pack_hash[:12]}…")
 
         # Step 5: Cache for future use
         self._save_to_cache(pack_hash, pack_content)
@@ -176,15 +178,20 @@ class PackFetcher:
             pack_content=pack_content,
         )
 
-    async def _fetch_pack(self, pack_url: str) -> Optional[str]:
+    async def _fetch_pack(self, pack_url: str, pack_hash: str) -> Optional[str]:
         """Download pack content from an HTTP URL.
 
         Args:
-            pack_url: Public HTTP(S) URL
+            pack_url: Public HTTP(S) URL. Used only for the actual HTTP
+                request — never written to logs.
+            pack_hash: Content hash; used to identify the pack in log
+                messages without exposing its URL (reveal-time
+                protection).
 
         Returns:
             Raw response text, or None on failure
         """
+        hash_id = pack_hash[:12]
         try:
             async with httpx.AsyncClient(follow_redirects=True) as client:
                 resp = await client.get(
@@ -195,7 +202,7 @@ class PackFetcher:
 
                 if resp.status_code != 200:
                     logger.warning(
-                        f"HTTP {resp.status_code} from {pack_url}"
+                        f"HTTP {resp.status_code} fetching pack {hash_id}"
                     )
                     return None
 
@@ -203,20 +210,24 @@ class PackFetcher:
                 if content_length > _MAX_RESPONSE_BYTES:
                     logger.warning(
                         f"Response too large: {content_length} bytes "
-                        f"(max {_MAX_RESPONSE_BYTES}) from {pack_url}"
+                        f"(max {_MAX_RESPONSE_BYTES}) fetching pack {hash_id}"
                     )
                     return None
 
                 return resp.text
 
         except httpx.TimeoutException:
-            logger.warning(f"Timeout fetching {pack_url}")
+            logger.warning(f"Timeout fetching pack {hash_id}")
             return None
         except httpx.RequestError as e:
-            logger.warning(f"HTTP request error for {pack_url}: {e}")
+            logger.warning(
+                f"HTTP request error fetching pack {hash_id}: {type(e).__name__}"
+            )
             return None
         except Exception as e:
-            logger.warning(f"Unexpected error fetching {pack_url}: {e}")
+            logger.warning(
+                f"Unexpected error fetching pack {hash_id}: {type(e).__name__}: {e}"
+            )
             return None
 
     def _load_from_cache(self, pack_hash: str) -> Optional[dict]:
