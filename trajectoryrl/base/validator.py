@@ -886,16 +886,29 @@ class TrajectoryValidator:
         """
         scores_by_hotkey: Dict[str, float] = {}
         disqualified_by_hotkey: Dict[str, str] = {}
+        pack_hashes_by_hotkey: Dict[str, str] = {}
 
         # Aggregate continuous quality scores from judge overall_score.
         # Winner-take-all downstream, so the mean is just used to rank miners.
+        # Stamp _eval_pack_hash per scored miner so peers can detect when a
+        # validator's published score is for a stale pack_hash and discard
+        # it during aggregation.
         for hotkey, scenario_s in self.scenario_scores.items():
-            if scenario_s:
-                score = sum(scenario_s.values()) / len(scenario_s)
-                scores_by_hotkey[hotkey] = round(score, 4)
+            if not scenario_s:
+                continue
+            score = sum(scenario_s.values()) / len(scenario_s)
+            scores_by_hotkey[hotkey] = round(score, 4)
+            ph = self._eval_pack_hash.get(hotkey)
+            if ph:
+                pack_hashes_by_hotkey[hotkey] = ph
 
         for hotkey, reason in getattr(self, "_disqualified_miners", {}).items():
             disqualified_by_hotkey[hotkey] = reason
+            # Mirror pack_hash for disqualifications too so peers can scope
+            # the DQ vote to the pack version this validator actually saw.
+            ph = self._eval_pack_hash.get(hotkey)
+            if ph and hotkey not in pack_hashes_by_hotkey:
+                pack_hashes_by_hotkey[hotkey] = ph
 
         if not scores_by_hotkey and not disqualified_by_hotkey:
             return None
@@ -911,6 +924,7 @@ class TrajectoryValidator:
             timestamp=int(time.time()),
             spec_number=_spec_number(),
             disqualified=disqualified_by_hotkey,
+            pack_hashes=pack_hashes_by_hotkey,
         )
 
     async def _run_consensus_aggregation(self, window: EvaluationWindow):
@@ -1024,7 +1038,20 @@ class TrajectoryValidator:
             )
             return
 
-        consensus_scores, disqualified = compute_consensus_scores(validated)
+        # Build local hotkey -> pack_hash from this window's snapshot so
+        # compute_consensus_scores can drop peer votes that scored a
+        # different pack version (peer's eval loop did not reach this
+        # miner, or peer's snapshot RPC was stale at fetch time).
+        local_snapshot = load_snapshot(
+            self.config.active_set_dir, window.window_number,
+        )
+        local_pack_hashes: Dict[str, str] = (
+            {c.hotkey: c.pack_hash for c in local_snapshot.commitments.values()}
+            if local_snapshot is not None else {}
+        )
+        consensus_scores, disqualified = compute_consensus_scores(
+            validated, local_pack_hashes=local_pack_hashes,
+        )
 
         # Build hotkey → UID mapping (used by pre-eval reporting, winner
         # selection, and logging)
