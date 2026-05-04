@@ -3,11 +3,13 @@
 from trajectoryrl.utils.commitments import MinerCommitment
 from trajectoryrl.utils.eval_snapshot import (
     DEFAULT_RETENTION,
+    EpochSnapshotEntry,
     EvalSnapshot,
     load_snapshot,
     save_snapshot,
     snapshot_path,
     take_snapshot,
+    take_snapshot_from_api,
 )
 
 
@@ -90,3 +92,98 @@ def test_save_snapshot_prunes_old_files(tmp_path):
 
 def test_load_snapshot_missing_file_returns_none(tmp_path):
     assert load_snapshot(tmp_path, 99) is None
+
+
+def _api_response(entries):
+    return {
+        "epoch_number": 1234,
+        "built_at": "2026-05-04T12:05:00.000Z",
+        "window_start": 8092800,
+        "cutoff_block": 8092080,
+        "cutoff_time": "2026-05-04T12:00:00.000Z",
+        "eligible_start_time": "2026-05-02T12:00:00.000Z",
+        "inactivity_window_hours": 48,
+        "snapshot_block": 8092105,
+        "entries": entries,
+    }
+
+
+def _entry(uid, hk, ph, status, reason=None, refresh="2026-05-04T08:00:00.000Z"):
+    return {
+        "uid": uid,
+        "hotkey": hk,
+        "pack_hash": ph,
+        "pack_url": f"https://example.com/{uid}.json",
+        "refresh_time": refresh,
+        "pre_eval_status": status,
+        "pre_eval_reason": reason,
+    }
+
+
+def test_take_snapshot_from_api_splits_passed_and_failed():
+    api = _api_response([
+        _entry(10, "hk_a", "a" * 64, "passed"),
+        _entry(11, "hk_b", "b" * 64, "failed", reason="hardcoded"),
+        _entry(12, "hk_c", "c" * 64, "passed"),
+    ])
+    snap = take_snapshot_from_api(api, window_number=1234)
+
+    # Passed entries land in commitments keyed by uid.
+    assert sorted(snap.commitments.keys()) == [10, 12]
+    assert snap.commitments[10].hotkey == "hk_a"
+    assert snap.commitments[12].pack_hash == "c" * 64
+
+    # Failed entry surfaces in pre_eval_failed keyed by hotkey,
+    # carrying the reason for downstream rejection submission.
+    assert set(snap.pre_eval_failed.keys()) == {"hk_b"}
+    assert snap.pre_eval_failed["hk_b"].pre_eval_reason == "hardcoded"
+
+    # window_start / snapshot_block come from the API response.
+    assert snap.window_start == 8092800
+    assert snap.snapshot_block == 8092105
+
+
+def test_take_snapshot_from_api_assigns_index_as_block_number():
+    """``block_number`` is synthesised from each passed entry's index in the
+    API-sorted ``entries`` list so the existing ``pack_first_seen``
+    tiebreak (sort by ``(block_number, hotkey)``) stays deterministic
+    across validators receiving the same byte-identical response."""
+    api = _api_response([
+        _entry(10, "hk_a", "a" * 64, "passed"),
+        _entry(11, "hk_b", "b" * 64, "failed", reason="hash_mismatch"),
+        _entry(12, "hk_c", "c" * 64, "passed"),
+        _entry(13, "hk_d", "d" * 64, "passed"),
+    ])
+    snap = take_snapshot_from_api(api, window_number=1234)
+    # Failed entry consumes index 1; passed entries get 0, 2, 3.
+    assert snap.commitments[10].block_number == 0
+    assert snap.commitments[12].block_number == 2
+    assert snap.commitments[13].block_number == 3
+
+
+def test_take_snapshot_from_api_drops_unknown_status():
+    api = _api_response([
+        _entry(10, "hk_a", "a" * 64, "passed"),
+        _entry(11, "hk_b", "b" * 64, "pending"),  # not 'passed' or 'failed'
+    ])
+    snap = take_snapshot_from_api(api, window_number=1234)
+    assert list(snap.commitments.keys()) == [10]
+    assert "hk_b" not in snap.pre_eval_failed
+
+
+def test_save_and_load_round_trip_with_pre_eval_failed(tmp_path):
+    api = _api_response([
+        _entry(10, "hk_a", "a" * 64, "passed"),
+        _entry(11, "hk_b", "b" * 64, "failed", reason="hardcoded"),
+    ])
+    snap = take_snapshot_from_api(api, window_number=42)
+
+    save_snapshot(snap, tmp_path)
+    loaded = load_snapshot(tmp_path, 42)
+
+    assert loaded is not None
+    assert sorted(loaded.commitments.keys()) == [10]
+    assert "hk_b" in loaded.pre_eval_failed
+    assert loaded.pre_eval_failed["hk_b"].pre_eval_reason == "hardcoded"
+
+

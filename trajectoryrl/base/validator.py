@@ -84,10 +84,12 @@ from ..utils.commitments import (
     is_consensus_commitment, parse_consensus_commitment,
 )
 from ..utils.eval_snapshot import (
-    EvalSnapshot, take_snapshot, load_snapshot, save_snapshot,
+    EvalSnapshot, take_snapshot, take_snapshot_from_api,
+    load_snapshot, save_snapshot,
 )
 from ..utils.status_reporter import (
-    heartbeat, pre_eval, submit_eval, upload_eval_logs, upload_cycle_logs,
+    heartbeat, submit_eval, upload_eval_logs, upload_cycle_logs,
+    fetch_epoch_snapshot, SnapshotNotReady,
 )
 from ..utils.llm_judge import PackIntegrityJudge, TrajectoryJudge
 from .. import __version__
@@ -979,82 +981,16 @@ class TrajectoryValidator:
 
         consensus_scores, disqualified = compute_consensus_scores(validated)
 
-        # Build hotkey → UID mapping (used by pre-eval reporting, winner
-        # selection, and logging)
+        # Build hotkey → UID mapping (used by winner selection and logging).
         hk_to_uid: Dict[str, int] = {}
         for uid in range(len(self.metagraph.hotkeys)):
             hk_to_uid[self.metagraph.hotkeys[uid]] = uid
 
-        # Pre-eval gate during aggregation: disqualify miners rejected by the
-        # platform before selecting a winner.  Uses epoch_number so the server
-        # resolves the pack that was active during this window (prevents
-        # pack-switch escapes).
-        if os.getenv("TRAJECTORYRL_PRE_EVAL_ENABLED", "1") != "0":
-            current_block = self.subtensor.get_current_block()
-            miners_to_check = list(consensus_scores.keys())
-
-            if miners_to_check:
-                sem = asyncio.Semaphore(8)
-
-                async def _limited_pre_eval(hk: str):
-                    async with sem:
-                        return await pre_eval(
-                            hk, epoch_number=window.window_number,
-                            wallet=self.wallet,
-                        )
-
-                results = await asyncio.gather(*(
-                    _limited_pre_eval(miner_hk)
-                    for miner_hk in miners_to_check
-                ))
-
-                pre_eval_disqualified = 0
-                for miner_hk, pre_eval_result in zip(miners_to_check, results):
-                    if pre_eval_result is not None and not pre_eval_result.get("allowed", True):
-                        reason = pre_eval_result.get("reason", "unknown")
-                        disqualified[miner_hk] = f"pre_eval:{reason}"
-                        pre_eval_disqualified += 1
-                        _stage = "integrity_check" if reason == "hardcoded" else "pack_fetch"
-                        _detail = (
-                            f"pre-eval rejected: {reason}"
-                            + (
-                                f", banned_until={pre_eval_result['banned_until']}"
-                                if "banned_until" in pre_eval_result
-                                else ""
-                            )
-                        )
-                        logger.info(
-                            "Window %d: miner %s pre-eval rejected during "
-                            "aggregation (reason=%s) — marked disqualified",
-                            window.window_number, miner_hk[:8], reason,
-                        )
-                        asyncio.ensure_future(
-                            submit_eval(
-                                self.wallet,
-                                miner_hotkey=miner_hk,
-                                miner_uid=hk_to_uid.get(miner_hk, -1),
-                                block_height=current_block,
-                                score=0.0,
-                                weight=0.0,
-                                qualified=False,
-                                pack_url=pre_eval_result.get("pack_url", ""),
-                                pack_hash=pre_eval_result.get("pack_hash", ""),
-                                llm_base_url=self._judge_base_url,
-                                llm_model=self._judge_model,
-                                rejected=True,
-                                rejection_stage=_stage,
-                                rejection_detail=_detail,
-                                spec_number=_spec_number(),
-                                epoch_number=window.window_number,
-                                **self._harness_metadata(),
-                            )
-                        )
-                if pre_eval_disqualified:
-                    logger.info(
-                        "Window %d: %d miner(s) disqualified by pre-eval "
-                        "during aggregation",
-                        window.window_number, pre_eval_disqualified,
-                    )
+        # No pre-eval gate here: the per-epoch snapshot already excluded
+        # failed miners from every validator's ``commitments``, so a
+        # failed miner cannot appear in ``consensus_scores``. Their
+        # rejection rows were submitted at eval-cycle start (see
+        # ``_dispatch_pre_eval_rejections``).
 
         self._consensus_window = window.window_number
 
@@ -1840,24 +1776,35 @@ class TrajectoryValidator:
         # 2. Acquire the window-N active-set snapshot.
         #
         # Each window has exactly one snapshot
-        # (``active_set_window_{N}.json``) freezing the deterministic
-        # commitment subset for that window (commit_block < window_start
-        # and not stale). The snapshot is the source of truth for the
+        # (``active_set_window_{N}.json``) frozen by
+        # ``/api/v2/validators/epoch_snapshot``. The endpoint absorbs
+        # the on-chain commitment scan and the per-miner pre-eval
+        # pipeline; its bytes are byte-identical across validators for
+        # a given epoch. The snapshot is the source of truth for the
         # remainder of the cycle: cross-validator consistency comes
-        # from chain commit_block, restart consistency from the file.
+        # from the API freeze, restart consistency from the local file.
         #
         # On the first cycle inside a window the file is absent, so we
-        # build it from a fresh chain query and persist immediately.
-        # On subsequent cycles (same window) the file hits and we
-        # avoid the chain round-trip entirely.
+        # fetch from the API and persist immediately. On subsequent
+        # cycles (same window) the file hits and we avoid the HTTP
+        # round-trip entirely.
         window = compute_window(current_block, self._window_config)
-        snapshot = self._acquire_window_snapshot(window, current_block)
+        snapshot = await self._acquire_window_snapshot(window, current_block)
         if snapshot is None:
             # Snapshot acquisition failed (chain query unreachable even after
             # reconnect retry). Returning False signals the outer loop NOT to
             # mark this window as evaluated, so the next iteration can retry
             # instead of locking the validator out of this ~24h window.
             return False
+
+        # Surface pre-eval failures from the snapshot as rejection
+        # submissions (no eval is run for these miners). The snapshot
+        # itself comes back to us only after the eval cycle has run;
+        # firing here ensures the dashboard sees the rejection rows
+        # at the same offset every window.
+        self._dispatch_pre_eval_rejections(
+            snapshot, current_block, window.window_number,
+        )
 
         # Per-validator runtime filters (validator_permit, blacklist)
         # are dynamic and applied on top of the frozen snapshot every
@@ -1869,6 +1816,7 @@ class TrajectoryValidator:
         logger.info(
             f"Window {window.window_number} snapshot: "
             f"{len(snapshot.commitments)} eligible, "
+            f"{len(snapshot.pre_eval_failed)} pre-eval rejected, "
             f"{len(active_commitments)} after runtime filter"
         )
 
@@ -1895,7 +1843,7 @@ class TrajectoryValidator:
         evaluated_count = 0
         attempted_count = 0
         skipped_interval_count = 0
-        rejected_pre_eval_count = 0
+        rejected_pre_eval_count = len(snapshot.pre_eval_failed)
         copy_rejected_count = 0
         total_eligible = len(active_commitments)
         logger.info(
@@ -1966,58 +1914,11 @@ class TrajectoryValidator:
                 self._drop_miner_eval_state(hotkey)
                 continue
 
-            # Pre-eval gate: ask the server whether this miner's submission
-            # is allowed before spending LLM tokens on a full evaluation.
-            # Controlled by TRAJECTORYRL_PRE_EVAL_ENABLED (default: 1).
-            # Fail-open on network/API errors so validators are self-sufficient.
-            if os.getenv("TRAJECTORYRL_PRE_EVAL_ENABLED", "1") != "0":
-                pre_eval_result = await pre_eval(
-                    hotkey,
-                    commitment.pack_hash,
-                    commitment.pack_url,
-                    wallet=self.wallet,
-                )
-                if pre_eval_result is not None and not pre_eval_result.get("allowed", True):
-                    rejected_pre_eval_count += 1
-                    reason = pre_eval_result.get("reason", "unknown")
-                    logger.info(
-                        f"[{miner_idx}/{total_eligible}] Miner {uid} ({hotkey[:8]}): "
-                        f"pre-eval rejected (reason={reason}) — skipping eval"
-                    )
-                    _stage = "integrity_check" if reason == "hardcoded" else "pack_fetch"
-                    _detail = (
-                        f"pre-eval rejected: {reason}"
-                        + (
-                            f", banned_until={pre_eval_result['banned_until']}"
-                            if "banned_until" in pre_eval_result
-                            else ""
-                        )
-                    )
-                    asyncio.ensure_future(
-                        submit_eval(
-                            self.wallet,
-                            miner_hotkey=hotkey,
-                            miner_uid=uid,
-                            block_height=current_block,
-                            score=0.0,
-                            weight=0.0,
-                            qualified=False,
-                            pack_url=commitment.pack_url,
-                            pack_hash=commitment.pack_hash,
-                            llm_base_url=self._judge_base_url,
-                            llm_model=self._judge_model,
-                            rejected=True,
-                            rejection_stage=_stage,
-                            rejection_detail=_detail,
-                            spec_number=_spec_number(),
-                            epoch_number=window_number,
-                            **self._harness_metadata(),
-                        )
-                    )
-                    self._disqualified_miners[hotkey] = f"pre_eval_rejected:{reason}"
-                    self._drop_miner_eval_state(hotkey)
-                    continue
-
+            # No per-miner pre-eval call here: the epoch_snapshot already
+            # encodes pre-eval verdicts. Failed entries are surfaced via
+            # ``snapshot.pre_eval_failed`` and rejection-submitted at the
+            # cycle's start (see ``_dispatch_pre_eval_rejections``); only
+            # passed entries reach this loop.
             needs_eval = self._needs_evaluation(
                 hotkey, commitment.pack_hash, window_number
             )
@@ -2281,63 +2182,126 @@ class TrajectoryValidator:
             active[uid] = commitment
         return active
 
-    def _acquire_window_snapshot(
+    async def _acquire_window_snapshot(
         self,
         window: EvaluationWindow,
         current_block: int,
     ) -> Optional[EvalSnapshot]:
-        """Load or build the active-set snapshot for ``window``.
+        """Load or fetch the active-set snapshot for ``window``.
 
         Order of operations:
 
         1. Try to load ``active_set_window_{N}.json``. A successful
            load is the fast path for any non-first cycle in window N
            (and for restart recovery within the same window).
-        2. On miss, query the chain once and apply the deterministic
-           filters (``commit_block < window_start`` plus stale-age vs
-           window_start). Persist the result so subsequent cycles in
-           the same window hit the cache.
+        2. On miss, fetch the snapshot from
+           ``/api/v2/validators/epoch_snapshot``. The endpoint freezes
+           an immutable per-epoch snapshot that already absorbs the
+           on-chain commitment scan and the per-miner pre-eval pipeline,
+           so the validator no longer queries the chain or calls
+           ``/api/v2/miners/pre-eval`` here. Persist the result so
+           subsequent cycles in the same window hit the cache.
 
-        Returns the snapshot, or None if there are no eligible
-        commitments at all (caller should fall back to owner weights).
+        Returns the snapshot, or None if the API is unreachable / the
+        snapshot has not been built yet (caller should retry next
+        cycle without locking the validator out of this window).
         """
         snapshot = load_snapshot(self.config.active_set_dir, window.window_number)
         if snapshot is not None:
             return snapshot
 
         logger.info(
-            "Window %d: building active-set snapshot from chain "
+            "Window %d: fetching epoch_snapshot from API "
             "(window_start=%d, current_block=%d)",
             window.window_number, window.window_start, current_block,
         )
-        raw = fetch_all_commitments(
-            self.subtensor,
-            self.config.netuid,
-            self.metagraph,
-            reconnect=lambda: self._reconnect_subtensor(
-                f"[snapshot window {window.window_number}] "
-            ),
-        )
-        if raw is None:
-            # Chain query failed even after reconnect retry. Returning None
-            # without persisting lets the next loop iteration (or restart)
-            # re-attempt the fetch instead of being locked by a poisoned
-            # cache file for the rest of the ~24h window.
+        try:
+            api_response = await fetch_epoch_snapshot(
+                epoch_number=window.window_number,
+                wallet=self.wallet,
+            )
+        except SnapshotNotReady:
+            logger.warning(
+                "Window %d: epoch_snapshot not yet built by sync worker — "
+                "will retry on next cycle",
+                window.window_number,
+            )
+            return None
+        if api_response is None:
+            # Network/auth failure. Returning None without persisting
+            # lets the next loop iteration retry instead of being
+            # locked by a poisoned cache file for the rest of the
+            # ~24h window.
             logger.error(
-                "Window %d: chain query for commitments failed; "
+                "Window %d: epoch_snapshot fetch failed; "
                 "skipping snapshot persistence so the next cycle can retry",
                 window.window_number,
             )
             return None
-        snapshot = take_snapshot(
-            raw,
+
+        snapshot = take_snapshot_from_api(
+            api_response,
             window_number=window.window_number,
-            window_start=window.window_start,
-            snapshot_block=current_block,
-            inactivity_blocks=self.config.inactivity_blocks,
         )
         save_snapshot(snapshot, self.config.active_set_dir)
         return snapshot
+
+    def _dispatch_pre_eval_rejections(
+        self,
+        snapshot: EvalSnapshot,
+        current_block: int,
+        window_number: int,
+    ) -> None:
+        """Submit rejection rows for snapshot entries flagged ``failed``.
+
+        The epoch_snapshot endpoint already ran the pre-eval pipeline
+        for each (hotkey, pack_hash); failed entries arrive with a
+        ``pre_eval_status='failed'`` and the verdict reason. We surface
+        each as a rejection submission (``rejected=True``,
+        ``score=weight=0``) so downstream consumers see the same shape
+        of row that the legacy per-miner ``pre_eval`` path produced.
+
+        Idempotency: this is invoked once per eval cycle. Re-running
+        the same cycle would re-submit identical rows — the dashboard
+        deduplicates by ``(validator_hotkey, miner_hotkey,
+        epoch_number)`` so duplicate sends are safe.
+        """
+        if not snapshot.pre_eval_failed:
+            return
+        self._disqualified_miners = getattr(self, "_disqualified_miners", {})
+        for entry in snapshot.pre_eval_failed.values():
+            reason = entry.pre_eval_reason or "unknown"
+            stage = "integrity_check" if reason == "hardcoded" else "pack_fetch"
+            detail = f"pre-eval rejected: {reason}"
+            self._get_miner_logger(entry.hotkey).info(
+                "Window %d: pre-eval failed (reason=%s) — submitting rejection",
+                window_number, reason,
+            )
+            asyncio.ensure_future(
+                submit_eval(
+                    self.wallet,
+                    miner_hotkey=entry.hotkey,
+                    miner_uid=entry.uid,
+                    block_height=current_block,
+                    score=0.0,
+                    weight=0.0,
+                    qualified=False,
+                    pack_url=entry.pack_url,
+                    pack_hash=entry.pack_hash,
+                    llm_base_url=self._judge_base_url,
+                    llm_model=self._judge_model,
+                    rejected=True,
+                    rejection_stage=stage,
+                    rejection_detail=detail,
+                    spec_number=_spec_number(),
+                    epoch_number=window_number,
+                    **self._harness_metadata(),
+                )
+            )
+            self._disqualified_miners[entry.hotkey] = (
+                f"pre_eval_rejected:{reason}"
+            )
+            self._drop_miner_eval_state(entry.hotkey)
 
     # ------------------------------------------------------------------
     # UID re-registration tracking
