@@ -450,7 +450,168 @@ class TestCLIHelp:
     def test_top_level_help_shows_subcommands(self):
         """'miner.py --help' must list all subcommands."""
         output = self._get_help("")
-        for cmd in ("build", "validate", "upload", "submit", "status"):
+        for cmd in ("build", "validate", "upload", "web-submit", "submit", "status"):
             assert cmd in output, (
                 f"top-level --help should list '{cmd}', got:\n{output}"
             )
+
+    def test_web_submit_help_shows_pack_path(self):
+        """'miner.py web-submit --help' must show pack_path + flags."""
+        output = self._get_help("web-submit")
+        assert "pack_path" in output
+        assert "--commit-onchain" in output
+        assert "--api-base-url" in output
+
+
+# ===================================================================
+# /api/v2/miners/submit — submit_pack_via_api
+# ===================================================================
+
+
+class TestSubmitPackViaApi:
+    """Unit tests for ``TrajectoryMiner.submit_pack_via_api``.
+
+    Mock out the wallet (so we never hit a real keystore), the
+    subtensor (never opens a websocket), and the HTTP client (we
+    inspect the payload + simulate server responses).
+    """
+
+    PACK = {"schema_version": 1, "files": {"SKILL.md": "# hello\nact wisely\n"}}
+    HOTKEY_ADDR = "5FFApaS75bvpgP9gQ5hTUdZHiTc6LB2VPP9gvHN6VQCNug6e"
+
+    def _make_miner(self):
+        """Build a TrajectoryMiner with mocked wallet (sign + ss58_address)."""
+        miner = TrajectoryMiner(
+            wallet_name="m", wallet_hotkey="default",
+            netuid=11, network="finney",
+        )
+        wallet = MagicMock()
+        wallet.hotkey.ss58_address = self.HOTKEY_ADDR
+        wallet.hotkey.sign.return_value = b"\xaa" * 64
+        miner._wallet = wallet
+        return miner
+
+    def _fake_response(self, status_code: int, json_body=None, text=""):
+        resp = MagicMock()
+        resp.status_code = status_code
+        if json_body is not None:
+            resp.json.return_value = json_body
+        else:
+            resp.json.side_effect = ValueError("not json")
+        resp.text = text
+        return resp
+
+    def _patched_client(self, response):
+        """Return a contextmanager-friendly httpx.Client mock."""
+        client = MagicMock()
+        client.post.return_value = response
+        client.__enter__ = MagicMock(return_value=client)
+        client.__exit__ = MagicMock(return_value=False)
+        return client
+
+    def test_success_path_returns_response_dict(self):
+        """200 response is parsed and returned with all server fields."""
+        miner = self._make_miner()
+        body = {
+            "success": True,
+            "pack_hash": TrajectoryMiner.compute_pack_hash(self.PACK),
+            "pack_url": "https://storage.googleapis.com/bucket/abc.json",
+            "submission_id": 42,
+            "next_upload_allowed_at": "2026-05-04T15:00:00.000Z",
+            "cooldown_seconds": 3600,
+            "pre_eval_status": "pending",
+        }
+        client = self._patched_client(self._fake_response(200, json_body=body))
+
+        with patch("trajectoryrl.base.miner.httpx.Client", return_value=client):
+            result = miner.submit_pack_via_api(self.PACK)
+
+        assert result == body
+        # Inspect the outgoing payload — the server uses these fields
+        # to verify the request, so the contract must match the spec
+        # exactly (canonical pack, hash matches, signed message, etc).
+        called_url, kwargs = client.post.call_args[0], client.post.call_args[1]
+        assert called_url[0].endswith("/api/v2/miners/submit")
+        payload = kwargs["json"]
+        assert payload["miner_hotkey"] == self.HOTKEY_ADDR
+        assert payload["pack_content"] == json.dumps(self.PACK, sort_keys=True)
+        assert payload["pack_hash"] == TrajectoryMiner.compute_pack_hash(self.PACK)
+        assert payload["signature"].startswith("0x")
+        assert isinstance(payload["timestamp"], int)
+
+    def test_signing_message_uses_dedicated_prefix(self):
+        """The submit endpoint expects ``trajectoryrl-miner-submit:`` —
+        not the validator-side ``trajectoryrl-report:`` shared prefix."""
+        miner = self._make_miner()
+        client = self._patched_client(self._fake_response(
+            200, json_body={"pack_url": "https://x", "submission_id": 1},
+        ))
+        with patch("trajectoryrl.base.miner.httpx.Client", return_value=client):
+            miner.submit_pack_via_api(self.PACK)
+
+        signed_message = miner._wallet.hotkey.sign.call_args[0][0]
+        assert signed_message.decode().startswith(
+            f"trajectoryrl-miner-submit:{self.HOTKEY_ADDR}:"
+        )
+
+    def test_429_cooldown_returns_none(self):
+        """429 (cooldown) is logged with next_upload_allowed_at and
+        returned as None — caller should not retry."""
+        miner = self._make_miner()
+        client = self._patched_client(self._fake_response(
+            429,
+            json_body={
+                "next_upload_allowed_at": "2026-05-04T15:00:00.000Z",
+                "cooldown_seconds": 3600,
+            },
+            text="cooldown",
+        ))
+        with patch("trajectoryrl.base.miner.httpx.Client", return_value=client):
+            result = miner.submit_pack_via_api(self.PACK)
+        assert result is None
+
+    def test_4xx_returns_none(self):
+        """400/403 (validation / signature / ban) returns None."""
+        miner = self._make_miner()
+        for status in (400, 403):
+            client = self._patched_client(self._fake_response(
+                status, text=f"HTTP {status} body",
+            ))
+            with patch("trajectoryrl.base.miner.httpx.Client", return_value=client):
+                result = miner.submit_pack_via_api(self.PACK)
+            assert result is None, f"status={status} should map to None"
+
+    def test_network_error_returns_none(self):
+        """httpx exception is caught and surfaces as None."""
+        miner = self._make_miner()
+        client = MagicMock()
+        client.__enter__ = MagicMock(return_value=client)
+        client.__exit__ = MagicMock(return_value=False)
+        client.post.side_effect = RuntimeError("boom")
+        with patch("trajectoryrl.base.miner.httpx.Client", return_value=client):
+            result = miner.submit_pack_via_api(self.PACK)
+        assert result is None
+
+    def test_oversize_pack_refused_locally_no_http(self):
+        """A pack that exceeds 32 KB must be rejected client-side
+        before any HTTP call (the server would reject it anyway)."""
+        miner = self._make_miner()
+        big_pack = {
+            "schema_version": 1,
+            "files": {"SKILL.md": "x" * 40000},
+        }
+        client = self._patched_client(self._fake_response(200))
+        with patch("trajectoryrl.base.miner.httpx.Client", return_value=client):
+            result = miner.submit_pack_via_api(big_pack)
+        assert result is None
+        assert client.post.call_count == 0
+
+    def test_unparseable_200_returns_none(self):
+        """A 200 response with non-JSON body or missing pack_url is
+        treated as a failure — the caller cannot proceed without the
+        URL it needs to chain-commit."""
+        miner = self._make_miner()
+        client = self._patched_client(self._fake_response(200))  # json() raises
+        with patch("trajectoryrl.base.miner.httpx.Client", return_value=client):
+            result = miner.submit_pack_via_api(self.PACK)
+        assert result is None

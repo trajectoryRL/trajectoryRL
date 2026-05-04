@@ -2,15 +2,17 @@
 """TrajectoryRL Miner — CLI toolbox for pack building and submission.
 
 Commands:
-    python neurons/miner.py build     SKILL.md [-o pack.json]
-    python neurons/miner.py validate  pack.json
-    python neurons/miner.py upload    pack.json [--bucket ...] [--endpoint-url ...]
-    python neurons/miner.py submit    <pack_url>
+    python neurons/miner.py build       SKILL.md [-o pack.json]
+    python neurons/miner.py validate    pack.json
+    python neurons/miner.py upload      pack.json [--bucket ...] [--endpoint-url ...]
+    python neurons/miner.py web-submit  pack.json [--commit-onchain] [--api-base-url ...]
+    python neurons/miner.py submit      <pack_url>
     python neurons/miner.py status
 
 Config is loaded from .env.miner (or environment variables):
     WALLET_NAME, WALLET_HOTKEY, NETUID, NETWORK
     S3_BUCKET, S3_ENDPOINT_URL, S3_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+    TRAJECTORYRL_API_BASE_URL (defaults to https://trajrl.com)
 """
 
 from __future__ import annotations
@@ -153,6 +155,68 @@ def cmd_upload(args):
     return 0
 
 
+def cmd_web_submit(args):
+    from trajectoryrl.base.miner import TrajectoryMiner, DEFAULT_MINER_SUBMIT_URL
+    from trajectoryrl.utils.config import MinerConfig
+
+    try:
+        pack = TrajectoryMiner.load_pack(args.pack_path)
+    except FileNotFoundError:
+        print(f"Error: file not found: {args.pack_path}")
+        return 1
+    except json.JSONDecodeError as e:
+        print(f"Error: invalid JSON: {e}")
+        return 1
+
+    issues = TrajectoryMiner.validate_s1(pack)
+    if issues:
+        print("Error: pack validation failed:")
+        for issue in issues:
+            print(f"  - {issue}")
+        return 1
+
+    pack_hash = TrajectoryMiner.compute_pack_hash(pack)
+    submit_url = (
+        f"{args.api_base_url.rstrip('/')}/api/v2/miners/submit"
+        if args.api_base_url else DEFAULT_MINER_SUBMIT_URL
+    )
+
+    config = MinerConfig.from_env()
+    miner = _make_miner(config)
+    print(f"Pack hash: {pack_hash}")
+    print(f"Endpoint: {submit_url}")
+    print("Submitting pack content to web service...")
+
+    response = miner.submit_pack_via_api(pack, submit_url=submit_url)
+    if response is None:
+        miner.close()
+        print("Submission failed. Check logs for details.")
+        return 1
+
+    pack_url = response.get("pack_url")
+    print(f"Submitted! pack_url = {pack_url}")
+    print(f"  submission_id:    {response.get('submission_id')}")
+    print(f"  cooldown_seconds: {response.get('cooldown_seconds')}")
+    print(f"  next_upload_at:   {response.get('next_upload_allowed_at')}")
+    print(f"  pre_eval_status:  {response.get('pre_eval_status')}")
+
+    if not args.commit_onchain:
+        miner.close()
+        print()
+        print(f"Next step: python neurons/miner.py submit {pack_url}")
+        return 0
+
+    print()
+    print("Submitting on-chain commitment...")
+    success = miner.submit_commitment(pack_hash, pack_url)
+    miner.close()
+    if success:
+        print("On-chain commitment submitted.")
+        return 0
+    print("On-chain commitment failed. Check logs.")
+    return 1
+
+
 def cmd_submit(args):
     from trajectoryrl.base.miner import TrajectoryMiner
     from trajectoryrl.utils.config import MinerConfig
@@ -238,7 +302,8 @@ def main():
 Examples:
   %(prog)s build SKILL.md -o pack.json
   %(prog)s validate pack.json
-  %(prog)s upload pack.json
+  %(prog)s upload pack.json                                # self-host on S3 / R2 / etc.
+  %(prog)s web-submit pack.json --commit-onchain           # managed GCS via trajrl.com
   %(prog)s submit https://your-bucket.s3.amazonaws.com/pack.json
   %(prog)s status
 """,
@@ -265,6 +330,21 @@ Examples:
     p_upload.add_argument("--endpoint-url", default=None, help="Override S3_ENDPOINT_URL")
     p_upload.add_argument("--region", default=None, help="Override S3_REGION")
 
+    # web-submit
+    p_web = sub.add_parser(
+        "web-submit",
+        help="Submit pack via /api/v2/miners/submit (managed GCS hosting)",
+    )
+    p_web.add_argument("pack_path", help="Path to pack.json")
+    p_web.add_argument(
+        "--commit-onchain", action="store_true",
+        help="Also run the on-chain commitment step after a successful submit",
+    )
+    p_web.add_argument(
+        "--api-base-url", default=None,
+        help="Override TRAJECTORYRL_API_BASE_URL for this run (default: https://trajrl.com)",
+    )
+
     # submit
     p_submit = sub.add_parser("submit", help="Submit pack on-chain")
     p_submit.add_argument("pack_url", help="Public URL where pack.json is hosted")
@@ -288,6 +368,7 @@ Examples:
         "build": cmd_build,
         "validate": cmd_validate,
         "upload": cmd_upload,
+        "web-submit": cmd_web_submit,
         "submit": cmd_submit,
         "status": cmd_status,
     }
