@@ -643,17 +643,27 @@ class TrajectorySandboxHarness:
     def _run_eval_sync(
         self, skill_md: str, epoch_seed: int, salt: str, pack_hash: str,
     ) -> _SessionResult:
-        """One sandbox container, one episode per scenario.
+        """One container per scenario, one episode each.
+
+        Each scenario image is layered on the sandbox-agent base image,
+        so the agent runs in the scenario's actual environment with all
+        scenario-specific deps available (chromium, selenium, etc.).
+        Per scenario:
+          1. ``docker run scenario-<name>:<tag>`` (CMD = tail -f /dev/null
+             from the sandbox-agent base; container stays alive).
+          2. Drop SKILL.md + INSTRUCTION.md into /workspace.
+          3. ``docker exec -u agent`` runs hermes chat against /app.
+          4. Extract ``agent_output_path``.
+          5. Run the verifier in a fresh container of the same scenario
+             image (clean filesystem to test against).
+          6. Stop + remove the scenario container.
 
         Each scenario contributes a correctness ratio (passed/total) in
         [0, 1]; final_score is the equal-weighted sum across scenarios.
-        ``/app`` is re-injected from each scenario's environment image
-        between cells. ``/workspace/learned`` persists across all
-        scenarios so SKILL.md can build cross-scenario state.
         """
-        # Pre-load metadata for every scenario so we fail early if the
-        # sandbox image is missing one. Each ``_load_scenario_info``
-        # call also primes the per-scenario image ref + tests payload.
+        # Pre-load metadata for every scenario so we fail early on a
+        # missing one. Each ``_load_scenario_info`` call also primes the
+        # per-scenario image ref + tests payload.
         scenario_specs: list[dict] = []
         for name in SANDBOX_SCENARIOS:
             self._scenario_info = None  # bust cache; loop reads each
@@ -681,16 +691,63 @@ class TrajectorySandboxHarness:
         session_result.skill_md = skill_md
 
         logger.info(
-            "[%s] session start (sandbox=%s, scenarios=%s)",
-            session_id, self._sandbox_image,
-            [s["name"] for s in scenario_specs],
+            "[%s] session start (scenarios=%s)",
+            session_id, [s["name"] for s in scenario_specs],
         )
+
+        for cell_index, spec in enumerate(scenario_specs):
+            episode = self._run_episode(
+                session_id=session_id,
+                episode_index=cell_index,
+                skill_md=skill_md,
+                spec=spec,
+            )
+            session_result.episodes.append(episode)
+
+        session_result.compute_scores()
+        return session_result
+
+    def _run_episode(
+        self,
+        session_id: str,
+        episode_index: int,
+        skill_md: str,
+        spec: dict,
+    ) -> _EpisodeResult:
+        """Run one cell: spin up the scenario container, exec hermes,
+        extract output, run verifier, tear down.
+
+        Each scenario gets a fresh container of its own image — no
+        ``/app`` injection, no shared sandbox container across
+        scenarios. Container CMD is ``tail -f /dev/null`` (inherited
+        from the sandbox-agent base) so the container stays alive
+        until we ``stop`` it.
+        """
+        scenario = spec["name"]
+        scenario_image = spec["image"]
+        instruction_md = spec["instruction_md"]
+        agent_output_path = spec["agent_output_path"]
+        tests_files_b64 = spec["tests_files_b64"]
+        verifier_timeout_s = spec["verifier_timeout_s"]
+
+        ep_data = {
+            "scenario": scenario,
+            "instruction_md": instruction_md,
+            "agent_output_path": agent_output_path,
+        }
+        episode = _EpisodeResult(
+            episode_index=episode_index,
+            scenario=scenario,
+            ep_data=ep_data,
+        )
+        t0 = time.time()
+        logger.info("[%s] %s starting (image=%s)", session_id, scenario, scenario_image)
 
         sandbox = None
         try:
             sandbox = self.client.containers.run(
-                self._sandbox_image,
-                name=f"sandbox_{session_id}",
+                scenario_image,
+                name=f"sandbox_{session_id}_{scenario.replace('/', '_')}",
                 detach=True,
                 # Default bridge → internet egress for both the agent
                 # (LLM API) and the verifier (apt + uv installs).
@@ -702,11 +759,15 @@ class TrajectorySandboxHarness:
                 },
                 mem_limit="4g", cpu_quota=200000,
                 labels={"trajectoryrl.role": "sandbox",
+                        "trajectoryrl.scenario": scenario,
                         "trajectoryrl.session": session_id},
                 log_config=LogConfig(type=LogConfig.types.JSON,
                                      config={"max-size": "50m"}),
             )
 
+            # Wait for the container to settle. Sandbox-agent's CMD is
+            # ``tail -f /dev/null`` so we just verify the container is
+            # running and that ``docker exec`` works against it.
             for attempt in range(30):
                 try:
                     sandbox.reload()
@@ -722,93 +783,23 @@ class TrajectorySandboxHarness:
             else:
                 raise RuntimeError("Sandbox container failed to start")
 
+            # Drop SKILL.md + INSTRUCTION.md into /workspace.
             _put_file(sandbox, "/workspace/SKILL.md", skill_md)
             sandbox.exec_run(["chown", "root:agent", "/workspace/SKILL.md"])
             sandbox.exec_run(["chmod", "440", "/workspace/SKILL.md"])
+            _put_file(sandbox, "/workspace/INSTRUCTION.md", instruction_md)
+            sandbox.exec_run(["chown", "root:agent", "/workspace/INSTRUCTION.md"])
+            sandbox.exec_run(["chmod", "440", "/workspace/INSTRUCTION.md"])
             sandbox.exec_run(["mkdir", "-p", "/workspace/learned"])
             sandbox.exec_run([
                 "chown", "-R", "agent:agent", "/workspace/learned",
             ])
-
-            for cell_index, spec in enumerate(scenario_specs):
-                # Re-inject /app from the scenario's environment image.
-                # Wipes whatever the prior scenario left; learned/
-                # persists.
-                sandbox.exec_run(
-                    ["sh", "-c", "rm -rf /app && mkdir -p /app"]
-                )
-                self._setup_app_dir(sandbox, spec["image"])
-
-                episode = self._run_episode(
-                    session_id=session_id,
-                    episode_index=cell_index,
-                    scenario=spec["name"],
-                    instruction_md=spec["instruction_md"],
-                    sandbox=sandbox,
-                    scenario_image=spec["image"],
-                    agent_output_path=spec["agent_output_path"],
-                    tests_files_b64=spec["tests_files_b64"],
-                    verifier_timeout_s=spec["verifier_timeout_s"],
-                )
-                session_result.episodes.append(episode)
-
-        finally:
-            if sandbox:
-                try:
-                    sandbox.stop(timeout=5)
-                    sandbox.remove(force=True, v=True)
-                except Exception:
-                    pass
-
-        session_result.compute_scores()
-        return session_result
-
-    def _run_episode(
-        self,
-        session_id: str,
-        episode_index: int,
-        scenario: str,
-        instruction_md: str,
-        sandbox: Container,
-        scenario_image: str,
-        agent_output_path: str,
-        tests_files_b64: dict[str, str],
-        verifier_timeout_s: int,
-    ) -> _EpisodeResult:
-        """Run one cell: docker exec hermes → extract output → verifier."""
-        ep_data = {
-            "scenario": scenario,
-            "instruction_md": instruction_md,
-            "agent_output_path": agent_output_path,
-        }
-        episode = _EpisodeResult(
-            episode_index=episode_index,
-            scenario=scenario,
-            ep_data=ep_data,
-        )
-        t0 = time.time()
-        logger.info("[%s] %s starting", session_id, scenario)
-
-        try:
-            _put_file(sandbox, "/workspace/INSTRUCTION.md", instruction_md)
-            sandbox.exec_run(["chown", "root:agent", "/workspace/INSTRUCTION.md"])
-            sandbox.exec_run(["chmod", "440", "/workspace/INSTRUCTION.md"])
-
-            # Reset per-episode Hermes state:
-            #   1. Wipe the SQLite session DB so this episode's chat is the
-            #      only session in the store. Without this,
-            #      ``hermes sessions export`` ships the cumulative DB every
-            #      episode and downstream readers can't tell which line is
-            #      "this episode".
-            #   2. Drop turns.jsonl + turns_export.err so a stale prior
-            #      export doesn't masquerade as this run.
+            # Per-episode hermes state already starts clean here (fresh
+            # container), but ensure /opt/data is agent-owned so the
+            # config + session DB land in the right place.
             sandbox.exec_run([
                 "sh", "-c",
-                "rm -f /opt/data/state.db /opt/data/state.db-* "
-                "/workspace/turns.jsonl /workspace/turns_export.err && "
-                "rm -rf /opt/data/sessions && "
-                "mkdir -p /opt/data/sessions && "
-                "chown -R agent:agent /opt/data",
+                "mkdir -p /opt/data && chown -R agent:agent /opt/data",
             ])
 
             harness_prompt = (
@@ -944,6 +935,13 @@ class TrajectorySandboxHarness:
                 "[%s] %s failed: %s",
                 session_id, scenario, e, exc_info=True,
             )
+        finally:
+            if sandbox:
+                try:
+                    sandbox.stop(timeout=5)
+                    sandbox.remove(force=True, v=True)
+                except Exception:
+                    pass
 
         episode.duration_s = time.time() - t0
         return episode
@@ -951,29 +949,6 @@ class TrajectorySandboxHarness:
     # ------------------------------------------------------------------
     # Container helpers
     # ------------------------------------------------------------------
-
-    def _setup_app_dir(self, sandbox: Container, scenario_image: str) -> None:
-        """Extract /app from the scenario image and inject into the sandbox."""
-        temp = self.client.containers.create(scenario_image)
-        try:
-            bits, _ = temp.get_archive("/app")
-            buf = io.BytesIO()
-            for chunk in bits:
-                buf.write(chunk)
-            buf.seek(0)
-        finally:
-            try:
-                temp.remove(force=True)
-            except docker.errors.APIError:
-                pass
-
-        sandbox.put_archive("/", buf)
-        sandbox.exec_run(["chown", "-R", "agent:agent", "/app"])
-        sandbox.exec_run(["chmod", "-R", "0770", "/app"])
-        logger.info(
-            "Injected /app from %s into sandbox %s",
-            scenario_image, sandbox.name,
-        )
 
     def _extract_file(self, container: Container, path: str) -> bytes | None:
         """Return the raw bytes at ``path`` inside ``container`` or None."""
