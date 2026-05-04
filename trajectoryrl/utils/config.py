@@ -42,6 +42,12 @@ SPEC_NUMBER = 7
 # removed after one validator release cycle.
 SCORING_VERSION = SPEC_NUMBER
 
+# At the start of each eval window, wipe cached scores for the local top-N
+# miners (ranked by mean scenario score) so they are forced to re-evaluate
+# this window. Anti-cheese: a one-off lucky cached score gets re-verified
+# before influencing consensus. Set to 0 to disable.
+TOP_N_RECHECK = 3
+
 
 @dataclass
 class ValidatorConfig:

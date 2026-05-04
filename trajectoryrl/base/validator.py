@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import bittensor as bt
 import docker.errors
 
-from ..utils.config import ValidatorConfig
+from ..utils.config import TOP_N_RECHECK, ValidatorConfig
 from ..utils.sandbox_harness import TrajectorySandboxHarness, SandboxEvaluationResult
 from ..scoring import TrajectoryScorer
 from ..utils.github import PackFetcher
@@ -587,6 +587,52 @@ class TrajectoryValidator:
                 changed = True
         if changed:
             self._save_eval_state()
+
+    def _wipe_top_n_for_recheck(self, window_number: int) -> List[str]:
+        """Clear cached scores for the top-N miners by mean scenario score
+        so they are forced to re-evaluate this window.
+
+        Anti-cheese: a one-off lucky cached score gets re-verified before
+        influencing consensus. Selection is from the in-memory
+        ``scenario_scores`` cache directly — not filtered to this window's
+        active set, so a top miner briefly absent from the snapshot still
+        has its stale cached score wiped.
+
+        Returns the hotkeys whose state was wiped (for logging / tests).
+        """
+        if TOP_N_RECHECK <= 0:
+            return []
+
+        candidates = [
+            (hk, sum(sc.values()) / len(sc))
+            for hk, sc in self.scenario_scores.items()
+            if sc
+        ]
+        if not candidates:
+            return []
+
+        candidates.sort(key=lambda x: (-x[1], x[0]))
+        top = candidates[:TOP_N_RECHECK]
+
+        for hk, _ in top:
+            for store in (
+                self.scenario_scores,
+                self._eval_pack_hash,
+                self.last_eval_block,
+                self.last_eval_window,
+                self._eval_counts,
+                self.latest_token_usage,
+                self.latest_model_usage,
+            ):
+                store.pop(hk, None)
+        self._save_eval_state()
+
+        logger.info(
+            "Top-%d re-check (window %d): wiped cache for %s",
+            TOP_N_RECHECK, window_number,
+            ", ".join(f"{hk[:8]}(mean={m:.4f})" for hk, m in top),
+        )
+        return [hk for hk, _ in top]
 
     # ------------------------------------------------------------------
     # Eval state update
@@ -1830,6 +1876,14 @@ class TrajectoryValidator:
             logger.warning("No active miners with valid commitments!")
             await self._set_fallback_weights()
             return
+
+        # Anti-cheese: force re-eval of the local top-N so a one-off lucky
+        # cached score doesn't keep influencing consensus. Gated on
+        # non-empty active set — when the runtime filter removes every
+        # miner the cycle short-circuits to fallback/burn anyway, so
+        # wiping cache here would just discard signal we'd want for the
+        # next window's consensus payload.
+        self._wipe_top_n_for_recheck(window.window_number)
 
         # 4. Evaluate miners (scenarios selected by sandbox image).
         # Pack-hash dedup is handled inside the loop via `pack_first_seen`
