@@ -60,7 +60,16 @@ _AGENT_UID = 10000
 @dataclass
 class _EpisodeResult:
     episode_index: int
+    # Continuous correctness in [0.0, 1.0]: passed_tests / total_tests from
+    # the verifier's ctrf.json. Falls back to ``float(reward)`` (binary
+    # 0 or 1) when ctrf isn't parseable.
     quality: float = 0.0
+    # Cost axis: actual_cost_usd from the agent's Hermes session export.
+    # ``None`` when the session JSONL is missing / billing not pinned.
+    # Reported alongside quality on artifacts and submit payloads but
+    # does NOT factor into the score (separate axis — see Ning's
+    # 2026-05-04 design call).
+    cost_usd: float | None = None
     transcript: str = ""
     turns_log: str = ""
     turns_export_err: str = ""
@@ -133,6 +142,14 @@ class SandboxEvaluationResult:
         self.mean_quality = session_result.mean_quality
         self.learning_bonus = session_result.learning_bonus
         self.episode_qualities = [ep.quality for ep in session_result.episodes]
+        # Cost axis (separate from score). Per-episode list and total —
+        # ``None`` means the agent didn't produce a billed session.
+        self.episode_costs_usd = [ep.cost_usd for ep in session_result.episodes]
+        billed = [c for c in self.episode_costs_usd if c is not None]
+        self.total_cost_usd: Optional[float] = sum(billed) if billed else None
+        self.mean_cost_usd: Optional[float] = (
+            sum(billed) / len(billed) if billed else None
+        )
 
     def write_artifacts(self, out_dir: "Path | str") -> None:
         """Write per-episode transcripts + verifier outputs + session
@@ -154,6 +171,9 @@ class SandboxEvaluationResult:
             "delta": sr.delta,
             "learning_bonus": sr.learning_bonus,
             "episode_qualities": [ep.quality for ep in sr.episodes],
+            "episode_costs_usd": [ep.cost_usd for ep in sr.episodes],
+            "total_cost_usd": self.total_cost_usd,
+            "mean_cost_usd": self.mean_cost_usd,
         }, indent=2, default=str))
 
         for ep in sr.episodes:
@@ -246,6 +266,59 @@ def _put_file(
 def _shell_quote(s: str) -> str:
     """Single-quote a string for safe inclusion in a bash -c invocation."""
     return "'" + s.replace("'", "'\\''") + "'"
+
+
+def _parse_ctrf_correctness(ctrf: dict | None) -> tuple[int, int]:
+    """Return (passed, total) from a pytest-json-ctrf payload.
+
+    Falls back to (0, 0) when the payload is missing or malformed —
+    callers must treat (0, 0) as "no signal" (not "100% pass").
+    """
+    if not isinstance(ctrf, dict):
+        return 0, 0
+    summary = (ctrf.get("results") or {}).get("summary") or {}
+    try:
+        total = int(summary.get("tests", 0))
+        passed = int(summary.get("passed", 0))
+    except (TypeError, ValueError):
+        return 0, 0
+    if total <= 0:
+        return 0, 0
+    return passed, total
+
+
+def _parse_session_cost(turns_log: str) -> float | None:
+    """Pull ``actual_cost_usd`` out of the latest Hermes session in
+    a turns.jsonl blob. Returns None when the blob is empty / unparseable
+    / Hermes didn't bill (e.g. unbilled provider, network error).
+
+    The validator wipes Hermes' SQLite store between episodes so the
+    JSONL should carry exactly one session per file — but we take the
+    last non-empty line defensively in case that ever drifts.
+    """
+    if not turns_log:
+        return None
+    last: dict | None = None
+    for line in turns_log.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            last = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+    if not isinstance(last, dict):
+        return None
+    cost = last.get("actual_cost_usd")
+    if cost is None:
+        cost = last.get("estimated_cost_usd")
+    try:
+        cost_f = float(cost)
+    except (TypeError, ValueError):
+        return None
+    if cost_f < 0:
+        return None
+    return cost_f
 
 
 def _strip_provider_prefix(model: str) -> str:
@@ -760,15 +833,39 @@ class TrajectorySandboxHarness:
                 timeout=verifier_timeout_s,
             )
             reward = int(verifier_result.get("reward", 0))
-            episode.quality = float(reward)
+            ctrf = verifier_result.get("ctrf")
+
+            # Continuous correctness from ctrf.json (passed/total).
+            # Falls back to the binary reward when the ctrf payload is
+            # absent or malformed — we'd rather record *something*
+            # than zero out a passing pack.
+            passed, total = _parse_ctrf_correctness(ctrf)
+            if total > 0:
+                episode.quality = passed / total
+            else:
+                episode.quality = float(reward)
+
+            # Cost axis: pulled from the agent's Hermes session export
+            # (turns.jsonl). Reported alongside quality, NOT folded
+            # into the score — separate axis on the leaderboard.
+            episode.cost_usd = _parse_session_cost(episode.turns_log)
+
             episode.judge_result = {
                 "reward": reward,
+                "passed": passed,
+                "total": total,
+                "correctness": episode.quality,
+                "cost_usd": episode.cost_usd,
                 "verifier_stdout": verifier_result.get("stdout", ""),
-                "ctrf": verifier_result.get("ctrf"),
+                "ctrf": ctrf,
             }
             logger.info(
-                "[%s] ep%d quality=%.1f (reward=%d)",
+                "[%s] ep%d quality=%.3f (reward=%d, %d/%d tests passed, "
+                "cost=%s)",
                 session_id, episode_index, episode.quality, reward,
+                passed, total,
+                f"${episode.cost_usd:.4f}" if episode.cost_usd is not None
+                else "n/a",
             )
 
         except Exception as e:

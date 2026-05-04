@@ -37,7 +37,7 @@ SANDBOX_IMAGE_REPO = "ghcr.io/trajectoryrl/sandbox-agent"
 # consulted only as the fallback target when no on-chain spec_number group
 # reaches >50% stake, and as the value written into outgoing commitments /
 # payloads.
-SPEC_NUMBER = 8
+SPEC_NUMBER = 9
 
 # Backwards-compatible alias for legacy callers / persisted state. Will be
 # removed after one validator release cycle.

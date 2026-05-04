@@ -13,6 +13,8 @@ from trajectoryrl.utils.sandbox_harness import (
     SandboxEvaluationResult,
     _SessionResult,
     _EpisodeResult,
+    _parse_ctrf_correctness,
+    _parse_session_cost,
 )
 
 
@@ -160,6 +162,121 @@ class TestImageChannel:
             sandbox_image="ghcr.io/custom/sandbox-agent:debug",
         )
         assert cfg.sandbox_image == "ghcr.io/custom/sandbox-agent:debug"
+
+
+# ---------------------------------------------------------------------------
+# Tests: ctrf-derived continuous correctness
+# ---------------------------------------------------------------------------
+
+class TestParseCtrfCorrectness:
+    def test_partial_pass(self):
+        ctrf = {"results": {"summary": {"tests": 6, "passed": 5, "failed": 1}}}
+        assert _parse_ctrf_correctness(ctrf) == (5, 6)
+
+    def test_all_pass(self):
+        ctrf = {"results": {"summary": {"tests": 4, "passed": 4, "failed": 0}}}
+        assert _parse_ctrf_correctness(ctrf) == (4, 4)
+
+    def test_all_fail(self):
+        ctrf = {"results": {"summary": {"tests": 3, "passed": 0, "failed": 3}}}
+        assert _parse_ctrf_correctness(ctrf) == (0, 3)
+
+    def test_missing_payload(self):
+        # None / non-dict / missing summary all return (0, 0) — caller
+        # uses that as the "fall back to binary reward" signal.
+        assert _parse_ctrf_correctness(None) == (0, 0)
+        assert _parse_ctrf_correctness({}) == (0, 0)
+        assert _parse_ctrf_correctness({"results": {}}) == (0, 0)
+        assert _parse_ctrf_correctness({"results": {"summary": {"tests": 0}}}) == (0, 0)
+
+    def test_malformed_counts(self):
+        # Hand-rolled non-int counts shouldn't crash, just yield no signal.
+        ctrf = {"results": {"summary": {"tests": "six", "passed": 5}}}
+        assert _parse_ctrf_correctness(ctrf) == (0, 0)
+
+
+# ---------------------------------------------------------------------------
+# Tests: cost extraction from turns.jsonl
+# ---------------------------------------------------------------------------
+
+class TestParseSessionCost:
+    def test_picks_actual_over_estimated(self):
+        import json as _json
+        line = _json.dumps({
+            "id": "abc", "actual_cost_usd": 0.0184, "estimated_cost_usd": 0.02,
+        })
+        assert _parse_session_cost(line + "\n") == 0.0184
+
+    def test_falls_back_to_estimated(self):
+        import json as _json
+        line = _json.dumps({"id": "abc", "actual_cost_usd": None,
+                            "estimated_cost_usd": 0.012})
+        assert _parse_session_cost(line) == 0.012
+
+    def test_takes_last_session_when_multiple(self):
+        # Defensive: validator wipes state.db between episodes so this
+        # shouldn't happen, but if cumulative export ever leaks through
+        # we still pick the most recent.
+        import json as _json
+        first = _json.dumps({"id": "old", "actual_cost_usd": 0.10})
+        last = _json.dumps({"id": "new", "actual_cost_usd": 0.02})
+        assert _parse_session_cost(first + "\n" + last + "\n") == 0.02
+
+    def test_empty_blob(self):
+        assert _parse_session_cost("") is None
+        assert _parse_session_cost("\n\n") is None
+
+    def test_unparseable_line(self):
+        assert _parse_session_cost("not json\n") is None
+
+    def test_negative_cost_ignored(self):
+        import json as _json
+        line = _json.dumps({"id": "x", "actual_cost_usd": -0.05})
+        assert _parse_session_cost(line) is None
+
+    def test_missing_cost_field(self):
+        import json as _json
+        line = _json.dumps({"id": "x", "messages": []})
+        assert _parse_session_cost(line) is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: SandboxEvaluationResult cost aggregation
+# ---------------------------------------------------------------------------
+
+class TestEvalResultCostAggregation:
+    def test_sums_billed_episodes(self):
+        sr = _SessionResult(episodes=[
+            _EpisodeResult(episode_index=0, quality=0.5, cost_usd=0.01),
+            _EpisodeResult(episode_index=1, quality=0.5, cost_usd=0.02),
+        ])
+        sr.compute_scores()
+        result = SandboxEvaluationResult(sr)
+        assert result.total_cost_usd == pytest.approx(0.03)
+        assert result.mean_cost_usd == pytest.approx(0.015)
+        assert result.episode_costs_usd == [0.01, 0.02]
+
+    def test_partial_billing(self):
+        # One episode unbilled (e.g. Hermes export failed) — aggregate
+        # over the billed ones, don't fabricate zeros.
+        sr = _SessionResult(episodes=[
+            _EpisodeResult(episode_index=0, quality=0.5, cost_usd=0.04),
+            _EpisodeResult(episode_index=1, quality=0.5, cost_usd=None),
+        ])
+        sr.compute_scores()
+        result = SandboxEvaluationResult(sr)
+        assert result.total_cost_usd == pytest.approx(0.04)
+        assert result.mean_cost_usd == pytest.approx(0.04)
+
+    def test_no_billing(self):
+        sr = _SessionResult(episodes=[
+            _EpisodeResult(episode_index=0, quality=0.5),
+            _EpisodeResult(episode_index=1, quality=0.5),
+        ])
+        sr.compute_scores()
+        result = SandboxEvaluationResult(sr)
+        assert result.total_cost_usd is None
+        assert result.mean_cost_usd is None
 
 
 # ---------------------------------------------------------------------------
