@@ -244,6 +244,62 @@ class TestParseSessionCost:
 # Tests: SandboxEvaluationResult cost aggregation
 # ---------------------------------------------------------------------------
 
+class TestWriteArtifacts:
+    def test_ctrf_and_verifier_stdout_split_out(self, tmp_path):
+        sr = _SessionResult(episodes=[
+            _EpisodeResult(
+                episode_index=0,
+                quality=0.833,
+                cost_usd=0.005,
+                judge_result={
+                    "reward": 0,
+                    "passed": 5,
+                    "total": 6,
+                    "correctness": 0.833,
+                    "cost_usd": 0.005,
+                    "verifier_stdout": "pytest output here\n",
+                    "ctrf": {"results": {"summary": {"tests": 6, "passed": 5}}},
+                },
+            ),
+        ])
+        sr.compute_scores()
+        result = SandboxEvaluationResult(sr, scenario_name="cancel-async-tasks")
+        out = tmp_path / "artifacts"
+        result.write_artifacts(out)
+
+        ep0 = out / "episodes" / "episode_0"
+        # ctrf is its own file
+        assert (ep0 / "ctrf.json").exists()
+        import json as _json
+        ctrf = _json.loads((ep0 / "ctrf.json").read_text())
+        assert ctrf["results"]["summary"]["passed"] == 5
+        # verifier_stdout is also broken out
+        assert (ep0 / "verifier_stdout.txt").read_text() == "pytest output here\n"
+        # evaluation.json still carries the full blob for back-compat
+        eval_blob = _json.loads((ep0 / "evaluation.json").read_text())
+        assert eval_blob["correctness"] == 0.833
+        assert eval_blob["ctrf"]["results"]["summary"]["passed"] == 5
+
+    def test_skips_ctrf_when_absent(self, tmp_path):
+        # Episode where the verifier never wrote ctrf (e.g. timeout).
+        sr = _SessionResult(episodes=[
+            _EpisodeResult(
+                episode_index=0,
+                quality=0.0,
+                judge_result={"reward": 0, "passed": 0, "total": 0,
+                              "verifier_stdout": "", "ctrf": None},
+            ),
+        ])
+        sr.compute_scores()
+        result = SandboxEvaluationResult(sr)
+        out = tmp_path / "artifacts"
+        result.write_artifacts(out)
+
+        ep0 = out / "episodes" / "episode_0"
+        assert not (ep0 / "ctrf.json").exists()
+        assert not (ep0 / "verifier_stdout.txt").exists()
+
+
 class TestEvalResultCostAggregation:
     def test_sums_billed_episodes(self):
         sr = _SessionResult(episodes=[

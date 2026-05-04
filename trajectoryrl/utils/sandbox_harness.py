@@ -186,6 +186,18 @@ class SandboxEvaluationResult:
                 (ep_dir / "turns_export.err").write_text(ep.turns_export_err)
             (ep_dir / "evaluation.json").write_text(
                 json.dumps(ep.judge_result, indent=2, default=str))
+            # Standalone ctrf.json so consumers don't need to dig into
+            # evaluation.json["ctrf"]. The full payload is also still
+            # nested inside evaluation.json for backward compat.
+            ctrf = ep.judge_result.get("ctrf") if ep.judge_result else None
+            if ctrf is not None:
+                (ep_dir / "ctrf.json").write_text(
+                    json.dumps(ctrf, indent=2, default=str))
+            verifier_stdout = (
+                ep.judge_result.get("verifier_stdout") if ep.judge_result else ""
+            )
+            if verifier_stdout:
+                (ep_dir / "verifier_stdout.txt").write_text(verifier_stdout)
             (ep_dir / "episode.json").write_text(
                 json.dumps(ep.ep_data, indent=2, default=str))
             if ep.error:
