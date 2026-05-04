@@ -26,7 +26,7 @@ async def heartbeat(
     last_set_weights_at: Optional[int] = None,
     last_eval_at: Optional[int] = None,
     bench_image_hash: Optional[str] = None,
-    harness_image_hash: Optional[str] = None,
+    scenario_image_hash: Optional[str] = None,
     bench_version: Optional[str] = None,
 ) -> bool:
     """Send a validator heartbeat to the dashboard API (v2).
@@ -36,8 +36,8 @@ async def heartbeat(
         heartbeat_url: Dashboard heartbeat endpoint.
         last_set_weights_at: Unix timestamp of most recent set_weights call.
         last_eval_at: Unix timestamp of most recent completed full eval cycle.
-        bench_image_hash: Docker image digest of the trajrl-bench sandbox.
-        harness_image_hash: Docker image digest of the hermes-agent harness.
+        bench_image_hash: Docker image digest of the sandbox-agent image.
+        scenario_image_hash: Docker image digest of the scenario environment image.
         bench_version: Version string reported by the trajrl-bench CLI.
 
     Returns:
@@ -67,8 +67,8 @@ async def heartbeat(
         payload["last_eval_at"] = last_eval_at
     if bench_image_hash is not None:
         payload["bench_image_hash"] = bench_image_hash
-    if harness_image_hash is not None:
-        payload["harness_image_hash"] = harness_image_hash
+    if scenario_image_hash is not None:
+        payload["scenario_image_hash"] = scenario_image_hash
     if bench_version is not None:
         payload["bench_version"] = bench_version
 
@@ -399,7 +399,7 @@ async def submit_eval(
     rejection_detail: Optional[str] = None,
     spec_number: Optional[int] = None,
     bench_image_hash: Optional[str] = None,
-    harness_image_hash: Optional[str] = None,
+    scenario_image_hash: Optional[str] = None,
     bench_version: Optional[str] = None,
     epoch_number: Optional[int] = None,
     submit_url: str = DEFAULT_SUBMIT_URL,
@@ -461,8 +461,8 @@ async def submit_eval(
         payload["spec_number"] = spec_number
     if bench_image_hash is not None:
         payload["bench_image_hash"] = bench_image_hash
-    if harness_image_hash is not None:
-        payload["harness_image_hash"] = harness_image_hash
+    if scenario_image_hash is not None:
+        payload["scenario_image_hash"] = scenario_image_hash
     if bench_version is not None:
         payload["bench_version"] = bench_version
     if epoch_number is not None:

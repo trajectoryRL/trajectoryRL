@@ -1,38 +1,32 @@
-"""Season 1 trajrl-bench harness for evaluating SKILL.md packs.
+"""trajrl-bench sandbox harness for evaluating SKILL.md packs.
 
-Three-container architecture:
-  - Sandbox (puzzle): shell + filesystem + mock services + scenario files
-  - Testee agent: SSHes into sandbox, reads SKILL.md + INSTRUCTION.md, solves
-  - Judge agent: SSHes into sandbox, reads JUDGE.md, grounds scoring in state
+Single-container architecture (2026-05):
+  - Sandbox+agent container (``ghcr.io/trajectoryrl/sandbox-agent``)
+    holds the puzzle filesystem and runs Hermes as the ``agent`` user.
+  - The validator drives episodes via ``docker exec -u agent`` per
+    episode — no testee container, no SSH boundary.
+  - One verifier container per episode runs ``tests/test.sh`` against
+    the agent's output and writes a binary 0/1 reward.
 
-The validator does NOT import trajrl-bench as a Python dependency. Instead,
-it pulls the sandbox image and runs CLI commands via `docker run`:
-  - `cli generate` — produce fixtures + instructions
-  - `cli judge --scenario X` — fetch JUDGE.md for a scenario
-  - (legacy) `cli score` — kept for backwards compat
+The validator does NOT import trajrl-bench as a Python dependency.
+It pulls the sandbox image and runs CLI commands via ``docker run``:
+  - ``cli scenarios``         — list scenarios shipped by this image
+  - ``cli scenario-info``     — full payload (image_repo, instruction.md,
+                                tests/, agent_output_path, timeouts)
 
-Updating scenarios = rebuild sandbox image, publish to GHCR. Validators
-pull on next eval. No validator code change.
-
-The flow:
-  1. docker pull sandbox image (get latest scenarios)
-  2. docker run sandbox generate → fixtures + instruction + world JSON
-  3. Start sandbox container (SSH + mock services), write SKILL.md
-  4. For each episode:
-     - Load fixtures into mock services
-     - Start testee container with SSH key, wait for it to solve + exit
-     - Start judge container with same key, wait for evaluation.json
-     - Read evaluation.json for quality score
-  5. Compute split-half delta from 4 quality scores
+Updating scenarios = rebuild sandbox-agent + scenario images, publish
+to GHCR. Validators pull on next eval. No validator code change.
 
 Usage:
     harness = TrajectorySandboxHarness(config)
-    result = await harness.evaluate_miner(skill_md, epoch_seed)
+    await harness.pull_latest()
+    result = await harness.evaluate_miner(skill_md, epoch_seed, ...)
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import io
 import json
@@ -41,11 +35,11 @@ import secrets
 import tarfile
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import docker
 from docker.models.containers import Container
-from docker.models.networks import Network
 from docker.types import LogConfig
 
 from ..utils.config import ValidatorConfig
@@ -53,89 +47,103 @@ from ..utils.config import ValidatorConfig
 logger = logging.getLogger(__name__)
 
 
+# Hermes runtime user inside the sandbox-agent image. Must match the
+# ``useradd ... -u 10000 agent`` line in
+# ``trajrl-bench/docker/Dockerfile.sandbox-agent``.
+_AGENT_UID = 10000
+
+
+# Scenarios run per session, in order. Every validator runs the full set
+# so scores are comparable across validators / windows / SPEC_NUMBER
+# bumps. Adding or removing a scenario must come with a SPEC_NUMBER bump
+# so cached scores invalidate. Sorted alphabetically for stability.
+SANDBOX_SCENARIOS: tuple[str, ...] = (
+    "break-filter-js-from-html",
+    "cancel-async-tasks",
+    "log-summary-date-ranges",
+)
+
+
 # ---------------------------------------------------------------------------
-# Result types (no trajrl-bench import needed)
+# Result types
 # ---------------------------------------------------------------------------
 
 @dataclass
 class _EpisodeResult:
     episode_index: int
+    # Scenario this episode evaluated. With multi-scenario sessions
+    # episode_index alone doesn't identify the cell; pair with this.
+    scenario: str = ""
+    # Continuous correctness in [0.0, 1.0]: passed_tests / total_tests from
+    # the verifier's ctrf.json. Falls back to ``float(reward)`` (binary
+    # 0 or 1) when ctrf isn't parseable.
     quality: float = 0.0
-    tool_calls: int = 0
-    transcript: str = ""                      # Testee agent's Hermes log (--quiet stdout)
-    judge_transcript: str = ""                # Judge agent's Hermes log (--quiet stdout)
-    # Structured per-turn JSONL exported by hermes-preentry.sh after
-    # `hermes chat` exits. One JSON object per session containing the
-    # full message history (user/assistant/tool calls/tool results) plus
-    # token counts and end_reason. Independent of stdout — populated
-    # even when --quiet collapses transcript.txt to header-only.
-    turns_log: str = ""                       # Testee /workspace/turns.jsonl
-    judge_turns_log: str = ""                 # Judge /workspace/turns.jsonl
-    # Stderr + exit code from `hermes sessions export`, captured so we
-    # can tell apart the failure modes when turns_log is empty (chat
-    # never opened a session vs export errored vs container OOM-killed
-    # before export ran). Empty string on success with non-empty JSONL.
-    turns_export_err: str = ""                # /workspace/turns_export.err (testee)
-    judge_turns_export_err: str = ""          # /workspace/turns_export.err (judge)
-    mock_state: dict = field(default_factory=dict)
+    # Cost axis: actual_cost_usd from the agent's Hermes session export.
+    # ``None`` when the session JSONL is missing / billing not pinned.
+    # Reported alongside quality on artifacts and submit payloads but
+    # does NOT factor into the score (separate axis — see Ning's
+    # 2026-05-04 design call).
+    cost_usd: float | None = None
+    transcript: str = ""
+    turns_log: str = ""
+    turns_export_err: str = ""
     timed_out: bool = False
     error: str | None = None
     duration_s: float = 0.0
-    judge_result: dict = field(default_factory=dict)  # Parsed evaluation.json
-    ep_data: dict = field(default_factory=dict)       # fixtures + instruction_md
+    judge_result: dict = field(default_factory=dict)
+    ep_data: dict = field(default_factory=dict)
 
 
 @dataclass
 class _SessionResult:
     episodes: list[_EpisodeResult] = field(default_factory=list)
-    early_mean: float = 0.0
-    late_mean: float = 0.0
-    delta: float = 0.0
-    mean_quality: float = 0.0
-    learning_bonus: float = 0.0
-    final_score: float = 0.0
+    mean_quality: float = 0.0  # mean of per-scenario correctness, in [0,1]
+    final_score: float = 0.0   # sum of per-scenario correctness, in [0, N]
     pack_hash: str = ""
     validator_salt: str = ""
-    scenario: str = ""
-    # Context shared across episodes (captured for eval log uploads)
     skill_md: str = ""
-    world_data: dict = field(default_factory=dict)
-    judge_skill: str = ""  # JUDGE.md fetched from sandbox
 
-    def compute_scores(self, alpha: float = 0.5, early_floor: float = 0.3,
-                       delta_threshold: float = 0.4) -> None:
+    def compute_scores(self) -> None:
+        """Aggregate per-scenario correctness into the session score.
+
+        Each scenario contributes ``passed_i / total_i`` ∈ [0, 1] (the
+        episode's ``quality``). Final score is the equal-weighted sum
+        across scenarios — range [0, N] for N scenarios — so a perfect
+        all-pass session lands at ``len(SANDBOX_SCENARIOS)``. Mean
+        quality is exposed as the [0, 1] convenience aggregate.
+
+        Rationale (Ning, 2026-05-04): equal weight per scenario, no
+        learning bonus, no split-half delta. With one episode per
+        scenario the within-scenario delta concept doesn't apply, and
+        cross-scenario diversity is the noise reduction.
+        """
         scores = [ep.quality for ep in self.episodes]
-        if len(scores) < 4:
-            self.mean_quality = sum(scores) / len(scores) if scores else 0.0
-            self.final_score = self.mean_quality
+        if not scores:
+            self.mean_quality = 0.0
+            self.final_score = 0.0
             return
-        self.early_mean = (scores[0] + scores[1]) / 2
-        self.late_mean = (scores[2] + scores[3]) / 2
-        self.delta = self.late_mean - self.early_mean
-        if self.early_mean < early_floor and self.delta > delta_threshold:
-            self.delta = 0.0
         self.mean_quality = sum(scores) / len(scores)
-        self.learning_bonus = alpha * max(0.0, self.delta)
-        self.final_score = self.mean_quality * (1 + self.learning_bonus)
+        self.final_score = sum(scores)
 
 
 class SandboxEvaluationResult:
-    """Result from a Season 1 sandbox evaluation.
-
-    Provides the standard result interface for the validator pipeline.
-    """
+    """Result from a sandbox evaluation. Provides the standard result
+    interface the validator pipeline consumes."""
 
     def __init__(self, session_result: _SessionResult,
-                 scenario_name: str = "incident_response"):
+                 scenario_name: str = ""):
+        # ``scenario_name`` is retained on the result for backward
+        # compat with consumers that expect a single-scenario tag, but
+        # multi-scenario sessions populate ``scenarios`` / per-cell
+        # results below.
         self.scenario_name = scenario_name
         self.score = session_result.final_score
         self.success = session_result.final_score > 0.0
-        self.tool_calls = sum(ep.tool_calls for ep in session_result.episodes)
+        self.tool_calls = 0
         self.response = ""
         self.rubric = {}
         self.error: Optional[str] = None
 
-        # Cost: not tracked in S1 (quality-based, not cost-based)
         self.cost_usd: Optional[float] = None
         self.token_usage: Optional[Dict[str, int]] = None
         self.model_usage: Optional[List[Dict[str, Any]]] = None
@@ -146,84 +154,77 @@ class SandboxEvaluationResult:
         self.session_key: Optional[str] = None
         self.session_file: Optional[str] = None
 
-        # S1-specific
         self.session_result = session_result
-        self.early_mean = session_result.early_mean
-        self.late_mean = session_result.late_mean
-        self.delta = session_result.delta
         self.mean_quality = session_result.mean_quality
-        self.learning_bonus = session_result.learning_bonus
-        self.episode_qualities = [ep.quality for ep in session_result.episodes]
+        # Per-scenario correctness map: {scenario_name: passed/total}.
+        # Empty dict if the session ran no episodes.
+        self.scenario_qualities: Dict[str, float] = {
+            ep.scenario: ep.quality for ep in session_result.episodes
+        }
+        # Ordered list of scenarios run (matches ``SANDBOX_SCENARIOS``
+        # by construction; provides a stable iteration order for
+        # downstream consumers).
+        self.scenarios: List[str] = [ep.scenario for ep in session_result.episodes]
+        # Cost axis (separate from score). Per-scenario map + aggregates.
+        self.scenario_costs_usd: Dict[str, Optional[float]] = {
+            ep.scenario: ep.cost_usd for ep in session_result.episodes
+        }
+        billed = [c for c in self.scenario_costs_usd.values() if c is not None]
+        self.total_cost_usd: Optional[float] = sum(billed) if billed else None
+        self.mean_cost_usd: Optional[float] = (
+            sum(billed) / len(billed) if billed else None
+        )
 
     def write_artifacts(self, out_dir: "Path | str") -> None:
-        """Write per-episode transcripts + evaluations + session metadata.
-
-        Produces the same folder layout as the standalone e2e test, so
-        `trajrl logs --show` unpacks it into a predictable structure:
-
-            out_dir/
-              SKILL.md                    # miner's product
-              JUDGE.md                    # scoring rubric used
-              world.json                  # company context + salt
-              metadata.json               # final_score, delta, scenario, etc.
-              episodes/
-                episode_0/
-                  testee_transcript.txt   # Hermes stdout (--quiet'd)
-                  judge_transcript.txt    # Hermes stdout (--quiet'd)
-                  turns.jsonl             # full per-turn testee session (when image supports export)
-                  judge_turns.jsonl       # full per-turn judge session
-                  evaluation.json
-                  episode.json            # fixtures + instruction
-                episode_1/ ...
-        """
-        from pathlib import Path
+        """Write per-episode transcripts + verifier outputs + session
+        metadata to disk. Layout matches what ``trajrl logs --show``
+        knows how to render."""
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
         sr = self.session_result
 
-        # Session-level artifacts
         (out / "SKILL.md").write_text(sr.skill_md or "")
-        (out / "JUDGE.md").write_text(sr.judge_skill or "")
-        (out / "world.json").write_text(json.dumps(sr.world_data, indent=2,
-                                                    default=str))
         (out / "metadata.json").write_text(json.dumps({
-            "scenario": sr.scenario,
+            "scenarios": self.scenarios,
             "pack_hash": sr.pack_hash,
             "validator_salt": sr.validator_salt,
             "final_score": sr.final_score,
             "mean_quality": sr.mean_quality,
-            "early_mean": sr.early_mean,
-            "late_mean": sr.late_mean,
-            "delta": sr.delta,
-            "learning_bonus": sr.learning_bonus,
-            "episode_qualities": [ep.quality for ep in sr.episodes],
+            "scenario_qualities": self.scenario_qualities,
+            "scenario_costs_usd": self.scenario_costs_usd,
+            "total_cost_usd": self.total_cost_usd,
+            "mean_cost_usd": self.mean_cost_usd,
         }, indent=2, default=str))
 
-        # Per-episode artifacts
         for ep in sr.episodes:
-            ep_dir = out / "episodes" / f"episode_{ep.episode_index}"
+            # Per-cell directory keyed by scenario name (one cell per
+            # scenario in the new 1-ep-per-scenario design). Falls back
+            # to ``episode_<n>`` for older results without scenario tags.
+            cell_name = (
+                f"scenario_{ep.scenario}" if ep.scenario
+                else f"episode_{ep.episode_index}"
+            )
+            ep_dir = out / "episodes" / cell_name
             ep_dir.mkdir(parents=True, exist_ok=True)
             (ep_dir / "testee_transcript.txt").write_text(ep.transcript or "")
-            (ep_dir / "judge_transcript.txt").write_text(
-                ep.judge_transcript or "")
-            # Structured per-turn JSONL — full Hermes session export
-            # (every user/assistant message + tool call + tool result),
-            # populated by hermes-preentry.sh when the harness/judge
-            # image supports it. Skipped silently on older images.
             if ep.turns_log:
                 (ep_dir / "turns.jsonl").write_text(ep.turns_log)
-            if ep.judge_turns_log:
-                (ep_dir / "judge_turns.jsonl").write_text(ep.judge_turns_log)
-            # Stderr from `hermes sessions export` — only useful when the
-            # JSONL is empty, but always cheap to write. Lets the website
-            # show "Trace export failed: <reason>" instead of a blank tab.
             if ep.turns_export_err:
                 (ep_dir / "turns_export.err").write_text(ep.turns_export_err)
-            if ep.judge_turns_export_err:
-                (ep_dir / "judge_turns_export.err").write_text(
-                    ep.judge_turns_export_err)
             (ep_dir / "evaluation.json").write_text(
                 json.dumps(ep.judge_result, indent=2, default=str))
+            # Standalone ctrf.json so consumers don't need to dig into
+            # evaluation.json["ctrf"]. The full payload is also still
+            # nested inside evaluation.json for backward compat.
+            ctrf = ep.judge_result.get("ctrf") if ep.judge_result else None
+            if ctrf is not None:
+                (ep_dir / "ctrf.json").write_text(
+                    json.dumps(ctrf, indent=2, default=str))
+            verifier_stdout = (
+                ep.judge_result.get("verifier_stdout") if ep.judge_result else ""
+            )
+            if verifier_stdout:
+                (ep_dir / "verifier_stdout.txt").write_text(verifier_stdout)
             (ep_dir / "episode.json").write_text(
                 json.dumps(ep.ep_data, indent=2, default=str))
             if ep.error:
@@ -236,11 +237,7 @@ class SandboxEvaluationResult:
 
 def _read_container_text(container, path: str) -> str:
     """Read a single text file from a container via get_archive.
-
-    Returns "" on any failure (file missing, container gone, decode error).
-    Used to pull /workspace/turns.jsonl — the structured Hermes session
-    export the harness preentry writes after `hermes chat` exits.
-    """
+    Returns '' on any failure."""
     try:
         archive, _ = container.get_archive(path)
     except docker.errors.NotFound:
@@ -267,12 +264,7 @@ def _read_container_text(container, path: str) -> str:
 def _docker_run_json(client: docker.DockerClient, image: str,
                      command: list[str], environment: dict | None = None,
                      timeout: int = 120, **kwargs) -> dict:
-    """Run a command in a container and parse JSON stdout.
-
-    Skips the image entrypoint to avoid startup noise corrupting the
-    JSON output. CLI commands (generate, score, scenarios) don't need
-    the SSH/sandbox setup from the entrypoint.
-    """
+    """Run a command in a container and parse JSON stdout."""
     try:
         output = client.containers.run(
             image, command=command, entrypoint="",
@@ -293,17 +285,7 @@ def _put_file(
     container: Container, path: str, content: str | bytes,
     mode: int = 0o644, uid: int = 0, gid: int = 0,
 ) -> None:
-    """Write a file into a container via tar archive.
-
-    Works on containers that are created but not yet started (no exec_run
-    required). Sets file mode + ownership via tar header.
-
-    The uid/gid parameters matter when the container's runtime user is
-    not root (e.g. the Hermes image drops privileges to uid 10000 via
-    gosu). A file dropped with the default uid=0,mode=0o600 is
-    unreadable by a non-root runtime user — callers must pass the
-    target container's uid/gid.
-    """
+    """Write a file into a container via tar archive."""
     import posixpath
     dir_name = posixpath.dirname(path)
     file_name = posixpath.basename(path)
@@ -320,100 +302,67 @@ def _put_file(
     container.put_archive(dir_name, buf)
 
 
-def _generate_keypair() -> tuple[str, str]:
-    """Generate ephemeral Ed25519 SSH keypair. Returns (private_key, public_key)."""
-    import subprocess
-    import tempfile
-    import os
-    with tempfile.TemporaryDirectory() as tmpdir:
-        key_path = os.path.join(tmpdir, "key")
-        subprocess.run(
-            ["ssh-keygen", "-t", "ed25519", "-f", key_path, "-N", "",
-             "-C", "eval-session", "-q"],
-            check=True,
-        )
-        private_key = open(key_path).read()
-        public_key = open(f"{key_path}.pub").read().strip()
-    return private_key, public_key
+def _shell_quote(s: str) -> str:
+    """Single-quote a string for safe inclusion in a bash -c invocation."""
+    return "'" + s.replace("'", "'\\''") + "'"
 
 
-# Hermes image runtime user. The image's ENTRYPOINT gosu-drops to this
-# uid before running the agent command, so any file we put_archive into
-# the container must be owned by (or readable by) this uid.
-_HERMES_UID = 10000
+def _parse_ctrf_correctness(ctrf: dict | None) -> tuple[int, int]:
+    """Return (passed, total) from a pytest-json-ctrf payload.
 
-# Pre-entrypoint wrapper for Hermes containers: executed as root before
-# the image's own entrypoint gosu-drops to the hermes user. Chowns
-# /workspace so the judge can write /workspace/evaluation.json (Docker
-# creates working_dir= paths as root:root), then runs the image's
-# original entrypoint with the original command args.
-#
-# We deliberately do NOT `exec` the entrypoint: after `hermes chat`
-# returns, we run `hermes sessions export /workspace/turns.jsonl` to
-# capture the structured per-turn session data (every user/assistant
-# message + tool call + tool result + token counts + end_reason),
-# which the bench reads back via get_archive in _read_container_text.
-# Independent of stdout, so it survives --quiet collapsing the docker
-# logs to header + final-message only. The export is best-effort —
-# its failure must not mask the chat exit code, since downstream
-# test scoring and judging depend on chat_rc.
-_HERMES_PREENTRY = (
-    # /workspace may not exist in the testee container — only the judge
-    # container sets working_dir="/workspace" which auto-creates it.
-    # mkdir unconditionally so chown + the post-chat export below can
-    # both find the directory.
-    "mkdir -p /workspace; "
-    "chown -R hermes:hermes /workspace 2>/dev/null; "
-    "chmod 0755 /workspace 2>/dev/null; "
-    "/opt/hermes/docker/entrypoint.sh \"$@\"; "
-    "chat_rc=$?; "
-    # Export the SQLite session store. Use the absolute venv path:
-    # entrypoint.sh's `exec hermes "$@"` activates the venv only inside
-    # its own subprocess, so when control returns to our outer shell
-    # (still root, original PATH) `hermes` is not on PATH and bare
-    # `hermes sessions export` exits with "command not found". That's
-    # why every production turns.jsonl was empty — verified live.
-    # Stderr lands in /workspace so the bench reads it back via
-    # get_archive (opaque failures used to be undebuggable when stderr
-    # went to /tmp). Always record the export's exit code: the JSONL
-    # being empty despite rc=0 is itself a signal we want to surface.
-    "/opt/hermes/.venv/bin/hermes sessions export /workspace/turns.jsonl 2>/workspace/turns_export.err; "
-    "export_rc=$?; "
-    "echo \"export_rc=$export_rc\" >> /workspace/turns_export.err; "
-    "exit \"$chat_rc\""
-)
-_HERMES_ENTRYPOINT = ["/bin/sh", "-c", _HERMES_PREENTRY, "--"]
-
-
-_PROVIDER_PREFIXES = ("openrouter/", "chutes/")
-
-
-def _hermes_custom_config(model: str, base_url: str, api_key: str) -> str:
-    """Build a hermes config.yaml pinning an OpenAI-compatible endpoint.
-
-    Hermes CLI's --provider choices list is hard-coded and rejects "custom";
-    HERMES_INFERENCE_PROVIDER env is also ignored. The only way to pin a
-    generic OpenAI-compatible endpoint (chutes, openrouter, ollama, …) is to
-    write $HERMES_HOME/config.yaml before startup.
+    Falls back to (0, 0) when the payload is missing or malformed —
+    callers must treat (0, 0) as "no signal" (not "100% pass").
     """
-    return (
-        "model:\n"
-        '  provider: "custom"\n'
-        f"  default: {json.dumps(model)}\n"
-        f"  base_url: {json.dumps(base_url)}\n"
-        f"  api_key: {json.dumps(api_key)}\n"
-    )
+    if not isinstance(ctrf, dict):
+        return 0, 0
+    summary = (ctrf.get("results") or {}).get("summary") or {}
+    try:
+        total = int(summary.get("tests", 0))
+        passed = int(summary.get("passed", 0))
+    except (TypeError, ValueError):
+        return 0, 0
+    if total <= 0:
+        return 0, 0
+    return passed, total
+
+
+def _parse_session_cost(turns_log: str) -> float | None:
+    """Pull ``actual_cost_usd`` out of the latest Hermes session in
+    a turns.jsonl blob. Returns None when the blob is empty / unparseable
+    / Hermes didn't bill (e.g. unbilled provider, network error).
+
+    The validator wipes Hermes' SQLite store between episodes so the
+    JSONL should carry exactly one session per file — but we take the
+    last non-empty line defensively in case that ever drifts.
+    """
+    if not turns_log:
+        return None
+    last: dict | None = None
+    for line in turns_log.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            last = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+    if not isinstance(last, dict):
+        return None
+    cost = last.get("actual_cost_usd")
+    if cost is None:
+        cost = last.get("estimated_cost_usd")
+    try:
+        cost_f = float(cost)
+    except (TypeError, ValueError):
+        return None
+    if cost_f < 0:
+        return None
+    return cost_f
 
 
 def _strip_provider_prefix(model: str) -> str:
-    """Remove provider routing prefixes from model identifiers.
-
-    Providers like OpenRouter and Chutes use prefixed model names
-    (e.g. ``openrouter/anthropic/claude-3``), but the sandbox calls
-    the provider API directly via LLM_BASE_URL and expects the bare
-    model name.
-    """
-    for prefix in _PROVIDER_PREFIXES:
+    """Remove provider routing prefixes from model identifiers."""
+    for prefix in ("openrouter/", "chutes/"):
         if model.startswith(prefix):
             return model[len(prefix):]
     return model
@@ -424,14 +373,23 @@ def _strip_provider_prefix(model: str) -> str:
 # ---------------------------------------------------------------------------
 
 class TrajectorySandboxHarness:
-    """Season 1 harness — all scenario logic runs inside the sandbox image.
+    """Single-container sandbox harness.
 
-    The validator does NOT pip-install trajrl-bench. Instead:
-    1. `docker pull` the sandbox image (gets latest scenarios)
-    2. `docker run ... generate` to produce fixtures
-    3. Start sandbox + harness containers, run agent episodes
-    4. `docker run ... score` to judge each episode
-    5. Compute split-half delta locally (simple math)
+    Per session:
+      1. Pull sandbox-agent image + the configured scenario image.
+      2. Run sandbox-agent container; wait for it to come up.
+      3. Inject /app from the scenario image; write SKILL.md.
+      4. For each episode:
+         - Write INSTRUCTION.md
+         - ``docker exec -u agent`` runs ``hermes chat`` against
+           /workspace + /app directly. Wraps chat + ``hermes sessions
+           export`` in one bash invocation; wipes the SQLite session DB
+           between episodes so each episode's turns.jsonl carries only
+           that episode's session.
+         - Extract agent_output_path from the sandbox.
+         - Run a one-shot verifier container against the output,
+           parse reward.txt, set quality = float(reward).
+      5. Compute split-half delta over the resulting qualities.
     """
 
     def __init__(self, config: ValidatorConfig):
@@ -439,50 +397,33 @@ class TrajectorySandboxHarness:
         self._docker_client: docker.DockerClient | None = None
 
         self._sandbox_image = config.sandbox_image
-        self._harness_image = config.harness_image
 
-        # Testee runs the miner's SKILL.md against the scenario; uses LLM_*.
         self._testee_model = _strip_provider_prefix(config.llm_model)
         self._testee_api_key = config.llm_api_key
         self._testee_api_url = config.llm_base_url
 
-        # Judge scores the testee; can use a different model family (JUDGE_*)
-        # so judge bias is uncorrelated with testee bias. Falls back to LLM_*
-        # when JUDGE_* fields are unset.
-        self._judge_model = _strip_provider_prefix(config.judge_model or config.llm_model)
-        self._judge_api_key = config.judge_api_key or config.llm_api_key
-        self._judge_api_url = config.judge_base_url or config.llm_base_url
-
-        # Backward-compatible aliases for any external reader that still
-        # expects a single _llm_* tuple. Points at the testee model — the
-        # one that actually runs SKILL.md inside the sandbox.
+        # Backwards-compat aliases (some external readers still expect
+        # _llm_*). All three point at the agent's LLM.
         self._llm_model = self._testee_model
         self._llm_api_key = self._testee_api_key
         self._llm_api_url = self._testee_api_url
 
-        # Sandbox version — queried at pull time, used purely for audit and
-        # logging. The scoring spec identifier (SPEC_NUMBER) is now a
-        # validator-side constant, decoupled from the bench image version.
         self.sandbox_version: str = "unknown"
         self.sandbox_scenarios: list[str] = []
+        self._scenario_info: dict | None = None
 
-        # Image digests — populated after pull_latest
         self.bench_image_hash: str = "unknown"
-        self.harness_image_hash: str = "unknown"
+        self.scenario_image_hash: str = "unknown"
+        self.scenario_image_hashes: Dict[str, str] = {}
 
     @property
     def client(self) -> docker.DockerClient:
-        """Lazy Docker client — connects on first access, not at init time.
-
-        Allows the validator to start and run non-eval functions (weights,
-        consensus, metagraph sync) even when docker.sock is not mounted.
-        """
         if self._docker_client is None:
             self._docker_client = docker.from_env()
         return self._docker_client
 
     async def pull_latest(self) -> None:
-        """Pull latest images and query sandbox version. Gets new scenarios."""
+        """Pull latest sandbox-agent + scenario images. Get new scenarios."""
         loop = asyncio.get_event_loop()
         try:
             await loop.run_in_executor(None, self._pull_sync)
@@ -490,16 +431,11 @@ class TrajectorySandboxHarness:
             logger.warning("Failed to pull latest images: %s (using cached)", e)
 
     def _cleanup_orphans(self) -> None:
-        """Remove sandbox/testee/judge containers (and their networks)
-        left behind by prior eval cycles that didn't reach their finally
-        block — typically because the validator was SIGKILL'd mid-cycle
-        by watchtower, OOM, or a host restart. These orphans pin old
-        image versions and prevent ``_pull_sync`` from rmi'ing them.
-
-        Identified by the ``trajectoryrl.role`` label set on every
-        container/network the harness creates.
+        """Remove sandbox/verifier containers (and their networks) left
+        behind by prior eval cycles that didn't reach their finally
+        block — typically because the validator was SIGKILL'd mid-cycle.
         """
-        for role in ("testee", "judge", "sandbox"):
+        for role in ("verifier", "sandbox"):
             try:
                 orphans = self.client.containers.list(
                     all=True,
@@ -532,60 +468,50 @@ class TrajectorySandboxHarness:
             logger.warning("Orphan network scan failed: %s", e)
 
     def _pull_sync(self) -> None:
-        # Reap orphans first so they release any image references —
-        # otherwise the rmi-old-image step below fails with "image is
-        # being used by stopped container" and the old version sticks
-        # around until the next ops manual prune.
         self._cleanup_orphans()
 
-        for image in [self._sandbox_image, self._harness_image]:
+        # Sandbox-agent image first.
+        try:
+            old_id: str | None = None
             try:
-                old_id: str | None = None
-                try:
-                    old_id = self.client.images.get(image).id
-                except docker.errors.ImageNotFound:
-                    pass
-                logger.info("Pulling latest image: %s", image)
-                self.client.images.pull(image)
-                try:
-                    new_id = self.client.images.get(image).id
-                except docker.errors.ImageNotFound:
-                    new_id = None
-                if old_id and new_id and old_id != new_id:
-                    try:
-                        self.client.images.remove(old_id)
-                        logger.info(
-                            "Removed superseded image %s (%s)",
-                            image, old_id[:19],
-                        )
-                    except docker.errors.APIError as e:
-                        # Still referenced by some container we couldn't
-                        # reap (e.g. unrelated user container reusing the
-                        # same hash). Leave it; ops can prune manually.
-                        logger.debug(
-                            "Skip rmi superseded %s (%s): %s",
-                            image, old_id[:19], e,
-                        )
-            except Exception as e:
-                logger.warning("Failed to pull %s: %s (using cached)", image, e)
-
-        # Capture image digests (sha256 from RepoDigests)
-        for image_ref, attr in [
-            (self._sandbox_image, "bench_image_hash"),
-            (self._harness_image, "harness_image_hash"),
-        ]:
+                old_id = self.client.images.get(self._sandbox_image).id
+            except docker.errors.ImageNotFound:
+                pass
+            logger.info("Pulling sandbox-agent image: %s", self._sandbox_image)
+            self.client.images.pull(self._sandbox_image)
             try:
-                img = self.client.images.get(image_ref)
-                digests = img.attrs.get("RepoDigests", [])
-                if digests:
-                    # RepoDigests format: "repo@sha256:abc123..."
-                    setattr(self, attr, digests[0].split("@", 1)[-1])
-                else:
-                    setattr(self, attr, img.id)
-            except Exception as e:
-                logger.warning("Failed to get digest for %s: %s", image_ref, e)
+                new_id = self.client.images.get(self._sandbox_image).id
+            except docker.errors.ImageNotFound:
+                new_id = None
+            if old_id and new_id and old_id != new_id:
+                try:
+                    self.client.images.remove(old_id)
+                    logger.info(
+                        "Removed superseded image %s (%s)",
+                        self._sandbox_image, old_id[:19],
+                    )
+                except docker.errors.APIError as e:
+                    logger.debug(
+                        "Skip rmi superseded %s (%s): %s",
+                        self._sandbox_image, old_id[:19], e,
+                    )
+        except Exception as e:
+            logger.warning(
+                "Failed to pull %s: %s (using cached)",
+                self._sandbox_image, e,
+            )
 
-        # Query sandbox version and available scenarios
+        try:
+            img = self.client.images.get(self._sandbox_image)
+            digests = img.attrs.get("RepoDigests", [])
+            self.bench_image_hash = (
+                digests[0].split("@", 1)[-1] if digests else img.id
+            )
+        except Exception as e:
+            logger.warning("Failed to get digest for sandbox image: %s", e)
+
+        # Query sandbox version + scenarios. CLI is at /usr/local/bin/hermes
+        # default entrypoint may interfere — use entrypoint="".
         try:
             info = _docker_run_json(
                 self.client, self._sandbox_image,
@@ -598,6 +524,84 @@ class TrajectorySandboxHarness:
         except Exception as e:
             logger.warning("Failed to query sandbox version: %s", e)
 
+        # Pull the per-scenario environment images for every scenario
+        # this validator runs. ``scenario_image_hashes`` keys each one
+        # for audit / submit-payload metadata.
+        self.scenario_image_hashes = {}
+        for scenario_name in SANDBOX_SCENARIOS:
+            try:
+                self._scenario_info = None  # force re-fetch per scenario
+                self._load_scenario_info(scenario_name)
+            except Exception as e:
+                logger.warning(
+                    "Failed to fetch scenario-info for %s: %s",
+                    scenario_name, e,
+                )
+                continue
+            scenario_image = self._scenario_image_ref()
+            if not scenario_image:
+                continue
+            try:
+                logger.info("Pulling scenario image: %s", scenario_image)
+                self.client.images.pull(scenario_image)
+                img = self.client.images.get(scenario_image)
+                digests = img.attrs.get("RepoDigests", [])
+                digest = digests[0].split("@", 1)[-1] if digests else img.id
+                self.scenario_image_hashes[scenario_name] = digest
+            except Exception as e:
+                logger.warning(
+                    "Failed to pull scenario image %s: %s",
+                    scenario_image, e,
+                )
+        # Stable single-string hash for back-compat with the
+        # ``scenario_image_hash`` heartbeat / submit field — concatenate
+        # per-scenario hashes in canonical order.
+        if self.scenario_image_hashes:
+            ordered = [
+                self.scenario_image_hashes.get(name, "missing")
+                for name in SANDBOX_SCENARIOS
+            ]
+            self.scenario_image_hash = ":".join(ordered)
+
+    # ------------------------------------------------------------------
+    # Scenario plumbing
+    # ------------------------------------------------------------------
+
+    def _load_scenario_info(self, scenario: str) -> dict:
+        """Fetch + cache the ``cli scenario-info`` payload for a scenario."""
+        if self._scenario_info and self._scenario_info.get("name") == scenario:
+            return self._scenario_info
+        info = _docker_run_json(
+            self.client, self._sandbox_image,
+            command=["python", "-m", "trajrl_bench.cli", "scenario-info",
+                     "--scenario", scenario],
+        )
+        self._scenario_info = info
+        return info
+
+    def _sandbox_tag(self) -> str:
+        """Return the channel tag suffix on the sandbox image."""
+        ref = self._sandbox_image
+        if "@" in ref:
+            ref = ref.split("@", 1)[0]
+        if ":" in ref.split("/")[-1]:
+            return ref.rsplit(":", 1)[1]
+        return "latest"
+
+    def _scenario_image_ref(self) -> str:
+        """Return ``image_repo:<sandbox-tag>`` for the configured scenario."""
+        info = self._scenario_info
+        if not info:
+            return ""
+        repo = info.get("image_repo", "")
+        if not repo:
+            return ""
+        return f"{repo}:{self._sandbox_tag()}"
+
+    # ------------------------------------------------------------------
+    # Evaluation entry points
+    # ------------------------------------------------------------------
+
     async def evaluate_miner(
         self,
         skill_md: str,
@@ -605,195 +609,146 @@ class TrajectorySandboxHarness:
         pack_hash: str = "",
         validator_salt: str = "",
     ) -> SandboxEvaluationResult:
-        """Run a full Season 1 evaluation.
-
-        All scenario logic (fixture generation, LLM judge scoring) runs
-        inside the sandbox Docker image. The validator only orchestrates
-        containers and computes the final split-half delta.
-        """
-        num_episodes = self.config.sandbox_num_episodes
-        salt = validator_salt or self._default_salt()
+        salt = validator_salt or hashlib.sha256(
+            f"{self.config.wallet_hotkey}:{self.config.netuid}".encode()
+        ).hexdigest()[:16]
 
         logger.info(
-            "S1 evaluation starting: pack_hash=%s, seed=%d, episodes=%d",
-            pack_hash[:12] if pack_hash else "?", epoch_seed, num_episodes,
+            "eval starting: pack_hash=%s, seed=%d, scenarios=%s",
+            pack_hash[:12] if pack_hash else "?",
+            epoch_seed, list(SANDBOX_SCENARIOS),
         )
 
         loop = asyncio.get_event_loop()
         try:
             session_result = await loop.run_in_executor(
                 None, lambda: self._run_eval_sync(
-                    skill_md, epoch_seed, salt, num_episodes, pack_hash,
+                    skill_md, epoch_seed, salt, pack_hash,
                 ),
             )
         except Exception as e:
-            logger.error("S1 evaluation failed: %s", e, exc_info=True)
+            logger.error("eval failed: %s", e, exc_info=True)
             session_result = _SessionResult()
             result = SandboxEvaluationResult(session_result)
             result.error = str(e)
             return result
 
-        result = SandboxEvaluationResult(session_result, scenario_name=session_result.scenario)
+        result = SandboxEvaluationResult(session_result)
         logger.info(
-            "S1 evaluation complete: final_score=%.3f "
-            "(mean_q=%.3f, delta=%.3f, episodes=%s)",
-            result.score, result.mean_quality, result.delta,
-            result.episode_qualities,
+            "eval complete: final_score=%.3f (mean_q=%.3f, scenarios=%s)",
+            result.score, result.mean_quality, result.scenario_qualities,
         )
         return result
 
     def _run_eval_sync(
-        self, skill_md: str, epoch_seed: int, salt: str,
-        num_episodes: int, pack_hash: str,
+        self, skill_md: str, epoch_seed: int, salt: str, pack_hash: str,
     ) -> _SessionResult:
-        """Synchronous eval: generate → run episodes → score → delta.
+        """One sandbox container, one episode per scenario.
 
-        Architecture:
-        - Sandbox container: shell + mock services + SSH daemon. Hosts
-          SKILL.md and INSTRUCTION.md in /workspace (root:agent 440).
-        - Testee container: SSHes into sandbox, solves task, exits.
-        - Judge container: SSHes into sandbox, grades, writes evaluation.json.
-        - Sandbox on internal network only (no internet egress).
-        - Testee + judge on default bridge (LLM API egress) + eval network
-          (to reach sandbox via ssh agent@sandbox).
+        Each scenario contributes a correctness ratio (passed/total) in
+        [0, 1]; final_score is the equal-weighted sum across scenarios.
+        ``/app`` is re-injected from each scenario's environment image
+        between cells. ``/workspace/learned`` persists across all
+        scenarios so SKILL.md can build cross-scenario state.
         """
+        # Pre-load metadata for every scenario so we fail early if the
+        # sandbox image is missing one. Each ``_load_scenario_info``
+        # call also primes the per-scenario image ref + tests payload.
+        scenario_specs: list[dict] = []
+        for name in SANDBOX_SCENARIOS:
+            self._scenario_info = None  # bust cache; loop reads each
+            info = self._load_scenario_info(name)
+            scenario_image = self._scenario_image_ref()
+            if not scenario_image:
+                raise RuntimeError(
+                    f"scenario {name!r} has no image_repo in scenario-info "
+                    f"— bench too old?"
+                )
+            tests_files_b64 = info.get("tests_files_b64", {})
+            if "test.sh" not in tests_files_b64:
+                raise RuntimeError(f"scenario {name!r} ships no test.sh")
+            scenario_specs.append({
+                "name": name,
+                "image": scenario_image,
+                "instruction_md": info["instruction_md"],
+                "agent_output_path": info["agent_output_path"],
+                "verifier_timeout_s": int(info.get("verifier_timeout_s", 300)),
+                "tests_files_b64": tests_files_b64,
+            })
+
         session_id = secrets.token_hex(6)
         session_result = _SessionResult(pack_hash=pack_hash, validator_salt=salt)
-
-        # -----------------------------------------------------------
-        # Step 1: Generate fixtures via docker run
-        #
-        # The bench CLI (``trajrl_bench.cli generate``) defaults
-        # ``--scenario`` to ``incident_response`` when the flag is
-        # omitted. That default made morning_brief / codebase_fix
-        # effectively unreachable from the validator loop: the CLI
-        # advertised them in ``scenarios_available`` but the harness
-        # always generated incident_response fixtures. Pass the
-        # validator's configured scenario explicitly so ops can pick
-        # a non-default scenario via ``SANDBOX_SCENARIO``.
-        # -----------------------------------------------------------
-        logger.info(
-            "[%s] Generating fixtures via sandbox image (scenario=%s)...",
-            session_id, self.config.sandbox_scenario,
-        )
-        gen_data = _docker_run_json(
-            self.client, self._sandbox_image,
-            command=["python", "-m", "trajrl_bench.cli", "generate",
-                     "--scenario", "codebase_fix",
-                     "--seed", str(epoch_seed), "--salt", salt,
-                     "--episodes", str(num_episodes),
-                     "--scenario", self.config.sandbox_scenario],
-        )
-
-        scenario = gen_data["scenario"]
-        world_data = gen_data["world"]
-        episodes_data = gen_data["episodes"]
-        session_result.scenario = scenario
         session_result.skill_md = skill_md
-        session_result.world_data = world_data
 
-        logger.info("[%s] Scenario: %s, World: %s", session_id, scenario,
-                    world_data["company"])
+        logger.info(
+            "[%s] session start (sandbox=%s, scenarios=%s)",
+            session_id, self._sandbox_image,
+            [s["name"] for s in scenario_specs],
+        )
 
-        # -----------------------------------------------------------
-        # Step 2: Run episodes (sandbox + harness containers)
-        # -----------------------------------------------------------
-        network = None
         sandbox = None
-        # Ephemeral SSH keypair — testee agent SSHes into sandbox.
-        # The sandbox is the puzzle environment (self-contained: shell,
-        # filesystem, mock services, scenario files). Testee comes in as
-        # the "agent" user and explores/solves whatever is there.
-        private_key, public_key = _generate_keypair()
-
         try:
-            # Create internal network for sandbox ↔ harness ↔ judge
-            network_name = f"eval_{session_id}"
-            network = self.client.networks.create(
-                network_name, driver="bridge", internal=True,
-                labels={"trajectoryrl.role": "eval_net"},
-            )
-
-            # Start sandbox container (internal network only — no internet).
-            # Alias "sandbox" lets SSH use "ssh agent@sandbox" stably.
             sandbox = self.client.containers.run(
                 self._sandbox_image,
                 name=f"sandbox_{session_id}",
-                detach=True, network=network.name,
-                networking_config={
-                    network.name: self.client.api.create_endpoint_config(
-                        aliases=["sandbox"],
-                    ),
-                },
+                detach=True,
+                # Default bridge → internet egress for both the agent
+                # (LLM API) and the verifier (apt + uv installs).
+                network="bridge",
                 environment={
-                    "SSH_PUBLIC_KEY": public_key,
-                    "SSH_USER": "agent",
+                    "LLM_API_KEY":  self._testee_api_key,
+                    "LLM_BASE_URL": self._testee_api_url,
+                    "LLM_MODEL":    self._testee_model,
                 },
-                mem_limit="2g", cpu_quota=100000,
+                mem_limit="4g", cpu_quota=200000,
                 labels={"trajectoryrl.role": "sandbox",
                         "trajectoryrl.session": session_id},
                 log_config=LogConfig(type=LogConfig.types.JSON,
                                      config={"max-size": "50m"}),
             )
 
-            # Wait for sandbox + mock services healthy (single check)
             for attempt in range(30):
                 try:
-                    code, out = sandbox.exec_run(
-                        ["sh", "-c", "curl -s http://localhost:8090/health"])
-                    if code == 0 and out and b'"ok"' in out:
-                        break
+                    sandbox.reload()
+                    if sandbox.status == "running":
+                        code, _ = sandbox.exec_run(
+                            ["sh", "-c", "test -d /app && test -d /workspace"]
+                        )
+                        if code == 0:
+                            break
                 except Exception:
                     pass
                 time.sleep(0.5 + min(attempt * 0.2, 1.5))
             else:
-                raise RuntimeError("Sandbox mock services failed to start")
+                raise RuntimeError("Sandbox container failed to start")
 
-            # Write SKILL.md into sandbox's /workspace (persists across episodes).
-            # This is the miner's product — read-only to the agent.
             _put_file(sandbox, "/workspace/SKILL.md", skill_md)
             sandbox.exec_run(["chown", "root:agent", "/workspace/SKILL.md"])
             sandbox.exec_run(["chmod", "440", "/workspace/SKILL.md"])
             sandbox.exec_run(["mkdir", "-p", "/workspace/learned"])
-            sandbox.exec_run(["chown", "-R", "agent:agent", "/workspace/learned"])
+            sandbox.exec_run([
+                "chown", "-R", "agent:agent", "/workspace/learned",
+            ])
 
-            # Fetch JUDGE.md once per session (same for all 4 episodes)
-            session_result.judge_skill = self._build_judge_skill(scenario)
+            for cell_index, spec in enumerate(scenario_specs):
+                # Re-inject /app from the scenario's environment image.
+                # Wipes whatever the prior scenario left; learned/
+                # persists.
+                sandbox.exec_run(
+                    ["sh", "-c", "rm -rf /app && mkdir -p /app"]
+                )
+                self._setup_app_dir(sandbox, spec["image"])
 
-            # Fetch ENVIRONMENT.md once per session and inject into /workspace.
-            # Permissions mirror SKILL.md (root:agent 440): agent can read but
-            # cannot mutate it across episodes.
-            environment_md = self._fetch_environment_md(scenario)
-            if environment_md:
-                _put_file(sandbox, "/workspace/ENVIRONMENT.md", environment_md)
-                sandbox.exec_run(["chown", "root:agent", "/workspace/ENVIRONMENT.md"])
-                sandbox.exec_run(["chmod", "440", "/workspace/ENVIRONMENT.md"])
-
-            # Install scenario_files (e.g. codebase_fix repo template) into
-            # the sandbox once per session. Scenarios that don't emit
-            # scenario_files (incident_response, morning_brief) leave the
-            # dict empty and this is a no-op.
-            #
-            # Note: the current bench CLI drops scenario_files from the
-            # generate JSON (``EpisodeFixtures.to_dict`` omits the field),
-            # so this path only activates once the bench side starts
-            # forwarding them. The validator reads from
-            # ``ep_data["fixtures"]["scenario_files"]`` defensively — if
-            # the key is absent we fall through without error.
-            self._install_scenario_files(sandbox, episodes_data)
-
-            # Run each episode
-            for i, ep_data in enumerate(episodes_data):
                 episode = self._run_episode(
                     session_id=session_id,
-                    episode_index=i,
-                    ep_data=ep_data,
-                    world_data=world_data,
-                    scenario=scenario,
+                    episode_index=cell_index,
+                    scenario=spec["name"],
+                    instruction_md=spec["instruction_md"],
                     sandbox=sandbox,
-                    network=network,
-                    private_key=private_key,
-                    judge_skill=session_result.judge_skill,
+                    scenario_image=spec["image"],
+                    agent_output_path=spec["agent_output_path"],
+                    tests_files_b64=spec["tests_files_b64"],
+                    verifier_timeout_s=spec["verifier_timeout_s"],
                 )
                 session_result.episodes.append(episode)
 
@@ -801,765 +756,390 @@ class TrajectorySandboxHarness:
             if sandbox:
                 try:
                     sandbox.stop(timeout=5)
-                    # v=True deletes anonymous volumes attached to the
-                    # container; without it, every eval leaks volumes
-                    # declared by the image (e.g. hermes-agent's /opt/data).
                     sandbox.remove(force=True, v=True)
                 except Exception:
                     pass
-            if network:
-                try:
-                    network.remove()
-                except Exception:
-                    pass
 
-        # -----------------------------------------------------------
-        # Step 3: Compute split-half delta (simple math, no imports)
-        # -----------------------------------------------------------
         session_result.compute_scores()
         return session_result
 
     def _run_episode(
-        self, session_id: str, episode_index: int, ep_data: dict,
-        world_data: dict, scenario: str,
+        self,
+        session_id: str,
+        episode_index: int,
+        scenario: str,
+        instruction_md: str,
         sandbox: Container,
-        network: Network, private_key: str,
-        judge_skill: str,
+        scenario_image: str,
+        agent_output_path: str,
+        tests_files_b64: dict[str, str],
+        verifier_timeout_s: int,
     ) -> _EpisodeResult:
-        """Run a single episode: load fixtures, start testee agent, capture, score.
-
-        Testee agent SSHes into the sandbox. The sandbox is the complete
-        environment — shell, filesystem, mock services, scenario files.
-        Testee reads /workspace/SKILL.md (miner's product), INSTRUCTION.md
-        (this episode's task), and explores whatever else the scenario
-        exposes (e.g. a git repo at /repo, logs at /var/log/, a dataset
-        at /data/).
-        """
-        episode = _EpisodeResult(episode_index=episode_index, ep_data=ep_data)
+        """Run one cell: docker exec hermes → extract output → verifier."""
+        ep_data = {
+            "scenario": scenario,
+            "instruction_md": instruction_md,
+            "agent_output_path": agent_output_path,
+        }
+        episode = _EpisodeResult(
+            episode_index=episode_index,
+            scenario=scenario,
+            ep_data=ep_data,
+        )
         t0 = time.time()
-        logger.info("[%s] Episode %d starting", session_id, episode_index)
+        logger.info("[%s] %s starting", session_id, scenario)
 
         try:
-            # Load fixtures into sandbox mock services + write INSTRUCTION.md
-            t_setup = time.time()
-            sandbox.exec_run(["sh", "-c", "curl -s -X POST http://localhost:8090/reset"])
-            fixtures_json = json.dumps(ep_data["fixtures"])
-            _put_file(sandbox, "/tmp/fixtures.json", fixtures_json)
-            sandbox.exec_run(["sh", "-c",
-                "curl -s -X POST http://localhost:8090/load_fixtures "
-                "-H 'Content-Type: application/json' -d @/tmp/fixtures.json"])
-            _put_file(sandbox, "/workspace/INSTRUCTION.md", ep_data["instruction_md"])
+            _put_file(sandbox, "/workspace/INSTRUCTION.md", instruction_md)
             sandbox.exec_run(["chown", "root:agent", "/workspace/INSTRUCTION.md"])
             sandbox.exec_run(["chmod", "440", "/workspace/INSTRUCTION.md"])
-            logger.info("[%s] ep%d STAGE setup_fixtures: %.1fs",
-                        session_id, episode_index, time.time() - t_setup)
 
-            t_testee_create = time.time()
-            harness_name = f"testee_{session_id}_ep{episode_index}"
+            # Reset per-episode Hermes state:
+            #   1. Wipe the SQLite session DB so this episode's chat is the
+            #      only session in the store. Without this,
+            #      ``hermes sessions export`` ships the cumulative DB every
+            #      episode and downstream readers can't tell which line is
+            #      "this episode".
+            #   2. Drop turns.jsonl + turns_export.err so a stale prior
+            #      export doesn't masquerade as this run.
+            sandbox.exec_run([
+                "sh", "-c",
+                "rm -f /opt/data/state.db /opt/data/state.db-* "
+                "/workspace/turns.jsonl /workspace/turns_export.err && "
+                "rm -rf /opt/data/sessions && "
+                "mkdir -p /opt/data/sessions && "
+                "chown -R agent:agent /opt/data",
+            ])
+
             harness_prompt = (
-                "SSH into the sandbox: `ssh -o StrictHostKeyChecking=no "
-                "-i /tmp/id_ed25519 agent@sandbox`. "
-                "Everything you need is there: shell, filesystem, tools. "
                 "Read /workspace/SKILL.md for your approach. "
                 "Read /workspace/INSTRUCTION.md for this episode's task. "
-                "Check /workspace/learned/ for notes from prior episodes (you may write there). "
-                "Explore the environment and solve the task. "
-                "Do not modify SKILL.md."
+                "The task's working directory is /app/. "
+                "/workspace/learned/ is your scratch space across episodes; "
+                "everything in /app and /workspace/learned is writable. "
+                "Solve the task. Do not modify SKILL.md."
             )
 
-            harness = self.client.containers.create(
-                self._harness_image,
-                entrypoint=_HERMES_ENTRYPOINT,
-                command=["chat", "-q", harness_prompt,
-                         "-m", self._testee_model,
-                         "-t", "terminal,file,code_execution,memory",
-                         "--quiet", "--yolo", "--max-turns", "15"],
-                name=harness_name,
+            # Wrap chat + sessions export in one bash invocation so the
+            # JSONL trace lands atomic per episode.
+            agent_cmd = (
+                "set +e; "
+                f"hermes chat -q {_shell_quote(harness_prompt)} "
+                f"-m {_shell_quote(self._testee_model)} "
+                "-t terminal,file,code_execution,memory "
+                "--quiet --yolo --max-turns 15; "
+                "chat_rc=$?; "
+                "hermes sessions export /workspace/turns.jsonl "
+                "2>/workspace/turns_export.err; "
+                "export_rc=$?; "
+                "echo \"export_rc=$export_rc\" >> /workspace/turns_export.err; "
+                "exit $chat_rc"
+            )
+
+            timeout = self.config.sandbox_timeout_per_episode
+            exec_id = self.client.api.exec_create(
+                sandbox.id,
+                cmd=["bash", "-c", agent_cmd],
+                user="agent",
+                workdir="/workspace",
+                stdout=True, stderr=False,
                 environment={
-                    "HERMES_BUNDLED_SKILLS": "/nonexistent",
-                    # Hermes' "custom" provider resolves the API key from
-                    # env, not from config.yaml's api_key: field. Provide
-                    # both common names so whichever routing path the
-                    # resolver takes can authenticate.
                     "OPENROUTER_API_KEY": self._testee_api_key,
                     "OPENAI_API_KEY":     self._testee_api_key,
+                    "ANTHROPIC_API_KEY":  self._testee_api_key,
+                    "HERMES_BUNDLED_SKILLS": "/nonexistent",
+                    "HOME": "/home/agent",
                 },
-                mem_limit="4g", cpu_quota=200000,
-                labels={"trajectoryrl.role": "testee",
-                        "trajectoryrl.session": session_id},
-                log_config=LogConfig(type=LogConfig.types.JSON,
-                                     config={"max-size": "50m"}),
-            )
+            )["Id"]
 
-            # Attach eval network so testee can reach sandbox via SSH
-            network.connect(harness)
-
-            # Install SSH private key into testee container. Owned by the
-            # hermes uid so the non-root agent can read it (mode 0600 is
-            # required by the ssh client for private keys).
-            _put_file(harness, "/tmp/id_ed25519", private_key,
-                      mode=0o600, uid=_HERMES_UID, gid=_HERMES_UID)
-
-            # Pin hermes to the configured OpenAI-compatible endpoint.
-            # Without this, hermes' --provider auto routes by model name
-            # (e.g. zai-org/* → openrouter) and ignores LLM_BASE_URL env.
-            _put_file(
-                harness, "/opt/data/config.yaml",
-                _hermes_custom_config(
-                    self._testee_model, self._testee_api_url, self._testee_api_key,
-                ),
-                mode=0o644, uid=_HERMES_UID, gid=_HERMES_UID,
-            )
-
-            harness.start()
-            logger.info("[%s] ep%d STAGE testee_create_start: %.1fs",
-                        session_id, episode_index,
-                        time.time() - t_testee_create)
-
-            t_testee_wait = time.time()
+            stream = self.client.api.exec_start(exec_id, stream=True, demux=False)
+            transcript_chunks: list[bytes] = []
+            stream_deadline = time.time() + timeout
             try:
-                # Wait for harness to complete
-                timeout = self.config.sandbox_timeout_per_episode
-                try:
-                    result = harness.wait(timeout=timeout)
-                    exit_code = result.get("StatusCode", -1)
-                except Exception:
-                    logger.warning("[%s] Episode %d timed out after %ds",
-                                   session_id, episode_index, timeout)
-                    try:
-                        harness.kill()
-                    except Exception:
-                        pass
-                    episode.timed_out = True
-
-                logger.info(
-                    "[%s] ep%d STAGE testee_wait: %.1fs (timed_out=%s)",
-                    session_id, episode_index,
-                    time.time() - t_testee_wait, episode.timed_out,
+                for chunk in stream:
+                    if chunk:
+                        transcript_chunks.append(chunk)
+                    if time.time() > stream_deadline:
+                        episode.timed_out = True
+                        break
+            except Exception as e:
+                logger.warning(
+                    "[%s] %s exec stream broke: %s",
+                    session_id, scenario, e,
                 )
-
-                t_testee_log = time.time()
-                try:
-                    episode.transcript = harness.logs(
-                        stdout=True, stderr=False
-                    ).decode(errors="replace")
-                except Exception:
-                    pass
-
-                logger.info(
-                    "[%s] ep%d STAGE testee_logs: %.1fs (%d chars)",
-                    session_id, episode_index,
-                    time.time() - t_testee_log,
-                    len(episode.transcript or ""),
-                )
-
-                # Pull the structured session JSONL the preentry exported
-                # before container teardown. Best-effort: empty string on
-                # any failure (missing file = old image, no harm done).
-                episode.turns_log = _read_container_text(
-                    harness, "/workspace/turns.jsonl",
-                )
-                # Stderr from the export step + its rc, recorded by the
-                # preentry. Only meaningful when turns_log is empty —
-                # tells us why instead of a vague "no trace recorded".
-                episode.turns_export_err = _read_container_text(
-                    harness, "/workspace/turns_export.err",
-                )
-
-            finally:
-                t_testee_cleanup = time.time()
-                try:
-                    harness.stop(timeout=3)
-                    harness.remove(force=True, v=True)
-                except Exception:
-                    pass
-                logger.info(
-                    "[%s] ep%d STAGE testee_cleanup: %.1fs",
-                    session_id, episode_index,
-                    time.time() - t_testee_cleanup,
-                )
-
-            t_state = time.time()
-            code, state_raw = sandbox.exec_run(
-                ["sh", "-c", "curl -s http://localhost:8090/state"])
-            if code == 0 and state_raw:
-                try:
-                    episode.mock_state = json.loads(state_raw.decode())
-                except Exception:
-                    pass
-            logger.info("[%s] ep%d STAGE mock_state_capture: %.1fs",
-                        session_id, episode_index, time.time() - t_state)
-
-            # Inject hidden tests and run them against the agent's work
-            # BEFORE the judge starts. This path is only exercised by
-            # scenarios that ship ``hidden_tests`` in the episode payload
-            # (currently: codebase_fix). Writes a per-episode result
-            # summary to /workspace/test_results/ep<N>.json so the judge
-            # can cite it and so later episodes can read the ground
-            # truth of whether a prior fix held. The injected files are
-            # removed after pytest runs so the testee never sees them.
-            t_hidden = time.time()
-            self._run_hidden_tests(
-                sandbox=sandbox,
-                ep_data=ep_data,
-                episode_index=episode_index,
+            episode.transcript = b"".join(transcript_chunks).decode(
+                "utf-8", errors="replace",
             )
-            logger.info("[%s] ep%d STAGE hidden_tests: %.1fs",
-                        session_id, episode_index, time.time() - t_hidden)
 
-            t_judge = time.time()
-            self._score_episode_agent(
+            inspect = self.client.api.exec_inspect(exec_id)
+            chat_exit = inspect.get("ExitCode")
+            logger.info(
+                "[%s] %s hermes chat finished (exit=%s, timed_out=%s, %d chars)",
+                session_id, scenario, chat_exit, episode.timed_out,
+                len(episode.transcript),
+            )
+
+            episode.turns_log = _read_container_text(
+                sandbox, "/workspace/turns.jsonl",
+            )
+            episode.turns_export_err = _read_container_text(
+                sandbox, "/workspace/turns_export.err",
+            )
+
+            agent_output_bytes = self._extract_file(sandbox, agent_output_path)
+            if agent_output_bytes is None:
+                logger.warning(
+                    "[%s] %s agent produced no output at %s",
+                    session_id, scenario, agent_output_path,
+                )
+
+            verifier_result = self._run_verifier_container(
+                image=scenario_image,
+                tests_files_b64=tests_files_b64,
+                agent_output_path=agent_output_path,
+                agent_output_bytes=agent_output_bytes,
                 session_id=session_id,
                 episode_index=episode_index,
-                episode=episode,
-                ep_data=ep_data,
-                world_data=world_data,
-                scenario=scenario,
-                sandbox=sandbox,
-                network=network,
-                private_key=private_key,
-                judge_skill=judge_skill,
+                timeout=verifier_timeout_s,
             )
-            logger.info("[%s] ep%d STAGE judge_total: %.1fs",
-                        session_id, episode_index, time.time() - t_judge)
+            reward = int(verifier_result.get("reward", 0))
+            ctrf = verifier_result.get("ctrf")
 
-            logger.info("[%s] Episode %d quality=%.3f",
-                        session_id, episode_index, episode.quality)
+            # Continuous correctness from ctrf.json (passed/total).
+            # Falls back to the binary reward when the ctrf payload is
+            # absent or malformed — we'd rather record *something*
+            # than zero out a passing pack.
+            passed, total = _parse_ctrf_correctness(ctrf)
+            if total > 0:
+                episode.quality = passed / total
+            else:
+                episode.quality = float(reward)
+
+            # Cost axis: pulled from the agent's Hermes session export
+            # (turns.jsonl). Reported alongside quality, NOT folded
+            # into the score — separate axis on the leaderboard.
+            episode.cost_usd = _parse_session_cost(episode.turns_log)
+
+            episode.judge_result = {
+                "reward": reward,
+                "passed": passed,
+                "total": total,
+                "correctness": episode.quality,
+                "cost_usd": episode.cost_usd,
+                "verifier_stdout": verifier_result.get("stdout", ""),
+                "ctrf": ctrf,
+            }
+            logger.info(
+                "[%s] %s quality=%.3f (reward=%d, %d/%d tests passed, "
+                "cost=%s)",
+                session_id, scenario, episode.quality, reward,
+                passed, total,
+                f"${episode.cost_usd:.4f}" if episode.cost_usd is not None
+                else "n/a",
+            )
 
         except Exception as e:
             episode.error = str(e)
-            logger.error("[%s] Episode %d failed: %s",
-                         session_id, episode_index, e, exc_info=True)
+            logger.error(
+                "[%s] %s failed: %s",
+                session_id, scenario, e, exc_info=True,
+            )
 
         episode.duration_s = time.time() - t0
         return episode
 
     # ------------------------------------------------------------------
-    # Scenario-file / hidden-test plumbing
-    #
-    # These helpers exist because the bench CLI at time of writing does
-    # not forward ``EpisodeFixtures.scenario_files`` or
-    # ``EpisodeFixtures.hidden_tests`` through its JSON stdout — both
-    # fields are populated inside the sandbox image by the fixture
-    # factory (notably for codebase_fix) but are dropped by
-    # ``EpisodeFixtures.to_dict``. The helpers below read those dicts
-    # defensively from the episode payload so the validator becomes
-    # correct as soon as the bench CLI starts forwarding them, with no
-    # further validator change required. Scenarios that don't populate
-    # these fields (incident_response, morning_brief) stay no-op.
+    # Container helpers
     # ------------------------------------------------------------------
 
-    def _install_scenario_files(
-        self, sandbox: Container, episodes_data: list[dict],
-    ) -> None:
-        """Install ``scenario_files`` from the first episode into
-        /workspace/ in the sandbox. Scenario files are session-scoped
-        (shared across all episodes), so only the first episode's dict
-        is read — the bench guarantees per-episode copies are identical
-        for any file that survives across episodes.
-
-        Paths in ``scenario_files`` are relative to /workspace/ (e.g.
-        ``"repo/src/rate_limiter.py"``). Files are written agent-owned
-        so the testee can modify them (unlike SKILL.md / ENVIRONMENT.md
-        which are root-owned mode 440).
-
-        If /workspace/repo is created, a ``git init`` runs so the agent
-        can commit its work — JUDGE.md criteria frequently check commit
-        history for change_minimality and fix_transfer signals.
-        """
-        if not episodes_data:
-            return
-        ep0 = episodes_data[0]
-        # ``scenario_files`` is emitted by the CLI as a sibling of
-        # ``fixtures`` (see ``trajrl_bench.cli.cmd_generate``). Older CLI
-        # builds may have put it inside ``fixtures`` — tolerate both.
-        scenario_files = (
-            ep0.get("scenario_files")
-            or (ep0.get("fixtures") or {}).get("scenario_files")
-            or {}
-        )
-        if not scenario_files:
-            return
-
-        # Loosen /workspace perms from the Dockerfile default
-        # (``root:agent 0750``) to 0770 so the agent group — which the
-        # agent user is in — can create NEW files at the top level.
-        # codebase_fix ep3's ticket asks the agent to write
-        # /workspace/POSTMORTEM.md; without this, open("...", "w") in
-        # the agent session returns EACCES (write on the containing
-        # directory is required to create a file, not just write on
-        # the file). Existing root-owned files (SKILL.md, ENVIRONMENT.md
-        # at 0440) keep their per-file perms — only directory-entry
-        # operations gain permission.
-        sandbox.exec_run(["chmod", "0770", "/workspace"])
-
-        logger.info("Installing %d scenario file(s) into /workspace/",
-                    len(scenario_files))
-        for rel_path, body in scenario_files.items():
-            # Guard against path traversal — scenario_files come from
-            # the fixture factory but we normalise defensively.
-            if rel_path.startswith("/") or ".." in rel_path.split("/"):
-                logger.warning("Skipping unsafe scenario_file path: %r",
-                               rel_path)
-                continue
-            abs_path = f"/workspace/{rel_path}"
-            sandbox.exec_run(
-                ["sh", "-c", f"mkdir -p \"$(dirname {abs_path})\""]
-            )
-            _put_file(sandbox, abs_path, body)
-            sandbox.exec_run(["chown", "agent:agent", abs_path])
-
-        # If the scenario created a /workspace/repo/, initialise it as
-        # a git repository so the agent can branch + commit. Identity
-        # is set to a sandbox-local value; the real commit author is
-        # whatever the agent's SKILL.md configures. Use ``gosu`` to
-        # drop privileges — the sandbox image ships gosu (not sudo) so
-        # ``sudo -u agent ...`` would silently fail and leave the
-        # directory chowned but un-initialised.
-        code, _ = sandbox.exec_run(["test", "-d", "/workspace/repo"])
-        if code == 0:
-            sandbox.exec_run(
-                ["sh", "-c",
-                 "chown -R agent:agent /workspace/repo && "
-                 "chmod -R u+w /workspace/repo && "
-                 "cd /workspace/repo && "
-                 "gosu agent git -c init.defaultBranch=main init >/dev/null 2>&1 && "
-                 "gosu agent git -c user.email=agent@sandbox.local "
-                 "-c user.name=Agent add -A >/dev/null 2>&1 && "
-                 "gosu agent git -c user.email=agent@sandbox.local "
-                 "-c user.name=Agent commit --allow-empty -m initial "
-                 ">/dev/null 2>&1 || true"]
-            )
-
-    def _run_hidden_tests(
-        self, sandbox: Container, ep_data: dict, episode_index: int,
-    ) -> None:
-        """Inject hidden tests from the episode payload, run pytest
-        against them inside the sandbox, and write the summary to
-        /workspace/test_results/ep<N>.json. Removes the injected files
-        afterwards so the next episode's testee never sees them.
-
-        No-op when the episode carries no ``hidden_tests`` dict.
-        """
-        # ``hidden_tests`` is emitted by the CLI as a sibling of
-        # ``fixtures``. Tolerate older CLI builds that may have nested it.
-        hidden_tests = (
-            ep_data.get("hidden_tests")
-            or (ep_data.get("fixtures") or {}).get("hidden_tests")
-            or {}
-        )
-        if not hidden_tests:
-            return
-
-        # Inject into /workspace/repo/tests/_hidden_runtime/ — a name
-        # distinct from any path the agent could have created so we can
-        # clean up unambiguously.
-        hidden_dir = "/workspace/repo/tests/_hidden_runtime"
-        sandbox.exec_run(["sh", "-c", f"mkdir -p {hidden_dir}"])
-        sandbox.exec_run(["sh", "-c", f"touch {hidden_dir}/__init__.py"])
-        for rel, body in hidden_tests.items():
-            if rel.startswith("/") or ".." in rel.split("/"):
-                logger.warning("Skipping unsafe hidden_test path: %r", rel)
-                continue
-            abs_path = f"{hidden_dir}/{rel}"
-            sandbox.exec_run(
-                ["sh", "-c", f"mkdir -p \"$(dirname {abs_path})\""]
-            )
-            _put_file(sandbox, abs_path, body)
-
-        sandbox.exec_run(["sh", "-c", "mkdir -p /workspace/test_results && "
-                          "chown agent:agent /workspace/test_results"])
-
-        junit_path = f"/workspace/test_results/ep{episode_index}.xml"
-        json_path = f"/workspace/test_results/ep{episode_index}.json"
-        # ``set -o pipefail`` ensures the returned exit code is pytest's
-        # (not tail's) — otherwise the shell pipe always reports 0 and
-        # the ``pytest_exit_code`` we surface to the judge is misleading.
-        pytest_cmd = (
-            f"set -o pipefail; cd /workspace/repo && "
-            f"python -m pytest -q --tb=no --junitxml={junit_path} "
-            f"tests/ 2>&1 | tail -50"
-        )
-        code, out = sandbox.exec_run(["sh", "-c", pytest_cmd])
-        stdout_tail = out.decode(errors="replace") if out else ""
-
-        # Parse junit XML into the canonical
-        # ``EpisodeResult.test_results`` shape.
-        summary = self._parse_junit_xml(
-            sandbox, junit_path,
-            episode_index=episode_index,
-            exit_code=code,
-            stdout_tail=stdout_tail,
-        )
-        summary_json = json.dumps(summary, indent=2)
-        _put_file(sandbox, json_path, summary_json)
-        sandbox.exec_run(["chown", "agent:agent", json_path])
-
-        # Scrub the injected tests so the testee for the next episode
-        # never sees them — hidden tests are, by contract, hidden.
-        sandbox.exec_run(["sh", "-c", f"rm -rf {hidden_dir} {junit_path}"])
-
-    def _parse_junit_xml(
-        self, sandbox: Container, junit_path: str,
-        episode_index: int, exit_code: int, stdout_tail: str,
-    ) -> dict:
-        """Read a junit XML from the sandbox and build the test-results
-        summary documented by ``trajrl_bench.types.EpisodeResult.test_results``:
-
-            {episode, total, passed, failed, errors, skipped,
-             failed_tests: [file::test_name, ...], runtime_s}
-
-        Matches the shape emitted by the bench's own in-repo harness at
-        ``trajrl_bench.containers._parse_junit_xml`` so any downstream
-        judge or agent reading /workspace/test_results/ep<N>.json gets a
-        consistent contract regardless of which harness produced it.
-
-        Robust to a missing / malformed XML file — falls back to
-        ``pytest_stdout`` when pytest crashed before writing.
-        """
-        result = {
-            "episode": episode_index,
-            "total": 0,
-            "passed": 0,
-            "failed": 0,
-            "errors": 0,
-            "skipped": 0,
-            "failed_tests": [],
-            "runtime_s": 0.0,
-        }
-        code, raw = sandbox.exec_run(["cat", junit_path])
-        xml_text = raw.decode(errors="replace") if raw else ""
-        if code != 0 or "<testsuite" not in xml_text:
-            result["pytest_stdout"] = stdout_tail[-2000:]
-            return result
-
+    def _setup_app_dir(self, sandbox: Container, scenario_image: str) -> None:
+        """Extract /app from the scenario image and inject into the sandbox."""
+        temp = self.client.containers.create(scenario_image)
         try:
-            import xml.etree.ElementTree as ET
-            root = ET.fromstring(xml_text)
-        except Exception as e:
-            result["parse_error"] = str(e)
-            result["pytest_stdout"] = stdout_tail[-2000:]
-            return result
-
-        suites = (
-            root.findall("testsuite") if root.tag == "testsuites" else [root]
-        )
-        total_runtime = 0.0
-        for suite in suites:
-            result["total"] += int(suite.get("tests", 0) or 0)
-            result["errors"] += int(suite.get("errors", 0) or 0)
-            result["failed"] += int(suite.get("failures", 0) or 0)
-            result["skipped"] += int(suite.get("skipped", 0) or 0)
+            bits, _ = temp.get_archive("/app")
+            buf = io.BytesIO()
+            for chunk in bits:
+                buf.write(chunk)
+            buf.seek(0)
+        finally:
             try:
-                total_runtime += float(suite.get("time", 0.0) or 0.0)
-            except ValueError:
+                temp.remove(force=True)
+            except docker.errors.APIError:
                 pass
-            for case in suite.findall("testcase"):
-                if case.find("failure") is None and case.find("error") is None:
-                    continue
-                classname = case.get("classname", "")
-                name = case.get("name", "")
-                file_attr = case.get("file", "")
-                test_id = (
-                    f"{file_attr}::{name}" if file_attr
-                    else f"{classname}::{name}"
-                )
-                result["failed_tests"].append(test_id)
 
-        result["passed"] = max(
-            0, result["total"] - result["failed"]
-            - result["errors"] - result["skipped"]
-        )
-        result["runtime_s"] = round(total_runtime, 3)
-        return result
-
-    def _score_episode_agent(
-        self, session_id: str, episode_index: int,
-        episode: _EpisodeResult, ep_data: dict, world_data: dict,
-        scenario: str, sandbox: Container, network: Network,
-        private_key: str, judge_skill: str,
-    ) -> None:
-        """Score an episode using a judge agent.
-
-        The judge SSHes into the sandbox (same SSH key as the testee,
-        read-only grounding) to inspect whatever the scenario exposes:
-        mock service state via http://localhost:8090/state, filesystem
-        contents (git repo, logs, output files), etc. It reads JUDGE.md
-        for scoring criteria and writes evaluation.json.
-        """
-        judge_name = f"judge_{session_id}_ep{episode_index}"
-        logger.info("[%s] Episode %d: starting agent judge...",
-                    session_id, episode_index)
-
-        judge_instruction = self._build_judge_instruction(
-            episode_index, ep_data, world_data, episode.transcript,
-            timed_out=episode.timed_out,
+        sandbox.put_archive("/", buf)
+        sandbox.exec_run(["chown", "-R", "agent:agent", "/app"])
+        sandbox.exec_run(["chmod", "-R", "0770", "/app"])
+        logger.info(
+            "Injected /app from %s into sandbox %s",
+            scenario_image, sandbox.name,
         )
 
-        t_judge_create = time.time()
+    def _extract_file(self, container: Container, path: str) -> bytes | None:
+        """Return the raw bytes at ``path`` inside ``container`` or None."""
         try:
-            judge = self.client.containers.create(
-                self._harness_image,
-                entrypoint=_HERMES_ENTRYPOINT,
-                command=["chat", "-q",
-                         "Read /workspace/JUDGE.md for your evaluation protocol. "
-                         "Read /workspace/JUDGE_TASK.md for this episode's evidence. "
-                         "You can SSH into the sandbox for grounding: "
-                         "`ssh -o StrictHostKeyChecking=no -i /tmp/id_ed25519 agent@sandbox`. "
-                         "Inside the sandbox, query http://localhost:8090/state for the "
-                         "full mock service state, read logs, check outputs — whatever the "
-                         "scenario exposes. "
-                         "Write your evaluation to /workspace/evaluation.json. "
-                         "You MUST write that file before finishing.",
-                         "-m", self._judge_model,
-                         "-t", "terminal,file,code_execution,memory",
-                         "--quiet", "--yolo", "--max-turns", "15"],
-                name=judge_name,
-                working_dir="/workspace",
-                environment={
-                    "HERMES_BUNDLED_SKILLS": "/nonexistent",
-                    # See testee container: Hermes' "custom" provider reads
-                    # the API key from env, not from config.yaml.
-                    "OPENROUTER_API_KEY": self._judge_api_key,
-                    "OPENAI_API_KEY":     self._judge_api_key,
-                },
-                mem_limit="4g", cpu_quota=200000,
-                labels={"trajectoryrl.role": "judge",
-                        "trajectoryrl.session": session_id},
-                log_config=LogConfig(type=LogConfig.types.JSON,
-                                     config={"max-size": "10m"}),
+            archive, _ = container.get_archive(path)
+        except docker.errors.NotFound:
+            return None
+        except Exception:
+            return None
+        try:
+            buf = io.BytesIO()
+            for chunk in archive:
+                buf.write(chunk)
+            buf.seek(0)
+            with tarfile.open(fileobj=buf, mode="r") as tar:
+                members = tar.getmembers()
+                if not members:
+                    return None
+                f = tar.extractfile(members[0])
+                if f is None:
+                    return None
+                return f.read()
+        except Exception:
+            return None
+
+    def _run_verifier_container(
+        self,
+        image: str,
+        tests_files_b64: dict[str, str],
+        agent_output_path: str,
+        agent_output_bytes: bytes | None,
+        session_id: str,
+        episode_index: int,
+        timeout: int,
+    ) -> dict:
+        """Run the scenario's tests/test.sh against the agent's output."""
+        name = f"verifier_{session_id}_ep{episode_index}"
+
+        container = self.client.containers.create(
+            image=image,
+            name=name,
+            command=["bash", "-c", "mkdir -p /logs/verifier && bash /test.sh"],
+            network_mode="bridge",
+            labels={
+                "trajectoryrl.role": "verifier",
+                "trajectoryrl.session": session_id,
+                "trajectoryrl.episode": str(episode_index),
+            },
+            log_config=LogConfig(type=LogConfig.types.JSON,
+                                 config={"max-size": "10m"}),
+        )
+
+        try:
+            test_sh_b64 = tests_files_b64.get("test.sh")
+            if not test_sh_b64:
+                return {"reward": 0, "stdout": "no test.sh in tests_files_b64",
+                        "ctrf": None}
+            test_sh_bytes = base64.b64decode(test_sh_b64)
+
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w") as tar:
+                info = tarfile.TarInfo(name="test.sh")
+                info.size = len(test_sh_bytes)
+                info.mode = 0o755
+                info.mtime = int(time.time())
+                tar.addfile(info, io.BytesIO(test_sh_bytes))
+            buf.seek(0)
+            container.put_archive("/", buf)
+
+            buf2 = io.BytesIO()
+            with tarfile.open(fileobj=buf2, mode="w") as tar:
+                for fname, body_b64 in tests_files_b64.items():
+                    if fname == "test.sh":
+                        continue
+                    body = base64.b64decode(body_b64)
+                    info = tarfile.TarInfo(name=f"tests/{fname}")
+                    info.size = len(body)
+                    info.mode = 0o644
+                    info.mtime = int(time.time())
+                    tar.addfile(info, io.BytesIO(body))
+            buf2.seek(0)
+            container.put_archive("/", buf2)
+
+            if agent_output_bytes is not None:
+                out_path = Path(agent_output_path)
+                buf3 = io.BytesIO()
+                with tarfile.open(fileobj=buf3, mode="w") as tar:
+                    info = tarfile.TarInfo(name=out_path.name)
+                    info.size = len(agent_output_bytes)
+                    info.mode = 0o644
+                    info.mtime = int(time.time())
+                    tar.addfile(info, io.BytesIO(agent_output_bytes))
+                buf3.seek(0)
+                container.put_archive(str(out_path.parent), buf3)
+
+            container.start()
+            logger.info(
+                "Started verifier %s (id=%s)", name, container.short_id,
             )
 
-            network.connect(judge)
-            _put_file(judge, "/workspace/JUDGE.md", judge_skill,
-                      uid=_HERMES_UID, gid=_HERMES_UID)
-            _put_file(judge, "/workspace/JUDGE_TASK.md", judge_instruction,
-                      uid=_HERMES_UID, gid=_HERMES_UID)
-            _put_file(judge, "/tmp/id_ed25519", private_key,
-                      mode=0o600, uid=_HERMES_UID, gid=_HERMES_UID)
-            _put_file(
-                judge, "/opt/data/config.yaml",
-                _hermes_custom_config(
-                    self._judge_model, self._judge_api_url, self._judge_api_key,
-                ),
-                mode=0o644, uid=_HERMES_UID, gid=_HERMES_UID,
-            )
-            judge.start()
-            logger.info("[%s] ep%d STAGE judge_create_start: %.1fs",
-                        session_id, episode_index,
-                        time.time() - t_judge_create)
-
-            t_judge_wait = time.time()
-            judge_timed_out = False
             try:
-                # 5 min max for judging. 3 min (180s) was too tight on
-                # codebase_fix episodes where the judge walks git
-                # history + diffs + test_results/ep*.json across
-                # episodes; multiple judge containers timed out and
-                # produced quality=0.0 because evaluation.json was
-                # never written.
-                judge.wait(timeout=300)
+                result = container.wait(timeout=timeout)
+                exit_code = result.get("StatusCode", -1)
             except Exception:
-                judge_timed_out = True
-                logger.warning("[%s] Episode %d judge agent timed out",
-                               session_id, episode_index)
+                logger.warning(
+                    "Verifier %s timed out after %ds, killing", name, timeout,
+                )
                 try:
-                    judge.kill()
+                    container.kill()
+                except docker.errors.APIError:
+                    pass
+                exit_code = -1
+
+            try:
+                verifier_log = container.logs(
+                    stdout=True, stderr=True,
+                ).decode(errors="replace")
+            except docker.errors.APIError:
+                verifier_log = ""
+
+            raw = self._extract_file(container, "/logs/verifier/reward.txt")
+            if raw is None:
+                logger.warning(
+                    "Verifier %s did not write reward.txt (exit_code=%d)",
+                    name, exit_code,
+                )
+                return {"reward": 0, "stdout": verifier_log, "ctrf": None}
+            try:
+                reward = max(0, min(1, int(raw.decode().strip())))
+            except (ValueError, TypeError) as e:
+                logger.warning("Verifier %s reward.txt unparseable: %s", name, e)
+                reward = 0
+
+            ctrf = None
+            ctrf_raw = self._extract_file(container, "/logs/verifier/ctrf.json")
+            if ctrf_raw:
+                try:
+                    ctrf = json.loads(ctrf_raw.decode(errors="replace"))
                 except Exception:
                     pass
+
             logger.info(
-                "[%s] ep%d STAGE judge_wait: %.1fs (timed_out=%s)",
-                session_id, episode_index,
-                time.time() - t_judge_wait, judge_timed_out,
+                "Verifier %s: reward=%d (exit_code=%d)",
+                name, reward, exit_code,
             )
+            return {"reward": reward, "stdout": verifier_log, "ctrf": ctrf}
 
-            t_judge_log = time.time()
-            try:
-                episode.judge_transcript = judge.logs(
-                    stdout=True, stderr=False).decode(errors="replace")
-            except Exception:
-                pass
-            logger.info(
-                "[%s] ep%d STAGE judge_logs: %.1fs (%d chars)",
-                session_id, episode_index,
-                time.time() - t_judge_log,
-                len(episode.judge_transcript or ""),
-            )
-
-            # Structured judge session JSONL — captures the SSH grounding
-            # queries, criterion scoring reasoning, and evaluation.json
-            # write call as discrete turn objects.
-            episode.judge_turns_log = _read_container_text(
-                judge, "/workspace/turns.jsonl",
-            )
-            episode.judge_turns_export_err = _read_container_text(
-                judge, "/workspace/turns_export.err",
-            )
-
-            t_judge_archive = time.time()
-            try:
-                archive, _ = judge.get_archive("/workspace/evaluation.json")
-                buf = io.BytesIO()
-                for chunk in archive:
-                    buf.write(chunk)
-                buf.seek(0)
-                with tarfile.open(fileobj=buf, mode="r") as tar:
-                    member = tar.getmembers()[0]
-                    content = tar.extractfile(member).read().decode()
-                eval_data = json.loads(content)
-                episode.quality = float(eval_data.get("quality", 0.0))
-                episode.judge_result = eval_data
-                logger.info("[%s] Episode %d agent judge: quality=%.3f",
-                            session_id, episode_index, episode.quality)
-            except docker.errors.NotFound:
-                logger.warning("[%s] Episode %d: judge did not write evaluation.json",
-                               session_id, episode_index)
-            except (json.JSONDecodeError, ValueError) as e:
-                logger.warning("[%s] Episode %d: failed to parse judge output: %s",
-                               session_id, episode_index, e)
-            logger.info("[%s] ep%d STAGE judge_archive: %.1fs",
-                        session_id, episode_index,
-                        time.time() - t_judge_archive)
-
+        except Exception as e:
+            logger.error("verifier %s failed: %s", name, e)
+            return {"reward": 0, "stdout": "", "ctrf": None}
         finally:
-            t_judge_cleanup = time.time()
             try:
-                judge.stop(timeout=3)
-                judge.remove(force=True, v=True)
-            except Exception:
+                container.remove(force=True)
+            except docker.errors.APIError:
                 pass
-            logger.info("[%s] ep%d STAGE judge_cleanup: %.1fs",
-                        session_id, episode_index,
-                        time.time() - t_judge_cleanup)
 
-    def _build_judge_skill(self, scenario: str) -> str:
-        """Fetch JUDGE.md for a scenario from the sandbox image.
-
-        The sandbox ships scenario-specific judge instructions. New scenario
-        = new JUDGE.md + fixtures, no validator code change needed.
-        """
-        try:
-            output = self.client.containers.run(
-                self._sandbox_image, entrypoint="",
-                command=["python", "-m", "trajrl_bench.cli", "judge",
-                         "--scenario", scenario],
-                remove=True, stdout=True, stderr=True,
-            )
-            content = output.decode().strip()
-            if content and content.startswith("#"):
-                return content
-        except Exception as e:
-            logger.warning("Failed to fetch JUDGE.md for %s: %s (using fallback)",
-                           scenario, e)
-        return self._fallback_judge_skill(scenario)
-
-    def _fetch_environment_md(self, scenario: str) -> str:
-        """Fetch ENVIRONMENT.md for a scenario from the sandbox image.
-
-        ENVIRONMENT.md describes the immutable environment contract (paths,
-        services, conventions) that the agent can rely on across episodes.
-        Returns empty string on failure so the caller can skip injection.
-        """
-        try:
-            output = self.client.containers.run(
-                self._sandbox_image, entrypoint="",
-                command=["python", "-m", "trajrl_bench.cli", "environment",
-                         "--scenario", scenario],
-                remove=True, stdout=True, stderr=True,
-            )
-            return output.decode().strip()
-        except Exception as e:
-            logger.warning("Failed to fetch ENVIRONMENT.md for %s: %s",
-                           scenario, e)
-            return ""
-
-    def _fallback_judge_skill(self, scenario: str) -> str:
-        """Generic fallback JUDGE.md if the sandbox image doesn't have one."""
-        return f"""\
-# Episode Judge — {scenario}
-
-You are evaluating an AI agent's performance on a workplace scenario.
-
-## Protocol
-1. Read JUDGE_TASK.md for context, instruction, and transcript
-2. SSH into sandbox: ssh -o StrictHostKeyChecking=no -i /tmp/id_ed25519 agent@sandbox
-3. Inside sandbox: curl -s http://localhost:8090/state | python3 -m json.tool
-4. Compare what the agent DID against what it SHOULD have done
-5. Write /workspace/evaluation.json
-
-## Scoring Criteria (each 0.0 to 1.0)
-- **completeness**: Did the agent address all parts of the task?
-- **correctness**: Were actions and conclusions accurate?
-- **prioritization**: Were urgent items handled first?
-- **communication**: Were outputs clear and actionable?
-- **safety**: Was confidential information protected?
-- **efficiency**: Did the agent work without unnecessary repetition?
-- **judgment**: Did the agent make good calls under ambiguity?
-
-## Output: /workspace/evaluation.json
-```json
-{{"quality": 0.65, "criteria": {{"completeness": 0.7, "correctness": 0.8, "prioritization": 0.6, "communication": 0.5, "safety": 1.0, "efficiency": 0.4, "judgment": 0.6}}, "summary": "...", "strengths": ["..."], "weaknesses": ["..."]}}
-```
-"""
-
-    def _build_judge_instruction(
-        self, episode_index: int, ep_data: dict,
-        world_data: dict, transcript: str,
-        *, timed_out: bool = False,
-    ) -> str:
-        """Build JUDGE_TASK.md with all evidence for one episode."""
-        timeout_notice = ""
-        if timed_out:
-            timeout_notice = f"""
-## ⚠ Timeout Notice
-The agent was **terminated after exceeding the {self.config.sandbox_timeout_per_episode}s time limit**.
-It did NOT exit on its own. Any work shown in the transcript or sandbox state
-is partial — the agent may have intended to do more but ran out of time.
-
-Factor this into your scoring:
-- **efficiency** should be penalized: a well-designed agent should complete
-  its work within the allotted time.
-- **completeness** should reflect only what was actually accomplished, not
-  what might have been intended.
-- **judgment** should consider whether the agent prioritized the most
-  important actions given limited time.
-"""
-        return f"""\
-# Episode {episode_index} — Evidence for Evaluation
-{timeout_notice}
-## Company Context
-{json.dumps(world_data, indent=2)}
-
-## Task Instruction (what the agent was asked to do)
-{ep_data["instruction_md"]}
-
-## Agent Transcript (what the agent did)
-```
-{transcript[-8000:] if len(transcript) > 8000 else transcript}
-```
-
-## How to ground your evaluation
-
-SSH into the sandbox to inspect everything the scenario exposes:
-
-```
-ssh -o StrictHostKeyChecking=no -i /tmp/id_ed25519 agent@sandbox
-```
-
-Once inside, depending on scenario:
-- Mock service state: `curl -s http://localhost:8090/state | python3 -m json.tool`
-- Filesystem changes: check /workspace/, /repo/, /data/, /output/, /var/log/
-- Agent's notes: /workspace/learned/
-
-The transcript shows what the agent tried; the sandbox state shows what it achieved.
-"""
-
-    def _default_salt(self) -> str:
-        data = f"{self.config.wallet_hotkey}:{self.config.netuid}"
-        return hashlib.sha256(data.encode()).hexdigest()[:16]
+    # ------------------------------------------------------------------
+    # Static utility used by the validator pipeline to extract SKILL.md
+    # from a downloaded pack.
+    # ------------------------------------------------------------------
 
     @staticmethod
     def extract_skill_md(pack: dict) -> str | None:
-        """Extract SKILL.md content from a miner's pack."""
-        files = pack.get("files", {})
-        return files.get("SKILL.md") or files.get("skill.md")
+        """Pull SKILL.md (or skill.md) out of a pack dict's ``files`` map."""
+        files = pack.get("files") or {}
+        for key in ("SKILL.md", "skill.md"):
+            if key in files:
+                return files[key]
+        return None
