@@ -3703,3 +3703,147 @@ class TestRunEvaluationCycleReturnPropagation:
         )
 
 
+class TestTopNRecheck:
+    """Tests for the anti-cheese top-N cache wipe at eval cycle start.
+
+    Mirrors the lightweight validator factory used by TestPerScenarioEvalState
+    so each test is self-contained with the minimum state needed by
+    `_wipe_top_n_for_recheck` and `_save_eval_state`.
+    """
+
+    def _make_validator(self):
+        v = TrajectoryValidator.__new__(TrajectoryValidator)
+        v.scenario_scores = {}
+        v._eval_pack_hash = {}
+        v.last_eval_block = {}
+        v.last_eval_window = {}
+        v._eval_counts = {}
+        v.latest_token_usage = {}
+        v.latest_model_usage = {}
+        v._save_eval_state = MagicMock()
+        return v
+
+    def _seed(self, v, hotkey, scores):
+        v.scenario_scores[hotkey] = dict(scores)
+        v._eval_pack_hash[hotkey] = f"hash_{hotkey}"
+        v.last_eval_block[hotkey] = 100
+        v.last_eval_window[hotkey] = 10
+        v._eval_counts[hotkey] = 1
+        v.latest_token_usage[hotkey] = {"client_escalation": {"input_tokens": 1}}
+        v.latest_model_usage[hotkey] = {"client_escalation": [{"name": "x"}]}
+
+    def test_wipes_top_3_by_mean(self):
+        v = self._make_validator()
+        # Means: hk_a=0.9, hk_b=0.8, hk_c=0.7, hk_d=0.6, hk_e=0.5
+        for hk, mean in [
+            ("hk_a", 0.9), ("hk_b", 0.8), ("hk_c", 0.7),
+            ("hk_d", 0.6), ("hk_e", 0.5),
+        ]:
+            self._seed(v, hk, {"s1": mean, "s2": mean})
+
+        wiped = v._wipe_top_n_for_recheck(window_number=42)
+
+        assert sorted(wiped) == ["hk_a", "hk_b", "hk_c"]
+        assert "hk_a" not in v.scenario_scores
+        assert "hk_b" not in v.scenario_scores
+        assert "hk_c" not in v.scenario_scores
+        assert v.scenario_scores["hk_d"] == {"s1": 0.6, "s2": 0.6}
+        assert v.scenario_scores["hk_e"] == {"s1": 0.5, "s2": 0.5}
+
+    def test_no_active_set_filter(self):
+        """Selection is from scenario_scores directly, not filtered by
+        any external active-set parameter. (Regression check that the
+        signature is window_number-only.)"""
+        v = self._make_validator()
+        for hk, mean in [("hk_a", 0.9), ("hk_b", 0.8), ("hk_c", 0.7)]:
+            self._seed(v, hk, {"s1": mean})
+
+        wiped = v._wipe_top_n_for_recheck(window_number=42)
+
+        assert sorted(wiped) == ["hk_a", "hk_b", "hk_c"]
+        # Active commitments are not consulted; method takes only window_number.
+
+    def test_tiebreak_by_hotkey_ascending(self):
+        v = self._make_validator()
+        # All four hotkeys have mean 0.8. Top 3 must be the lex-smallest.
+        for hk in ["hk_d", "hk_a", "hk_c", "hk_b"]:
+            self._seed(v, hk, {"s1": 0.8})
+
+        wiped = v._wipe_top_n_for_recheck(window_number=42)
+
+        assert wiped == ["hk_a", "hk_b", "hk_c"]
+        assert "hk_d" in v.scenario_scores
+
+    def test_fewer_than_n_candidates(self):
+        v = self._make_validator()
+        self._seed(v, "hk_a", {"s1": 0.9})
+        self._seed(v, "hk_b", {"s1": 0.8})
+
+        wiped = v._wipe_top_n_for_recheck(window_number=42)
+
+        assert sorted(wiped) == ["hk_a", "hk_b"]
+        assert v.scenario_scores == {}
+
+    def test_empty_cache_noop(self):
+        v = self._make_validator()
+
+        wiped = v._wipe_top_n_for_recheck(window_number=42)
+
+        assert wiped == []
+        v._save_eval_state.assert_not_called()
+
+    def test_skips_hotkeys_with_empty_scenario_dict(self):
+        """A hotkey present in scenario_scores but with an empty inner dict
+        must not be selectable (mean is undefined; treat as no cache)."""
+        v = self._make_validator()
+        v.scenario_scores["hk_empty"] = {}
+        self._seed(v, "hk_a", {"s1": 0.5})
+
+        wiped = v._wipe_top_n_for_recheck(window_number=42)
+
+        assert wiped == ["hk_a"]
+        assert "hk_empty" in v.scenario_scores
+
+    def test_wipe_clears_all_state_stores(self):
+        v = self._make_validator()
+        self._seed(v, "hk_a", {"s1": 0.9})
+
+        v._wipe_top_n_for_recheck(window_number=42)
+
+        for store_name in (
+            "scenario_scores", "_eval_pack_hash",
+            "last_eval_block", "last_eval_window",
+            "_eval_counts", "latest_token_usage", "latest_model_usage",
+        ):
+            assert "hk_a" not in getattr(v, store_name), (
+                f"{store_name} still contains hk_a after wipe"
+            )
+
+    def test_post_wipe_needs_evaluation_returns_true(self):
+        """After wipe, _needs_evaluation should return True for the wiped
+        hotkey on its (unchanged) pack_hash — confirming the wipe actually
+        re-triggers evaluation."""
+        v = self._make_validator()
+        # _needs_evaluation calls self._get_miner_logger; stub it.
+        v._get_miner_logger = MagicMock(return_value=MagicMock())
+        self._seed(v, "hk_a", {"s1": 0.9})
+        original_pack_hash = v._eval_pack_hash["hk_a"]
+
+        assert v._needs_evaluation("hk_a", original_pack_hash, current_window=42) is False
+
+        v._wipe_top_n_for_recheck(window_number=42)
+
+        assert v._needs_evaluation("hk_a", original_pack_hash, current_window=42) is True
+
+    def test_save_called_once_per_invocation(self):
+        v = self._make_validator()
+        for hk, mean in [("hk_a", 0.9), ("hk_b", 0.8), ("hk_c", 0.7)]:
+            self._seed(v, hk, {"s1": mean})
+
+        v._wipe_top_n_for_recheck(window_number=42)
+
+        # One save covers all N wipes (vs N saves if we'd called the
+        # per-miner _drop_miner_eval_state primitive in a loop).
+        assert v._save_eval_state.call_count == 1
+
+
