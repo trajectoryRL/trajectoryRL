@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 _BASE_URL = os.getenv("TRAJECTORYRL_API_BASE_URL", "https://trajrl.com")
 DEFAULT_HEARTBEAT_URL = f"{_BASE_URL}/api/v2/validators/heartbeat"
 DEFAULT_SUBMIT_URL = f"{_BASE_URL}/api/v2/scores/submit"
-DEFAULT_PRE_EVAL_URL = f"{_BASE_URL}/api/v2/miners/pre-eval"
+DEFAULT_EPOCH_SNAPSHOT_URL = f"{_BASE_URL}/api/v2/validators/epoch_snapshot"
 DEFAULT_LOGS_UPLOAD_URL = f"{_BASE_URL}/api/validators/logs/upload"
 DEFAULT_CYCLE_LOGS_URL = f"{_BASE_URL}/api/validators/logs/cycle"
 
@@ -87,129 +87,107 @@ async def heartbeat(
         return False
 
 
-# Cache keyed by (miner_hotkey, identifier) → last valid pre-eval response.
-_pre_eval_cache: Dict[tuple, Dict[str, Any]] = {}
+class SnapshotNotReady(Exception):
+    """Raised when /api/v2/validators/epoch_snapshot returns 404 for the
+    requested epoch (sync worker hasn't built it yet). Caller should
+    retry on the next loop iteration without treating this as a hard
+    failure."""
 
 
-def _is_valid_pre_eval_response(data: Any) -> bool:
-    """Check that the response has the expected pre-eval format."""
-    return isinstance(data, dict) and "allowed" in data
-
-
-async def pre_eval(
-    miner_hotkey: str,
-    pack_hash: Optional[str] = None,
-    pack_url: Optional[str] = None,
+async def fetch_epoch_snapshot(
+    epoch_number: int,
+    wallet,
     *,
-    epoch_number: Optional[int] = None,
-    wallet=None,
-    pre_eval_url: str = DEFAULT_PRE_EVAL_URL,
+    snapshot_url: str = DEFAULT_EPOCH_SNAPSHOT_URL,
+    timeout: float = 15.0,
 ) -> Optional[Dict[str, Any]]:
-    """Call the pre-eval API to check whether a miner's submission is allowed.
+    """Fetch the eval target set for ``epoch_number`` from trajrl.com.
 
-    Supports two query modes:
-      - By pack_hash: checks a specific pack (used during per-miner evaluation)
-      - By epoch_number: server resolves the most recently submitted pack in
-        that epoch (used during aggregation to avoid pack-switch escapes)
-
-    At least one of pack_hash or epoch_number must be provided.
-
-    Signing is optional — the v2 endpoint is read-only. When wallet is
-    provided, the request is signed for auditability.
-
-    Uses a local cache so that when the API is unreachable or returns an
-    unexpected format, the last known-good response is used instead of
-    blindly failing open.
+    The endpoint is the validator's only source for the eval set: it
+    absorbs both the on-chain commitment query and per-miner pre-eval
+    (each entry comes back with ``pre_eval_status`` baked in). The
+    snapshot is precomputed by the sync worker and frozen — every
+    validator gets byte-identical bytes for the same epoch.
 
     Args:
-        miner_hotkey: Miner hotkey to check.
-        pack_hash: Pack hash submitted by the miner. Required if
-            epoch_number is not provided.
-        pack_url: Pack download URL (optional context for the server).
-        epoch_number: Epoch/window number. When provided, the server
-            returns the eval result for the miner's most recently
-            submitted pack in that epoch.
-        wallet: bt.Wallet with accessible hotkey for signing (optional).
-        pre_eval_url: Pre-eval API endpoint.
+        epoch_number: Epoch (window) number for which to fetch the
+            snapshot. Non-negative integer.
+        wallet: bt.Wallet with accessible hotkey for signing. Signing
+            is required by the endpoint because the response includes
+            sensitive ``pack_url`` values for web-source submissions.
+        snapshot_url: Endpoint URL (override for tests).
+        timeout: HTTP timeout in seconds.
 
     Returns:
-        Parsed response dict on success or from cache, or None only if the
-        request failed AND no cached result exists (fail-open).
-    """
-    if pack_hash is None and epoch_number is None:
-        logger.warning("pre_eval: neither pack_hash nor epoch_number provided — failing open")
-        return None
+        Parsed response dict on HTTP 200 (with ``entries`` list, etc.).
+        ``None`` for any other outcome — 404 (snapshot not ready),
+        network error, auth/signature error, or unparseable JSON. The
+        caller is expected to retry on its next loop iteration.
 
-    cache_key = (miner_hotkey, pack_hash or f"epoch:{epoch_number}")
+    Raises:
+        SnapshotNotReady: When the server replies 404. Distinct from
+            ``None`` so callers that want to log "still building" vs.
+            "transient error" can differentiate. Currently the
+            validator path treats both as "skip this cycle, retry."
+    """
+    try:
+        hotkey_kp = wallet.hotkey
+    except Exception:
+        logger.error("fetch_epoch_snapshot: wallet hotkey not available")
+        return None
+    hotkey_addr = hotkey_kp.ss58_address
+    timestamp = int(time.time())
+
+    # The endpoint expects its own dedicated signing prefix
+    # (``trajectoryrl-snapshot``); other v2 endpoints use different
+    # prefixes (e.g. /api/v2/scores/submit uses ``trajectoryrl-submit``,
+    # /api/v2/validators/heartbeat uses ``trajectoryrl-heartbeat``).
+    message = f"trajectoryrl-snapshot:{hotkey_addr}:{timestamp}"
+    sig = hotkey_kp.sign(message.encode())
+    signature = "0x" + (sig if isinstance(sig, bytes) else bytes(sig)).hex()
 
     payload: Dict[str, Any] = {
-        "miner_hotkey": miner_hotkey,
+        "epoch_number": epoch_number,
+        "validator_hotkey": hotkey_addr,
+        "timestamp": timestamp,
+        "signature": signature,
     }
-    if pack_hash is not None:
-        payload["pack_hash"] = pack_hash
-    if epoch_number is not None:
-        payload["epoch_number"] = epoch_number
-    if pack_url is not None:
-        payload["pack_url"] = pack_url
-
-    if wallet is not None:
-        try:
-            hotkey_kp = wallet.hotkey
-            validator_hotkey = hotkey_kp.ss58_address
-            timestamp = int(time.time())
-            message = f"trajectoryrl-report:{validator_hotkey}:{timestamp}"
-            sig = hotkey_kp.sign(message.encode())
-            signature = "0x" + (sig if isinstance(sig, bytes) else bytes(sig)).hex()
-            payload["validator_hotkey"] = validator_hotkey
-            payload["timestamp"] = timestamp
-            payload["signature"] = signature
-        except Exception:
-            logger.debug("pre_eval: wallet hotkey not available, sending unsigned")
 
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.post(pre_eval_url, json=payload, timeout=10)
-        if resp.status_code == 200:
+            resp = await client.post(snapshot_url, json=payload, timeout=timeout)
+    except Exception as e:
+        logger.warning("fetch_epoch_snapshot error for epoch %d: %s", epoch_number, e)
+        return None
+
+    if resp.status_code == 200:
+        try:
             data = resp.json()
-            if _is_valid_pre_eval_response(data):
-                _pre_eval_cache[cache_key] = data
-                logger.info(
-                    "Pre-eval check passed: allowed=%s reason=%s",
-                    data.get("allowed"),
-                    data.get("reason", ""),
-                )
-                return data
+        except Exception as e:
             logger.warning(
-                "Pre-eval returned unexpected format (keys=%s)",
+                "fetch_epoch_snapshot epoch %d: response not JSON-decodable: %s",
+                epoch_number, e,
+            )
+            return None
+        if not isinstance(data, dict) or "entries" not in data:
+            logger.warning(
+                "fetch_epoch_snapshot epoch %d: unexpected payload shape (keys=%s)",
+                epoch_number,
                 list(data.keys()) if isinstance(data, dict) else type(data).__name__,
             )
-        else:
-            logger.warning(
-                "Pre-eval check failed: %d %s",
-                resp.status_code,
-                resp.text[:200],
-            )
-    except Exception as e:
-        logger.warning("Pre-eval check error: %s", e)
+            return None
+        return data
 
-    # API failed or returned bad data — fall back to cache.
-    cached = _pre_eval_cache.get(cache_key)
-    if cached is not None:
-        identifier = pack_hash[:12] if pack_hash else f"epoch:{epoch_number}"
+    if resp.status_code == 404:
         logger.info(
-            "Using cached pre-eval result for %s/%s: allowed=%s",
-            miner_hotkey[:8],
-            identifier,
-            cached.get("allowed"),
+            "fetch_epoch_snapshot epoch %d: snapshot not yet built (HTTP 404)",
+            epoch_number,
         )
-        return cached
+        raise SnapshotNotReady(epoch_number)
 
-    # No cache available — fail-open.
-    identifier = pack_hash[:12] if pack_hash else f"epoch:{epoch_number}"
     logger.warning(
-        "No cached pre-eval for %s/%s — failing open",
-        miner_hotkey[:8],
-        identifier,
+        "fetch_epoch_snapshot epoch %d: HTTP %d %s",
+        epoch_number, resp.status_code, resp.text[:200],
     )
     return None
 
