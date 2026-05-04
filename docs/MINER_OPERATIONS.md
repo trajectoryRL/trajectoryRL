@@ -56,9 +56,12 @@ python neurons/miner.py submit https://your-bucket.s3.amazonaws.com/pack.json
 **Option B — Managed hosting via `/api/v2/miners/submit`**
 
 ```bash
-# 3b + 4b. Submit pack content to trajrl.com (managed GCS) and chain-commit in one step
-python neurons/miner.py web-submit pack.json --commit-onchain
-# → prints pack_url + cooldown info, then submits the on-chain commitment
+# 3b. Submit pack content to trajrl.com (managed GCS), get back pack_url
+python neurons/miner.py web-submit pack.json
+# → prints pack_url + cooldown info
+
+# 4b. Submit on-chain (same step as Option A)
+python neurons/miner.py submit <pack_url>
 ```
 
 Then check status:
@@ -77,7 +80,7 @@ That's it. Repeat steps 1 → 4 whenever you improve your SKILL.md.
 python neurons/miner.py build       <skill_md_path> [-o pack.json]
 python neurons/miner.py validate    <pack.json>
 python neurons/miner.py upload      <pack.json> [--bucket ...] [--endpoint-url ...]
-python neurons/miner.py web-submit  <pack.json> [--commit-onchain] [--api-base-url ...]
+python neurons/miner.py web-submit  <pack.json> [--api-base-url ...]
 python neurons/miner.py submit      <pack_url>
 python neurons/miner.py status
 ```
@@ -123,13 +126,14 @@ Reads S3 config from environment or CLI flags. Returns the public URL for use wi
 
 Submit pack content directly to the managed web service (`POST /api/v2/miners/submit`). The server stores your pack at an unguessable random GCS path and returns the public URL. No S3 / R2 / bucket config required — the request is signed with your hotkey, so the only credential you need is the wallet itself.
 
+This command does **only** the HTTP upload — it does not touch the chain. The on-chain commit is a separate step, run via `submit <pack_url>` (same step you'd run after `upload`).
+
 ```bash
 python neurons/miner.py web-submit pack.json
-python neurons/miner.py web-submit pack.json --commit-onchain
 python neurons/miner.py web-submit pack.json --api-base-url https://staging.trajrl.com
 ```
 
-Output (without `--commit-onchain`):
+Output:
 
 ```
 Pack hash: a3f8c2...
@@ -143,8 +147,6 @@ Submitted! pack_url = https://storage.googleapis.com/<bucket>/<prefix>/<uid>/<ra
 
 Next step: python neurons/miner.py submit https://storage.googleapis.com/<bucket>/<prefix>/<uid>/<random_key>.json
 ```
-
-With `--commit-onchain`, the on-chain commit step runs immediately after the web submit and you skip the separate `submit <url>` invocation.
 
 **Cooldown**: The endpoint enforces a per-miner cooldown (default **1 hour**, set server-side via `MINER_SUBMIT_COOLDOWN_SECONDS`). Submitting again before `next_upload_allowed_at` returns HTTP 429 and the CLI prints the cooldown info to stderr. Field-validation, signature, and GCS-upload errors do **not** consume the cooldown — only successfully persisted submissions do.
 
@@ -254,7 +256,6 @@ For what to write in SKILL.md, see [MINER_GUIDE.md § Writing SKILL.md](MINER_GU
 │       • upload      → self-hosted public URL            │
 │       • web-submit  → managed GCS URL via /api/v2/...   │
 │  4. submit → on-chain commitment                        │
-│       (web-submit --commit-onchain folds 3+4 together)  │
 │  5. Wait for validator evaluation (~24h epoch)           │
 │  6. Check results, iterate                              │
 └─────────────────────────────────────────────────────────┘

@@ -459,7 +459,6 @@ class TestCLIHelp:
         """'miner.py web-submit --help' must show pack_path + flags."""
         output = self._get_help("web-submit")
         assert "pack_path" in output
-        assert "--commit-onchain" in output
         assert "--api-base-url" in output
 
 
