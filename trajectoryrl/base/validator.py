@@ -7,8 +7,8 @@ Architecture (Season 1 — trajrl-bench):
     2. Read on-chain commitments (subtensor.get_all_commitments)
     3. Fetch packs from miners' public HTTP URLs
     4. NCD pairwise dedup; schema validation in _evaluate_miner
-    5. Run trajrl-bench sandbox evaluation (SKILL.md packs, SSH sandbox, LLM judge)
-    6. Compute split-half delta scoring (quality-based)
+    5. Run trajrl-bench shell_verifier sandbox evaluation (SKILL.md packs)
+    6. Score = Σ (passed/total) across scenarios; cost reported on a separate axis
     7. Set on-chain weights (winner-take-all / bootstrap)
 
 Each validator operates independently — Yuma Consensus aggregates on-chain.
@@ -113,8 +113,8 @@ class TrajectoryValidator:
     1. Reads on-chain commitments from miners
     2. Fetches and verifies packs from miners' public HTTP URLs
     3. NCD pairwise dedup (copiers rejected like integrity fail)
-    4. Runs trajrl-bench sandbox evaluation (SSH sandbox, LLM judge)
-    5. Computes split-half delta scoring (quality-based)
+    4. Runs trajrl-bench shell_verifier sandbox evaluation
+    5. Score = Σ (passed/total) across scenarios; cost on a separate axis
     6. Sets on-chain weights (winner-take-all or bootstrap)
     7. Re-sets weights every tempo (~72 min) for convergence
 
@@ -2482,11 +2482,12 @@ class TrajectoryValidator:
             )
             return 0.0
 
-        # Aggregate raw score (mean across scenarios)
-        raw_score = (
-            sum(_scenario_score(s, q) for s, q in raw_qualified.items())
-            / len(raw_qualified)
-            if raw_qualified else 0.0
+        # Aggregate raw score: Σ per-scenario quality (range [0, N] for
+        # N scenarios). Each per-scenario quality is passed/total ∈ [0, 1]
+        # from the verifier's ctrf.json; equal-weighted sum is the
+        # session score per Ning's 2026-05-04 design.
+        raw_score = sum(
+            _scenario_score(s, q) for s, q in raw_qualified.items()
         )
 
         # Per-scenario results

@@ -373,23 +373,24 @@ def _strip_provider_prefix(model: str) -> str:
 # ---------------------------------------------------------------------------
 
 class TrajectorySandboxHarness:
-    """Single-container sandbox harness.
+    """Per-scenario sandbox harness.
 
     Per session:
-      1. Pull sandbox-agent image + the configured scenario image.
-      2. Run sandbox-agent container; wait for it to come up.
-      3. Inject /app from the scenario image; write SKILL.md.
-      4. For each episode:
-         - Write INSTRUCTION.md
+      1. Pull sandbox-agent image + every scenario image in
+         ``SANDBOX_SCENARIOS``.
+      2. For each scenario (one episode each):
+         - Run a fresh container of the scenario image (which layers
+           on sandbox-agent and ships /app preloaded).
+         - Drop SKILL.md + INSTRUCTION.md into /workspace (read-only).
          - ``docker exec -u agent`` runs ``hermes chat`` against
-           /workspace + /app directly. Wraps chat + ``hermes sessions
-           export`` in one bash invocation; wipes the SQLite session DB
-           between episodes so each episode's turns.jsonl carries only
-           that episode's session.
-         - Extract agent_output_path from the sandbox.
-         - Run a one-shot verifier container against the output,
-           parse reward.txt, set quality = float(reward).
-      5. Compute split-half delta over the resulting qualities.
+           /workspace + /app. Wraps chat + ``hermes sessions export``
+           in one bash invocation so turns.jsonl is atomic per episode.
+         - Extract ``agent_output_path`` from the container.
+         - Run a one-shot verifier container against the output;
+           parse ctrf.json → quality = passed / total ∈ [0, 1].
+         - Tear down the container.
+      3. Final score = Σ qualities across scenarios (range [0, N]).
+         No learning bonus, no split-half delta.
     """
 
     def __init__(self, config: ValidatorConfig):
@@ -804,10 +805,10 @@ class TrajectorySandboxHarness:
 
             harness_prompt = (
                 "Read /workspace/SKILL.md for your approach. "
-                "Read /workspace/INSTRUCTION.md for this episode's task. "
+                "Read /workspace/INSTRUCTION.md for the task. "
                 "The task's working directory is /app/. "
-                "/workspace/learned/ is your scratch space across episodes; "
-                "everything in /app and /workspace/learned is writable. "
+                "/app and /workspace/learned are writable scratch; "
+                "everything else is read-only. "
                 "Solve the task. Do not modify SKILL.md."
             )
 
