@@ -74,6 +74,54 @@ That's it. Repeat steps 1 → 4 whenever you improve your SKILL.md.
 
 ---
 
+## Two submission paths
+
+| Path | What you operate | Where the pack lives | Reveal | Use this when |
+|------|-----------------|----------------------|--------|---------------|
+| **A. Self-host + chain commit** | An HTTP host (S3/GCS/GH/own server) for `pack.json` | Your bucket | Public on chain immediately (commit URL is on-chain) | You already have hosting and want full control |
+| **B. Web submit (recommended for new miners)** | Just the miner CLI, no hosting | Subnet's GCS at an unguessable random key | URL hidden 48 h; commit on-chain still required for discovery | You want the easiest path; you don't want to run hosting |
+
+Both paths produce the same on-chain artifact: `set_commitment(pack_hash | url)`. The difference is who hosts the pack content.
+
+### Path A — chain commit (classic)
+
+```bash
+python neurons/miner.py build  SKILL.md -o pack.json
+python neurons/miner.py upload pack.json                       # to your S3/GCS
+python neurons/miner.py submit https://your-bucket/pack.json   # set_commitment on chain
+```
+
+### Path B — web submit (preferred)
+
+```bash
+# 1. Build pack locally (same as Path A)
+python neurons/miner.py build SKILL.md -o pack.json
+
+# 2. POST pack to the subnet's hosted submit endpoint (signed with your hotkey).
+#    The endpoint stores the pack at an unguessable random GCS path and
+#    returns the `pack_url` to use on-chain.
+curl -X POST https://trajrl.com/api/v2/miners/submit \
+  -H 'content-type: application/json' \
+  -d "$(jq -n --slurpfile pack pack.json \
+              --arg miner_hotkey "$MINER_HOTKEY" \
+              --arg ts "$(date +%s)" \
+              --arg sig "$(sign 'trajectoryrl-miner-submit:'"$MINER_HOTKEY"':'"$ts")" \
+              --arg hash "$(sha256_canonical pack.json)" \
+        '{ miner_hotkey: $miner_hotkey, timestamp: ($ts | tonumber),
+           signature: $sig, pack_hash: $hash, pack_content: ($pack[0] | tostring) }')"
+
+# Response → { pack_url: "https://storage.googleapis.com/.../pack.json", ... }
+
+# 3. Commit on-chain with the returned pack_url
+python neurons/miner.py submit <pack_url_from_response>
+```
+
+The `submit` endpoint immediately validates your signature, hash and pack format, kicks off pre-eval asynchronously, and returns the `pack_url`. Web-source URLs are not exposed in any other API for **48 hours** (the "reveal gate"), so a competitor can't simply scrape the dashboard to harvest your fresh SKILL.md.
+
+Full request/response spec for `/api/v2/miners/submit` is in [`trajectoryrl.web/API.md`](https://github.com/trajectoryRL/trajectoryrl.web/blob/main/API.md).
+
+---
+
 ## CLI Reference
 
 ```bash
@@ -261,7 +309,9 @@ For what to write in SKILL.md, see [MINER_GUIDE.md § Writing SKILL.md](MINER_GU
 └─────────────────────────────────────────────────────────┘
 ```
 
-Validators only re-evaluate when your `pack_hash` changes. No need to resubmit if your SKILL.md hasn't changed.
+Validators only re-evaluate when your `pack_hash` changes. No need to resubmit if your SKILL.md hasn't changed. **However**, if you want to remain in the active eval set you must keep your on-chain commitment alive — the snapshot endpoint excludes packs whose `refresh_time` (the rolling activity stamp) is older than 48 hours. The sync service refreshes this stamp every 5 min for any commitment still on chain, so as long as you don't deregister you stay active.
+
+Re-submitting the same `(hotkey, pack_hash)` to `/api/v2/miners/submit` (Path B) within 1h is rate-limited by the cooldown; outside the cooldown it just bumps `refresh_time` without re-running the pipeline.
 
 ### Picking a hosting option
 
@@ -326,6 +376,8 @@ Use the testee transcript + judge feedback together to debug failure modes and i
 ## References
 
 - **Season 1 Guide**: [MINER_GUIDE.md](MINER_GUIDE.md) — scoring, sandbox, SKILL.md writing, anti-gaming rules
+- **Validator side**: [VALIDATOR_OPERATIONS.md](VALIDATOR_OPERATIONS.md) — how validators consume the eval set you submit to
 - **Incentive Mechanism**: [INCENTIVE_MECHANISM.md](INCENTIVE_MECHANISM.md) — consensus protocol, winner selection
 - **Scoring & Evaluation**: [EVALUATION_S1.md](EVALUATION_S1.md) — pack schema, scoring formula
+- **Web API spec**: [API.md](https://github.com/trajectoryRL/trajectoryrl.web/blob/main/API.md) — full request/response for `/api/v2/miners/submit` and other endpoints
 - **Benchmark**: [trajrl-bench](https://github.com/trajectoryRL/trajrl-bench) — scenarios, JUDGE.md, local testing

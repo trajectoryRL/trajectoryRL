@@ -1076,59 +1076,99 @@ class TestFetchAllCommitmentsResilience:
 
 
 class TestAcquireWindowSnapshotGuard:
-    """Tests for _acquire_window_snapshot's behavior when chain query fails.
+    """Tests for ``_acquire_window_snapshot``'s behavior when the
+    ``/api/v2/validators/epoch_snapshot`` fetch fails.
 
-    A failed chain query (fetch_all_commitments returns None) MUST NOT be
-    persisted as an "empty active set" snapshot — that locks the validator
-    into a no-eval state for the rest of the ~24h window.
+    A failed fetch (``fetch_epoch_snapshot`` returns None or raises
+    ``SnapshotNotReady``) MUST NOT be persisted as an "empty active
+    set" snapshot — that locks the validator into a no-eval state for
+    the rest of the ~24h window.
     """
 
-    def test_does_not_save_snapshot_when_fetch_returns_none(self, tmp_path):
-        """When fetch_all_commitments returns None, _acquire_window_snapshot
-        must return None and must NOT call save_snapshot — so the next loop
-        iteration (or restart) can re-attempt the fetch instead of being
-        locked by a poisoned cache file."""
+    def _make_stub_validator(self, tmp_path):
         from trajectoryrl.base import validator as validator_module
-        from trajectoryrl.utils.eval_snapshot import EvalSnapshot
 
-        # Build a minimal stub validator that exposes the methods/attrs
-        # _acquire_window_snapshot needs, without going through the full
-        # TrajectoryValidator constructor.
         validator = MagicMock()
         validator.config.active_set_dir = str(tmp_path)
         validator.config.netuid = 11
-        validator.config.inactivity_blocks = 120
-        validator.subtensor = MagicMock()
-        validator.metagraph = MagicMock()
+        validator.wallet = MagicMock()
 
-        # Bind the real _acquire_window_snapshot onto our stub.
         validator._acquire_window_snapshot = (
             validator_module.TrajectoryValidator._acquire_window_snapshot.__get__(
                 validator
             )
         )
+        return validator, validator_module
 
-        # Build a minimal EvaluationWindow-like object (the method only reads
-        # window_number and window_start from it).
+    def test_does_not_save_snapshot_when_fetch_returns_none(self, tmp_path):
+        """When fetch_epoch_snapshot returns None,
+        _acquire_window_snapshot must return None and must NOT call
+        save_snapshot — so the next loop iteration (or restart) can
+        re-attempt the fetch instead of being locked by a poisoned
+        cache file."""
+        import asyncio
+
+        validator, validator_module = self._make_stub_validator(tmp_path)
+
         window = MagicMock()
         window.window_number = 1123
         window.window_start = 8085600
 
+        async def _fake_fetch(*args, **kwargs):
+            return None
+
         with patch.object(
-            validator_module, "fetch_all_commitments", return_value=None,
+            validator_module, "fetch_epoch_snapshot", side_effect=_fake_fetch,
         ) as fetch_mock, patch.object(
             validator_module, "save_snapshot",
         ) as save_mock, patch.object(
             validator_module, "load_snapshot", return_value=None,
         ):
-            result = validator._acquire_window_snapshot(window, current_block=8085614)
+            result = asyncio.run(
+                validator._acquire_window_snapshot(
+                    window, current_block=8085614,
+                )
+            )
 
         assert fetch_mock.called
         assert result is None, "should return None to signal caller to fall back"
         assert not save_mock.called, (
-            "must NOT persist a snapshot when chain query failed — "
+            "must NOT persist a snapshot when API fetch failed — "
             "would poison the cache and block the next ~24h window"
         )
+
+    def test_does_not_save_snapshot_when_fetch_raises_not_ready(self, tmp_path):
+        """When the endpoint replies 404 (sync worker hasn't built the
+        snapshot yet), ``fetch_epoch_snapshot`` raises ``SnapshotNotReady``;
+        ``_acquire_window_snapshot`` must propagate that as a None
+        return without persisting anything."""
+        import asyncio
+
+        validator, validator_module = self._make_stub_validator(tmp_path)
+        from trajectoryrl.utils.status_reporter import SnapshotNotReady
+
+        window = MagicMock()
+        window.window_number = 1123
+        window.window_start = 8085600
+
+        async def _fake_fetch(*args, **kwargs):
+            raise SnapshotNotReady(1123)
+
+        with patch.object(
+            validator_module, "fetch_epoch_snapshot", side_effect=_fake_fetch,
+        ), patch.object(
+            validator_module, "save_snapshot",
+        ) as save_mock, patch.object(
+            validator_module, "load_snapshot", return_value=None,
+        ):
+            result = asyncio.run(
+                validator._acquire_window_snapshot(
+                    window, current_block=8085614,
+                )
+            )
+
+        assert result is None
+        assert not save_mock.called
 
 
 # ===================================================================

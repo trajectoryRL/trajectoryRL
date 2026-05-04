@@ -209,13 +209,33 @@ while running:
 
 ### Deterministic Active-Set Snapshot
 
-Each target window persists a frozen miner set as `active_set_window_{N}.json`:
+The eval target set for epoch N is fetched once per cycle from `POST /api/v2/validators/epoch_snapshot` (see VALIDATOR_OPERATIONS.md for the request shape). The endpoint absorbs the on-chain commitment scan and the per-miner pre-eval pipeline; its response is **immutable** for a given epoch — every validator that calls with `epoch_number=N` gets byte-identical bytes regardless of when they call. Cross-validator determinism follows directly from this guarantee, not from any local filter the validator applies.
+
+Each entry comes back with `pre_eval_status ∈ {passed, failed}` plus `pre_eval_reason` for failures. Failed entries are rejection-submitted as `(rejected=true, score=weight=0)` and **never enter the eval loop**; passed entries proceed to scenario evaluation. Runtime-only filters (validator permit, blacklist) are applied live on top of the snapshot — those are dynamic and intentionally outside the immutable freeze.
+
+#### Local cache & restart behavior
+
+The successful response is mirrored to disk so a validator restart inside epoch N resumes without another HTTP round-trip:
 
 ```
-active_set_window_N = { commitment | commitment.block_number < window_start(N) }
+{ACTIVE_SET_DIR or /var/lib/trajectoryrl/active_sets/}/active_set_window_{N}.json
 ```
 
-This makes evaluation inputs restart-safe and cross-validator consistent (within accepted polling-granularity overwrite races). Runtime-only filters such as validator permit and blacklist are still applied live, outside snapshot materialization.
+Per cycle:
+
+1. `load_snapshot(active_set_dir, N)` — read the file from disk.
+2. Hit → return cached → **no API call**.
+3. Miss / unparseable → `fetch_epoch_snapshot(N)` and persist on success.
+
+Practical consequences:
+
+| Scenario | Behavior |
+|---|---|
+| Container restart mid-epoch (volume intact) | reuse cache, 0 API calls |
+| Volume wiped or first cycle in a new epoch | one API fetch, then cache reused for the rest of the epoch |
+| Crash before the first cycle wrote the cache | one API fetch on restart |
+
+Because the API guarantees byte-identical output per epoch, "reuse cache" and "re-fetch from API" are equivalent paths — the cache is purely a round-trip optimization, never a divergence source. Rejection-row submissions for failed entries fire on every cycle (including the first cycle after restart); the dashboard deduplicates by `(validator_hotkey, miner_hotkey, epoch_number)`, so re-firing is idempotent. The validator keeps the most recent four `active_set_window_*.json` files and prunes older ones on each save.
 
 ### Evaluation Rate-Limiting
 
@@ -308,22 +328,21 @@ Each validator maintains a per-validator persistent table `pack_first_seen[pack_
 
 **Paraphrase defense**: pre-v5.1 the validator ran a pairwise NCD comparison among all active packs. NCD has known false positives/negatives near the threshold and shared the on-chain `block_number` rotation problem. As of v5.1 paraphrase defense is delegated to **Winner Protection's δ threshold + score-based competition**: a paraphrased copy must beat the current winner by at least δ to take over emissions, the same bar a genuine improvement faces. The NCD library functions in `trajectoryrl/utils/ncd.py` are kept for tooling but no longer gate evaluation.
 
-### 4. Pre-Eval Gate (Platform API)
+### 4. Pre-Eval Gate (baked into the epoch snapshot)
 
-**Enforcement**: Before evaluating a miner's pack (and again during aggregation), validators call the platform pre-eval API to check whether the submission is allowed. Miners flagged by the platform (banned, hardcoded packs detected server-side) are disqualified before spending evaluation resources.
+**Enforcement**: Pre-eval is no longer a per-miner HTTP call from the validator. The platform runs the gate (ban list, server-side hardcoded-pack detection, hash-uniqueness, etc.) before each epoch's `cutoff_time` and stamps the verdict directly onto the epoch_snapshot — every entry returned by `/api/v2/validators/epoch_snapshot` carries `pre_eval_status ∈ {passed, failed}` and (for failures) `pre_eval_reason`.
 
 **Prevents**:
-- Known-bad packs from consuming validator evaluation budget
-- Banned miners from participating after being flagged
-- Pack-switch escapes (aggregation re-checks using epoch_number to resolve the pack that was active during the evaluation window)
+- Known-bad packs from consuming validator evaluation budget (failed entries skip the eval loop entirely).
+- Banned miners from participating after being flagged.
+- Pack-switch escapes — the snapshot freezes the pack that was active at the epoch's cutoff_time, so a mid-epoch pack swap cannot dodge the gate.
 
 **How it works**:
-- **Evaluation phase**: Each miner is checked via `pre_eval(hotkey, pack_hash, pack_url)` before episodes run. Rejected miners are marked disqualified and skipped.
-- **Aggregation phase**: All miners in the consensus set are re-checked via `pre_eval(hotkey, epoch_number)`. Miners rejected since evaluation are disqualified before winner selection.
-- **Fail-open**: If the API is unreachable, validators fall back to cached results or proceed without gating (validators remain self-sufficient).
-- **Caching**: Responses are cached by `(hotkey, identifier)` to handle transient API failures.
+- **One source, one fetch**: validators read the snapshot once at the start of an eval cycle (see "Deterministic Active-Set Snapshot" above). Failed entries are rejection-submitted (`rejected=true, score=weight=0`) and excluded from the eval loop; passed entries proceed to scenario evaluation.
+- **No per-miner HTTP fan-out**: the legacy per-miner `/api/v2/miners/pre-eval` calls (both the eval-loop check and the aggregation-phase re-check) are gone — they are redundant with the snapshot's frozen verdict.
+- **No client-side fallback**: if the snapshot endpoint is unreachable for a whole epoch, the validator does not eval that epoch and falls through to fallback weights. There is no chain-side or cached pre-eval to "fail-open" against.
 
-Controlled by `TRAJECTORYRL_PRE_EVAL_ENABLED` (default: enabled).
+Cross-validator determinism is mechanical: every validator gets byte-identical entries for the same epoch, so disqualification is identical across the consensus set without any voting or reconciliation step.
 
 ### 5. Validator-Side Evaluation
 
