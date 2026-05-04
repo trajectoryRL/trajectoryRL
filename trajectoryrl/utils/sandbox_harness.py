@@ -53,6 +53,17 @@ logger = logging.getLogger(__name__)
 _AGENT_UID = 10000
 
 
+# Scenarios run per session, in order. Every validator runs the full set
+# so scores are comparable across validators / windows / SPEC_NUMBER
+# bumps. Adding or removing a scenario must come with a SPEC_NUMBER bump
+# so cached scores invalidate. Sorted alphabetically for stability.
+SANDBOX_SCENARIOS: tuple[str, ...] = (
+    "break-filter-js-from-html",
+    "cancel-async-tasks",
+    "log-summary-date-ranges",
+)
+
+
 # ---------------------------------------------------------------------------
 # Result types
 # ---------------------------------------------------------------------------
@@ -60,6 +71,9 @@ _AGENT_UID = 10000
 @dataclass
 class _EpisodeResult:
     episode_index: int
+    # Scenario this episode evaluated. With multi-scenario sessions
+    # episode_index alone doesn't identify the cell; pair with this.
+    scenario: str = ""
     # Continuous correctness in [0.0, 1.0]: passed_tests / total_tests from
     # the verifier's ctrf.json. Falls back to ``float(reward)`` (binary
     # 0 or 1) when ctrf isn't parseable.
@@ -83,32 +97,33 @@ class _EpisodeResult:
 @dataclass
 class _SessionResult:
     episodes: list[_EpisodeResult] = field(default_factory=list)
-    early_mean: float = 0.0
-    late_mean: float = 0.0
-    delta: float = 0.0
-    mean_quality: float = 0.0
-    learning_bonus: float = 0.0
-    final_score: float = 0.0
+    mean_quality: float = 0.0  # mean of per-scenario correctness, in [0,1]
+    final_score: float = 0.0   # sum of per-scenario correctness, in [0, N]
     pack_hash: str = ""
     validator_salt: str = ""
-    scenario: str = ""
     skill_md: str = ""
 
-    def compute_scores(self, alpha: float = 0.5, early_floor: float = 0.3,
-                       delta_threshold: float = 0.4) -> None:
+    def compute_scores(self) -> None:
+        """Aggregate per-scenario correctness into the session score.
+
+        Each scenario contributes ``passed_i / total_i`` ∈ [0, 1] (the
+        episode's ``quality``). Final score is the equal-weighted sum
+        across scenarios — range [0, N] for N scenarios — so a perfect
+        all-pass session lands at ``len(SANDBOX_SCENARIOS)``. Mean
+        quality is exposed as the [0, 1] convenience aggregate.
+
+        Rationale (Ning, 2026-05-04): equal weight per scenario, no
+        learning bonus, no split-half delta. With one episode per
+        scenario the within-scenario delta concept doesn't apply, and
+        cross-scenario diversity is the noise reduction.
+        """
         scores = [ep.quality for ep in self.episodes]
-        if len(scores) < 4:
-            self.mean_quality = sum(scores) / len(scores) if scores else 0.0
-            self.final_score = self.mean_quality
+        if not scores:
+            self.mean_quality = 0.0
+            self.final_score = 0.0
             return
-        self.early_mean = (scores[0] + scores[1]) / 2
-        self.late_mean = (scores[2] + scores[3]) / 2
-        self.delta = self.late_mean - self.early_mean
-        if self.early_mean < early_floor and self.delta > delta_threshold:
-            self.delta = 0.0
         self.mean_quality = sum(scores) / len(scores)
-        self.learning_bonus = alpha * max(0.0, self.delta)
-        self.final_score = self.mean_quality * (1 + self.learning_bonus)
+        self.final_score = sum(scores)
 
 
 class SandboxEvaluationResult:
@@ -117,10 +132,14 @@ class SandboxEvaluationResult:
 
     def __init__(self, session_result: _SessionResult,
                  scenario_name: str = ""):
+        # ``scenario_name`` is retained on the result for backward
+        # compat with consumers that expect a single-scenario tag, but
+        # multi-scenario sessions populate ``scenarios`` / per-cell
+        # results below.
         self.scenario_name = scenario_name
         self.score = session_result.final_score
         self.success = session_result.final_score > 0.0
-        self.tool_calls = 0  # not tracked in unified path
+        self.tool_calls = 0
         self.response = ""
         self.rubric = {}
         self.error: Optional[str] = None
@@ -136,16 +155,21 @@ class SandboxEvaluationResult:
         self.session_file: Optional[str] = None
 
         self.session_result = session_result
-        self.early_mean = session_result.early_mean
-        self.late_mean = session_result.late_mean
-        self.delta = session_result.delta
         self.mean_quality = session_result.mean_quality
-        self.learning_bonus = session_result.learning_bonus
-        self.episode_qualities = [ep.quality for ep in session_result.episodes]
-        # Cost axis (separate from score). Per-episode list and total —
-        # ``None`` means the agent didn't produce a billed session.
-        self.episode_costs_usd = [ep.cost_usd for ep in session_result.episodes]
-        billed = [c for c in self.episode_costs_usd if c is not None]
+        # Per-scenario correctness map: {scenario_name: passed/total}.
+        # Empty dict if the session ran no episodes.
+        self.scenario_qualities: Dict[str, float] = {
+            ep.scenario: ep.quality for ep in session_result.episodes
+        }
+        # Ordered list of scenarios run (matches ``SANDBOX_SCENARIOS``
+        # by construction; provides a stable iteration order for
+        # downstream consumers).
+        self.scenarios: List[str] = [ep.scenario for ep in session_result.episodes]
+        # Cost axis (separate from score). Per-scenario map + aggregates.
+        self.scenario_costs_usd: Dict[str, Optional[float]] = {
+            ep.scenario: ep.cost_usd for ep in session_result.episodes
+        }
+        billed = [c for c in self.scenario_costs_usd.values() if c is not None]
         self.total_cost_usd: Optional[float] = sum(billed) if billed else None
         self.mean_cost_usd: Optional[float] = (
             sum(billed) / len(billed) if billed else None
@@ -161,23 +185,26 @@ class SandboxEvaluationResult:
 
         (out / "SKILL.md").write_text(sr.skill_md or "")
         (out / "metadata.json").write_text(json.dumps({
-            "scenario": sr.scenario,
+            "scenarios": self.scenarios,
             "pack_hash": sr.pack_hash,
             "validator_salt": sr.validator_salt,
             "final_score": sr.final_score,
             "mean_quality": sr.mean_quality,
-            "early_mean": sr.early_mean,
-            "late_mean": sr.late_mean,
-            "delta": sr.delta,
-            "learning_bonus": sr.learning_bonus,
-            "episode_qualities": [ep.quality for ep in sr.episodes],
-            "episode_costs_usd": [ep.cost_usd for ep in sr.episodes],
+            "scenario_qualities": self.scenario_qualities,
+            "scenario_costs_usd": self.scenario_costs_usd,
             "total_cost_usd": self.total_cost_usd,
             "mean_cost_usd": self.mean_cost_usd,
         }, indent=2, default=str))
 
         for ep in sr.episodes:
-            ep_dir = out / "episodes" / f"episode_{ep.episode_index}"
+            # Per-cell directory keyed by scenario name (one cell per
+            # scenario in the new 1-ep-per-scenario design). Falls back
+            # to ``episode_<n>`` for older results without scenario tags.
+            cell_name = (
+                f"scenario_{ep.scenario}" if ep.scenario
+                else f"episode_{ep.episode_index}"
+            )
+            ep_dir = out / "episodes" / cell_name
             ep_dir.mkdir(parents=True, exist_ok=True)
             (ep_dir / "testee_transcript.txt").write_text(ep.transcript or "")
             if ep.turns_log:
@@ -387,6 +414,7 @@ class TrajectorySandboxHarness:
 
         self.bench_image_hash: str = "unknown"
         self.scenario_image_hash: str = "unknown"
+        self.scenario_image_hashes: Dict[str, str] = {}
 
     @property
     def client(self) -> docker.DockerClient:
@@ -496,31 +524,44 @@ class TrajectorySandboxHarness:
         except Exception as e:
             logger.warning("Failed to query sandbox version: %s", e)
 
-        # Pull the configured scenario's image.
-        scenario_name = self.config.sandbox_scenario
-        try:
-            self._load_scenario_info(scenario_name)
-        except Exception as e:
-            logger.warning(
-                "Failed to fetch scenario-info for %s: %s",
-                scenario_name, e,
-            )
-            return
-        scenario_image = self._scenario_image_ref()
-        if scenario_image:
+        # Pull the per-scenario environment images for every scenario
+        # this validator runs. ``scenario_image_hashes`` keys each one
+        # for audit / submit-payload metadata.
+        self.scenario_image_hashes = {}
+        for scenario_name in SANDBOX_SCENARIOS:
+            try:
+                self._scenario_info = None  # force re-fetch per scenario
+                self._load_scenario_info(scenario_name)
+            except Exception as e:
+                logger.warning(
+                    "Failed to fetch scenario-info for %s: %s",
+                    scenario_name, e,
+                )
+                continue
+            scenario_image = self._scenario_image_ref()
+            if not scenario_image:
+                continue
             try:
                 logger.info("Pulling scenario image: %s", scenario_image)
                 self.client.images.pull(scenario_image)
                 img = self.client.images.get(scenario_image)
                 digests = img.attrs.get("RepoDigests", [])
-                self.scenario_image_hash = (
-                    digests[0].split("@", 1)[-1] if digests else img.id
-                )
+                digest = digests[0].split("@", 1)[-1] if digests else img.id
+                self.scenario_image_hashes[scenario_name] = digest
             except Exception as e:
                 logger.warning(
                     "Failed to pull scenario image %s: %s",
                     scenario_image, e,
                 )
+        # Stable single-string hash for back-compat with the
+        # ``scenario_image_hash`` heartbeat / submit field — concatenate
+        # per-scenario hashes in canonical order.
+        if self.scenario_image_hashes:
+            ordered = [
+                self.scenario_image_hashes.get(name, "missing")
+                for name in SANDBOX_SCENARIOS
+            ]
+            self.scenario_image_hash = ":".join(ordered)
 
     # ------------------------------------------------------------------
     # Scenario plumbing
@@ -568,22 +609,21 @@ class TrajectorySandboxHarness:
         pack_hash: str = "",
         validator_salt: str = "",
     ) -> SandboxEvaluationResult:
-        num_episodes = self.config.sandbox_num_episodes
         salt = validator_salt or hashlib.sha256(
             f"{self.config.wallet_hotkey}:{self.config.netuid}".encode()
         ).hexdigest()[:16]
 
         logger.info(
-            "eval starting: pack_hash=%s, seed=%d, episodes=%d, scenario=%s",
+            "eval starting: pack_hash=%s, seed=%d, scenarios=%s",
             pack_hash[:12] if pack_hash else "?",
-            epoch_seed, num_episodes, self.config.sandbox_scenario,
+            epoch_seed, list(SANDBOX_SCENARIOS),
         )
 
         loop = asyncio.get_event_loop()
         try:
             session_result = await loop.run_in_executor(
                 None, lambda: self._run_eval_sync(
-                    skill_md, epoch_seed, salt, num_episodes, pack_hash,
+                    skill_md, epoch_seed, salt, pack_hash,
                 ),
             )
         except Exception as e:
@@ -593,49 +633,57 @@ class TrajectorySandboxHarness:
             result.error = str(e)
             return result
 
-        result = SandboxEvaluationResult(
-            session_result, scenario_name=session_result.scenario,
-        )
+        result = SandboxEvaluationResult(session_result)
         logger.info(
-            "eval complete: final_score=%.3f (mean_q=%.3f, delta=%.3f, "
-            "episodes=%s)",
-            result.score, result.mean_quality, result.delta,
-            result.episode_qualities,
+            "eval complete: final_score=%.3f (mean_q=%.3f, scenarios=%s)",
+            result.score, result.mean_quality, result.scenario_qualities,
         )
         return result
 
     def _run_eval_sync(
-        self, skill_md: str, epoch_seed: int, salt: str,
-        num_episodes: int, pack_hash: str,
+        self, skill_md: str, epoch_seed: int, salt: str, pack_hash: str,
     ) -> _SessionResult:
-        scenario = self.config.sandbox_scenario
-        info = self._load_scenario_info(scenario)
-        scenario_image = self._scenario_image_ref()
-        if not scenario_image:
-            raise RuntimeError(
-                f"scenario {scenario!r} has no image_repo in scenario-info "
-                f"— bench too old?"
-            )
+        """One sandbox container, one episode per scenario.
 
-        instruction_md = info["instruction_md"]
-        agent_output_path = info["agent_output_path"]
-        verifier_timeout_s = int(info.get("verifier_timeout_s", 300))
-        tests_files_b64 = info.get("tests_files_b64", {})
-        if "test.sh" not in tests_files_b64:
-            raise RuntimeError(
-                f"scenario {scenario!r} ships no test.sh"
-            )
+        Each scenario contributes a correctness ratio (passed/total) in
+        [0, 1]; final_score is the equal-weighted sum across scenarios.
+        ``/app`` is re-injected from each scenario's environment image
+        between cells. ``/workspace/learned`` persists across all
+        scenarios so SKILL.md can build cross-scenario state.
+        """
+        # Pre-load metadata for every scenario so we fail early if the
+        # sandbox image is missing one. Each ``_load_scenario_info``
+        # call also primes the per-scenario image ref + tests payload.
+        scenario_specs: list[dict] = []
+        for name in SANDBOX_SCENARIOS:
+            self._scenario_info = None  # bust cache; loop reads each
+            info = self._load_scenario_info(name)
+            scenario_image = self._scenario_image_ref()
+            if not scenario_image:
+                raise RuntimeError(
+                    f"scenario {name!r} has no image_repo in scenario-info "
+                    f"— bench too old?"
+                )
+            tests_files_b64 = info.get("tests_files_b64", {})
+            if "test.sh" not in tests_files_b64:
+                raise RuntimeError(f"scenario {name!r} ships no test.sh")
+            scenario_specs.append({
+                "name": name,
+                "image": scenario_image,
+                "instruction_md": info["instruction_md"],
+                "agent_output_path": info["agent_output_path"],
+                "verifier_timeout_s": int(info.get("verifier_timeout_s", 300)),
+                "tests_files_b64": tests_files_b64,
+            })
 
         session_id = secrets.token_hex(6)
         session_result = _SessionResult(pack_hash=pack_hash, validator_salt=salt)
-        session_result.scenario = scenario
         session_result.skill_md = skill_md
 
         logger.info(
-            "[%s] session start (scenario=%s, sandbox=%s, scenario_image=%s, "
-            "episodes=%d)",
-            session_id, scenario, self._sandbox_image, scenario_image,
-            num_episodes,
+            "[%s] session start (sandbox=%s, scenarios=%s)",
+            session_id, self._sandbox_image,
+            [s["name"] for s in scenario_specs],
         )
 
         sandbox = None
@@ -644,8 +692,8 @@ class TrajectorySandboxHarness:
                 self._sandbox_image,
                 name=f"sandbox_{session_id}",
                 detach=True,
-                # Default bridge → internet egress for both the agent (LLM
-                # API) and the verifier (apt + uv installs).
+                # Default bridge → internet egress for both the agent
+                # (LLM API) and the verifier (apt + uv installs).
                 network="bridge",
                 environment={
                     "LLM_API_KEY":  self._testee_api_key,
@@ -659,9 +707,6 @@ class TrajectorySandboxHarness:
                                      config={"max-size": "50m"}),
             )
 
-            # Wait for the container to settle. Sandbox-agent CMD is
-            # ``tail -f /dev/null`` so we just verify the container is
-            # running and ``docker exec`` works against it.
             for attempt in range(30):
                 try:
                     sandbox.reload()
@@ -677,8 +722,6 @@ class TrajectorySandboxHarness:
             else:
                 raise RuntimeError("Sandbox container failed to start")
 
-            self._setup_app_dir(sandbox, scenario_image)
-
             _put_file(sandbox, "/workspace/SKILL.md", skill_md)
             sandbox.exec_run(["chown", "root:agent", "/workspace/SKILL.md"])
             sandbox.exec_run(["chmod", "440", "/workspace/SKILL.md"])
@@ -687,16 +730,25 @@ class TrajectorySandboxHarness:
                 "chown", "-R", "agent:agent", "/workspace/learned",
             ])
 
-            for i in range(num_episodes):
+            for cell_index, spec in enumerate(scenario_specs):
+                # Re-inject /app from the scenario's environment image.
+                # Wipes whatever the prior scenario left; learned/
+                # persists.
+                sandbox.exec_run(
+                    ["sh", "-c", "rm -rf /app && mkdir -p /app"]
+                )
+                self._setup_app_dir(sandbox, spec["image"])
+
                 episode = self._run_episode(
                     session_id=session_id,
-                    episode_index=i,
-                    instruction_md=instruction_md,
+                    episode_index=cell_index,
+                    scenario=spec["name"],
+                    instruction_md=spec["instruction_md"],
                     sandbox=sandbox,
-                    scenario_image=scenario_image,
-                    agent_output_path=agent_output_path,
-                    tests_files_b64=tests_files_b64,
-                    verifier_timeout_s=verifier_timeout_s,
+                    scenario_image=spec["image"],
+                    agent_output_path=spec["agent_output_path"],
+                    tests_files_b64=spec["tests_files_b64"],
+                    verifier_timeout_s=spec["verifier_timeout_s"],
                 )
                 session_result.episodes.append(episode)
 
@@ -715,6 +767,7 @@ class TrajectorySandboxHarness:
         self,
         session_id: str,
         episode_index: int,
+        scenario: str,
         instruction_md: str,
         sandbox: Container,
         scenario_image: str,
@@ -722,14 +775,19 @@ class TrajectorySandboxHarness:
         tests_files_b64: dict[str, str],
         verifier_timeout_s: int,
     ) -> _EpisodeResult:
-        """Run one episode: docker exec hermes → extract output → verifier."""
+        """Run one cell: docker exec hermes → extract output → verifier."""
         ep_data = {
+            "scenario": scenario,
             "instruction_md": instruction_md,
             "agent_output_path": agent_output_path,
         }
-        episode = _EpisodeResult(episode_index=episode_index, ep_data=ep_data)
+        episode = _EpisodeResult(
+            episode_index=episode_index,
+            scenario=scenario,
+            ep_data=ep_data,
+        )
         t0 = time.time()
-        logger.info("[%s] ep%d starting", session_id, episode_index)
+        logger.info("[%s] %s starting", session_id, scenario)
 
         try:
             _put_file(sandbox, "/workspace/INSTRUCTION.md", instruction_md)
@@ -806,8 +864,8 @@ class TrajectorySandboxHarness:
                         break
             except Exception as e:
                 logger.warning(
-                    "[%s] ep%d exec stream broke: %s",
-                    session_id, episode_index, e,
+                    "[%s] %s exec stream broke: %s",
+                    session_id, scenario, e,
                 )
             episode.transcript = b"".join(transcript_chunks).decode(
                 "utf-8", errors="replace",
@@ -816,8 +874,8 @@ class TrajectorySandboxHarness:
             inspect = self.client.api.exec_inspect(exec_id)
             chat_exit = inspect.get("ExitCode")
             logger.info(
-                "[%s] ep%d hermes chat finished (exit=%s, timed_out=%s, %d chars)",
-                session_id, episode_index, chat_exit, episode.timed_out,
+                "[%s] %s hermes chat finished (exit=%s, timed_out=%s, %d chars)",
+                session_id, scenario, chat_exit, episode.timed_out,
                 len(episode.transcript),
             )
 
@@ -831,8 +889,8 @@ class TrajectorySandboxHarness:
             agent_output_bytes = self._extract_file(sandbox, agent_output_path)
             if agent_output_bytes is None:
                 logger.warning(
-                    "[%s] ep%d agent produced no output at %s",
-                    session_id, episode_index, agent_output_path,
+                    "[%s] %s agent produced no output at %s",
+                    session_id, scenario, agent_output_path,
                 )
 
             verifier_result = self._run_verifier_container(
@@ -872,9 +930,9 @@ class TrajectorySandboxHarness:
                 "ctrf": ctrf,
             }
             logger.info(
-                "[%s] ep%d quality=%.3f (reward=%d, %d/%d tests passed, "
+                "[%s] %s quality=%.3f (reward=%d, %d/%d tests passed, "
                 "cost=%s)",
-                session_id, episode_index, episode.quality, reward,
+                session_id, scenario, episode.quality, reward,
                 passed, total,
                 f"${episode.cost_usd:.4f}" if episode.cost_usd is not None
                 else "n/a",
@@ -883,8 +941,8 @@ class TrajectorySandboxHarness:
         except Exception as e:
             episode.error = str(e)
             logger.error(
-                "[%s] ep%d failed: %s",
-                session_id, episode_index, e, exc_info=True,
+                "[%s] %s failed: %s",
+                session_id, scenario, e, exc_info=True,
             )
 
         episode.duration_s = time.time() - t0

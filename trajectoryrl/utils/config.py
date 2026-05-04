@@ -37,7 +37,7 @@ SANDBOX_IMAGE_REPO = "ghcr.io/trajectoryrl/sandbox-agent"
 # consulted only as the fallback target when no on-chain spec_number group
 # reaches >50% stake, and as the value written into outgoing commitments /
 # payloads.
-SPEC_NUMBER = 9
+SPEC_NUMBER = 10
 
 # Backwards-compatible alias for legacy callers / persisted state. Will be
 # removed after one validator release cycle.
@@ -162,13 +162,12 @@ class ValidatorConfig:
     # Direct programmatic assignment to sandbox_image (e.g. tests) wins.
     image_channel: str = DEFAULT_IMAGE_CHANNEL
     sandbox_image: str = ""
-    sandbox_timeout_per_episode: int = 600  # 10 min per episode
-    sandbox_num_episodes: int = 4
-    # Scenario the sandbox runs. Currently published shell_verifier
-    # scenarios: cancel-async-tasks, log-summary-date-ranges,
-    # break-filter-js-from-html. Operators can pin a non-default
-    # scenario via the ``SANDBOX_SCENARIO`` env var.
-    sandbox_scenario: str = "cancel-async-tasks"
+    sandbox_timeout_per_episode: int = 600  # 10 min per scenario cell
+    # Scenarios + episodes-per-scenario are not configurable on purpose:
+    # every validator runs the same set so scores are comparable across
+    # validators / windows / SPEC_NUMBER bumps. To change the set, add a
+    # new ``SANDBOX_SCENARIOS`` constant in ``sandbox_harness.py`` and
+    # bump ``SPEC_NUMBER`` so cached scores invalidate.
 
     # Evaluation state persistence
     eval_state_path: Path = field(
@@ -272,8 +271,6 @@ class ValidatorConfig:
             # can still pass sandbox_image directly to bypass it.
             image_channel=os.getenv("IMAGE_CHANNEL", DEFAULT_IMAGE_CHANNEL),
             sandbox_timeout_per_episode=int(os.getenv("SANDBOX_TIMEOUT_PER_EPISODE", "600")),
-            sandbox_num_episodes=int(os.getenv("SANDBOX_NUM_EPISODES", "4")),
-            sandbox_scenario=os.getenv("SANDBOX_SCENARIO", "cancel-async-tasks"),
             # --- Startup aggregation ---
             aggregate_when_start=os.getenv("AGGREGATE_WHEN_START", "0") == "1",
             full_cycle_on_startup=os.getenv("FULL_CYCLE_ON_STARTUP", "0") == "1",

@@ -22,13 +22,19 @@ from trajectoryrl.utils.sandbox_harness import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_session_result(qualities: list[float]) -> _SessionResult:
-    result = _SessionResult(
-        episodes=[
-            _EpisodeResult(episode_index=i, quality=q)
-            for i, q in enumerate(qualities)
-        ],
-    )
+def _make_session_result(
+    cells: list[tuple[str, float]] | list[float],
+) -> _SessionResult:
+    """Build a session result. Accepts either ``[(scenario, q), ...]``
+    or a flat list of qualities (auto-tagged with ``scenario_<i>``)."""
+    eps: list[_EpisodeResult] = []
+    for i, item in enumerate(cells):
+        if isinstance(item, tuple):
+            scenario, q = item
+        else:
+            scenario, q = f"scenario_{i}", item
+        eps.append(_EpisodeResult(episode_index=i, scenario=scenario, quality=q))
+    result = _SessionResult(episodes=eps)
     result.compute_scores()
     return result
 
@@ -38,70 +44,76 @@ def _make_session_result(qualities: list[float]) -> _SessionResult:
 # ---------------------------------------------------------------------------
 
 class TestSandboxEvaluationResult:
-    def test_maps_final_score(self):
-        sr = _make_session_result([0.6, 0.7, 0.8, 0.9])
+    def test_maps_final_score_sums_per_scenario(self):
+        # Three scenarios, equal weight per scenario → final = sum.
+        sr = _make_session_result([
+            ("cancel-async-tasks",        0.833),
+            ("log-summary-date-ranges",   1.0),
+            ("break-filter-js-from-html", 0.5),
+        ])
         result = SandboxEvaluationResult(sr)
-        assert result.score == sr.final_score
+        assert abs(result.score - (0.833 + 1.0 + 0.5)) < 1e-6
         assert result.success is True
 
     def test_zero_score_not_qualified(self):
-        sr = _make_session_result([0.0, 0.0, 0.0, 0.0])
+        sr = _make_session_result([0.0, 0.0, 0.0])
         result = SandboxEvaluationResult(sr)
         assert result.score == 0.0
         assert result.success is False
 
-    def test_episode_qualities_exposed(self):
-        sr = _make_session_result([0.5, 0.6, 0.7, 0.8])
+    def test_scenario_qualities_exposed(self):
+        sr = _make_session_result([
+            ("a", 0.5), ("b", 0.6), ("c", 0.7),
+        ])
         result = SandboxEvaluationResult(sr)
-        assert result.episode_qualities == [0.5, 0.6, 0.7, 0.8]
+        assert result.scenario_qualities == {"a": 0.5, "b": 0.6, "c": 0.7}
+        assert result.scenarios == ["a", "b", "c"]
 
-    def test_delta_and_means(self):
-        sr = _make_session_result([0.4, 0.4, 0.8, 0.8])
+    def test_mean_quality_in_unit_range(self):
+        sr = _make_session_result([
+            ("a", 0.4), ("b", 0.4), ("c", 1.0),
+        ])
         result = SandboxEvaluationResult(sr)
-        assert abs(result.early_mean - 0.4) < 1e-9
-        assert abs(result.late_mean - 0.8) < 1e-9
-        assert abs(result.delta - 0.4) < 1e-9
+        assert abs(result.mean_quality - 0.6) < 1e-9
+        # final_score is a *sum* (range [0, N]); mean_quality is the
+        # convenience [0, 1] aggregate.
+        assert abs(result.score - 1.8) < 1e-9
 
     def test_error_field_default_none(self):
-        sr = _make_session_result([0.5, 0.5, 0.5, 0.5])
+        sr = _make_session_result([0.5, 0.5, 0.5])
         result = SandboxEvaluationResult(sr)
         assert result.error is None
 
-    def test_cost_fields_none_for_s1(self):
-        sr = _make_session_result([0.5, 0.5, 0.5, 0.5])
-        result = SandboxEvaluationResult(sr)
-        assert result.cost_usd is None
-        assert result.token_usage is None
-
 
 # ---------------------------------------------------------------------------
-# Tests: Split-half delta scoring
+# Tests: per-scenario session scoring
 # ---------------------------------------------------------------------------
 
 class TestSessionResultScoring:
-    def test_basic_delta(self):
-        sr = _make_session_result([0.4, 0.4, 0.8, 0.8])
-        assert abs(sr.early_mean - 0.4) < 1e-9
-        assert abs(sr.late_mean - 0.8) < 1e-9
-        assert abs(sr.delta - 0.4) < 1e-9
-        # final = 0.6 * (1 + 0.5 * 0.4) = 0.6 * 1.2 = 0.72
-        assert abs(sr.final_score - 0.72) < 0.01
+    def test_sum_across_scenarios(self):
+        sr = _make_session_result([("a", 0.5), ("b", 0.833), ("c", 1.0)])
+        # final_score = sum of correctness ratios (no learning bonus,
+        # equal weight per scenario).
+        assert abs(sr.final_score - 2.333) < 1e-3
+        assert abs(sr.mean_quality - 0.7777) < 1e-3
 
-    def test_negative_delta_no_bonus(self):
-        sr = _make_session_result([0.8, 0.8, 0.4, 0.4])
-        assert sr.delta < 0
-        assert sr.learning_bonus == 0.0
-        assert abs(sr.final_score - 0.6) < 1e-9
+    def test_no_episodes(self):
+        sr = _SessionResult()
+        sr.compute_scores()
+        assert sr.final_score == 0.0
+        assert sr.mean_quality == 0.0
 
-    def test_anti_sandbagging(self):
-        sr = _make_session_result([0.1, 0.1, 0.8, 0.8])
-        # early_mean=0.1 < 0.3, delta=0.7 > 0.4 → delta zeroed
-        assert sr.delta == 0.0
-        assert abs(sr.final_score - sr.mean_quality) < 1e-9
+    def test_perfect_session(self):
+        sr = _make_session_result([("a", 1.0), ("b", 1.0), ("c", 1.0)])
+        assert sr.final_score == 3.0
+        assert sr.mean_quality == 1.0
 
-    def test_fewer_than_4_episodes(self):
-        sr = _make_session_result([0.5, 0.8])
-        assert abs(sr.final_score - 0.65) < 0.01
+    def test_partial_credit_visible(self):
+        # The whole point of moving off binary scoring: a pack that
+        # passes 5 of 6 tests on one scenario gets credit instead of 0.
+        sr = _make_session_result([("scenario_a", 5 / 6)])
+        assert abs(sr.final_score - 5 / 6) < 1e-9
+        assert abs(sr.mean_quality - 5 / 6) < 1e-9
 
 
 # ---------------------------------------------------------------------------
@@ -113,13 +125,15 @@ class TestConfigWiring:
         assert hasattr(ValidatorConfig, "image_channel")
         assert hasattr(ValidatorConfig, "sandbox_image")
         assert hasattr(ValidatorConfig, "sandbox_timeout_per_episode")
-        assert hasattr(ValidatorConfig, "sandbox_num_episodes")
-        assert hasattr(ValidatorConfig, "sandbox_scenario")
 
-    def test_defaults(self):
-        assert ValidatorConfig.sandbox_num_episodes == 4
+    def test_dropped_legacy_fields(self):
+        # ``sandbox_scenario`` and ``sandbox_num_episodes`` were removed
+        # 2026-05-04 — the harness now hardcodes the scenario set.
+        assert not hasattr(ValidatorConfig, "sandbox_scenario")
+        assert not hasattr(ValidatorConfig, "sandbox_num_episodes")
+
+    def test_default_timeout(self):
         assert ValidatorConfig.sandbox_timeout_per_episode == 600
-        assert ValidatorConfig.sandbox_scenario == "cancel-async-tasks"
 
 
 # ---------------------------------------------------------------------------
@@ -301,23 +315,23 @@ class TestWriteArtifacts:
 
 
 class TestEvalResultCostAggregation:
-    def test_sums_billed_episodes(self):
+    def test_sums_billed_scenarios(self):
         sr = _SessionResult(episodes=[
-            _EpisodeResult(episode_index=0, quality=0.5, cost_usd=0.01),
-            _EpisodeResult(episode_index=1, quality=0.5, cost_usd=0.02),
+            _EpisodeResult(episode_index=0, scenario="a", quality=0.5, cost_usd=0.01),
+            _EpisodeResult(episode_index=1, scenario="b", quality=0.5, cost_usd=0.02),
         ])
         sr.compute_scores()
         result = SandboxEvaluationResult(sr)
         assert result.total_cost_usd == pytest.approx(0.03)
         assert result.mean_cost_usd == pytest.approx(0.015)
-        assert result.episode_costs_usd == [0.01, 0.02]
+        assert result.scenario_costs_usd == {"a": 0.01, "b": 0.02}
 
     def test_partial_billing(self):
-        # One episode unbilled (e.g. Hermes export failed) — aggregate
+        # One scenario unbilled (e.g. Hermes export failed) — aggregate
         # over the billed ones, don't fabricate zeros.
         sr = _SessionResult(episodes=[
-            _EpisodeResult(episode_index=0, quality=0.5, cost_usd=0.04),
-            _EpisodeResult(episode_index=1, quality=0.5, cost_usd=None),
+            _EpisodeResult(episode_index=0, scenario="a", quality=0.5, cost_usd=0.04),
+            _EpisodeResult(episode_index=1, scenario="b", quality=0.5, cost_usd=None),
         ])
         sr.compute_scores()
         result = SandboxEvaluationResult(sr)
@@ -326,8 +340,8 @@ class TestEvalResultCostAggregation:
 
     def test_no_billing(self):
         sr = _SessionResult(episodes=[
-            _EpisodeResult(episode_index=0, quality=0.5),
-            _EpisodeResult(episode_index=1, quality=0.5),
+            _EpisodeResult(episode_index=0, scenario="a", quality=0.5),
+            _EpisodeResult(episode_index=1, scenario="b", quality=0.5),
         ])
         sr.compute_scores()
         result = SandboxEvaluationResult(sr)
@@ -365,17 +379,11 @@ class TestExtractSkillMd:
 # Tests: shell_verifier scenario plumbing
 # ---------------------------------------------------------------------------
 
-def _make_harness(
-    scenario: str, sandbox_image: str = "", tmp_path=None,
-) -> TrajectorySandboxHarness:
+def _make_harness(sandbox_image: str = "", tmp_path=None) -> TrajectorySandboxHarness:
     """Build a harness without going near docker.from_env().
 
-    The shell_verifier helpers we test below only touch ``self.config``
-    + cached attribute state; we never call ``self.client``.
-
-    ``tmp_path`` redirects ``pack_cache_dir`` / ``log_dir`` so the
-    config's ``__post_init__`` mkdir doesn't try to create
-    ``/var/lib/trajectoryrl`` on the test runner.
+    The helpers we test only touch ``self.config`` + cached attribute
+    state; we never call ``self.client``.
     """
     from pathlib import Path
     import tempfile
@@ -383,7 +391,6 @@ def _make_harness(
     if tmp_path is None:
         tmp_path = Path(tempfile.mkdtemp())
     cfg = ValidatorConfig(
-        sandbox_scenario=scenario,
         pack_cache_dir=tmp_path / "packs",
         log_dir=tmp_path / "logs",
         eval_state_path=tmp_path / "eval_state.json",
@@ -398,31 +405,19 @@ def _make_harness(
 
 class TestSandboxTag:
     def test_named_tag(self):
-        h = _make_harness(
-            "cancel-async-tasks",
-            sandbox_image="ghcr.io/trajectoryrl/sandbox-agent:v4.0.0",
-        )
+        h = _make_harness(sandbox_image="ghcr.io/trajectoryrl/sandbox-agent:v4.0.0")
         assert h._sandbox_tag() == "v4.0.0"
 
     def test_latest_tag(self):
-        h = _make_harness(
-            "cancel-async-tasks",
-            sandbox_image="ghcr.io/trajectoryrl/sandbox-agent:latest",
-        )
+        h = _make_harness(sandbox_image="ghcr.io/trajectoryrl/sandbox-agent:latest")
         assert h._sandbox_tag() == "latest"
 
     def test_no_tag_falls_back_to_latest(self):
-        h = _make_harness(
-            "cancel-async-tasks",
-            sandbox_image="ghcr.io/trajectoryrl/sandbox-agent",
-        )
+        h = _make_harness(sandbox_image="ghcr.io/trajectoryrl/sandbox-agent")
         assert h._sandbox_tag() == "latest"
 
     def test_digest_pin_strips_to_latest(self):
-        # ``image@sha256:...`` references can't be reused against a
-        # sibling repo, so fall back to ``:latest`` for the scenario.
         h = _make_harness(
-            "cancel-async-tasks",
             sandbox_image="ghcr.io/trajectoryrl/sandbox-agent@sha256:abc123",
         )
         assert h._sandbox_tag() == "latest"
@@ -430,14 +425,11 @@ class TestSandboxTag:
 
 class TestScenarioImageRef:
     def test_returns_empty_when_no_info_loaded(self):
-        h = _make_harness("cancel-async-tasks")
+        h = _make_harness()
         assert h._scenario_image_ref() == ""
 
     def test_combines_repo_with_sandbox_tag(self):
-        h = _make_harness(
-            "cancel-async-tasks",
-            sandbox_image="ghcr.io/trajectoryrl/sandbox-agent:v4.0.0",
-        )
+        h = _make_harness(sandbox_image="ghcr.io/trajectoryrl/sandbox-agent:v4.0.0")
         h._scenario_info = {
             "name": "cancel-async-tasks",
             "image_repo": "ghcr.io/trajectoryrl/scenario-cancel-async-tasks",
@@ -447,6 +439,6 @@ class TestScenarioImageRef:
         )
 
     def test_returns_empty_when_image_repo_missing(self):
-        h = _make_harness("cancel-async-tasks")
+        h = _make_harness()
         h._scenario_info = {"name": "cancel-async-tasks"}
         assert h._scenario_image_ref() == ""
