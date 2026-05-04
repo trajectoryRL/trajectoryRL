@@ -287,66 +287,6 @@ class TestTrajectoryScorer:
         assert agg.success_rate == 0.5
         assert agg.mean_score == 0.45
 
-    def test_compute_final_score_no_variance(self, scorer):
-        agg = AggregatedScore(
-            mean_score=0.9,
-            variance=0.0,
-            success_rate=1.0,
-            total_evaluations=4,
-            scenario_scores={"a": 0.9},
-        )
-        final = scorer.compute_final_score(agg)
-        assert final == 0.9  # No penalty
-
-    def test_compute_final_score_with_variance(self, scorer):
-        agg = AggregatedScore(
-            mean_score=0.9,
-            variance=0.1,
-            success_rate=1.0,
-            total_evaluations=4,
-            scenario_scores={"a": 0.9},
-        )
-        # final = 0.9 - 0.1 * 0.1 = 0.89
-        final = scorer.compute_final_score(agg)
-        assert abs(final - 0.89) < 1e-6
-
-    def test_compute_final_score_clamped(self, scorer):
-        agg = AggregatedScore(
-            mean_score=0.01,
-            variance=1.0,
-            success_rate=0.0,
-            total_evaluations=1,
-            scenario_scores={},
-        )
-        final = scorer.compute_final_score(agg)
-        assert final == 0.0  # Clamped to 0
-
-    def test_full_scoring_pipeline(self, scorer, sample_results):
-        """End-to-end: results -> aggregate -> final score."""
-        agg = scorer.aggregate_scores(sample_results)
-        final = scorer.compute_final_score(agg)
-
-        expected_mean = (0.92 + 0.85 + 0.78 + 0.88) / 4  # 0.8575
-        expected_penalty = 0.1 * agg.variance
-        expected_final = max(0.0, min(1.0, expected_mean - expected_penalty))
-
-        assert abs(final - expected_final) < 1e-6
-        assert 0.0 <= final <= 1.0
-
-    def test_compute_final_score_no_quantization(self):
-        """Final score is continuous (no quantization)."""
-        s = TrajectoryScorer(rho_reliability=0.1)
-        agg = AggregatedScore(
-            mean_score=0.87,
-            variance=0.0,
-            success_rate=1.0,
-            total_evaluations=1,
-            scenario_scores={"a": 0.87},
-        )
-        # 0.87 - 0 = 0.87, returned as-is
-        assert s.compute_final_score(agg) == 0.87
-
-
 
 # ===================================================================
 # Epoch Seed & Scenario Rotation Tests
@@ -3288,7 +3228,7 @@ class TestIssue1EpochSkipSemantics:
         v.pack_fetcher = MagicMock()
         v._sandbox_harness = MagicMock()
         v._sandbox_harness.bench_image_hash = "bench"
-        v._sandbox_harness.harness_image_hash = "harness"
+        v._sandbox_harness.scenario_image_hash = "scenario"
         v._sandbox_harness.sandbox_version = "vtest"
 
         v._replay_pending_uploads = AsyncMock()

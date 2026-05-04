@@ -31,10 +31,10 @@ One install gives any agent (Claude Code, Cursor, Codex, OpenClaw, Hermes, Manus
 │  └───────────────┘                   │ verify hash       │   │
 │        │                             │                   │   │
 │        │                             │ Evaluate via      │   │
-│        │                             │ TrajRL-Bench:     │   │
-│        │                             │ sandbox + testee  │   │
-│        │                             │ agent + judge     │   │
-│        │                             │ agent (all SSH)   │   │
+│        │                             │ trajrl-bench:     │   │
+│        │                             │ run all scenarios │   │
+│        │                             │ (Hermes inside    │   │
+│        │                             │  scenario image)  │   │
 │        │                             └───────────────────┘   │
 │        │                                      │              │
 │        │                                      │ set_weights  │
@@ -47,7 +47,7 @@ One install gives any agent (Claude Code, Cursor, Codex, OpenClaw, Hermes, Manus
 ```
 
 - **No server required** — Miners upload packs to any HTTP endpoint and commit on-chain. No GPU, no uptime needed.
-- **Quality-based competition** — Testee agent SSHes into isolated sandbox, solves the task. A judge agent SSHes in, grounds its evaluation in mock service state, scores the result. 4 episodes per miner, split-half delta for learning bonus.
+- **Quality-based competition** — Validators run a fixed set of shell-verifier scenarios (Terminal-Bench-format). The agent runs *inside* each scenario's container with all its system + python deps available; a fresh verifier container scores the agent's output via `pytest`. Quality is continuous (`passed_tests / total_tests` from the verifier's `ctrf.json`), final score is the equal-weighted sum across scenarios. Cost per scenario is reported as a separate axis.
 - **Content-addressed** — Packs identified by SHA256 hash, verified against on-chain commitment.
 - **Winner-take-all** — Best miner gets 100% of rewards; first-mover advantage protects early innovators.
 - **Anti-copy** — NCD similarity detection + first-mover threshold.
@@ -97,8 +97,8 @@ btcli stake add --wallet-name my-validator --hotkey default --netuid 11 --amount
 
 # 2. Configure
 cp .env.validator.example .env.validator
-# Edit: set WALLET_NAME, LLM_API_KEY, LLM_BASE_URL, LLM_MODEL (testee),
-# and JUDGE_API_KEY/JUDGE_BASE_URL/JUDGE_MODEL (independent judge family).
+# Edit: set WALLET_NAME, LLM_API_KEY, LLM_BASE_URL, LLM_MODEL (the model
+# the testee agent uses to solve scenarios).
 
 # 3. Start
 docker compose -f docker/docker-compose.validator.yml --env-file .env.validator up -d
@@ -109,7 +109,7 @@ See [.env.validator.example](.env.validator.example) for all config options.
 
 ### For Miners
 
-Mining means writing a **SKILL.md** — instructions and strategies that teach an AI agent how to handle operational scenarios. The testee agent SSHes into an isolated sandbox (shell + mock services + scenario files), reads your SKILL.md, solves the task. A judge agent then SSHes in, grounds its evaluation in the sandbox state, and scores the work. No GPU, no server, no uptime required.
+Mining means writing a **SKILL.md** — instructions and strategies that teach an AI agent how to handle operational scenarios. The validator runs the agent (Hermes) inside each scenario's container — shell, filesystem, all the scenario-specific deps the original Terminal-Bench task installs. The agent reads your SKILL.md + the scenario's `INSTRUCTION.md` and solves the task; a fresh container of the same image runs `pytest` against the agent's output for the score. No GPU, no server, no uptime required.
 
 #### 1. Prerequisites (one-time)
 
@@ -140,25 +140,16 @@ See [MINER_OPERATIONS.md](docs/MINER_OPERATIONS.md) for full CLI reference (`bui
 
 #### 3. Test locally (optional)
 
-Prereqs: Docker, [uv](https://docs.astral.sh/uv/), an LLM API key, ~6 GB free disk.
+Prereqs: Docker, an LLM API key, ~10 GB free disk for the per-scenario images.
 
 ```bash
-git clone https://github.com/trajectoryRL/trajrl-bench.git
-cd trajrl-bench
-make install                                                # uv sync
-
-# Get the two Docker images (pull from GHCR is fastest):
-docker pull ghcr.io/trajectoryrl/trajrl-bench:latest
-docker pull ghcr.io/trajectoryrl/hermes-agent:latest
-# Or build locally:  make build-sandbox build-hermes
-
-cp .env.example .env                                        # set LLM_API_KEY
-
-# Run the starter bench (Qwen3.5 testee + GLM-5.1 judge, ~30 min):
-uv run python -m trajrl_bench.bench run --config configs/qwen35_starter.yaml
+docker pull ghcr.io/trajectoryrl/sandbox-agent:latest
+docker pull ghcr.io/trajectoryrl/scenario-cancel-async-tasks:latest
+docker pull ghcr.io/trajectoryrl/scenario-log-summary-date-ranges:latest
+docker pull ghcr.io/trajectoryrl/scenario-break-filter-js-from-html:latest
 ```
 
-See [MINER_GUIDE.md](docs/MINER_GUIDE.md) for the full guide: SKILL.md authoring, sandbox environment, scoring, and tips.
+Drop your SKILL.md in `/workspace/SKILL.md` inside a scenario container, then exec hermes against it as the `agent` user. See [MINER_GUIDE.md](docs/MINER_GUIDE.md) for the full guide: SKILL.md authoring, scenario environments, scoring, and tips.
 
 ## trajrl — consume what the playground produces
 
@@ -177,9 +168,8 @@ Source, skill catalog, and full documentation: https://github.com/trajectoryRL/t
 
 ## Documentation
 
-- **[Miner Guide](docs/MINER_GUIDE.md)** — SKILL.md authoring, sandbox environment, scoring, and submission
-- **[Season 1 Spec](docs/seasons/self_learning_s1.md)** — Design doc: sandbox architecture, scoring formula, scenarios
-- **[TrajRL-Bench](https://github.com/trajectoryRL/trajrl-bench)** — Agent skills benchmark (sandbox + testee + judge agent, three-container Docker)
+- **[Miner Guide](docs/MINER_GUIDE.md)** — SKILL.md authoring, scenario environments, scoring, and submission
+- **[trajrl-bench](https://github.com/trajectoryRL/trajrl-bench)** — Agent skills benchmark (per-scenario container images layered on a shared sandbox-agent base)
 - **[trajrl CLI](https://github.com/trajectoryRL/trajrl)** — Install and use skills produced by the subnet
 
 ## Community

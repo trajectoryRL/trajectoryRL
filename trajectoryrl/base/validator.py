@@ -7,8 +7,8 @@ Architecture (Season 1 — trajrl-bench):
     2. Read on-chain commitments (subtensor.get_all_commitments)
     3. Fetch packs from miners' public HTTP URLs
     4. NCD pairwise dedup; schema validation in _evaluate_miner
-    5. Run trajrl-bench sandbox evaluation (SKILL.md packs, SSH sandbox, LLM judge)
-    6. Compute split-half delta scoring (quality-based)
+    5. Run trajrl-bench shell_verifier sandbox evaluation (SKILL.md packs)
+    6. Score = Σ (passed/total) across scenarios; cost reported on a separate axis
     7. Set on-chain weights (winner-take-all / bootstrap)
 
 Each validator operates independently — Yuma Consensus aggregates on-chain.
@@ -115,8 +115,8 @@ class TrajectoryValidator:
     1. Reads on-chain commitments from miners
     2. Fetches and verifies packs from miners' public HTTP URLs
     3. NCD pairwise dedup (copiers rejected like integrity fail)
-    4. Runs trajrl-bench sandbox evaluation (SSH sandbox, LLM judge)
-    5. Computes split-half delta scoring (quality-based)
+    4. Runs trajrl-bench shell_verifier sandbox evaluation
+    5. Score = Σ (passed/total) across scenarios; cost on a separate axis
     6. Sets on-chain weights (winner-take-all or bootstrap)
     7. Re-sets weights every tempo (~72 min) for convergence
 
@@ -730,7 +730,7 @@ class TrajectoryValidator:
                     last_set_weights_at=self._last_set_weights_at,
                     last_eval_at=self._last_eval_at,
                     bench_image_hash=self._sandbox_harness.bench_image_hash,
-                    harness_image_hash=self._sandbox_harness.harness_image_hash,
+                    scenario_image_hash=self._sandbox_harness.scenario_image_hash,
                     bench_version=self._sandbox_harness.sandbox_version,
                 )
             except Exception as e:
@@ -2405,13 +2405,13 @@ class TrajectoryValidator:
     # ------------------------------------------------------------------
 
     def _harness_metadata(self) -> Dict[str, str]:
-        """Return bench/harness image hashes and bench version for submit payloads."""
+        """Return bench + scenario image hashes and bench version for submit payloads."""
         h = self._sandbox_harness
         meta: Dict[str, str] = {}
         if h.bench_image_hash != "unknown":
             meta["bench_image_hash"] = h.bench_image_hash
-        if h.harness_image_hash != "unknown":
-            meta["harness_image_hash"] = h.harness_image_hash
+        if h.scenario_image_hash != "unknown":
+            meta["scenario_image_hash"] = h.scenario_image_hash
         if h.sandbox_version != "unknown":
             meta["bench_version"] = h.sandbox_version
         return meta
@@ -2446,11 +2446,12 @@ class TrajectoryValidator:
             )
             return 0.0
 
-        # Aggregate raw score (mean across scenarios)
-        raw_score = (
-            sum(_scenario_score(s, q) for s, q in raw_qualified.items())
-            / len(raw_qualified)
-            if raw_qualified else 0.0
+        # Aggregate raw score: Σ per-scenario quality (range [0, N] for
+        # N scenarios). Each per-scenario quality is passed/total ∈ [0, 1]
+        # from the verifier's ctrf.json; equal-weighted sum is the
+        # session score per Ning's 2026-05-04 design.
+        raw_score = sum(
+            _scenario_score(s, q) for s, q in raw_qualified.items()
         )
 
         # Per-scenario results

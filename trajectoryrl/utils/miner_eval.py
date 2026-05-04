@@ -152,8 +152,8 @@ async def evaluate_miner_s1(
         )
 
     log.info(
-        "S1 evaluation: %d episodes, skill_md=%d chars",
-        harness.config.sandbox_num_episodes, len(skill_md),
+        "S1 evaluation: %d scenarios, skill_md=%d chars",
+        len(harness.sandbox_scenarios), len(skill_md),
     )
 
     # Step 2: Run trajrl-bench sandbox evaluation
@@ -183,42 +183,33 @@ async def evaluate_miner_s1(
 
     # Step 3: Per-episode transcript tail logging (file-only via mlog)
     for ep in result.session_result.episodes:
-        idx = ep.episode_index
         if ep.transcript:
             log.info(
-                "Episode %d testee transcript tail (%d chars):\n%s",
-                idx, len(ep.transcript), ep.transcript[-3000:],
-            )
-        if ep.judge_transcript:
-            log.info(
-                "Episode %d judge transcript tail (%d chars):\n%s",
-                idx, len(ep.judge_transcript), ep.judge_transcript[-3000:],
+                "[%s] testee transcript tail (%d chars):\n%s",
+                ep.scenario, len(ep.transcript), ep.transcript[-3000:],
             )
 
-    # Step 4: Map S1 result to validator pipeline judge_details
-    scenario_name = result.scenario_name
-    qualified = result.success
-
+    # Step 4: Map S1 result to validator pipeline judge_details.
+    # One entry per scenario, keyed by scenario name. ``overall_score``
+    # is the per-scenario quality (passed/total ∈ [0, 1]); the headline
+    # session score = Σ qualities is computed downstream by
+    # _fire_submit_eval.
     log.info(
-        "S1 result: final_score=%.3f, mean_quality=%.3f, delta=%.3f, "
-        "episodes=%s, qualified=%s",
-        result.score, result.mean_quality, result.delta,
-        result.episode_qualities, qualified,
+        "S1 result: final_score=%.3f, mean_quality=%.3f, scenarios=%s",
+        result.score, result.mean_quality, result.scenario_qualities,
     )
 
-    judge_details = {
-        scenario_name: {
-            "overall_score": round(result.score, 4),
-            "mean_quality": round(result.mean_quality, 4),
-            "delta": round(result.delta, 4),
-            "early_mean": round(result.early_mean, 4),
-            "late_mean": round(result.late_mean, 4),
-            "episode_qualities": [round(q, 4) for q in result.episode_qualities],
-            "qualification_gate": qualified,
+    judge_details: Dict[str, Dict] = {}
+    for scenario in result.scenarios:
+        quality = float(result.scenario_qualities.get(scenario, 0.0))
+        cost = result.scenario_costs_usd.get(scenario)
+        judge_details[scenario] = {
+            "overall_score": round(quality, 4),
+            "qualification_gate": quality > 0.0,
+            "cost_usd": round(cost, 6) if cost is not None else None,
             "harness": "trajrl-bench",
             "sandbox_version": harness.sandbox_version,
-        },
-    }
+        }
 
     return MinerEvalOutcome(
         success=True,

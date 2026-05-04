@@ -145,32 +145,6 @@ class TrajectoryScorer:
             scenario_weights=weights,
         )
 
-    def compute_final_score(
-        self,
-        aggregated: AggregatedScore
-    ) -> float:
-        """Compute final score with reliability penalty.
-
-        Args:
-            aggregated: AggregatedScore from multiple evaluations
-
-        Returns:
-            Final score in [0, 1]
-        """
-        # Apply variance penalty
-        reliability_penalty = self.rho_reliability * aggregated.variance
-        final = aggregated.mean_score - reliability_penalty
-
-        # Clamp to [0, 1]
-        final = max(0.0, min(1.0, final))
-
-        logger.debug(
-            f"Final score: {final:.3f} = "
-            f"{aggregated.mean_score:.3f} - {reliability_penalty:.3f}"
-        )
-
-        return final
-
     def select_winner(
         self,
         scores: Dict[int, float],
@@ -547,7 +521,9 @@ def compute_consensus_scores(
 
     Returns:
         Tuple of (consensus_scores, consensus_disqualified):
-          - consensus_scores: Dict[miner_hotkey -> stake-weighted score (0.0–1.0)]
+          - consensus_scores: Dict[miner_hotkey -> stake-weighted score].
+            Range follows the per-validator score range — currently
+            [0, N] where N = number of shell_verifier scenarios.
           - consensus_disqualified: Dict[miner_hotkey -> reason] for miners
             where disqualification stake exceeds the threshold
     """
