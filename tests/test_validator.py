@@ -3248,7 +3248,7 @@ class TestIssue1EpochSkipSemantics:
         v.pack_fetcher = MagicMock()
         v._sandbox_harness = MagicMock()
         v._sandbox_harness.bench_image_hash = "bench"
-        v._sandbox_harness.harness_image_hash = "harness"
+        v._sandbox_harness.scenario_image_hash = "scenario"
         v._sandbox_harness.sandbox_version = "vtest"
 
         v._replay_pending_uploads = AsyncMock()

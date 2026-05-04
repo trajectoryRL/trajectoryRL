@@ -11,12 +11,13 @@ logger = logging.getLogger(__name__)
 DEFAULT_LLM_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
 DEFAULT_LLM_MODEL = "glm-5.1"
 
-# Image channel drives the tag of sandbox/harness images pulled by the
-# validator at runtime. Compose files set this per-channel (latest, staging,
-# etc.). Full overrides via SANDBOX_IMAGE / HARNESS_IMAGE take precedence.
+# Image channel drives the tag of the sandbox-agent image pulled by the
+# validator at runtime. Compose files set this per-channel (latest,
+# staging, etc.). Full override via SANDBOX_IMAGE takes precedence. The
+# legacy harness image (ghcr.io/trajectoryrl/hermes-agent) was retired
+# 2026-05-04 with the unified sandbox+agent architecture.
 DEFAULT_IMAGE_CHANNEL = "latest"
-SANDBOX_IMAGE_REPO = "ghcr.io/trajectoryrl/trajrl-bench"
-HARNESS_IMAGE_REPO = "ghcr.io/trajectoryrl/hermes-agent"
+SANDBOX_IMAGE_REPO = "ghcr.io/trajectoryrl/sandbox-agent"
 
 # SPEC_NUMBER identifies a "scoring specification": the combination of
 # scenario set, scoring methodology, and judge prompt that determines whether
@@ -36,7 +37,7 @@ HARNESS_IMAGE_REPO = "ghcr.io/trajectoryrl/hermes-agent"
 # consulted only as the fallback target when no on-chain spec_number group
 # reaches >50% stake, and as the value written into outgoing commitments /
 # payloads.
-SPEC_NUMBER = 7
+SPEC_NUMBER = 8
 
 # Backwards-compatible alias for legacy callers / persisted state. Will be
 # removed after one validator release cycle.
@@ -155,23 +156,19 @@ class ValidatorConfig:
     judge_api_key: str = ""
     judge_base_url: str = ""
 
-    # trajrl-bench sandbox evaluation
-    # image_channel is the canonical knob: it selects the tag (e.g. "latest",
-    # "staging", "v1.2.0-rc.1") used to construct sandbox_image / harness_image
-    # when those are left empty. Direct programmatic assignment to
-    # sandbox_image / harness_image (e.g. tests) still wins.
+    # trajrl-bench sandbox evaluation.
+    # image_channel selects the tag (e.g. "latest", "staging",
+    # "vX.Y.Z") used to construct sandbox_image when it's left empty.
+    # Direct programmatic assignment to sandbox_image (e.g. tests) wins.
     image_channel: str = DEFAULT_IMAGE_CHANNEL
     sandbox_image: str = ""
-    harness_image: str = ""
-    sandbox_timeout_per_episode: int = 600  # 10 min per episode (Qwen3-class testees)
+    sandbox_timeout_per_episode: int = 600  # 10 min per episode
     sandbox_num_episodes: int = 4
-    # Scenario the sandbox CLI should generate fixtures for. The CLI
-    # supports incident_response, morning_brief, and codebase_fix (see
-    # trajrl_bench.fixture_factory.SCENARIOS). Default is codebase_fix
-    # — the newest scenario and the one the mistakes-and-memory
-    # learning rubric is designed around; operators can still pin an
-    # older scenario via ``SANDBOX_SCENARIO``.
-    sandbox_scenario: str = "codebase_fix"
+    # Scenario the sandbox runs. Currently published shell_verifier
+    # scenarios: cancel-async-tasks, log-summary-date-ranges,
+    # break-filter-js-from-html. Operators can pin a non-default
+    # scenario via the ``SANDBOX_SCENARIO`` env var.
+    sandbox_scenario: str = "cancel-async-tasks"
 
     # Evaluation state persistence
     eval_state_path: Path = field(
@@ -219,8 +216,6 @@ class ValidatorConfig:
 
         if not self.sandbox_image:
             self.sandbox_image = f"{SANDBOX_IMAGE_REPO}:{self.image_channel}"
-        if not self.harness_image:
-            self.harness_image = f"{HARNESS_IMAGE_REPO}:{self.image_channel}"
 
     @classmethod
     def from_env(cls, dotenv_path: Optional[Path] = None) -> "ValidatorConfig":
@@ -272,13 +267,13 @@ class ValidatorConfig:
             consensus_api_url=os.getenv("CONSENSUS_API_URL", "https://trajrl.com"),
             quorum_threshold=float(os.getenv("QUORUM_THRESHOLD", "0.5")),
             # --- trajrl-bench ---
-            # IMAGE_CHANNEL is the only env-driven knob: it selects the tag
-            # for both sandbox and harness images. Programmatic callers can
-            # still pass sandbox_image / harness_image directly to bypass it.
+            # IMAGE_CHANNEL is the only env-driven image knob: it selects
+            # the tag of the sandbox-agent image. Programmatic callers
+            # can still pass sandbox_image directly to bypass it.
             image_channel=os.getenv("IMAGE_CHANNEL", DEFAULT_IMAGE_CHANNEL),
             sandbox_timeout_per_episode=int(os.getenv("SANDBOX_TIMEOUT_PER_EPISODE", "600")),
             sandbox_num_episodes=int(os.getenv("SANDBOX_NUM_EPISODES", "4")),
-            sandbox_scenario=os.getenv("SANDBOX_SCENARIO", "codebase_fix"),
+            sandbox_scenario=os.getenv("SANDBOX_SCENARIO", "cancel-async-tasks"),
             # --- Startup aggregation ---
             aggregate_when_start=os.getenv("AGGREGATE_WHEN_START", "0") == "1",
             full_cycle_on_startup=os.getenv("FULL_CYCLE_ON_STARTUP", "0") == "1",

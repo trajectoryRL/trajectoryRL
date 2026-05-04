@@ -728,7 +728,7 @@ class TrajectoryValidator:
                     last_set_weights_at=self._last_set_weights_at,
                     last_eval_at=self._last_eval_at,
                     bench_image_hash=self._sandbox_harness.bench_image_hash,
-                    harness_image_hash=self._sandbox_harness.harness_image_hash,
+                    scenario_image_hash=self._sandbox_harness.scenario_image_hash,
                     bench_version=self._sandbox_harness.sandbox_version,
                 )
             except Exception as e:
@@ -2441,13 +2441,13 @@ class TrajectoryValidator:
     # ------------------------------------------------------------------
 
     def _harness_metadata(self) -> Dict[str, str]:
-        """Return bench/harness image hashes and bench version for submit payloads."""
+        """Return bench + scenario image hashes and bench version for submit payloads."""
         h = self._sandbox_harness
         meta: Dict[str, str] = {}
         if h.bench_image_hash != "unknown":
             meta["bench_image_hash"] = h.bench_image_hash
-        if h.harness_image_hash != "unknown":
-            meta["harness_image_hash"] = h.harness_image_hash
+        if h.scenario_image_hash != "unknown":
+            meta["scenario_image_hash"] = h.scenario_image_hash
         if h.sandbox_version != "unknown":
             meta["bench_version"] = h.sandbox_version
         return meta

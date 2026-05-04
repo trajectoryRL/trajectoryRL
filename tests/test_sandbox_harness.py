@@ -60,15 +60,6 @@ class TestSandboxEvaluationResult:
         assert abs(result.late_mean - 0.8) < 1e-9
         assert abs(result.delta - 0.4) < 1e-9
 
-    def test_tool_calls_summed(self):
-        sr = _SessionResult(episodes=[
-            _EpisodeResult(episode_index=0, quality=0.5, tool_calls=5),
-            _EpisodeResult(episode_index=1, quality=0.5, tool_calls=10),
-        ])
-        sr.compute_scores()
-        result = SandboxEvaluationResult(sr)
-        assert result.tool_calls == 15
-
     def test_error_field_default_none(self):
         sr = _make_session_result([0.5, 0.5, 0.5, 0.5])
         result = SandboxEvaluationResult(sr)
@@ -116,67 +107,59 @@ class TestSessionResultScoring:
 # ---------------------------------------------------------------------------
 
 class TestConfigWiring:
-    def test_default_harness_is_trajrl_bench(self):
-        assert ValidatorConfig.evaluation_harness == "trajrl-bench"
-
-    def test_season1_config_fields_exist(self):
-        assert hasattr(ValidatorConfig, "evaluation_harness")
+    def test_config_fields_exist(self):
         assert hasattr(ValidatorConfig, "image_channel")
         assert hasattr(ValidatorConfig, "sandbox_image")
-        assert hasattr(ValidatorConfig, "harness_image")
         assert hasattr(ValidatorConfig, "sandbox_timeout_per_episode")
         assert hasattr(ValidatorConfig, "sandbox_num_episodes")
+        assert hasattr(ValidatorConfig, "sandbox_scenario")
 
-    def test_season1_defaults(self):
+    def test_defaults(self):
         assert ValidatorConfig.sandbox_num_episodes == 4
-        assert ValidatorConfig.sandbox_timeout_per_episode == 180
+        assert ValidatorConfig.sandbox_timeout_per_episode == 600
+        assert ValidatorConfig.sandbox_scenario == "cancel-async-tasks"
 
 
 # ---------------------------------------------------------------------------
 # Tests: image channel resolution
 # ---------------------------------------------------------------------------
 
+def _config(tmp_path, **overrides) -> ValidatorConfig:
+    """Build a ValidatorConfig pointed at a tmp dir so the
+    ``__post_init__`` mkdir doesn't try to create
+    ``/var/lib/trajectoryrl`` on the test runner."""
+    return ValidatorConfig(
+        pack_cache_dir=tmp_path / "packs",
+        log_dir=tmp_path / "logs",
+        eval_state_path=tmp_path / "eval_state.json",
+        winner_state_path=tmp_path / "winner_state.json",
+        pack_first_seen_path=tmp_path / "pack_first_seen.json",
+        active_set_dir=tmp_path / "active_sets",
+        **overrides,
+    )
+
+
 class TestImageChannel:
-    def test_default_channel_derives_latest(self):
-        cfg = ValidatorConfig()
+    def test_default_channel_derives_latest(self, tmp_path):
+        cfg = _config(tmp_path)
         assert cfg.image_channel == "latest"
-        assert cfg.sandbox_image == "ghcr.io/trajectoryrl/trajrl-bench:latest"
-        assert cfg.harness_image == "ghcr.io/trajectoryrl/hermes-agent:latest"
+        assert cfg.sandbox_image == "ghcr.io/trajectoryrl/sandbox-agent:latest"
 
-    def test_staging_channel_derives_staging_tag(self):
-        cfg = ValidatorConfig(image_channel="staging")
-        assert cfg.sandbox_image == "ghcr.io/trajectoryrl/trajrl-bench:staging"
-        assert cfg.harness_image == "ghcr.io/trajectoryrl/hermes-agent:staging"
+    def test_staging_channel_derives_staging_tag(self, tmp_path):
+        cfg = _config(tmp_path, image_channel="staging")
+        assert cfg.sandbox_image == "ghcr.io/trajectoryrl/sandbox-agent:staging"
 
-    def test_arbitrary_channel_derives_matching_tag(self):
-        cfg = ValidatorConfig(image_channel="v1.2.0-rc.1")
-        assert cfg.sandbox_image == "ghcr.io/trajectoryrl/trajrl-bench:v1.2.0-rc.1"
-        assert cfg.harness_image == "ghcr.io/trajectoryrl/hermes-agent:v1.2.0-rc.1"
+    def test_arbitrary_channel_derives_matching_tag(self, tmp_path):
+        cfg = _config(tmp_path, image_channel="v1.2.0-rc.1")
+        assert cfg.sandbox_image == "ghcr.io/trajectoryrl/sandbox-agent:v1.2.0-rc.1"
 
-    def test_explicit_sandbox_image_overrides_channel(self):
-        cfg = ValidatorConfig(
+    def test_explicit_sandbox_image_overrides_channel(self, tmp_path):
+        cfg = _config(
+            tmp_path,
             image_channel="staging",
-            sandbox_image="ghcr.io/custom/sandbox:debug",
+            sandbox_image="ghcr.io/custom/sandbox-agent:debug",
         )
-        assert cfg.sandbox_image == "ghcr.io/custom/sandbox:debug"
-        assert cfg.harness_image == "ghcr.io/trajectoryrl/hermes-agent:staging"
-
-    def test_explicit_harness_image_overrides_channel(self):
-        cfg = ValidatorConfig(
-            image_channel="staging",
-            harness_image="ghcr.io/custom/hermes:debug",
-        )
-        assert cfg.sandbox_image == "ghcr.io/trajectoryrl/trajrl-bench:staging"
-        assert cfg.harness_image == "ghcr.io/custom/hermes:debug"
-
-    def test_both_overrides_bypass_channel(self):
-        cfg = ValidatorConfig(
-            image_channel="staging",
-            sandbox_image="trajrl-bench:local",
-            harness_image="hermes-agent:local",
-        )
-        assert cfg.sandbox_image == "trajrl-bench:local"
-        assert cfg.harness_image == "hermes-agent:local"
+        assert cfg.sandbox_image == "ghcr.io/custom/sandbox-agent:debug"
 
 
 # ---------------------------------------------------------------------------
@@ -203,3 +186,94 @@ class TestExtractSkillMd:
     def test_returns_none_for_no_files_key(self):
         pack = {"agents": []}
         assert TrajectorySandboxHarness.extract_skill_md(pack) is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: shell_verifier scenario plumbing
+# ---------------------------------------------------------------------------
+
+def _make_harness(
+    scenario: str, sandbox_image: str = "", tmp_path=None,
+) -> TrajectorySandboxHarness:
+    """Build a harness without going near docker.from_env().
+
+    The shell_verifier helpers we test below only touch ``self.config``
+    + cached attribute state; we never call ``self.client``.
+
+    ``tmp_path`` redirects ``pack_cache_dir`` / ``log_dir`` so the
+    config's ``__post_init__`` mkdir doesn't try to create
+    ``/var/lib/trajectoryrl`` on the test runner.
+    """
+    from pathlib import Path
+    import tempfile
+
+    if tmp_path is None:
+        tmp_path = Path(tempfile.mkdtemp())
+    cfg = ValidatorConfig(
+        sandbox_scenario=scenario,
+        pack_cache_dir=tmp_path / "packs",
+        log_dir=tmp_path / "logs",
+        eval_state_path=tmp_path / "eval_state.json",
+        winner_state_path=tmp_path / "winner_state.json",
+        pack_first_seen_path=tmp_path / "pack_first_seen.json",
+        active_set_dir=tmp_path / "active_sets",
+    )
+    if sandbox_image:
+        cfg.sandbox_image = sandbox_image
+    return TrajectorySandboxHarness(cfg)
+
+
+class TestSandboxTag:
+    def test_named_tag(self):
+        h = _make_harness(
+            "cancel-async-tasks",
+            sandbox_image="ghcr.io/trajectoryrl/sandbox-agent:v4.0.0",
+        )
+        assert h._sandbox_tag() == "v4.0.0"
+
+    def test_latest_tag(self):
+        h = _make_harness(
+            "cancel-async-tasks",
+            sandbox_image="ghcr.io/trajectoryrl/sandbox-agent:latest",
+        )
+        assert h._sandbox_tag() == "latest"
+
+    def test_no_tag_falls_back_to_latest(self):
+        h = _make_harness(
+            "cancel-async-tasks",
+            sandbox_image="ghcr.io/trajectoryrl/sandbox-agent",
+        )
+        assert h._sandbox_tag() == "latest"
+
+    def test_digest_pin_strips_to_latest(self):
+        # ``image@sha256:...`` references can't be reused against a
+        # sibling repo, so fall back to ``:latest`` for the scenario.
+        h = _make_harness(
+            "cancel-async-tasks",
+            sandbox_image="ghcr.io/trajectoryrl/sandbox-agent@sha256:abc123",
+        )
+        assert h._sandbox_tag() == "latest"
+
+
+class TestScenarioImageRef:
+    def test_returns_empty_when_no_info_loaded(self):
+        h = _make_harness("cancel-async-tasks")
+        assert h._scenario_image_ref() == ""
+
+    def test_combines_repo_with_sandbox_tag(self):
+        h = _make_harness(
+            "cancel-async-tasks",
+            sandbox_image="ghcr.io/trajectoryrl/sandbox-agent:v4.0.0",
+        )
+        h._scenario_info = {
+            "name": "cancel-async-tasks",
+            "image_repo": "ghcr.io/trajectoryrl/scenario-cancel-async-tasks",
+        }
+        assert h._scenario_image_ref() == (
+            "ghcr.io/trajectoryrl/scenario-cancel-async-tasks:v4.0.0"
+        )
+
+    def test_returns_empty_when_image_repo_missing(self):
+        h = _make_harness("cancel-async-tasks")
+        h._scenario_info = {"name": "cancel-async-tasks"}
+        assert h._scenario_image_ref() == ""
