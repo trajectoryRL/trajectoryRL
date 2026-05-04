@@ -313,6 +313,25 @@ Validators only re-evaluate when your `pack_hash` changes. No need to resubmit i
 
 Re-submitting the same `(hotkey, pack_hash)` to `/api/v2/miners/submit` (Path B) within 1h is rate-limited by the cooldown; outside the cooldown it just bumps `refresh_time` without re-running the pipeline.
 
+### Submission timing — the 2.4 h freeze gap
+
+The eval set for an epoch is **frozen 2.4 h before the epoch starts** (at `aggregation_start` of the previous epoch). A pack that lands inside that 2.4 h window is **not** in the upcoming epoch's snapshot — it gets evaluated in the *next* epoch instead.
+
+```
+... ← previous epoch ──┬───── 2.4 h freeze gap ─────┐ epoch N starts ... eval runs ...
+                       ↑                            ↑
+                    cutoff for                     window_start(N)
+                    epoch N's snapshot
+```
+
+Practical rules of thumb:
+
+- **Want to be evaluated this epoch?** Get your `set_commitment` (Path A) or `web-submit` (Path B) confirmed at least **~3 h before the next epoch boundary**. Anything later goes into the epoch after.
+- **Pack already on chain, no `pack_hash` change?** You don't need to do anything — the sync worker re-stamps `refresh_time` every ~5 min as long as the chain commitment is alive, so you stay in every future window.
+- **Switched packs late?** Pack swaps that miss the cutoff don't dodge anything — they simply land in the next snapshot. The frozen snapshot rule means validators evaluate the pack you had at cutoff, not the one you swap in mid-epoch.
+
+For the full window math (`cutoff_time`, `eligible_start_time`, `refresh_time` semantics), see [INCENTIVE_MECHANISM.md § Snapshot eligibility window](INCENTIVE_MECHANISM.md#snapshot-eligibility-window).
+
 ### Picking a hosting option
 
 | | `upload` (self-hosted) | `web-submit` (managed) |

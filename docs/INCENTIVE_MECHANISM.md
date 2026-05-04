@@ -213,6 +213,25 @@ The eval target set for epoch N is fetched once per cycle from `POST /api/v2/val
 
 Each entry comes back with `pre_eval_status ∈ {passed, failed}` plus `pre_eval_reason` for failures. Failed entries are rejection-submitted as `(rejected=true, score=weight=0)` and **never enter the eval loop**; passed entries proceed to scenario evaluation. Runtime-only filters (validator permit, blacklist) are applied live on top of the snapshot — those are dynamic and intentionally outside the immutable freeze.
 
+#### Snapshot eligibility window
+
+The snapshot for epoch N freezes the eval set at a deterministic cutoff before epoch N starts:
+
+```
+cutoff_block        = window_start(N) - (EVAL_INTERVAL - T_AGGREGATE)
+                    = window_start(N) - 720 blocks         // ≈ 2.4 h
+                    = aggregation_start(N-1)
+cutoff_time         = block→time(cutoff_block)
+eligible_start_time = cutoff_time - inactivity_window_hours      // 48 h
+```
+
+The eligibility window is the half-open interval `[eligible_start_time, cutoff_time)` evaluated against each row's `refresh_time` (the rolling activity stamp on `miner_submissions`). Two consequences:
+
+- **Upper bound (`cutoff_time`)**: rows with `refresh_time ≥ cutoff_time` are excluded from epoch N. The 2.4 h gap from `window_start(N)` is the contract with the platform's sync worker — every commitment that lands before `cutoff_time` is guaranteed to have its full pre-eval pipeline complete before epoch N's eval phase opens. A pack that arrives *during* the 2.4 h gap is held over to **epoch N+1**, never silently re-evaluated mid-epoch.
+- **Lower bound (`eligible_start_time`)**: rows with `refresh_time` older than 48 h before `cutoff_time` are treated as abandoned and excluded. `refresh_time` is bumped on every upsert touch — the platform's `sync-metagraph` job re-stamps it every ~5 min for any commitment still on chain, and `/api/v2/miners/submit` re-stamps it whenever the same `(hotkey, pack_hash)` is re-posted. So an active miner whose chain commitment stays in place is held in the window indefinitely; only genuinely silent miners age out.
+
+For each surviving miner the latest row by `refresh_time` is kept (DISTINCT ON `miner_hotkey`); entries are returned sorted `(refresh_time ASC, hotkey ASC)`.
+
 #### Local cache & restart behavior
 
 The successful response is mirrored to disk so a validator restart inside epoch N resumes without another HTTP round-trip:
