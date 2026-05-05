@@ -1898,8 +1898,9 @@ class TrajectoryValidator:
                         qualified=False,
                         pack_url=commitment.pack_url,
                         pack_hash=commitment.pack_hash,
-                        llm_base_url=self._judge_base_url,
-                        llm_model=self._judge_model,
+                        llm_base_url=self.config.llm_base_url,
+                        llm_model=self.config.llm_model,
+                        judge_model=self._judge_model,
                         rejected=True,
                         rejection_stage="integrity_check",
                         rejection_detail=detail,
@@ -2288,8 +2289,9 @@ class TrajectoryValidator:
                     qualified=False,
                     pack_url=entry.pack_url,
                     pack_hash=entry.pack_hash,
-                    llm_base_url=self._judge_base_url,
-                    llm_model=self._judge_model,
+                    llm_base_url=self.config.llm_base_url,
+                    llm_model=self.config.llm_model,
+                    judge_model=self._judge_model,
                     rejected=True,
                     rejection_stage=stage,
                     rejection_detail=detail,
@@ -2534,8 +2536,15 @@ class TrajectoryValidator:
             pack_hash=commitment.pack_hash,
             eval_count=eval_count,
             scenario_results=scenario_results,
-            llm_base_url=self._judge_base_url,
-            llm_model=self._judge_model,
+            # Report the testee model (the LLM that ran the SKILL.md) in
+            # llm_model. judge_model carries the LLM-judge model for
+            # backward-compat / future use; with v0.6.0+ shell_verifier
+            # there is no LLM judge in the eval pipeline, but the field
+            # is preserved so operators can pin an evaluator model when
+            # we re-introduce a judge for a subset of scenarios.
+            llm_base_url=self.config.llm_base_url,
+            llm_model=self.config.llm_model,
+            judge_model=self._judge_model,
             spec_number=_spec_number(),
             epoch_number=window_number,
             **self._harness_metadata(),
