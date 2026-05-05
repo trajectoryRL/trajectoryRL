@@ -2520,7 +2520,16 @@ class TrajectoryValidator:
             block_height=block_height,
             score=round(raw_score, 4),
             weight=0.0,
-            qualified=bool(raw_qualified and all(raw_qualified.values())),
+            # Qualified = miner produced *some* real output (≥1 scenario
+            # passed ≥1 test). The previous all-pass gate was too strict
+            # under the N=3 shell_verifier contract: scenarios like
+            # break-filter-js-from-html require non-obvious bypass
+            # payloads (e.g. parser-discrepancy XSS) that virtually no
+            # pack ships, so the all-pass gate flagged every miner as
+            # unqualified — including ones cleanly hitting 5/6 on
+            # cancel-async-tasks. Relax to any-pass; tighten back when
+            # the scenario pool is bigger and more uniformly tractable.
+            qualified=bool(raw_qualified) and any(raw_qualified.values()),
             pack_url=commitment.pack_url,
             pack_hash=commitment.pack_hash,
             eval_count=eval_count,
