@@ -2,12 +2,13 @@
 """Evaluate a local pack file as a validator would (Season 1 sandbox).
 
 Reads a local Season 1 pack JSON (or a bare SKILL.md), validates schema,
-runs the trajrl-bench 3-container evaluation (sandbox + testee + judge),
-and prints the split-half delta scoring summary.
+runs the trajrl-bench shell_verifier evaluation across every scenario in
+``SANDBOX_SCENARIOS`` (one episode per scenario, one fresh container per
+scenario), and prints per-scenario passed/total + the equal-weighted Σ
+final score in [0, N].
 
-No chain connection needed — pure local evaluation. Same harness and
-scoring as ``scripts/eval_miners.py`` but skips the on-chain commitment
-fetch in favour of a local pack file.
+No chain connection needed — pure local evaluation. Same harness as the
+production validator pipeline.
 
 Configuration is taken from ``.env.validator`` via ``ValidatorConfig.from_env``.
 The CLI exposes only the few flags that are unique to local pack
@@ -26,7 +27,6 @@ Usage:
 
 To override env values temporarily:
     LLM_MODEL=openai/gpt-4o python scripts/eval_pack.py --pack pack.json
-    SANDBOX_NUM_EPISODES=2 python scripts/eval_pack.py --pack pack.json
 """
 
 import argparse
@@ -111,25 +111,23 @@ def _print_summary(
     print(f"Pack hash:       {pack_hash[:16]}...")
     print(f"Sandbox version: {sandbox_version}")
     print(f"Spec number:     {spec_number}")
-    print(f"Scenario:        {result.scenario_name}")
     print("=" * W)
 
-    print(f"\n  {'Episode':<12} {'Quality':>8}")
-    print(f"  {'-' * 22}")
+    print(f"\n  {'Scenario':<32} {'Quality':>8} {'Cost USD':>10}")
+    print(f"  {'-' * 52}")
     for ep in sr.episodes:
-        timeout_mark = " (TIMEOUT)" if ep.timed_out else ""
-        error_mark = " (ERROR)" if ep.error else ""
+        timeout_mark = " TIMEOUT" if ep.timed_out else ""
+        error_mark = " ERROR" if ep.error else ""
+        cost = f"${ep.cost_usd:.4f}" if ep.cost_usd is not None else "-"
         print(
-            f"  ep_{ep.episode_index:<8} {ep.quality:>8.3f}"
+            f"  {ep.scenario:<32} {ep.quality:>8.3f} {cost:>10}"
             f"{timeout_mark}{error_mark}"
         )
 
-    print(f"\n  Early mean (ep 0-1):  {sr.early_mean:.3f}")
-    print(f"  Late mean  (ep 2-3):  {sr.late_mean:.3f}")
-    print(f"  Delta (late - early): {sr.delta:+.3f}")
-    print(f"  Learning bonus:       {sr.learning_bonus:+.3f}")
-    print(f"  Mean quality:         {sr.mean_quality:.3f}")
-    print(f"  Final score:          {sr.final_score:.3f}")
+    print(f"\n  Mean quality (avg ∈ [0,1]):    {sr.mean_quality:.3f}")
+    print(f"  Final score  (Σ ∈ [0, N]):     {sr.final_score:.3f}")
+    if result.total_cost_usd is not None:
+        print(f"  Total session cost:            ${result.total_cost_usd:.4f}")
 
     qualified = result.success
     print(f"\n  Qualification: {'QUALIFIED' if qualified else 'NOT QUALIFIED'}")
@@ -193,9 +191,7 @@ async def run_evaluation(args) -> int:
     logger.info("Model:           %s", config.llm_model)
     logger.info("Base URL:        %s", config.llm_base_url)
     logger.info("Sandbox image:   %s", config.sandbox_image)
-    logger.info("Harness image:   %s", config.harness_image)
-    logger.info("Episodes:        %d", config.sandbox_num_episodes)
-    logger.info("Timeout/episode: %ds", config.sandbox_timeout_per_episode)
+    logger.info("Timeout/scenario: %ds", config.sandbox_timeout_per_episode)
 
     if args.no_pull:
         logger.info("Skipping image pull (--no-pull)")
@@ -234,18 +230,16 @@ async def run_evaluation(args) -> int:
 
     for ep in result.session_result.episodes:
         logger.info(
-            "  Episode %d: quality=%.3f, duration=%.1fs%s",
-            ep.episode_index, ep.quality, ep.duration_s,
+            "  [%s] quality=%.3f, duration=%.1fs%s",
+            ep.scenario, ep.quality, ep.duration_s,
             " (TIMEOUT)" if ep.timed_out else "",
         )
         if ep.error:
-            logger.warning("  Episode %d error: %s", ep.episode_index, ep.error)
+            logger.warning("  [%s] error: %s", ep.scenario, ep.error)
 
     logger.info(
-        "S1 result: final_score=%.3f, mean_quality=%.3f, delta=%.3f, "
-        "episodes=%s, scenario=%s",
-        result.score, result.mean_quality, result.delta,
-        result.episode_qualities, result.scenario_name,
+        "S1 result: final_score=%.3f, mean_quality=%.3f, qualities=%s",
+        result.score, result.mean_quality, result.scenario_qualities,
     )
 
     qualified = _print_summary(
@@ -272,18 +266,23 @@ async def run_evaluation(args) -> int:
             "validator_salt": validator_salt,
             "sandbox_version": harness.sandbox_version,
             "spec_number": SPEC_NUMBER,
-            "scenario": result.scenario_name,
+            "scenarios": result.scenarios,
             "model": config.llm_model,
             "evaluation": {
                 "final_score": round(sr.final_score, 4),
                 "mean_quality": round(sr.mean_quality, 4),
-                "early_mean": round(sr.early_mean, 4),
-                "late_mean": round(sr.late_mean, 4),
-                "delta": round(sr.delta, 4),
-                "learning_bonus": round(sr.learning_bonus, 4),
-                "episode_qualities": [
-                    round(q, 4) for q in result.episode_qualities
-                ],
+                "scenario_qualities": {
+                    s: round(q, 4)
+                    for s, q in result.scenario_qualities.items()
+                },
+                "scenario_costs_usd": {
+                    s: (round(c, 6) if c is not None else None)
+                    for s, c in result.scenario_costs_usd.items()
+                },
+                "total_cost_usd": (
+                    round(result.total_cost_usd, 6)
+                    if result.total_cost_usd is not None else None
+                ),
                 "qualified": qualified,
             },
         }

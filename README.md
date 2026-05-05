@@ -140,16 +140,23 @@ See [MINER_OPERATIONS.md](docs/MINER_OPERATIONS.md) for full CLI reference (`bui
 
 #### 3. Test locally (optional)
 
-Prereqs: Docker, an LLM API key, ~10 GB free disk for the per-scenario images.
+Prereqs: Docker, an LLM API key (e.g. OpenRouter), ~10 GB free disk for the per-scenario images on first run.
+
+The validator and miner share the same harness — `scripts/eval_pack.py` runs your SKILL.md through every scenario in `SANDBOX_SCENARIOS` end-to-end, no chain interaction needed. It auto-pulls the sandbox-agent + scenario images on first invocation.
 
 ```bash
-docker pull ghcr.io/trajectoryrl/sandbox-agent:latest
-docker pull ghcr.io/trajectoryrl/scenario-cancel-async-tasks:latest
-docker pull ghcr.io/trajectoryrl/scenario-log-summary-date-ranges:latest
-docker pull ghcr.io/trajectoryrl/scenario-break-filter-js-from-html:latest
+git clone https://github.com/trajectoryRL/trajectoryRL && cd trajectoryRL
+cp .env.validator.example .env.validator
+# Edit .env.validator: set LLM_API_KEY=sk-... and LLM_MODEL=qwen/qwen3.5-35b-a3b
+
+python scripts/eval_pack.py --skill-md path/to/SKILL.md
+# or, if you've already built a pack.json:
+python scripts/eval_pack.py --pack pack.json --json results.json
 ```
 
-Drop your SKILL.md in `/workspace/SKILL.md` inside a scenario container, then exec hermes against it as the `agent` user. See [MINER_GUIDE.md](docs/MINER_GUIDE.md) for the full guide: SKILL.md authoring, scenario environments, scoring, and tips.
+Output: per-scenario passed/total quality, per-scenario cost, final Σ score in [0, N]. Use `--json` to capture machine-readable results, `-o ./eval_output` to save full transcripts + verifier artifacts.
+
+See [MINER_GUIDE.md](docs/MINER_GUIDE.md) for SKILL.md authoring patterns, the harness contract, and tips.
 
 ## trajrl — consume what the playground produces
 
