@@ -16,9 +16,13 @@ services:
     env_file:
       - ../.env.validator
     environment:
-      # Pin sandbox/harness images to the staging channel so this validator
-      # always tracks pre-release builds, regardless of .env.validator.
-      - IMAGE_CHANNEL=staging
+      # Pin sandbox-agent / scenario images to the ``latest`` channel.
+      # The bench publishes a single rolling :latest tag (no separate
+      # :staging) — pinning to :staging here would 404 every scenario
+      # fetch. The validator-side staging signal is the validator
+      # image itself (ghcr.io/trajectoryrl/trajectoryrl:staging set
+      # via the ``image:`` line above), not the bench tag.
+      - IMAGE_CHANNEL=latest
     volumes:
       - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
       - trajectoryrl_data_staging:/var/lib/trajectoryrl
