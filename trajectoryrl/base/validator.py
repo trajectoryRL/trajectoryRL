@@ -97,7 +97,7 @@ from .. import __version__
 logger = logging.getLogger(__name__)
 
 OWNER_UID = 74
-BURN_FRACTION = 0.50  # 50% of miner emissions burned via owner UID
+BURN_FRACTION = 0.95  # 95% of miner emissions burned via owner UID
 EVAL_START_BLOCK = 7986780  # 2026-04-17 08:00 UTC (ref: block 7986030 @ 05:30:09 UTC, ~12s/block)
 
 _METAGRAPH_SYNC_RETRIES = 3
