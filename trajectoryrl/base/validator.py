@@ -1192,12 +1192,44 @@ class TrajectoryValidator:
             )
 
     def _ensure_target_window(self, physical_window: EvaluationWindow) -> int:
-        """Initialize target window from persisted state or physical window."""
+        """Initialize target window from persisted state or physical window.
+
+        Stuck-state recovery (v0.6.3): if a saved target_window points at a
+        previous physical window AND that target was never aggregated (i.e.
+        consensus_window < target_window), the validator's main loop has no
+        path to advance — _should_start_target_evaluation requires
+        ``target == physical`` and the aggregation branch requires consensus
+        to have caught up. The validator sits idle until restarted with
+        edited state.
+
+        This happens cleanly when a validator container is killed mid-
+        aggregation phase (e.g. a Watchtower roll during the v0.6.0/0.6.1/
+        0.6.2 sequence on 2026-05-05 left every operator stuck on
+        target_window=1126 with consensus_window=-1 once physical advanced
+        to 1127). The previous window's aggregation can't be retried —
+        every other validator has moved on — so we forfeit the missed
+        window and advance to the current physical window.
+        """
         if self._target_window < 0:
             self._target_window = max(self._consensus_window + 1, 0)
             if self._target_window < physical_window.window_number:
                 self._target_window = physical_window.window_number
             self._target_submit_done = False
+            self._save_eval_state()
+        elif (
+            self._target_window < physical_window.window_number
+            and self._consensus_window < self._target_window
+        ):
+            stale = self._target_window
+            self._target_window = physical_window.window_number
+            self._target_submit_done = False
+            logger.warning(
+                "Stuck-state recovery: saved target_window=%d but physical "
+                "is %d and consensus_window=%d (target was never aggregated). "
+                "Advancing target to physical window — the missed window's "
+                "aggregation is forfeit.",
+                stale, physical_window.window_number, self._consensus_window,
+            )
             self._save_eval_state()
         return self._target_window
 
