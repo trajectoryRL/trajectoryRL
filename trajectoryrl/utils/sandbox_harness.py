@@ -60,7 +60,12 @@ _AGENT_UID = 10000
 SANDBOX_SCENARIOS: tuple[str, ...] = (
     "break-filter-js-from-html",
     "cancel-async-tasks",
+    "db-wal-recovery",
+    "fix-git",
     "log-summary-date-ranges",
+    "nginx-request-logging",
+    "path-tracing",
+    "vulnerable-secret",
 )
 
 
