@@ -131,11 +131,11 @@ class ValidatorConfig:
     weight_interval_blocks: int = 360  # 1 tempo ≈ 72 min at 12s/block
 
     # Startup aggregation: run consensus aggregation before entering main loop.
-    # Default off: startup aggregation reads chain commitments and trusts them,
-    # which is unsafe when chain commitments may be stale/poisoned (e.g. from a
-    # prior ws-timeout incident). The main loop's aggregation phase is the
-    # authoritative path; the startup variant is now opt-in only.
-    aggregate_when_start: bool = False
+    # Default on: lets a restarted validator catch up to the latest agreed
+    # window without waiting for the next aggregation phase. The
+    # ``_run_consensus_aggregation`` quorum gate (added in PR #214) prevents a
+    # single stale on-chain commitment from poisoning ``_consensus_window``.
+    aggregate_when_start: bool = True
 
     # Startup full cycle: run eval → propagation → aggregation before main loop.
     # When enabled, ``aggregate_when_start`` is ignored (full cycle includes it).
@@ -272,7 +272,7 @@ class ValidatorConfig:
             image_channel=os.getenv("IMAGE_CHANNEL", DEFAULT_IMAGE_CHANNEL),
             sandbox_timeout_per_episode=int(os.getenv("SANDBOX_TIMEOUT_PER_EPISODE", "600")),
             # --- Startup aggregation ---
-            aggregate_when_start=os.getenv("AGGREGATE_WHEN_START", "0") == "1",
+            aggregate_when_start=os.getenv("AGGREGATE_WHEN_START", "1") == "1",
             full_cycle_on_startup=os.getenv("FULL_CYCLE_ON_STARTUP", "0") == "1",
             disable_winner_protection=os.getenv("DISABLE_WINNER_PROTECTION", "1") == "1",
             # --- IM parameters are hardcoded (dataclass defaults) ---
