@@ -41,10 +41,13 @@ async def heartbeat(
     last_set_weights_at: Optional[int] = None,
     last_eval_at: Optional[int] = None,
     bench_image_hash: Optional[str] = None,
-    scenario_image_hash: Optional[str] = None,
+    harness_image_hash: Optional[str] = None,
     bench_version: Optional[str] = None,
 ) -> bool:
-    """Send a validator heartbeat to the dashboard API (v2)."""
+    """Send a validator heartbeat to the dashboard API (v2).
+
+    Wire contract: ``docs/API.md`` POST /api/v2/validators/heartbeat.
+    """
     try:
         hotkey_kp = wallet.hotkey
     except Exception:
@@ -68,8 +71,8 @@ async def heartbeat(
         payload["last_eval_at"] = last_eval_at
     if bench_image_hash is not None:
         payload["bench_image_hash"] = bench_image_hash
-    if scenario_image_hash is not None:
-        payload["scenario_image_hash"] = scenario_image_hash
+    if harness_image_hash is not None:
+        payload["harness_image_hash"] = harness_image_hash
     if bench_version is not None:
         payload["bench_version"] = bench_version
 

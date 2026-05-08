@@ -328,7 +328,7 @@ class TrajectoryValidator:
                     last_set_weights_at=self._last_set_weights_at,
                     last_eval_at=self._last_eval_at,
                     bench_image_hash=self._sandbox_harness.bench_image_hash,
-                    scenario_image_hash=self._sandbox_harness.scenario_image_hash,
+                    harness_image_hash=self._sandbox_harness.scenario_image_hash,
                     bench_version=self._sandbox_harness.sandbox_version,
                 )
             except Exception as e:
