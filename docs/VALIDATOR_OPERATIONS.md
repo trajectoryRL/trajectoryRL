@@ -6,6 +6,8 @@
 > For consensus protocol, winner selection, and reward distribution, see [INCENTIVE_MECHANISM.md](INCENTIVE_MECHANISM.md).
 > For miner-side flow (pack hosting, submission), see [MINER_OPERATIONS.md](MINER_OPERATIONS.md).
 
+> **v6.0 update (2026-05-07).** This guide describes the v5.x `epoch_snapshot`-driven validator flow, which evaluates the full active miner set every epoch. **v6.0 replaces that with the winner-challenger model**: the validator polls `GET /api/v2/epoch/current` for the single active challenger (and the seated winner), and posts results to `POST /api/v2/epoch/{challenge_epoch_id}/score`. The `epoch_snapshot` endpoint and the legacy `POST /api/v2/scores/submit` write path remain for the v5.2 daemon during cutover, but new code must target the v6 endpoints. See [INCENTIVE_MECHANISM.md → Challenge Epoch Lifecycle](INCENTIVE_MECHANISM.md#challenge-epoch-lifecycle) and [API.md → v6.0: Challenge Epoch APIs](API.md#v60-challenge-epoch-apis).
+
 ---
 
 ## What you do as a validator
@@ -208,7 +210,9 @@ The full request/response spec for `/api/v2/validators/epoch_snapshot` (includin
 
 ## References
 
-- **API spec**: [API.md (POST /api/v2/validators/epoch_snapshot)](https://github.com/trajectoryRL/trajectoryrl.web/blob/main/API.md)
+- **API spec (v5.2)**: [API.md (GET /api/v2/validators/epoch_snapshot)](https://github.com/trajectoryRL/trajectoryrl.web/blob/main/API.md#get-apiv2validatorsepoch_snapshot)
+- **API spec (v6.0)**: [API.md (v6.0 Challenge Epoch APIs)](https://github.com/trajectoryRL/trajectoryrl.web/blob/main/API.md#v60-challenge-epoch-apis) — `GET /api/v2/epoch/current`, `POST /api/v2/epoch/{challenge_epoch_id}/score`
 - **Incentive Mechanism**: [INCENTIVE_MECHANISM.md](INCENTIVE_MECHANISM.md) — consensus protocol, winner selection
-- **Score submission**: [API.md (POST /api/v2/scores/submit)](https://github.com/trajectoryRL/trajectoryrl.web/blob/main/API.md) — how to report eval results
+- **Score submission (v5.2 legacy)**: [API.md (POST /api/v2/scores/submit)](https://github.com/trajectoryRL/trajectoryrl.web/blob/main/API.md) — how the v5.2 daemon reports eval results during cutover
+- **Score submission (v6.0)**: [API.md (POST /api/v2/epoch/{challenge_epoch_id}/score)](https://github.com/trajectoryRL/trajectoryrl.web/blob/main/API.md) — the v6 critical path
 - **Heartbeat & log upload**: [API.md (POST /api/v2/validators/heartbeat, POST /api/validators/logs/upload)](https://github.com/trajectoryRL/trajectoryrl.web/blob/main/API.md)
