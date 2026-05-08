@@ -2,7 +2,7 @@
 
 Covers the small set of pure helpers that survived the v5.2 → v6.0
 refactor: server-driven challenge-epoch flow, the local winner cache,
-and the v6 ``status_reporter`` signing helper. Pre-existing tests for
+and the v6 ``trajrl_api`` signing helper. Pre-existing tests for
 v5.x consensus, eval-snapshot, integrity-judge, and pack-ownership-lock
 machinery were retired alongside those modules.
 
@@ -43,7 +43,7 @@ from trajectoryrl.utils.winner_state import (
     save_winner_state,
     load_winner_state,
 )
-from trajectoryrl.utils.status_reporter import _sign
+from trajectoryrl.utils.trajrl_api import _sign
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +350,7 @@ class TestValidatorEpochHelpers:
 
 
 # ---------------------------------------------------------------------------
-# status_reporter signing helper (pure)
+# trajrl_api signing helper (pure)
 # ---------------------------------------------------------------------------
 
 

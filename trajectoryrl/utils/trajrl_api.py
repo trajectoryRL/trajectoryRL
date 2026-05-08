@@ -1,4 +1,18 @@
-"""Validator status reporting to the TrajectoryRL web dashboard."""
+"""HTTP client for the TrajectoryRL platform server (`trajrl.com`).
+
+Implements the validator-side surface of the v6 winner-challenger
+protocol described in ``docs/API.md``:
+
+* ``fetch_current_epoch``  → ``GET /api/v2/epoch/current``
+* ``fetch_current_winner`` → ``GET /api/v2/winner/current``
+* ``submit_challenge_score`` → ``POST /api/v2/epoch/{id}/score``
+* ``heartbeat``            → ``POST /api/v2/validators/heartbeat``
+* ``upload_eval_logs`` / ``upload_cycle_logs`` → ``POST /api/validators/logs/{upload,cycle}``
+
+Read endpoints are public; write endpoints sign their payload with the
+hotkey via the ``_sign`` helper. Each endpoint uses a distinct signing
+prefix so signatures are not interchangeable across endpoints.
+"""
 
 import logging
 import os

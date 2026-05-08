@@ -40,7 +40,7 @@ from ..utils.github import PackFetcher
 from ..utils import config as _config_mod
 from ..utils.commitments import MinerCommitment
 from ..utils.miner_eval import evaluate_miner_s1, SKIP_PACK_VERIFY
-from ..utils.status_reporter import (
+from ..utils.trajrl_api import (
     heartbeat,
     fetch_current_epoch,
     fetch_current_winner,
