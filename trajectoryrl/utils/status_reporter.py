@@ -43,6 +43,8 @@ async def heartbeat(
     bench_image_hash: Optional[str] = None,
     harness_image_hash: Optional[str] = None,
     bench_version: Optional[str] = None,
+    llm_model: Optional[str] = None,
+    llm_base_url: Optional[str] = None,
 ) -> bool:
     """Send a validator heartbeat to the dashboard API (v2).
 
@@ -75,6 +77,10 @@ async def heartbeat(
         payload["harness_image_hash"] = harness_image_hash
     if bench_version is not None:
         payload["bench_version"] = bench_version
+    if llm_model is not None:
+        payload["llm_model"] = llm_model
+    if llm_base_url is not None:
+        payload["llm_base_url"] = llm_base_url
 
     try:
         async with httpx.AsyncClient() as client:
