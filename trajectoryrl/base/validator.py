@@ -43,13 +43,14 @@ from ..utils.miner_eval import evaluate_miner_s1, SKIP_PACK_VERIFY
 from ..utils.status_reporter import (
     heartbeat,
     fetch_current_epoch,
+    fetch_current_winner,
     submit_challenge_score,
     upload_eval_logs,
     upload_cycle_logs,
 )
 from ..utils.winner_state import (
     WinnerState,
-    winner_from_server_block,
+    derive_winner_state,
     save_winner_state,
     load_winner_state,
     WINNER_FALLBACK_TTL_SECONDS,
@@ -800,7 +801,15 @@ class TrajectoryValidator:
     # ------------------------------------------------------------------
 
     async def _eval_loop(self):
-        """Poll /api/v2/epoch/current; eval the challenger; submit score."""
+        """Two-poll tick on the v6 daemon hot path:
+
+        - ``GET /api/v2/epoch/current`` for the eval task (challenger pack).
+        - ``GET /api/v2/winner/current`` for the local-derivation inputs
+          that drive the winner cache (and therefore ``set_weights``).
+
+        These are independent endpoints with distinct caching contracts;
+        we run them on the same ~30 s tick so a single sleep cycles both.
+        """
         logger.info("Eval loop started (poll interval %ds)", _EPOCH_POLL_INTERVAL)
         while True:
             try:
@@ -810,23 +819,25 @@ class TrajectoryValidator:
             await asyncio.sleep(_EPOCH_POLL_INTERVAL)
 
     async def _eval_loop_tick(self):
+        # 1) Refresh the winner cache from /api/v2/winner/current. The
+        #    server's `winner` field is advisory; derive_winner_state
+        #    runs the same stake-weighted aggregation locally and warns
+        #    on divergence.
+        try:
+            await self._refresh_winner_cache()
+        except Exception as e:
+            logger.warning("Winner cache refresh failed: %s", e)
+
+        # 2) Poll the active challenge epoch. The `winner` block on this
+        #    response is intentionally ignored — see
+        #    fetch_current_winner / derive_winner_state.
         resp = await fetch_current_epoch()
         if resp is None:
-            return  # transient error, retry next tick
-
-        # Refresh the winner cache on every successful poll. Server is
-        # canonical; we overwrite local state regardless of staleness.
-        winner_block = resp.get("winner")
-        new_winner = winner_from_server_block(winner_block)
-        self._winner_state = new_winner
-        try:
-            save_winner_state(self._winner_state, self._winner_state_path)
-        except Exception as e:
-            logger.warning("Failed to persist winner cache: %s", e)
+            return
 
         epoch = resp.get("epoch")
         if not epoch:
-            return  # no in-progress epoch; just keep polling
+            return  # no in-progress epoch; keep polling
 
         try:
             challenge_epoch_id = int(epoch.get("challenge_epoch_id"))
@@ -846,6 +857,19 @@ class TrajectoryValidator:
             return
 
         await self._score_challenger(challenge_epoch_id, commitment)
+
+    async def _refresh_winner_cache(self):
+        """Pull /api/v2/winner/current, run local derivation, persist cache."""
+        winner_resp = await fetch_current_winner()
+        if winner_resp is None:
+            return  # transport error; keep the previous cache + TTL countdown
+
+        new_winner = derive_winner_state(winner_resp)
+        self._winner_state = new_winner
+        try:
+            save_winner_state(self._winner_state, self._winner_state_path)
+        except Exception as e:
+            logger.warning("Failed to persist winner cache: %s", e)
 
     async def _score_challenger(
         self, challenge_epoch_id: int, commitment: MinerCommitment,

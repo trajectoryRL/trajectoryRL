@@ -37,6 +37,8 @@ from trajectoryrl.utils.commitments import MinerCommitment
 from trajectoryrl.utils.winner_state import (
     WinnerState,
     WINNER_FALLBACK_TTL_SECONDS,
+    aggregate_challenger_score,
+    derive_winner_state,
     winner_from_server_block,
     save_winner_state,
     load_winner_state,
@@ -120,6 +122,157 @@ class TestWinnerStateCache:
             now=0,
         )
         assert s.winner_score is None  # graceful fallback
+
+
+# ---------------------------------------------------------------------------
+# Local winner derivation (v6.0 /api/v2/winner/current)
+# ---------------------------------------------------------------------------
+
+
+class TestAggregateChallengerScore:
+    def test_empty_returns_none(self):
+        assert aggregate_challenger_score(None) is None
+        assert aggregate_challenger_score([]) is None
+
+    def test_single_qualified_vote(self):
+        subs = [{
+            "validator_stake": 100.0,
+            "challenger_score": 0.9,
+            "challenger_qualified": True,
+            "challenger_rejected": False,
+        }]
+        score, qualified = aggregate_challenger_score(subs)
+        assert score == pytest.approx(0.9)
+        assert qualified is True
+
+    def test_stake_weighted_average(self):
+        subs = [
+            {"validator_stake": 75.0, "challenger_score": 1.0,
+             "challenger_qualified": True, "challenger_rejected": False},
+            {"validator_stake": 25.0, "challenger_score": 0.0,
+             "challenger_qualified": True, "challenger_rejected": False},
+        ]
+        score, qualified = aggregate_challenger_score(subs)
+        # 75/100 → 1.0, 25/100 → 0.0  ⇒  weighted avg = 0.75
+        assert score == pytest.approx(0.75)
+        assert qualified is True
+
+    def test_rejected_rows_dropped(self):
+        subs = [
+            {"validator_stake": 50.0, "challenger_score": 0.0,
+             "challenger_qualified": True, "challenger_rejected": True},
+            {"validator_stake": 50.0, "challenger_score": 0.8,
+             "challenger_qualified": True, "challenger_rejected": False},
+        ]
+        score, qualified = aggregate_challenger_score(subs)
+        assert score == pytest.approx(0.8)
+        assert qualified is True
+
+    def test_null_stake_rows_dropped(self):
+        subs = [
+            {"validator_stake": None, "challenger_score": 0.0,
+             "challenger_qualified": True, "challenger_rejected": False},
+            {"validator_stake": 100.0, "challenger_score": 0.6,
+             "challenger_qualified": True, "challenger_rejected": False},
+        ]
+        score, qualified = aggregate_challenger_score(subs)
+        assert score == pytest.approx(0.6)
+        assert qualified is True
+
+    def test_stake_weighted_majority_qualified(self):
+        subs = [
+            {"validator_stake": 60.0, "challenger_score": 0.0,
+             "challenger_qualified": False, "challenger_rejected": False},
+            {"validator_stake": 40.0, "challenger_score": 0.9,
+             "challenger_qualified": True, "challenger_rejected": False},
+        ]
+        score, qualified = aggregate_challenger_score(subs)
+        # qualified stake is 40/100 = 40% — not a majority
+        assert qualified is False
+        # score is computed only over qualified rows
+        assert score == pytest.approx(0.9)
+
+    def test_no_qualified_rows_returns_zero_score(self):
+        subs = [
+            {"validator_stake": 100.0, "challenger_score": 0.5,
+             "challenger_qualified": False, "challenger_rejected": False},
+        ]
+        score, qualified = aggregate_challenger_score(subs)
+        assert score == 0.0
+        assert qualified is False
+
+
+class TestDeriveWinnerState:
+    def test_none_response_yields_empty(self):
+        s = derive_winner_state(None, now=100.0)
+        assert not s.is_seated
+
+    def test_cold_start_response(self):
+        # No finalized epoch yet
+        resp = {"winner": None, "finalized_epoch": None, "submissions": []}
+        s = derive_winner_state(resp, now=100.0)
+        assert not s.is_seated
+        assert s.updated_at == 100.0
+
+    def test_winner_held_uses_server_winner(self):
+        resp = {
+            "winner": {"hotkey": "5G", "uid": 7, "score": "0.95"},
+            "finalized_epoch": {
+                "challenge_epoch_id": 100,
+                "winner_replaced": False,
+                "outcome": "winner_held",
+            },
+            "submissions": [{
+                "validator_stake": 100.0,
+                "challenger_score": 0.10,
+                "challenger_qualified": True,
+                "challenger_rejected": False,
+            }],
+        }
+        s = derive_winner_state(resp, now=100.0)
+        assert s.winner_hotkey == "5G"
+        assert s.winner_uid == 7
+        assert s.winner_score == 0.95
+
+    def test_winner_replaced_matches_server(self, caplog):
+        resp = {
+            "winner": {"hotkey": "5G", "uid": 7, "score": "0.90"},
+            "finalized_epoch": {
+                "challenge_epoch_id": 200,
+                "winner_replaced": True,
+                "outcome": "winner_replaced",
+            },
+            "submissions": [{
+                "validator_stake": 100.0,
+                "challenger_score": 0.90,
+                "challenger_qualified": True,
+                "challenger_rejected": False,
+            }],
+        }
+        with caplog.at_level("WARNING", logger="trajectoryrl.utils.winner_state"):
+            s = derive_winner_state(resp, now=100.0)
+        assert s.winner_score == 0.90
+        # No divergence → no warning emitted
+        assert not any("divergence" in r.message for r in caplog.records)
+
+    def test_winner_replaced_divergence_logs_warning(self, caplog):
+        resp = {
+            "winner": {"hotkey": "5G", "uid": 7, "score": "0.90"},
+            "finalized_epoch": {
+                "challenge_epoch_id": 201,
+                "winner_replaced": True,
+                "outcome": "winner_replaced",
+            },
+            "submissions": [{
+                "validator_stake": 100.0,
+                "challenger_score": 0.50,  # local consensus 0.50 vs server 0.90
+                "challenger_qualified": True,
+                "challenger_rejected": False,
+            }],
+        }
+        with caplog.at_level("WARNING", logger="trajectoryrl.utils.winner_state"):
+            derive_winner_state(resp, now=100.0)
+        assert any("divergence" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------

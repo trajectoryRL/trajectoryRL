@@ -15,6 +15,7 @@ _BASE_URL = os.getenv("TRAJECTORYRL_API_BASE_URL", "https://trajrl.com")
 DEFAULT_HEARTBEAT_URL = f"{_BASE_URL}/api/v2/validators/heartbeat"
 DEFAULT_EPOCH_CURRENT_URL = f"{_BASE_URL}/api/v2/epoch/current"
 DEFAULT_EPOCH_SCORE_URL_TEMPLATE = f"{_BASE_URL}/api/v2/epoch/{{challenge_epoch_id}}/score"
+DEFAULT_WINNER_CURRENT_URL = f"{_BASE_URL}/api/v2/winner/current"
 DEFAULT_LOGS_UPLOAD_URL = f"{_BASE_URL}/api/validators/logs/upload"
 DEFAULT_CYCLE_LOGS_URL = f"{_BASE_URL}/api/validators/logs/cycle"
 
@@ -102,26 +103,28 @@ async def fetch_current_epoch(
     epoch_url: str = DEFAULT_EPOCH_CURRENT_URL,
     timeout: float = 15.0,
 ) -> Optional[Dict[str, Any]]:
-    """Fetch the active challenge epoch and seated winner from trajrl.com.
+    """Fetch the active challenge epoch from trajrl.com.
 
     Public read endpoint — no signing required. Returns the parsed
-    response dict, which has shape::
+    response dict::
 
         {
           "epoch": { "challenge_epoch_id", "challenger_hotkey",
                      "challenger_pack_hash", "challenger_pack_url",
-                     "start_block", "end_block", "status" } | None,
-          "winner": { "hotkey", "uid", "pack_hash", "pack_url",
-                      "score", "spec_number", ... } | None,
+                     "start_block", "end_block", "status",
+                     "current_block", "remaining_blocks", ... } | None,
+          ...
         }
 
-    Either field may be ``None``: ``epoch`` is ``None`` when no epoch is
-    currently in-progress (server returned 404 or the response had no
-    epoch block), ``winner`` is ``None`` on cold start before any epoch
-    has finalized.
+    The response also carries a ``winner`` block, but v6 daemons must
+    ignore it: the authoritative source of seated-winner state is
+    ``GET /api/winner/current`` (see ``fetch_current_winner``). The
+    ``winner`` field on this endpoint is retained as a non-authoritative
+    convenience for the website. See ``docs/API.md`` "Migration note".
 
-    Returns ``None`` on transport / parse errors so callers can simply
-    retry on the next poll.
+    ``epoch`` is ``None`` when no epoch is in progress (404 from server
+    or response without an epoch block). Returns ``None`` on transport /
+    parse errors so callers can simply retry on the next poll.
     """
     try:
         async with httpx.AsyncClient() as client:
@@ -131,7 +134,7 @@ async def fetch_current_epoch(
         return None
 
     if resp.status_code == 404:
-        return {"epoch": None, "winner": None}
+        return {"epoch": None}
 
     if resp.status_code != 200:
         logger.warning(
@@ -152,9 +155,79 @@ async def fetch_current_epoch(
         )
         return None
 
+    return {"epoch": data.get("epoch")}
+
+
+async def fetch_current_winner(
+    *,
+    winner_url: str = DEFAULT_WINNER_CURRENT_URL,
+    timeout: float = 15.0,
+) -> Optional[Dict[str, Any]]:
+    """Fetch the seated-winner inputs from trajrl.com.
+
+    Public read endpoint — no signing required. The response carries the
+    raw inputs needed for **local** winner derivation: per-validator
+    submissions with ``validator_stake`` snapshotted at score-POST time,
+    plus the server's advisory ``winner`` claim for cross-checking.
+
+    Shape::
+
+        {
+          "winner": { "hotkey", "uid", "pack_hash", "pack_url",
+                      "score", "since_epoch_id" } | None,
+          "finalized_epoch": { "challenge_epoch_id", "challenger_hotkey",
+                               "challenger_pack_hash",
+                               "outcome", "winner_replaced",
+                               "finalized_at" } | None,
+          "submissions": [
+            { "validator_hotkey", "validator_stake",
+              "challenger_pack_hash", "challenger_score",
+              "challenger_qualified", "challenger_rejected",
+              "winner_pack_hash", "winner_score",
+              "winner_qualified", "winner_rejected" }, ...
+          ],
+        }
+
+    Cold start (no finalized epoch yet) has all three fields null /
+    empty. The caller (typically ``derive_winner_state``) is responsible
+    for running the local aggregation and comparing to ``response.winner``.
+
+    Returns ``None`` on transport / parse errors so callers can simply
+    retry on the next poll.
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(winner_url, timeout=timeout)
+    except Exception as e:
+        logger.warning("fetch_current_winner error: %s", e)
+        return None
+
+    if resp.status_code == 404:
+        return {"winner": None, "finalized_epoch": None, "submissions": []}
+
+    if resp.status_code != 200:
+        logger.warning(
+            "fetch_current_winner: HTTP %d %s",
+            resp.status_code, resp.text[:200],
+        )
+        return None
+
+    try:
+        data = resp.json()
+    except Exception as e:
+        logger.warning("fetch_current_winner: response not JSON-decodable: %s", e)
+        return None
+
+    if not isinstance(data, dict):
+        logger.warning(
+            "fetch_current_winner: unexpected payload type %s", type(data).__name__
+        )
+        return None
+
     return {
-        "epoch": data.get("epoch"),
         "winner": data.get("winner"),
+        "finalized_epoch": data.get("finalized_epoch"),
+        "submissions": data.get("submissions") or [],
     }
 
 
