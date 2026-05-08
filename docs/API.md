@@ -1,6 +1,122 @@
 # API Documentation
 
-This document covers the **validator and miner integration** endpoints (miner pack submission, score submit, log upload, heartbeat, consensus payload, epoch snapshot). Website-only monitoring endpoints (e.g. epoch summary / leaderboard) live in [docs/web-api-epoch-summary.md](docs/web-api-epoch-summary.md).
+This document focuses on **validator integration** (pre-eval, score submit, consensus payload, etc.). Website-only monitoring endpoints (for example per-miner epoch breakdown) live in [docs/web-api-epoch-summary.md](docs/web-api-epoch-summary.md).
+
+## POST /api/v2/miners/pre-eval
+
+Read-only query for validators to check a miner's eval status before spending resources on a full evaluation. All actual pack evaluation is handled by the background `syncMinerSubmissions` process using on-chain commitment data — this endpoint never triggers evaluation itself.
+
+See [docs/pre-eval.md](docs/pre-eval.md) for full architecture and integration guide.
+
+### Method
+`POST`
+
+### Headers
+- `Content-Type`: `application/json`
+
+### Request Body
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `miner_hotkey` | string | Yes | Hotkey of the miner to check |
+| `pack_hash` | string | Conditional | Pack hash to query. Required if `epoch_number` is not provided. |
+| `epoch_number` | number | Conditional | Epoch number to query. Required if `pack_hash` is not provided. When used, returns the eval result for the most recently submitted pack in this epoch. |
+| `validator_hotkey` | string | No | Hotkey of the calling validator. Required for signed requests. |
+| `timestamp` | number | No | Unix timestamp in seconds. Required for signed requests. |
+| `signature` | string | No | Validator's signature over `"trajectoryrl-report:{validator_hotkey}:{timestamp}"`. Required for signed requests. |
+
+> **Signing is optional.** If all three signing fields (`validator_hotkey`, `timestamp`, `signature`) are provided, the server verifies the validator's identity and signature. If omitted, the request is processed without authentication. This is safe because the endpoint is purely read-only.
+
+### Request Examples
+
+**Minimal request (by pack_hash, unsigned):**
+```json
+{
+  "miner_hotkey": "5FFApaS75bvpgP9gQ5hTUdZHiTc6LB2VPP9gvHN6VQCNug6e",
+  "pack_hash": "abc123def456"
+}
+```
+
+**By epoch_number (unsigned):**
+```json
+{
+  "miner_hotkey": "5FFApaS75bvpgP9gQ5hTUdZHiTc6LB2VPP9gvHN6VQCNug6e",
+  "epoch_number": 1234
+}
+```
+
+**Signed request (backward compatible):**
+```json
+{
+  "validator_hotkey": "5FFApaS75bvpgP9gQ5hTUdZHiTc6LB2VPP9gvHN6VQCNug6f",
+  "timestamp": 1710000000,
+  "signature": "0xabc123...",
+  "miner_hotkey": "5FFApaS75bvpgP9gQ5hTUdZHiTc6LB2VPP9gvHN6VQCNug6e",
+  "pack_hash": "abc123def456"
+}
+```
+
+### Success Responses
+
+**Allowed — pack passed verification:**
+```json
+{ "allowed": true, "verified": true, "pack_hash": "abc123def456" }
+```
+
+**Allowed — pack not yet evaluated:**
+```json
+{ "allowed": true, "verified": false, "pack_hash": "abc123def456" }
+```
+
+**Blocked — miner's owner is banned:**
+```json
+{
+  "allowed": false,
+  "reason": "banned",
+  "ownerkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+  "banned_until": "2025-04-01T00:00:00.000Z"
+}
+```
+
+**Blocked — hardcoding detected:**
+```json
+{
+  "allowed": false,
+  "reason": "hardcoded",
+  "verified": true,
+  "pack_hash": "abc123def456"
+}
+```
+
+> **Note:** When querying by `epoch_number`, the response `pack_hash` is resolved from the most recently submitted pack in that epoch. This lets callers discover which pack was matched.
+
+### Error Responses
+
+| Status | Error | Message |
+|--------|-------|---------|
+| 400 | Missing/invalid fields | Field-specific error message (e.g. `"Either pack_hash or epoch_number is required"`) |
+| 403 | Validator not on-chain | `"Hotkey is not a registered validator on-chain"` (signed requests only) |
+| 403 | Miner not on-chain | `"miner_hotkey is not a registered miner on-chain"` |
+| 403 | Invalid signature | Verification error message (signed requests only) |
+| 500 | Server error | `"Internal server error"` |
+
+### Processing Flow
+
+1. Validate request body fields (`miner_hotkey` required; at least one of `pack_hash` or `epoch_number`)
+2. If signing fields are present (`validator_hotkey` + `timestamp` + `signature`):
+   a. Verify `validator_hotkey` is a registered on-chain validator
+   b. Verify validator Sr25519 signature (5-minute drift tolerance)
+3. Verify `miner_hotkey` is a registered, non-deregistered miner
+4. Check if the miner's ownerkey is banned → return `allowed: false, reason: "banned"`
+5. Look up cached eval result:
+   - If `pack_hash` provided → query by `(miner_hotkey, pack_hash)`
+   - If `epoch_number` provided → query by `(miner_hotkey, epoch_number)`, returning the latest submission in that epoch
+6. Return result:
+   - `passed` → return `allowed: true, verified: true, pack_hash`
+   - `failed` → return `allowed: false, reason, verified: true, pack_hash`
+   - Not found / `pending` → return `allowed: true, verified: false`
+
+---
 
 
 ## POST /api/v2/miners/submit
@@ -48,7 +164,7 @@ This **complements** — does not replace — the existing self-hosted flow. Val
   "pack_url": "https://storage.googleapis.com/<bucket>/<prefix>/<uid>/<random_key>.json",
   "submission_id": 12345,
   "next_upload_allowed_at": "2026-05-04T15:00:00.000Z",
-  "cooldown_seconds": 3600,
+  "cooldown_seconds": 1200,
   "pre_eval_status": "pending"
 }
 ```
@@ -59,8 +175,8 @@ This **complements** — does not replace — the existing self-hosted flow. Val
 | `pack_url` | GCS URL of the stored pack, hosted under `<S3_PREFIX>/<uid>/<random_key>.json`. **Returned only to the submitting miner** — this URL is intentionally not exposed by any other public endpoint, so leak risk is bounded to the miner's own response. The miner uses this URL to verify upload contents and commits `<pack_hash>\|<pack_url>` on-chain so validators can pick it up via the existing chain-sync flow. |
 | `submission_id` | Row id in `miner_submissions`. |
 | `next_upload_allowed_at` | When the per-miner cooldown lifts. |
-| `cooldown_seconds` | Configured cooldown window (default 3600). |
-| `pre_eval_status` | Always `"pending"` at submit time — pre-eval runs asynchronously after this response is sent. Poll `/api/v2/miners/pre-eval` to check whether it ended up `passed` or `failed`. |
+| `cooldown_seconds` | Configured cooldown window (default 1200 = 20 min, matching the on-chain commitment rate limit). |
+| `pre_eval_status` | `"pending"` / `"passed"` / `"failed"`. On a first-time `(hotkey, pack_hash)` insert this is always `"pending"` — pre-eval runs asynchronously after the response. On a refresh of an existing pair, the row's current lifecycle state is collapsed via `toLegacyPreEvalStatus()`: internal `pending_pre_eval` → `"pending"`, `pending_eval` and `completed` → `"passed"`, `failed` → `"failed"`. The wire value set is the same as before — see `docs/eval-status-lifecycle.md`. Poll `/api/v2/miners/pre-eval` to check the outcome of an async run. |
 
 ### Error Responses
 
@@ -78,7 +194,7 @@ This **complements** — does not replace — the existing self-hosted flow. Val
 
 ### Cooldown Semantics
 
-- **Per-miner**, **strict counting**: 1 successful submission per `cooldown_seconds` (default 3600 — overridable via `MINER_SUBMIT_COOLDOWN_SECONDS`), regardless of whether pre-eval ultimately passes or fails.
+- **Per-miner**, **strict counting**: 1 successful submission per `cooldown_seconds` (default **1200 = 20 min**, matching the Bittensor on-chain commitment rate limit so neither submit channel offers a faster path; overridable via `MINER_SUBMIT_COOLDOWN_SECONDS`), regardless of whether pre-eval ultimately passes or fails.
 - The cooldown clock starts when the `miner_submissions` row is persisted (which is **after** GCS upload succeeds). Field-validation errors, signature errors, and GCS upload failures do not consume the cooldown.
 - Resubmitting the same `pack_hash` within the cooldown window returns `429`. The previously-issued `pack_url` remains valid.
 
@@ -109,7 +225,48 @@ After a successful submission, miners should still commit `<pack_hash>|<pack_url
 ---
 
 
+## GET /api/previous-epoch
+
+Returns the computed summary for the previous epoch from `epoch_summary`.
+
+### Method
+`GET`
+
+### Success Response (200)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `blockHeight` | number | Latest synced chain block height |
+| `epochNumber` | number \| null | Previous epoch number; `null` when unavailable |
+| `status` | `"winner"` \| `"burn"` \| `"no_quorum"` \| null | Epoch resolution status |
+| `winner` | object \| null | Winner details when `status="winner"` |
+| `diagnostics` | object \| null | Quorum and aggregation diagnostics |
+| `finalMinerResults` | array \| null | Full final miner list used by epoch summary winner resolution |
+| `stats` | object | Operational counters for validators/miners/submissions |
+
+### `finalMinerResults` Item Schema
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `hotkey` | string | Miner hotkey |
+| `uid` | number \| null | Miner UID |
+| `score` | number \| null | Final aggregated score for this epoch (`0` is valid) |
+| `rank` | number \| null | Rank among **eligible** miners only; `null` for disqualified rows |
+| `disqualified` | boolean | Whether this miner was filtered out from winner candidacy |
+
+### Semantics
+
+- `disqualified=true` means the miner was excluded by consensus/pre-eval filters and is not ranked (`rank=null`).
+- `disqualified=false` with `score=0` means the miner remained eligible, was not filtered, and is still represented separately from disqualified rows.
+
+For per-miner stake-weighted validator breakdown (`GET /api/previous-epoch/miner-breakdown`), used by the website leaderboard, see [docs/web-api-epoch-summary.md](docs/web-api-epoch-summary.md).
+
+---
+
+
 ## POST /api/v2/scores/submit
+
+> **Legacy (v5.2).** v6.0 daemons must use [`POST /api/v2/epoch/{challenge_epoch_id}/score`](#post-apiv2epochchallenge_epoch_idscore) instead. Retained for the v5.2 daemon during cutover; new code must not target this path.
 
 **Purpose: statistics and auditing only. This endpoint is not in the validator's critical path.**
 
@@ -565,6 +722,8 @@ Submit a validator heartbeat with running version, Docker image digests, and san
 
 ## POST /api/v2/consensus/payload
 
+> **Legacy (v5.x).** Part of the v5.x off-chain CAS + chain-commitment-pointer consensus protocol, retired in v6.0. v6.0 daemons do not call this endpoint; see [v6.0: Challenge Epoch APIs](#v60-challenge-epoch-apis).
+
 Upload a consensus payload to GCS-backed content-addressable storage. Used by validators during the consensus protocol's publish phase to share evaluation results with other validators.
 
 The payload is content-addressed: the server computes a SHA-256 hash of the canonical JSON serialization and uses it as the storage key. Duplicate uploads (same content hash) return HTTP 409 with the existing URL.
@@ -657,7 +816,9 @@ HTTP 409 is returned when the payload already exists (duplicate upload); the res
 
 
 ---
-## POST /api/v2/validators/epoch_snapshot
+## GET /api/v2/validators/epoch_snapshot
+
+> **Legacy (v5.x).** Provided the all-miners-per-epoch evaluation target set used by the v5.x validator. v6.0 evaluates exactly one challenger per epoch via [`GET /api/v2/epoch/current`](#get-apiv2epochcurrent), so v6 daemons do not call this endpoint.
 
 Returns the eval target set for one epoch — the list of (miner_hotkey, pack_hash) tuples a validator should evaluate this epoch, with each tuple's pre-eval verdict baked in. This is the **single source** of the eval target set: validators no longer query chain commitments directly or call `/api/v2/miners/pre-eval` per miner.
 
@@ -666,12 +827,11 @@ The snapshot is **precomputed by the sync worker and frozen** on `epoch_summary.
 If the snapshot for the requested epoch hasn't been built yet (e.g., the cutoff just passed and sync hasn't run), the endpoint returns **404**. Validators should retry on their next cycle (~5 min later).
 
 ### Method
-`POST`
+`GET` is the canonical method (read-only, idempotent).
 
-### Headers
-- `Content-Type`: `application/json`
+`POST` with a JSON body of identical shape is also accepted for backward compatibility with older validator clients — the signed payload is identical, so the same signature works on both.
 
-### Request Body
+### Query Parameters (GET)
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -682,7 +842,13 @@ If the snapshot for the requested epoch hasn't been built yet (e.g., the cutoff 
 
 > **Signing is required** for this endpoint. Unlike `/api/v2/miners/pre-eval`, the response includes `pack_url` for each entry — for web-source submissions this is a random-key GCS URL that must not leak before the 48 h reveal gate. Mandatory auth keeps that promise.
 
-### Request Example
+### Request Example (GET)
+
+```
+GET /api/v2/validators/epoch_snapshot?epoch_number=1234&validator_hotkey=5FFA...&timestamp=1714000000&signature=0xabc123...
+```
+
+### Request Example (POST, legacy)
 
 ```json
 {
@@ -750,8 +916,8 @@ If the snapshot for the requested epoch hasn't been built yet (e.g., the cutoff 
 | `hotkey` | string | Miner hotkey. |
 | `pack_hash` | string | SHA-256 of the canonical pack JSON. |
 | `pack_url` | string | URL the validator should fetch. For chain-source rows this is the miner's self-hosted URL committed on chain; for web-source rows it's the random-key GCS URL we hosted at submission time. |
-| `refresh_time` | string | ISO-8601 timestamp of the most recent commitment refresh — set whenever sync sees the chain commitment OR the miner re-calls `/api/v2/miners/submit`. |
-| `pre_eval_status` | `"passed"` \| `"failed"` | Direct mirror of the row's `eval_status` column on `miner_submissions`. Rows whose `eval_status` is still `'pending'` are filtered out at the SQL layer and absent from `entries`. Reading the summary status (instead of the 7 per-step columns) keeps the endpoint backward-compatible with rows evaluated by the legacy pipeline. |
+| `refresh_time` | string | **Deprecated, retained for wire compatibility.** Server now populates this field from `miner_submissions.submitted_at` (the immutable first-commit timestamp back-derived from the on-chain commit block). Eligibility is no longer driven by a heartbeat; the server filters entries by joining to the live `nodes.commit_block` (see "Cutoff Semantics" and migration 062). Subnet code that only treats this as a monotone time stamp is unaffected. |
+| `pre_eval_status` | `"passed"` \| `"failed"` | Pre-eval verdict for this `(miner_hotkey, pack_hash)`. The wire-level value set is intentionally narrow — `"passed"` for any row that cleared the 7-step pre-eval pipeline, `"failed"` for any rejection. Internally `miner_submissions.eval_status` holds a broader 4-state lifecycle (`pending_pre_eval` / `pending_eval` / `completed` / `failed`); the snapshot builder collapses it via `toLegacyPreEvalStatus()` so subnet code only ever sees the legacy 2-value set and requires no changes when the column expands. Rows still in `pending_pre_eval` are filtered out at the SQL layer and absent from `entries`. See `docs/eval-status-lifecycle.md` for the full mapping. |
 | `pre_eval_reason` | string \| null | Human-readable failure reason. Populated only when `pre_eval_status = "failed"`; mirrors the row's `eval_reason` column (e.g. `"hardcoded"`, `"hash_mismatch"`, `"banned until 2026-06-01..."`, `"similarity=0.834 match=5HBE…"`). |
 
 ### Cutoff Semantics
@@ -766,13 +932,11 @@ cutoff_time         = block→time(cutoff_block)
 eligible_start_time = cutoff_time - inactivity_window_hours       // 48 h
 ```
 
-**Upper bound (cutoff)**: rows whose `refresh_time` ≥ `cutoff_time` are excluded. The 2.4 h gap from window_start is the contract with the sync worker — every row that lands before cutoff is guaranteed to have its full check pipeline complete before epoch N's eval phase opens. A pack submitted *during* that 2.4 h window is not in epoch N's snapshot but is eligible for epoch N+1.
+**Upper bound (cutoff)**: rows whose `submitted_at` ≥ `cutoff_time` are excluded. The 2.4 h gap from window_start is the contract with the sync worker — every row that lands before cutoff is guaranteed to have its full check pipeline complete before epoch N's eval phase opens. A pack submitted *during* that 2.4 h window is not in epoch N's snapshot but is eligible for epoch N+1.
 
-**Lower bound (eligible_start_time)**: rows whose `refresh_time` is older than 48 h before cutoff are considered abandoned and excluded. With `sync-metagraph` bumping `refresh_time` every 5 min for any commitment still on chain, only genuinely inactive rows (web miner who stopped calling submit, chain miner who removed their commitment) age out of the window.
+**Active commitment check (post-062)**: each surviving `miner_submissions` row must JOIN to the current `nodes` snapshot on `commit_block` — i.e. the row corresponds to the miner's *current* on-chain commitment. A miner who switched to a different `pack_hash` falls out immediately (their old `commit_block` no longer matches `nodes.commit_block`); a miner who removed their commitment falls out as soon as the syncer observes the change. The 48 h `eligible_start_time` field is still emitted for legacy compat but no longer drives selection — it is now informational only, since active-commitment matching is exact rather than time-windowed.
 
-For each surviving miner, **DISTINCT ON (miner_hotkey)** picks the row with the latest `refresh_time` in the window. Then entries are sorted by `(refresh_time ASC, hotkey ASC)` — earliest active miner first.
-
-`refresh_time` is bumped on every upsert touch — both `sync-metagraph` re-seeing a chain commitment each cycle and `/api/v2/miners/submit` being re-called for the same `(hotkey, pack_hash)`. A miner who stops refreshing naturally falls out of the eval set.
+The legacy `refresh_time` field on `entries[]` is populated from `submitted_at` (immutable first-commit timestamp). Subnet code that treats it as a monotone time stamp is unaffected. The field is documented as deprecated and may be renamed in a future protocol version.
 
 ### Error Responses
 
@@ -789,8 +953,8 @@ For each surviving miner, **DISTINCT ON (miner_hotkey)** picks the row with the 
 For a fixed `epoch_number`, the response is deterministic across validators:
 
 1. **Cutoff time** is derived purely from `epoch_number` + chain math + `sync_state.block_height` (which converges across validators within seconds).
-2. **`refresh_time < cutoff` filter** + **latest-per-hotkey** grouping yields the same row set.
-3. **Sort order** `(refresh_time ASC, hotkey ASC)` is stable.
+2. **`submitted_at < cutoff_time` filter** + **JOIN to `nodes.commit_block`** yields exactly one row per active hotkey.
+3. **Sort order** `(refresh_time ASC, hotkey ASC)` — note `refresh_time` is now backed by `submitted_at` — is stable.
 4. **Verdict mapping** is deterministic — same row state always produces the same `pre_eval_status` / `pre_eval_reason`.
 
 The only non-determinism source is the per-step check column write order from the sync worker. Once a row's check columns are stable (which they are by `cutoff_time` thanks to the 2.4 h margin), the verdict is fixed.
@@ -806,8 +970,8 @@ The only non-determinism source is the per-step check column write order from th
 The snapshot itself is built by the sync worker (offline from the request path):
 
 a. Each sync cycle, scan recent epochs whose `cutoff_block ≤ sync_state.block_height` and whose `eval_snapshot IS NULL`.
-b. For each, run the latest-per-miner query: `eligible_start_time <= refresh_time < cutoff_time` AND `eval_status IN ('passed', 'failed')`.
-c. Map each surviving row: `pre_eval_status ← eval_status`, `pre_eval_reason ← eval_reason` (only for failures).
+b. For each, run the active-commitment query: JOIN `miner_submissions` to `nodes` on `(hotkey, commit_block)` WHERE `nodes.is_active = true AND NOT nodes.deregistered`, AND `submitted_at < cutoff_time`, AND `eval_status IN ('pending_eval', 'completed', 'failed')` (i.e. any row past the pending_pre_eval stage). The JOIN restricts to one row per hotkey by construction.
+c. Map each surviving row: `pre_eval_status ← toLegacyPreEvalStatus(eval_status)` (collapses `pending_eval`/`completed` → `"passed"`, `failed` → `"failed"`), `pre_eval_reason ← eval_reason` (only for failures), `refresh_time ← submitted_at` (wire-compat alias).
 d. Sort entries by `(refresh_time ASC, hotkey ASC)`.
 e. UPSERT to `epoch_summary.eval_snapshot` with COALESCE — first write wins, subsequent ticks skip already-built epochs.
 
@@ -820,3 +984,462 @@ This endpoint is the validator's only source for the epoch eval set, so any non-
 Snapshots are cached in PostgreSQL (`epoch_summary.eval_snapshot` JSONB) — once frozen, never recomputed. Reads are O(1) (PK lookup by `epoch_number`). Operationally, each epoch's snapshot is written at most once, by whichever sync cycle first observes the epoch's cutoff in the past. Recovery from a corrupt snapshot would require manually clearing the column to allow re-build (out of scope).
 
 ---
+
+## v6.0: Challenge Epoch APIs
+
+The endpoints in this section implement the **winner-challenger model**. Sections marked **(validator critical-path)** are the ones a v6 daemon must call. Sections marked **(public read)** are observability-only — websites, dashboards, and operators consume them; the daemon does not.
+
+### v6 daemon main loop
+
+```
+loop forever:
+  resp = GET /api/v2/epoch/current
+  if 404:                                       // no epoch in progress
+    sleep 30s, continue
+  // resp.winner is the canonical seated winner. Daemons MUST overwrite
+  // their local winner cache with resp.winner on every successful poll —
+  // this is the only endpoint that exposes seated-winner state to v6
+  // daemons.
+  cache.winner = resp.winner   // null on cold start
+  if already submitted for resp.challenge_epoch_id:
+    sleep until resp.end_block, continue
+  fetch pack(resp.challenger_pack_hash), run eval
+  POST /api/v2/epoch/{resp.challenge_epoch_id}/score  // body has `challenger` block;
+                                                       // optional `winner` block under dual-eval
+  on 409 "epoch is finalized": this epoch is closed; next loop
+
+# set_weights cadence (independent loop):
+  winner = cache.winner                          // refreshed by main loop above
+  if winner is null:                             // cold start, no epoch finalized yet
+    skip set_weights this round
+  if cache age > WINNER_FALLBACK_TTL (24 h):     // main loop hasn't refreshed
+    refuse set_weights + alarm                   // server has been unreachable too long
+  set_weights(winner.uid)
+```
+
+There is no dedicated `winner_state` HTTP endpoint — `GET /api/v2/epoch/current` is the single source of truth for both the in-progress epoch and the seated winner. One GET per tick keeps both fresh.
+
+### v6 signature prefixes
+
+Each endpoint signs a different prefix string — signatures are not interchangeable across endpoints, and the v6 score-submit path includes `challenge_epoch_id` to defeat cross-epoch replay.
+
+| Endpoint | Prefix | Signed payload |
+|---|---|---|
+| `POST /api/v2/epoch/{id}/score` | `trajectoryrl-challenge-score` | `{validator_hotkey}:{timestamp}:{challenge_epoch_id}` |
+| `POST /api/v2/validators/heartbeat` | `trajectoryrl-heartbeat` | `{validator_hotkey}:{timestamp}` |
+| `POST /api/validators/logs/upload` / `cycle` | `trajectoryrl-logs` | `{validator_hotkey}:{timestamp}` |
+
+The legacy v5.2 path `POST /api/v2/scores/submit` uses `trajectoryrl-submit` and is **not** the v6 score path; v6 daemons must not call it.
+
+---
+
+### `GET /api/v2/epoch/current` (validator critical-path)
+
+Returns the single in-progress challenge epoch. The daemon's main-loop poll target.
+
+#### Method
+`GET`
+
+#### Auth
+None — public read.
+
+#### Success response (200)
+
+```jsonc
+{
+  "success": true,
+  "epoch": {
+    "challenge_epoch_id":   1234,
+    "challenger_hotkey":    "5...",
+    "challenger_pack_hash": "abc...",
+    "start_block":          5300000,
+    "end_block":            5300100,
+    "epoch_length_blocks":  100,
+    "status":               "in_progress",
+    "created_at":           "2026-05-09T01:00:00.000Z"
+  },
+  // Canonical seated winner. Null on cold start (no epoch has finalized yet).
+  "winner": {
+    "hotkey":         "5...",
+    "uid":            1,
+    "pack_hash":      "def...",
+    "pack_url":       "https://.../pack.json",
+    "score":          "0.92",
+    "since_epoch_id": "100"
+  },
+  // Server's chain-time view at request time. Daemons use this to decide
+  // whether an eval can finish in the remaining window. Null on chain RPC
+  // failure — daemon should fall back to its own block reading.
+  "current_block":    5300050,
+  "elapsed_blocks":   50,
+  "remaining_blocks": 50
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `epoch.challenge_epoch_id` | Server-assigned BIGINT. The daemon passes this to `POST /api/v2/epoch/{id}/score`. Distinct from `epoch_number` (chain-tempo label) — the two have different semantics under v6. |
+| `epoch.challenger_hotkey` | The miner whose pack is being scored this epoch. Server-stamped — validator does not need to verify it independently. |
+| `epoch.challenger_pack_hash` | SHA-256 of the canonical pack JSON. The daemon uses this to fetch and verify the pack before scoring. |
+| `epoch.start_block` / `epoch.end_block` | The chain-block window. The eval window closes at `end_block`; submissions arriving after `finalizeEpoch` runs (≈ next scheduler tick after `end_block`) are rejected with 409. |
+| `epoch.epoch_length_blocks` | Convenience: `end_block − start_block`. Tells the daemon "an epoch lasts this many blocks" without subtracting. |
+| `epoch.status` | Always `"in_progress"` for rows returned here. (`"finalized"` and `"aborted_quorum"` rows are not returned by this endpoint — fetch them via `GET /api/epoch/{id}`.) |
+| `winner` | The canonical seated winner from `winner_state`. Includes `pack_url` (the URL the consensus agreed on, frozen at finalize time — does not drift if the miner re-uploads). `null` on cold start. |
+| `current_block` | Server-stamped chain block at the moment of this response. `null` if chain RPC is unreachable. |
+| `elapsed_blocks` | `current_block − start_block`, clamped at 0. `null` if `current_block` is null. |
+| `remaining_blocks` | `end_block − current_block`, clamped at 0. `null` if `current_block` is null. **Use this to decide whether to start an eval** (see "Mid-epoch start" below). |
+
+#### Mid-epoch start
+
+A daemon launched mid-epoch may not have enough remaining time to fetch the pack, run the LLM-as-judge eval, and POST the score before the scheduler finalizes. If you start the eval anyway you'll likely hit `409 epoch is finalized` on submit, get recorded as `participated=false` for that epoch, and (after `INACTIVE_THRESHOLD_EPOCHS=3` consecutive misses) be flagged inactive.
+
+Recommended pattern:
+
+```
+resp = GET /api/v2/epoch/current
+remaining_secs = (resp.remaining_blocks ?? 0) * 12   // Bittensor block time
+if remaining_secs < EXPECTED_EVAL_SECONDS + SAFETY_MARGIN:
+  // Not enough time. Skip this epoch, refresh winner cache,
+  // sleep until the next epoch is likely open.
+  cache.winner = resp.winner
+  sleep min(remaining_secs + 30, POLL_INTERVAL)
+  continue
+// Enough time → fetch pack and eval as normal.
+```
+
+`EXPECTED_EVAL_SECONDS` is daemon-side: a conservative initial estimate (e.g. 5 min) and the rolling p95 of recent eval durations once you have data. `SAFETY_MARGIN` (e.g. 60 s) absorbs network/upload variance.
+
+When `current_block` is `null` (server's chain RPC down), the daemon uses its own chain reading; same math.
+
+#### Winner-cache contract for v6 daemons
+
+The `winner` block here is **authoritative**: every successful poll returns the latest committed `winner_state`. Daemons that maintain a local winner cache for `set_weights` should **overwrite the cache with `winner` on each successful poll**. This unifies the daemon's polling loop:
+
+- One GET per tick (~30 s) keeps both `epoch` and `winner` fresh.
+- `WINNER_FALLBACK_TTL` (24 h) becomes the staleness alarm threshold for "main loop has been unable to reach the server."
+- This is the only endpoint that exposes seated-winner state to v6 daemons.
+
+Cold-start handling: when `winner` is `null`, daemons must skip `set_weights` until a finalized epoch seats the first winner.
+
+#### 404 response
+
+```json
+{ "success": false, "error": "no epoch in progress" }
+```
+
+Returned when:
+- The previous epoch has finalized but the scheduler hasn't yet opened the next one (≤ `SCHEDULER_POLL_INTERVAL_MS` ≈ 30 s gap).
+- The challenger queue is empty (no `pending_eval` rows pass the cooldown / attempt filter).
+
+Validators **must treat 404 as a normal state**, sleep, and retry. It is not an error condition.
+
+#### Polling cadence
+
+Recommend 30 s between polls. The scheduler ticks at most every `SCHEDULER_POLL_INTERVAL_MS` (default 30 s), so polling faster yields no fresher data. Each poll returns the same `challenge_epoch_id` for the entire epoch duration (`end_block − start_block` blocks; default 100 ≈ 20 min).
+
+#### Idempotency
+
+Read-only and idempotent. Calling repeatedly returns the same row until either (a) the epoch transitions out of `in_progress`, or (b) a new epoch opens — at which point a fresh `challenge_epoch_id` is returned.
+
+---
+
+### `POST /api/v2/epoch/{challenge_epoch_id}/score` (validator critical-path)
+
+Validator-side score submission for a single challenge epoch. Distinct from the v5.2 `/api/v2/scores/submit` path: the v6 daemon **must** use this endpoint, the v5.2 daemon **must** keep using the old one. The two paths are independent in code, schema, and signature prefix.
+
+The wire contract is built around the **winner-challenger** model and is forward-compatible with **dual-eval**: in v6.0 a validator only evaluates the challenger (`challenger` block required, `winner` block omitted); when dual-eval lands, validators include both blocks in the same submission.
+
+#### Method
+`POST`
+
+#### Path parameter
+- `challenge_epoch_id` (positive integer) — the id returned by `GET /api/v2/epoch/current`. Server resolves this to a `challenge_epochs` row and stamps the **challenger** identity (`challenger_hotkey`, `challenger_pack_hash`) from it; the validator does **not** supply these.
+
+#### Headers
+`Content-Type: application/json`
+
+#### Request body
+
+```jsonc
+{
+  "validator_hotkey": "5...",
+  "timestamp":        1746700000,
+  "signature":        "0x...",
+  "version":          "v6.0.0",
+  "spec_number":      1,
+
+  // REQUIRED — every submission must include the challenger verdict.
+  "challenger": {
+    "score":             0.91,
+    "qualified":         true,
+    "rejected":          false,          // optional, default false
+    "rejection_detail":  null,           // optional free-text
+    "scenario_results":  { ... }         // optional JSONB; per-side audit blob
+  },
+
+  // OPTIONAL — present iff the validator ran dual-eval against the
+  // currently-seated winner. When present, `pack_hash` is what the
+  // validator actually evaluated and is server-validated against
+  // `winner_state.winner_pack_hash`.
+  "winner": {
+    "pack_hash":         "abc...",
+    "score":             0.85,
+    "qualified":         true,
+    "rejected":          false,
+    "rejection_detail":  null,
+    "scenario_results":  { ... }
+  },
+
+  // shared audit
+  "llm_base_url":       "http://...",
+  "llm_model":          "...",
+  "judge_model":        "...",
+  "bench_image_hash":   "...",
+  "harness_image_hash": "...",
+  "bench_version":      "..."
+}
+```
+
+Required: `validator_hotkey`, `timestamp`, `signature`, `version`, `challenger.score`, `challenger.qualified`.
+
+Rejection (per side): set `rejected=true`, `score=0`, `qualified=false`, optionally `rejection_detail` for free-form context. There is no enumerated rejection-stage anymore — under v6 the validator's pack-integrity work happens server-side before the row reaches `pending_eval`, so a rejection from the validator is "I couldn't run the eval" and a one-line text suffices.
+
+#### Signature
+
+Signed message (Ed25519, hotkey-bound):
+```
+trajectoryrl-challenge-score:{validator_hotkey}:{timestamp}:{challenge_epoch_id}
+```
+
+`challenge_epoch_id` is in the signed payload — a signature for epoch N cannot be replayed against epoch M. Distinct prefix from `trajectoryrl-submit` (v5.2) so v5.2 sigs don't cross-validate. Timestamp must be within 5 minutes of server clock.
+
+#### Server-side validations
+
+| Check | On failure |
+|---|---|
+| `challenge_epoch_id` path is positive integer | 400 |
+| `challenger.score` is finite, in `[0, 100]`; `challenger.qualified` is boolean | 400 |
+| `challenger.rejected=true` ⇒ `score=0, qualified=false` | 400 |
+| If `winner` present: `winner.pack_hash` non-empty; same shape rules as `challenger` | 400 |
+| `validator_hotkey` is on-chain validator | 403 |
+| Signature verifies (when `VALIDATE_VALIDATOR_IDENTITY=true`) | 401 |
+| `challenge_epochs(id)` exists | 404 |
+| `challenge_epochs.status = 'in_progress'` | 409 — eval window closed |
+| If `winner` present: `winner_state.winner_pack_hash` is non-NULL **and** equals `winner.pack_hash` | 409 |
+| No prior submission for `(challenge_epoch_id, validator_hotkey)` | 409 — duplicate |
+
+`challenger_hotkey` and `challenger_pack_hash` are **never** read from the request body. Server stamps them from `challenge_epochs(id)`. This eliminates the "validator evaluated the wrong pack but reported the right epoch_id" attack vector. For dual-eval, `winner_hotkey` is similarly server-stamped from `winner_state` (only `winner.pack_hash` is taken from the validator, and only to verify it matches the seated winner).
+
+#### Success response (200)
+
+```jsonc
+{
+  "success": true,
+  "challenge_epoch_id": 1234,
+  "validator_hotkey":   "5...",
+
+  "challenger": {
+    "hotkey":    "5...",
+    "pack_hash": "abc..."
+  },
+
+  // null in single-eval; populated when winner block was supplied
+  "winner": {
+    "hotkey":    "5...",
+    "pack_hash": "abc..."
+  },
+
+  "block_height": 5300000
+}
+```
+
+`block_height` is server-stamped from chain RPC at receipt; `null` if chain is unavailable.
+
+#### Storage
+
+Inserts into `challenge_scores` (migration 067). One row per `(challenge_epoch_id, validator_hotkey)` enforced by `UNIQUE`. Columns split into `challenger_*` (always populated, including `challenger_scenario_results` JSONB) and `winner_*` (NULL in single-eval, populated in dual-eval, including `winner_scenario_results` JSONB; CHECK enforces all-or-nothing on the four winner essentials). The `score_submit_log` table is never written by this endpoint.
+
+#### Aggregation
+
+At `end_block`, scheduler tick triggers `finalizeEpoch` which `SELECT`s `challenger_*` columns from `challenge_scores` for this epoch, applies the filter pipeline (drop rejected, below-min-stake, inactive, duplicate-hotkey), runs stake-weighted aggregation, then either updates `winner_state` (winner replaced/held) or marks the epoch `aborted_quorum`. Late submissions arriving after `finalizeEpoch` runs are rejected at the API layer (409 from the `in_progress` check). Dual-eval aggregation (using `winner_*` columns to derive a fresh per-epoch winner-score baseline) is a future finalize.ts change — the schema is already shaped for it.
+
+---
+
+### `GET /api/queue` (public read)
+
+FIFO challenger queue snapshot. Returned in the order the scheduler will pick from. **Validators do not call this** — observability for websites and ops only.
+
+```json
+{
+  "success": true,
+  "queue": [
+    {
+      "submission_id": 12345,
+      "miner_hotkey": "5...",
+      "miner_uid": 7,
+      "pack_hash": "abc...",
+      "pack_url": "https://...",
+      "submitted_at": "2026-05-07T12:00:00Z",
+      "attempt_count": 0,
+      "eligible_now": true
+    }
+  ],
+  "max_attempts": 3
+}
+```
+
+`eligible_now=false` rows are still in the queue but currently filtered out (per-miner cooldown, attempt-count exhausted, etc.). `max_attempts` is the configured `MAX_ATTEMPTS`; rows with `attempt_count >= max_attempts` will move to `eval_status='exhausted'`.
+
+### `GET /api/epoch/{id}` (public read)
+
+Full audit view of a specific challenge epoch: the `challenge_epochs` row plus every `challenge_scores` submission tied to it. Used by ops to audit aggregation outcomes, by the website for the per-epoch detail page, and by external auditors to replay a finalize decision.
+
+```jsonc
+{
+  "success": true,
+  "epoch": { /* full challenge_epochs row, including outcome */ },
+  "submissions": [
+    {
+      "validator_hotkey": "5...",
+      "challenger": {
+        "hotkey": "5...", "pack_hash": "abc...",
+        "score": 0.91, "qualified": true,
+        "rejected": false, "rejection_detail": null,
+        "scenario_results": { /* JSONB */ }
+      },
+      "winner": null,           // populated under dual-eval
+      "submitted_at": "2026-05-09T01:30:00.000Z"
+    }
+  ]
+}
+```
+
+Late submissions (rows that arrived after finalize ran) appear here too — they're stored but excluded from aggregation; they show up in this list as data debris. **Validators do not call this.**
+
+### `GET /api/winner/history?limit=N` (public read)
+
+Recent winner transitions from `winner_history` (default `limit=20`, max `200`). One row per epoch where the seated winner was reaffirmed or replaced. Used by the website's leaderboard timeline. **Validators do not call this.**
+
+### `GET /api/validator/{hotkey}/activity?limit=N` (public read)
+
+Recent `validator_activity` rows for a specific validator (default `limit=20`, max `200`). Each row is a per-epoch participation record (`participated: true | false`). Useful for ops to spot validators trending toward `INACTIVE_THRESHOLD_EPOCHS` exclusion. **Validators do not call this** — own-state introspection should come from the daemon's local logs.
+
+### `POST /api/v2/epoch/{challenge_epoch_id}/score`
+
+Validator-side score submission for a single challenge epoch. Distinct from the v5.2 `/api/v2/scores/submit` path: the v6 daemon **must** use this endpoint, the v5.2 daemon **must** keep using the old one. The two paths are independent in code, schema, and signature prefix.
+
+The wire contract is built around the **winner-challenger** model and is forward-compatible with **dual-eval**: in v6.0 a validator only evaluates the challenger (`challenger` block required, `winner` block omitted); when dual-eval lands, validators include both blocks in the same submission.
+
+#### Method
+`POST`
+
+#### Path parameter
+- `challenge_epoch_id` (positive integer) — the id returned by `GET /api/v2/epoch/current`. Server resolves this to a `challenge_epochs` row and stamps the **challenger** identity (`challenger_hotkey`, `challenger_pack_hash`) from it; the validator does **not** supply these.
+
+#### Headers
+`Content-Type: application/json`
+
+#### Request body
+
+```jsonc
+{
+  "validator_hotkey": "5...",
+  "timestamp":        1746700000,
+  "signature":        "0x...",
+  "version":          "v6.0.0",
+  "spec_number":      1,
+
+  // REQUIRED — every submission must include the challenger verdict.
+  "challenger": {
+    "score":             0.91,
+    "qualified":         true,
+    "rejected":          false,          // optional, default false
+    "rejection_detail":  null,           // optional free-text
+    "scenario_results":  { ... }         // optional JSONB; per-side audit blob
+  },
+
+  // OPTIONAL — present iff the validator ran dual-eval against the
+  // currently-seated winner. When present, `pack_hash` is what the
+  // validator actually evaluated and is server-validated against
+  // `winner_state.winner_pack_hash`.
+  "winner": {
+    "pack_hash":         "abc...",
+    "score":             0.85,
+    "qualified":         true,
+    "rejected":          false,
+    "rejection_detail":  null,
+    "scenario_results":  { ... }
+  },
+
+  // shared audit
+  "llm_base_url":       "http://...",
+  "llm_model":          "...",
+  "judge_model":        "...",
+  "bench_image_hash":   "...",
+  "harness_image_hash": "...",
+  "bench_version":      "..."
+}
+```
+
+Required: `validator_hotkey`, `timestamp`, `signature`, `version`, `challenger.score`, `challenger.qualified`.
+
+Rejection (per side): set `rejected=true`, `score=0`, `qualified=false`, optionally `rejection_detail` for free-form context. There is no enumerated rejection-stage anymore — under v6 the validator's pack-integrity work happens server-side before the row reaches `pending_eval`, so a rejection from the validator is "I couldn't run the eval" and a one-line text suffices.
+
+#### Signature
+
+Signed message (Ed25519, hotkey-bound):
+```
+trajectoryrl-challenge-score:{validator_hotkey}:{timestamp}:{challenge_epoch_id}
+```
+
+`challenge_epoch_id` is in the signed payload — a signature for epoch N cannot be replayed against epoch M. Distinct prefix from `trajectoryrl-submit` (v5.2) so v5.2 sigs don't cross-validate. Timestamp must be within 5 minutes of server clock.
+
+#### Server-side validations
+
+| Check | On failure |
+|---|---|
+| `challenge_epoch_id` path is positive integer | 400 |
+| `challenger.score` is finite, in `[0, 100]`; `challenger.qualified` is boolean | 400 |
+| `challenger.rejected=true` ⇒ `score=0, qualified=false` | 400 |
+| If `winner` present: `winner.pack_hash` non-empty; same shape rules as `challenger` | 400 |
+| `validator_hotkey` is on-chain validator | 403 |
+| Signature verifies (when `VALIDATE_VALIDATOR_IDENTITY=true`) | 401 |
+| `challenge_epochs(id)` exists | 404 |
+| `challenge_epochs.status = 'in_progress'` | 409 — eval window closed |
+| If `winner` present: `winner_state.winner_pack_hash` is non-NULL **and** equals `winner.pack_hash` | 409 |
+| No prior submission for `(challenge_epoch_id, validator_hotkey)` | 409 — duplicate |
+
+`challenger_hotkey` and `challenger_pack_hash` are **never** read from the request body. Server stamps them from `challenge_epochs(id)`. This eliminates the "validator evaluated the wrong pack but reported the right epoch_id" attack vector. For dual-eval, `winner_hotkey` is similarly server-stamped from `winner_state` (only `winner.pack_hash` is taken from the validator, and only to verify it matches the seated winner).
+
+#### Success response (200)
+
+```jsonc
+{
+  "success": true,
+  "challenge_epoch_id": 1234,
+  "validator_hotkey":   "5...",
+
+  "challenger": {
+    "hotkey":    "5...",
+    "pack_hash": "abc..."
+  },
+
+  // null in single-eval; populated when winner block was supplied
+  "winner": {
+    "hotkey":    "5...",
+    "pack_hash": "abc..."
+  },
+
+  "block_height": 5300000
+}
+```
+
+`block_height` is server-stamped from chain RPC at receipt; `null` if chain is unavailable.
+
+#### Storage
+
+Inserts into `challenge_scores` (migration 067). One row per `(challenge_epoch_id, validator_hotkey)` enforced by `UNIQUE`. Columns split into `challenger_*` (always populated, including `challenger_scenario_results` JSONB) and `winner_*` (NULL in single-eval, populated in dual-eval, including `winner_scenario_results` JSONB; CHECK enforces all-or-nothing on the four winner essentials). The `score_submit_log` table is never written by this endpoint.
+
+#### Aggregation
+
+At `end_block`, scheduler tick triggers `finalizeEpoch` which `SELECT`s `challenger_*` columns from `challenge_scores` for this epoch, applies the filter pipeline (drop rejected, below-min-stake, inactive, duplicate-hotkey), runs stake-weighted aggregation, then either updates `winner_state` (winner replaced/held) or marks the epoch `aborted_quorum`. Late submissions arriving after `finalizeEpoch` runs are rejected at the API layer (409 from the `in_progress` check). Dual-eval aggregation (using `winner_*` columns to derive a fresh per-epoch winner-score baseline) is a future finalize.ts change — the schema is already shaped for it.
