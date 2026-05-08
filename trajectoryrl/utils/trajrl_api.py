@@ -125,14 +125,21 @@ async def fetch_current_epoch(
         {
           "epoch": { "challenge_epoch_id", "challenger_hotkey",
                      "challenger_pack_hash", "challenger_pack_url",
-                     "start_block", "end_block", "status",
-                     "current_block", "remaining_blocks", ... } | None,
-          ...
+                     "start_block", "end_block",
+                     "epoch_length_blocks", "status", ... } | None,
+          "current_block":    int | None,   # server-stamped chain block
+          "elapsed_blocks":   int | None,   # current_block - start_block
+          "remaining_blocks": int | None,   # end_block - current_block
         }
+
+    ``current_block`` / ``remaining_blocks`` are ``None`` when the
+    server's chain RPC is unreachable; callers that gate on remaining
+    eval budget should fall back to their own block reading in that
+    case (see ``docs/API.md`` "Mid-epoch start").
 
     The response also carries a ``winner`` block, but v6 daemons must
     ignore it: the authoritative source of seated-winner state is
-    ``GET /api/winner/current`` (see ``fetch_current_winner``). The
+    ``GET /api/v2/winner/current`` (see ``fetch_current_winner``). The
     ``winner`` field on this endpoint is retained as a non-authoritative
     convenience for the website. See ``docs/API.md`` "Migration note".
 
@@ -148,7 +155,12 @@ async def fetch_current_epoch(
         return None
 
     if resp.status_code == 404:
-        return {"epoch": None}
+        return {
+            "epoch": None,
+            "current_block": None,
+            "elapsed_blocks": None,
+            "remaining_blocks": None,
+        }
 
     if resp.status_code != 200:
         logger.warning(
@@ -169,7 +181,20 @@ async def fetch_current_epoch(
         )
         return None
 
-    return {"epoch": data.get("epoch")}
+    def _opt_int(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "epoch": data.get("epoch"),
+        "current_block": _opt_int(data.get("current_block")),
+        "elapsed_blocks": _opt_int(data.get("elapsed_blocks")),
+        "remaining_blocks": _opt_int(data.get("remaining_blocks")),
+    }
 
 
 async def fetch_current_winner(

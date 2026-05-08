@@ -83,6 +83,21 @@ _EPOCH_POLL_INTERVAL = 30        # seconds between GET /api/v2/epoch/current
 _WEIGHT_CHECK_INTERVAL = 300     # seconds between weight-set attempts
 _HEARTBEAT_INTERVAL = 600        # seconds between heartbeats
 
+# Mid-epoch budget gate. Don't start an eval if the chain window left in
+# the active epoch can't accommodate a typical run plus a safety margin —
+# the eval would either burn cycles for nothing or finish past `end_block`
+# and 409 on submit (counted as participated=false).
+#
+# 12 s/block is the Bittensor block time. Defaults are conservative for
+# the Season 1 trajrl-bench harness; operators can override by env.
+_BITTENSOR_BLOCK_TIME_SECONDS = 12
+_EXPECTED_EVAL_SECONDS = int(
+    os.getenv("VALIDATOR_EXPECTED_EVAL_SECONDS", "600")  # 10 min default
+)
+_EVAL_BUDGET_SAFETY_SECONDS = int(
+    os.getenv("VALIDATOR_EVAL_BUDGET_SAFETY_SECONDS", "60")
+)
+
 
 class TrajectoryValidator:
     """v6.0 thin validator daemon."""
@@ -847,6 +862,25 @@ class TrajectoryValidator:
 
         if self._last_scored_challenge_epoch_id == challenge_epoch_id:
             return  # idempotent: already evaluated this epoch
+
+        # Mid-epoch budget gate (docs/API.md "Mid-epoch start"). When the
+        # server reports `remaining_blocks`, only start the eval if there
+        # is enough chain time left for a typical run plus safety margin.
+        # When `remaining_blocks` is null (server chain RPC down) we
+        # cautiously proceed — the daemon has no better signal, and a
+        # post-finalize submit will 409 cleanly.
+        remaining_blocks = resp.get("remaining_blocks")
+        if remaining_blocks is not None:
+            remaining_secs = remaining_blocks * _BITTENSOR_BLOCK_TIME_SECONDS
+            needed_secs = _EXPECTED_EVAL_SECONDS + _EVAL_BUDGET_SAFETY_SECONDS
+            if remaining_secs < needed_secs:
+                logger.info(
+                    "Skipping epoch %s: %ds remaining < %ds needed "
+                    "(EXPECTED_EVAL=%ds + SAFETY=%ds). Will pick up next epoch.",
+                    challenge_epoch_id, remaining_secs, needed_secs,
+                    _EXPECTED_EVAL_SECONDS, _EVAL_BUDGET_SAFETY_SECONDS,
+                )
+                return
 
         commitment = self._commitment_from_epoch(epoch)
         if commitment is None:

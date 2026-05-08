@@ -350,6 +350,91 @@ class TestValidatorEpochHelpers:
 
 
 # ---------------------------------------------------------------------------
+# fetch_current_epoch — propagates remaining_blocks for the budget gate
+# ---------------------------------------------------------------------------
+
+
+class TestFetchCurrentEpochResponseShape:
+    """fetch_current_epoch must surface current_block / remaining_blocks
+    so the eval loop can run the mid-epoch budget gate. We mock httpx at
+    the module level rather than poking the wire."""
+
+    @pytest.mark.asyncio
+    async def test_200_propagates_chain_time(self, monkeypatch):
+        from trajectoryrl.utils import trajrl_api
+
+        class _FakeResp:
+            status_code = 200
+            text = ""
+
+            def json(self):
+                return {
+                    "success": True,
+                    "epoch": {
+                        "challenge_epoch_id": 17,
+                        "challenger_hotkey": "5G",
+                        "challenger_pack_hash": "f" * 64,
+                        "challenger_pack_url": "https://x/p.json",
+                        "start_block": 8000000,
+                        "end_block": 8000150,
+                        "epoch_length_blocks": 150,
+                        "status": "in_progress",
+                    },
+                    "current_block": 8000075,
+                    "elapsed_blocks": 75,
+                    "remaining_blocks": 75,
+                }
+
+        class _FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, *a, **kw):
+                return _FakeResp()
+
+        monkeypatch.setattr(trajrl_api.httpx, "AsyncClient", lambda: _FakeClient())
+        out = await trajrl_api.fetch_current_epoch()
+        assert out is not None
+        assert out["epoch"]["challenge_epoch_id"] == 17
+        assert out["current_block"] == 8000075
+        assert out["elapsed_blocks"] == 75
+        assert out["remaining_blocks"] == 75
+
+    @pytest.mark.asyncio
+    async def test_404_returns_null_block_fields(self, monkeypatch):
+        from trajectoryrl.utils import trajrl_api
+
+        class _FakeResp:
+            status_code = 404
+            text = ""
+
+            def json(self):
+                return {}
+
+        class _FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, *a, **kw):
+                return _FakeResp()
+
+        monkeypatch.setattr(trajrl_api.httpx, "AsyncClient", lambda: _FakeClient())
+        out = await trajrl_api.fetch_current_epoch()
+        assert out == {
+            "epoch": None,
+            "current_block": None,
+            "elapsed_blocks": None,
+            "remaining_blocks": None,
+        }
+
+
+# ---------------------------------------------------------------------------
 # trajrl_api signing helper (pure)
 # ---------------------------------------------------------------------------
 
