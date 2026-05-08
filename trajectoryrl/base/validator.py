@@ -83,20 +83,16 @@ _EPOCH_POLL_INTERVAL = 30        # seconds between GET /api/v2/epoch/current
 _WEIGHT_CHECK_INTERVAL = 300     # seconds between weight-set attempts
 _HEARTBEAT_INTERVAL = 600        # seconds between heartbeats
 
-# Mid-epoch budget gate. Don't start an eval if the chain window left in
-# the active epoch can't accommodate a typical run plus a safety margin —
-# the eval would either burn cycles for nothing or finish past `end_block`
-# and 409 on submit (counted as participated=false).
-#
-# 12 s/block is the Bittensor block time. Defaults are conservative for
-# the Season 1 trajrl-bench harness; operators can override by env.
-_BITTENSOR_BLOCK_TIME_SECONDS = 12
-_EXPECTED_EVAL_SECONDS = int(
-    os.getenv("VALIDATOR_EXPECTED_EVAL_SECONDS", "600")  # 10 min default
-)
-_EVAL_BUDGET_SAFETY_SECONDS = int(
-    os.getenv("VALIDATOR_EVAL_BUDGET_SAFETY_SECONDS", "60")
-)
+# Mid-epoch budget gate. We don't pin an absolute eval-duration budget
+# (operator-tunable env vars would just shift mis-configuration risk
+# from one knob to another). Instead use a progress ratio against the
+# server-reported `elapsed_blocks` / `epoch_length_blocks`: if more than
+# `_EVAL_LATEST_START_RATIO` of the epoch is already gone when we look,
+# skip and wait for the next one. This auto-adapts to whatever
+# `EPOCH_LENGTH_BLOCKS` the server is configured with — e.g. on a
+# 150-block (~30 min) epoch with ratio 0.5 the daemon must start eval
+# within the first ~15 min of the window.
+_EVAL_LATEST_START_RATIO = 0.5
 
 
 class TrajectoryValidator:
@@ -691,6 +687,52 @@ class TrajectoryValidator:
         return int(hashlib.sha256(raw).hexdigest()[:8], 16)
 
     @staticmethod
+    def _epoch_has_budget(
+        resp: Dict[str, Any],
+        epoch: Dict[str, Any],
+        challenge_epoch_id: int,
+    ) -> bool:
+        """Mid-epoch start gate based on server-reported elapsed progress.
+
+        Returns False (skip) when more than ``_EVAL_LATEST_START_RATIO``
+        of the epoch has already passed; True otherwise. When the server
+        cannot report ``elapsed_blocks`` (chain RPC down), or epoch
+        length is missing/zero, the gate is bypassed and the caller
+        proceeds — the daemon has no better signal locally.
+        """
+        elapsed_blocks = resp.get("elapsed_blocks")
+        if elapsed_blocks is None:
+            return True
+
+        # Prefer the explicit epoch_length_blocks field; fall back to
+        # end_block - start_block. The two should agree but the latter
+        # is the safer ground truth.
+        start_block = epoch.get("start_block")
+        end_block = epoch.get("end_block")
+        try:
+            length = int(epoch.get("epoch_length_blocks") or 0)
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0:
+            try:
+                length = int((end_block or 0) - (start_block or 0))
+            except (TypeError, ValueError):
+                length = 0
+        if length <= 0:
+            return True
+
+        progress = elapsed_blocks / length
+        if progress > _EVAL_LATEST_START_RATIO:
+            logger.info(
+                "Skipping epoch %s: elapsed %d/%d blocks (%.0f%%) "
+                "past latest-start cutoff %.0f%%; waiting for next epoch.",
+                challenge_epoch_id, elapsed_blocks, length,
+                progress * 100, _EVAL_LATEST_START_RATIO * 100,
+            )
+            return False
+        return True
+
+    @staticmethod
     def _commitment_from_epoch(epoch_block: Dict[str, Any]) -> Optional[MinerCommitment]:
         """Build a ``MinerCommitment`` from the API ``epoch`` block.
 
@@ -863,24 +905,14 @@ class TrajectoryValidator:
         if self._last_scored_challenge_epoch_id == challenge_epoch_id:
             return  # idempotent: already evaluated this epoch
 
-        # Mid-epoch budget gate (docs/API.md "Mid-epoch start"). When the
-        # server reports `remaining_blocks`, only start the eval if there
-        # is enough chain time left for a typical run plus safety margin.
-        # When `remaining_blocks` is null (server chain RPC down) we
-        # cautiously proceed — the daemon has no better signal, and a
-        # post-finalize submit will 409 cleanly.
-        remaining_blocks = resp.get("remaining_blocks")
-        if remaining_blocks is not None:
-            remaining_secs = remaining_blocks * _BITTENSOR_BLOCK_TIME_SECONDS
-            needed_secs = _EXPECTED_EVAL_SECONDS + _EVAL_BUDGET_SAFETY_SECONDS
-            if remaining_secs < needed_secs:
-                logger.info(
-                    "Skipping epoch %s: %ds remaining < %ds needed "
-                    "(EXPECTED_EVAL=%ds + SAFETY=%ds). Will pick up next epoch.",
-                    challenge_epoch_id, remaining_secs, needed_secs,
-                    _EXPECTED_EVAL_SECONDS, _EVAL_BUDGET_SAFETY_SECONDS,
-                )
-                return
+        # Mid-epoch budget gate (docs/API.md "Mid-epoch start"). Use the
+        # server-reported elapsed/total progress ratio rather than a
+        # hard-coded eval-duration budget. When the server can't report
+        # `elapsed_blocks` (chain RPC down) the gate is bypassed — the
+        # daemon has no better signal, and a post-finalize submit will
+        # 409 cleanly.
+        if not self._epoch_has_budget(resp, epoch, challenge_epoch_id):
+            return
 
         commitment = self._commitment_from_epoch(epoch)
         if commitment is None:

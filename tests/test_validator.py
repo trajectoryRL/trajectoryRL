@@ -350,6 +350,78 @@ class TestValidatorEpochHelpers:
 
 
 # ---------------------------------------------------------------------------
+# Mid-epoch budget gate (elapsed/total progress ratio)
+# ---------------------------------------------------------------------------
+
+
+class TestEpochBudgetGate:
+    """_epoch_has_budget should skip when more than 50% of the epoch
+    has elapsed; otherwise proceed. Bypass on missing chain-time data."""
+
+    def _epoch(self, start=8000000, end=8000150, length=150):
+        return {
+            "challenge_epoch_id": 17,
+            "challenger_hotkey": "5G",
+            "challenger_pack_hash": "f" * 64,
+            "challenger_pack_url": "https://x/p.json",
+            "start_block": start,
+            "end_block": end,
+            "epoch_length_blocks": length,
+            "status": "in_progress",
+        }
+
+    def test_proceeds_when_under_threshold(self):
+        from trajectoryrl.base.validator import TrajectoryValidator
+        epoch = self._epoch()
+        resp = {"epoch": epoch, "elapsed_blocks": 30, "remaining_blocks": 120}
+        # 30/150 = 20% → proceed
+        assert TrajectoryValidator._epoch_has_budget(resp, epoch, 17) is True
+
+    def test_skips_when_past_threshold(self):
+        from trajectoryrl.base.validator import TrajectoryValidator
+        epoch = self._epoch()
+        resp = {"epoch": epoch, "elapsed_blocks": 100, "remaining_blocks": 50}
+        # 100/150 ≈ 66.7% → skip
+        assert TrajectoryValidator._epoch_has_budget(resp, epoch, 17) is False
+
+    def test_skips_at_exactly_half_plus_one(self):
+        from trajectoryrl.base.validator import TrajectoryValidator
+        epoch = self._epoch()
+        # 76/150 = 50.7% → skip
+        resp = {"epoch": epoch, "elapsed_blocks": 76, "remaining_blocks": 74}
+        assert TrajectoryValidator._epoch_has_budget(resp, epoch, 17) is False
+
+    def test_proceeds_at_exactly_half(self):
+        from trajectoryrl.base.validator import TrajectoryValidator
+        epoch = self._epoch()
+        # 75/150 = 50.0% → proceed (gate is `>` strict)
+        resp = {"epoch": epoch, "elapsed_blocks": 75, "remaining_blocks": 75}
+        assert TrajectoryValidator._epoch_has_budget(resp, epoch, 17) is True
+
+    def test_bypass_when_elapsed_blocks_null(self):
+        from trajectoryrl.base.validator import TrajectoryValidator
+        epoch = self._epoch()
+        # Server chain RPC down → bypass gate, proceed
+        resp = {"epoch": epoch, "elapsed_blocks": None, "remaining_blocks": None}
+        assert TrajectoryValidator._epoch_has_budget(resp, epoch, 17) is True
+
+    def test_falls_back_to_end_minus_start(self):
+        from trajectoryrl.base.validator import TrajectoryValidator
+        # Length field missing → fall back to end - start
+        epoch = self._epoch(length=0)
+        resp = {"epoch": epoch, "elapsed_blocks": 30, "remaining_blocks": 120}
+        # end - start = 150; 30/150 = 20% → proceed
+        assert TrajectoryValidator._epoch_has_budget(resp, epoch, 17) is True
+
+    def test_bypass_when_length_unknowable(self):
+        from trajectoryrl.base.validator import TrajectoryValidator
+        # No length, no usable start/end either → bypass
+        epoch = {"challenge_epoch_id": 17}
+        resp = {"epoch": epoch, "elapsed_blocks": 30, "remaining_blocks": None}
+        assert TrajectoryValidator._epoch_has_budget(resp, epoch, 17) is True
+
+
+# ---------------------------------------------------------------------------
 # fetch_current_epoch — propagates remaining_blocks for the budget gate
 # ---------------------------------------------------------------------------
 
