@@ -75,6 +75,7 @@ _METAGRAPH_SYNC_RETRIES = 3
 _METAGRAPH_SYNC_DELAY = 10  # seconds between retries
 _METAGRAPH_MIN_NEURONS = 1
 
+# Total set_weights attempts per tick: 1 initial + 2 retries on failure.
 _SET_WEIGHTS_MAX_RETRIES = 3
 _SET_WEIGHTS_RETRY_DELAY = 12  # seconds; roughly 1 block interval
 
@@ -87,7 +88,7 @@ _SET_WEIGHTS_RETRY_DELAY = 12  # seconds; roughly 1 block interval
 # fallback used only when the server response is indeterminate: 404,
 # transient HTTP error, or remaining_blocks null.
 _EPOCH_POLL_INTERVAL = 30
-_WEIGHT_CHECK_INTERVAL = 300
+_WEIGHT_CHECK_INTERVAL = 60
 _HEARTBEAT_INTERVAL = 600
 
 # Mid-epoch budget gate. We don't pin an absolute eval-duration budget
