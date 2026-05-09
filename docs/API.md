@@ -1354,15 +1354,13 @@ FIFO challenger queue snapshot. Returned in the order the scheduler will pick fr
       "pack_hash": "abc...",
       "pack_url": "https://...",
       "submitted_at": "2026-05-07T12:00:00Z",
-      "attempt_count": 0,
       "eligible_now": true
     }
-  ],
-  "max_attempts": 3
+  ]
 }
 ```
 
-`eligible_now=false` rows are still in the queue but currently filtered out (per-miner cooldown, attempt-count exhausted, etc.). `max_attempts` is the configured `MAX_ATTEMPTS`; rows with `attempt_count >= max_attempts` will move to `eval_status='exhausted'`.
+`eligible_now=false` rows are still in the queue but currently filtered out by the per-miner cooldown — a miner_hotkey that was challenger in any `challenge_epoch` within the last `MINER_COOLDOWN_HOURS` (default 12 h) is held back from being picked again. There is no retry mechanism for quorum-aborted submissions: a single `aborted_quorum` finalize moves the row to `eval_status='exhausted'`, dropping it from the queue. The miner can submit a new `pack_hash` to re-enter.
 
 ### `GET /api/epoch/{id}` (public read)
 

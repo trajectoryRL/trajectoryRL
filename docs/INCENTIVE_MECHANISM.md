@@ -334,7 +334,7 @@ Aggregation runs server-side, but every input (per-validator `score_submit_log` 
 
 ### 8. Quorum Gate
 
-**Enforcement**: An epoch finalizes only if reporting stake ≥ `QUORUM_FRACTION` (default 0.5) of the start_block-snapshot active stake. Below quorum, the epoch is `aborted_quorum`; the same challenger is retried up to `MAX_ATTEMPTS = 3` total before its `pack_hash` is `blacklisted` (see [Challenge Epoch Lifecycle](#challenge-epoch-lifecycle)).
+**Enforcement**: An epoch finalizes only if reporting stake ≥ `QUORUM_FRACTION` (default 0.5) of the start_block-snapshot active stake. Below quorum, the epoch is `aborted_quorum` and the challenger submission is moved to `eval_status = 'exhausted'` immediately — there is no retry. The miner can submit a different `pack_hash` to re-enter the queue (see [Challenge Epoch Lifecycle](#challenge-epoch-lifecycle)).
 
 **Prevents**:
 
@@ -379,7 +379,6 @@ The on-chain layer (YC3 + commit-reveal + bond dynamics) is unchanged from v5.x.
    pick queue head:
      SELECT FROM miner_submissions
        WHERE eval_status = 'pending_eval'
-         AND attempt_count < MAX_ATTEMPTS
          AND no recent epoch with same hotkey within MINER_COOLDOWN_EPOCHS
        ORDER BY submitted_at ASC
        LIMIT 1
@@ -423,8 +422,6 @@ The on-chain layer (YC3 + commit-reveal + bond dynamics) is unchanged from v5.x.
 
    reporting_stake / total_active_stake < QUORUM_FRACTION:
      → status = aborted_quorum
-     → miner_submissions.attempt_count++
-     → if attempt_count >= MAX_ATTEMPTS:
             eval_status = 'blacklisted'
        else:
             row stays pending_eval, will be repicked next epoch
@@ -496,7 +493,7 @@ See [Winner Protection](#winner-protection-score-based-δ--3) above for the full
 | Pre-Eval LLM unavailable | New rows stay `pending_pre_eval`; server retries on next tick. Queue does not move on these rows; previously-eligible rows continue normally. |
 | Chain RPC unavailable | Channel A sync stops; Channel B unaffected. Previously-queued rows continue. |
 | CAS / GCS read failure on validator | Validator skips the epoch. Counted as non-participation. |
-| Quorum miss | Epoch `aborted_quorum`; challenger retried up to `MAX_ATTEMPTS` then blacklisted. |
+| Quorum miss | Epoch `aborted_quorum`; challenger submission moves to `eval_status='exhausted'` immediately — no retry. Miner can submit a different `pack_hash`. |
 | DB outage on server | Write APIs return 5xx; validators retry. Read APIs serve last cached state if available. |
 | Single validator submitting malicious score | Diluted by stake-weighted average. Cannot dethrone unless > 50% stake collusion (already a network-level trust assumption). |
 
@@ -638,8 +635,7 @@ miner_submissions row inserted with eval_status = 'pending_pre_eval'
    │
    ▼ epoch end (hard block deadline)
    │
-   ├─ quorum < QUORUM_FRACTION  → aborted_quorum, attempt_count++
-   │                              attempt_count == MAX_ATTEMPTS  → blacklisted
+   ├─ quorum < QUORUM_FRACTION  → aborted_quorum, eval_status='exhausted' (no retry)
    │
    └─ quorum ≥ QUORUM_FRACTION  → aggregate (stake-weighted)
                                   → apply Winner Protection (δ = 0.03)
@@ -694,7 +690,6 @@ Bootstrap:     70/20/10 split among top-3 qualified
 |-----------|---------|----------|
 | `EPOCH_LENGTH_BLOCKS` | 150 (≈ 30 min) | Yes (bench-driven; 30 min – several days) |
 | `QUORUM_FRACTION` | 0.50 | Yes |
-| `MAX_ATTEMPTS` | 3 | Yes |
 | `WINNER_PROTECTION_MARGIN` (δ) | 0.03 (3%) | Yes |
 | `MINER_COOLDOWN_EPOCHS` | 5 | Yes |
 | `INACTIVE_THRESHOLD_EPOCHS` | 3 | Yes |
@@ -733,7 +728,7 @@ v6.0 ships in three phases gated by an `INCENTIVE_MECHANISM` major-version bump.
 - Remove disabled v5.2 consensus code path.
 - Optionally archive and drop `consensus_payload_log` (separate spec).
 
-No data migration is required for `miner_submissions` rows that landed under v5.x — the new `attempt_count` defaults to 0, and existing rows remain in their existing `eval_status`. The new `'blacklisted'` value applies to v6.0 onward.
+No data migration is required for `miner_submissions` rows that landed under v5.x — existing rows remain in their existing `eval_status`. The new `'exhausted'` value applies to v6.0 onward (terminal on first quorum-abort under the no-retry policy).
 
 The full design rationale lives in [`docs/superpowers/specs/2026-05-07-per-epoch-per-miner-design.md`](https://github.com/trajectoryRL/trajectoryrl.web/blob/main/docs/superpowers/specs/2026-05-07-per-epoch-per-miner-design.md) (in the web repo).
 
@@ -743,7 +738,7 @@ The full design rationale lives in [`docs/superpowers/specs/2026-05-07-per-epoch
 
 | Version | Date | Summary |
 |---------|------|---------|
-| **v6.0** | **2026-05-07** | **Winner-challenger model.** Replaced decentralized off-chain CAS + chain-commitment-pointer consensus with server-coordinated challenge epochs (one challenger per epoch, evaluated against the seated winner). Centralized Phase-1 pre-eval as queue gate. Added `web submit` as a first-class submission channel alongside on-chain commitments. `winner_state` is now server-canonical (replaces per-validator local `WinnerState` JSON). Tightened Winner Protection δ from 10% to 3%. New tables: `challenge_epochs`, `winner_state`, `winner_history`, `validator_activity`. New `eval_status = 'blacklisted'` for `pack_hash` that exhausted `MAX_ATTEMPTS = 3`. |
+| **v6.0** | **2026-05-07** | **Winner-challenger model.** Replaced decentralized off-chain CAS + chain-commitment-pointer consensus with server-coordinated challenge epochs (one challenger per epoch, evaluated against the seated winner). Centralized Phase-1 pre-eval as queue gate. Added `web submit` as a first-class submission channel alongside on-chain commitments. `winner_state` is now server-canonical (replaces per-validator local `WinnerState` JSON). Tightened Winner Protection δ from 10% to 3%. New tables: `challenge_epochs`, `winner_state`, `winner_history`, `validator_activity`.  New `eval_status = 'exhausted'` for `pack_hash` whose first scheduled epoch ended in `aborted_quorum` (no-retry policy — superseded the earlier retry-up-to-3 design). |
 | v5.2 | 2026-04-26 | Deterministic window-start active-set snapshots; submit-when-fully-done with stake-quorum-gated aggregation; dual-window `physical_window` vs `target_window`; burn-while-waiting on quorum miss. |
 | v5.1 | 2026-04-24 | Replaced on-chain `block_number` first-mover + NCD pre-eval with `pack_first_seen` ownership lock (no succession; 7-window grace). |
 | v5.0 | 2026-04-21 | Refactored into season-agnostic core. Extracted scoring + pack schema to `SCORING_AND_EVALUATION.md`. Abstracted "cost" to "score". |
