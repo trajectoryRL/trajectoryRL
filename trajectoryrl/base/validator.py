@@ -1,17 +1,24 @@
-"""TrajectoryRL Validator — Main validator implementation.
+"""TrajectoryRL Validator — v6.0 winner-challenger daemon.
 
-Architecture (Season 1 — trajrl-bench):
-    1. Continuous evaluation loop with dual cadence:
-       - eval_interval (~24h): re-evaluate all active packs
-       - tempo (~72 min): compute weights from qualification + cost, set_weights
-    2. Read on-chain commitments (subtensor.get_all_commitments)
-    3. Fetch packs from miners' public HTTP URLs
-    4. NCD pairwise dedup; schema validation in _evaluate_miner
-    5. Run trajrl-bench shell_verifier sandbox evaluation (SKILL.md packs)
-    6. Score = Σ (passed/total) across scenarios; cost reported on a separate axis
-    7. Set on-chain weights (winner-take-all / bootstrap)
+Architecture (Season 1 — trajrl-bench, v6.0 IM):
+    1. Polls ``GET /api/v2/epoch/current`` (~30 s) for the active
+       challenger and the seated winner.
+    2. Refreshes the local winner cache from the server response on every
+       successful poll.
+    3. Fetches and verifies the challenger pack (SHA256), runs trajrl-bench
+       sandbox evaluation, and posts the signed score to
+       ``POST /api/v2/epoch/{challenge_epoch_id}/score``.
+    4. Sets on-chain weights from the cached winner; tempo-gated so the
+       chain accepts at most one weight write per tempo regardless of
+       how often the daemon ticks.
+    5. Heartbeats every ~10 min with version + image digests.
 
-Each validator operates independently — Yuma Consensus aggregates on-chain.
+The validator carries no per-miner evaluation cache, no client-side
+integrity LLM judge, no ``pack_first_seen`` ownership state, and no
+``epoch_snapshot`` polling. Pre-eval, integrity gating, and ownership
+locks are all handled server-side (see INCENTIVE_MECHANISM.md §4 and §3).
+
+Each validator runs independently — Yuma Consensus aggregates on-chain.
 """
 
 import asyncio
@@ -22,109 +29,74 @@ import logging
 import os
 import time
 
-from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import bittensor as bt
-import docker.errors
 
-from ..utils.config import TOP_N_RECHECK, ValidatorConfig
-from ..utils.sandbox_harness import TrajectorySandboxHarness, SandboxEvaluationResult
-from ..scoring import TrajectoryScorer
+from ..utils.config import ValidatorConfig
+from ..utils.sandbox_harness import TrajectorySandboxHarness
 from ..utils.github import PackFetcher
-from ..utils.eval_window import (
-    WindowConfig, WindowPhase, EvaluationWindow,
-    compute_window, is_new_window, can_evaluate,
-    should_submit, should_aggregate,
-)
 from ..utils import config as _config_mod
-from ..utils.consensus import (
-    ConsensusPayload, ConsensusPointer,
-    CONSENSUS_PROTOCOL_VERSION,
+from ..utils.commitments import MinerCommitment
+from ..utils.miner_eval import evaluate_miner_s1, SKIP_PACK_VERIFY
+from ..utils.trajrl_api import (
+    heartbeat,
+    fetch_current_epoch,
+    fetch_current_winner,
+    submit_challenge_score,
+    upload_eval_logs,
+    upload_cycle_logs,
 )
+from ..utils.winner_state import (
+    WinnerState,
+    derive_winner_state,
+    save_winner_state,
+    load_winner_state,
+    WINNER_FALLBACK_TTL_SECONDS,
+)
+from .. import __version__
 
 
 def _spec_number() -> int:
     """Current scoring spec identifier (validator-side constant).
 
     See ``trajectoryrl/utils/config.py::SPEC_NUMBER`` for bump policy.
-    Used as the value written into outgoing commitments / payloads and as
-    the fallback target when no on-chain spec_number group reaches
-    stake-weighted majority.
     """
     return _config_mod.SPEC_NUMBER
 
-
-from ..utils.consensus_store import (
-    ConsensusStore, IPFSBackend, TrajRLAPIBackend,
-)
-from ..utils.consensus_filter import (
-    run_filter_pipeline, ValidatedSubmission,
-)
-from ..scoring import compute_consensus_scores
-from ..utils.winner_state import (
-    WinnerState, select_winner_with_protection,
-    save_winner_state, load_winner_state,
-)
-from ..utils.pack_ownership import (
-    claim_owner, evict_orphans,
-    save_pack_first_seen, load_pack_first_seen,
-    EVICTION_GRACE_WINDOWS,
-    _decode_table as _decode_pack_first_seen_table,
-)
-from ..utils.miner_eval import (
-    evaluate_miner_s1,
-    SKIP_PACK_VERIFY,
-)
-from ..utils.commitments import (
-    MinerCommitment, fetch_all_commitments,
-    ValidatorConsensusCommitment, fetch_validator_consensus_commitments,
-    format_consensus_commitment, decode_dual_address,
-    is_consensus_commitment, parse_consensus_commitment,
-)
-from ..utils.eval_snapshot import (
-    EvalSnapshot, take_snapshot, take_snapshot_from_api,
-    load_snapshot, save_snapshot,
-)
-from ..utils.status_reporter import (
-    heartbeat, submit_eval, upload_eval_logs, upload_cycle_logs,
-    fetch_epoch_snapshot, SnapshotNotReady,
-)
-from ..utils.llm_judge import PackIntegrityJudge, TrajectoryJudge
-from .. import __version__
 
 logger = logging.getLogger(__name__)
 
 OWNER_UID = 74
 BURN_FRACTION = 0.95  # 95% of miner emissions burned via owner UID
-EVAL_START_BLOCK = 7986780  # 2026-04-17 08:00 UTC (ref: block 7986030 @ 05:30:09 UTC, ~12s/block)
 
 _METAGRAPH_SYNC_RETRIES = 3
 _METAGRAPH_SYNC_DELAY = 10  # seconds between retries
-_METAGRAPH_MIN_NEURONS = 1  # minimum expected neurons for a healthy metagraph
+_METAGRAPH_MIN_NEURONS = 1
 
 _SET_WEIGHTS_MAX_RETRIES = 3
 _SET_WEIGHTS_RETRY_DELAY = 12  # seconds; roughly 1 block interval
 
+# Daemon cadence (v6.0)
+_EPOCH_POLL_INTERVAL = 30        # seconds between GET /api/v2/epoch/current
+_WEIGHT_CHECK_INTERVAL = 300     # seconds between weight-set attempts
+_HEARTBEAT_INTERVAL = 600        # seconds between heartbeats
+
+# Mid-epoch budget gate. We don't pin an absolute eval-duration budget
+# (operator-tunable env vars would just shift mis-configuration risk
+# from one knob to another). Instead use a progress ratio against the
+# server-reported `elapsed_blocks` / `epoch_length_blocks`: if more than
+# `_EVAL_LATEST_START_RATIO` of the epoch is already gone when we look,
+# skip and wait for the next one. This auto-adapts to whatever
+# `EPOCH_LENGTH_BLOCKS` the server is configured with — e.g. on a
+# 150-block (~30 min) epoch with ratio 0.5 the daemon must start eval
+# within the first ~15 min of the window.
+_EVAL_LATEST_START_RATIO = 0.5
+
 
 class TrajectoryValidator:
-    """TrajectoryRL validator that evaluates SKILL.md packs via trajrl-bench.
-
-    Season 1 flow:
-    1. Reads on-chain commitments from miners
-    2. Fetches and verifies packs from miners' public HTTP URLs
-    3. NCD pairwise dedup (copiers rejected like integrity fail)
-    4. Runs trajrl-bench shell_verifier sandbox evaluation
-    5. Score = Σ (passed/total) across scenarios; cost on a separate axis
-    6. Sets on-chain weights (winner-take-all or bootstrap)
-    7. Re-sets weights every tempo (~72 min) for convergence
-
-    Example:
-        >>> config = ValidatorConfig.from_env()
-        >>> validator = TrajectoryValidator(config)
-        >>> await validator.run()
-    """
+    """v6.0 thin validator daemon."""
 
     def __init__(self, config: ValidatorConfig):
         self.config = config
@@ -150,158 +122,82 @@ class TrajectoryValidator:
         logger.info(f"Metagraph: n={mg_n}, block={getattr(self.metagraph, 'block', '?')}")
         if not mg_n:
             logger.error(
-                "METAGRAPH EMPTY at startup (n=0). "
-                "This validator will not be able to set weights until "
-                "metagraph sync is healthy. Check subtensor endpoint: %s",
+                "METAGRAPH EMPTY at startup (n=0). On-chain operations "
+                "will fail until sync recovers. Endpoint: %s",
                 config.network,
             )
 
         logger.info("Initializing trajrl-bench sandbox harness...")
         self._sandbox_harness = TrajectorySandboxHarness(config)
 
-        self.scorer = TrajectoryScorer(
-            consensus_epsilon=config.consensus_epsilon,
-            bootstrap_threshold=config.bootstrap_threshold,
-        )
-
-        judge_model = config.judge_model or config.llm_model
-        judge_api_key = config.judge_api_key or config.llm_api_key
-        judge_base_url = config.judge_base_url or config.llm_base_url
-        self._judge_model = judge_model
-        self._judge_base_url = judge_base_url
-        logger.debug("Initializing LLM judges (model=%s)...", judge_model)
-
-        self.integrity_judge = PackIntegrityJudge(
-            model=judge_model,
-            api_key=judge_api_key,
-            base_url=judge_base_url,
-        )
-        self.trajectory_judge = TrajectoryJudge(
-            model=judge_model,
-            api_key=judge_api_key,
-            base_url=judge_base_url,
-        )
-
         logger.debug("Initializing pack fetcher...")
-        self.pack_fetcher = PackFetcher(
-            cache_dir=config.pack_cache_dir,
-        )
+        self.pack_fetcher = PackFetcher(cache_dir=config.pack_cache_dir)
 
-        # Per-scenario continuous quality scores: {hotkey: {scenario: float in [0.0, 1.0]}}
-        # Source: judge_details[scenario].overall_score (S1 sandbox eval).
-        self.scenario_scores: Dict[str, Dict[str, float]] = {}
+        # Winner cache (server-canonical, mirrored locally for fallback)
+        self._winner_state_path = str(config.winner_state_path)
+        self._winner_state: WinnerState = load_winner_state(self._winner_state_path)
 
-        # Latest token usage per hotkey/scenario: {hotkey: {scenario: {input_tokens, ...}}}
-        self.latest_token_usage: Dict[str, Dict[str, Dict[str, int]]] = {}
-
-        # Latest model usage per hotkey/scenario: {hotkey: {scenario: [model_entry, ...]}}
-        self.latest_model_usage: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
-
-        # Track the pack_hash that each hotkey was last evaluated with.
-        self._eval_pack_hash: Dict[str, str] = {}
-
-        # Last eval block for each hotkey (telemetry only — eval gating is
-        # by pack_hash, see _needs_evaluation).
-        self.last_eval_block: Dict[str, int] = {}
-
-        # Last eval window for each hotkey. Used by _needs_evaluation logging
-        # and surfaces "which window did we last score this miner in" for
-        # debugging restart / cross-epoch reuse behavior.
-        self.last_eval_window: Dict[str, int] = {}
-
-        # Per-validator ownership lock for exact pack_hash dedup.
-        # pack_hash -> (first_observed_hotkey, first_observed_block).
-        # Set once via setdefault, never updated. No succession: if the
-        # original owner goes inactive, no other miner inherits — copies
-        # always receive weight 0 until eviction (see end-of-cycle sweep
-        # in _execute_evaluation_cycle).
-        self.pack_first_seen: Dict[str, Tuple[str, int]] = {}
-
-        # pack_hash -> last window number we observed it in any active
-        # commitment. Updated by `evict_orphans` at the end of each
-        # evaluation cycle. Drives the grace-windowed eviction policy:
-        # a pack_first_seen entry is dropped only after its hash has
-        # been absent for `EVICTION_GRACE_WINDOWS` consecutive
-        # wall-clock windows (any re-activation resets the clock).
-        self.pack_last_seen_window: Dict[str, int] = {}
-
-        # Tracks which UID each hotkey was last evaluated at for re-registration detection.
-        self._hotkey_uid_map: Dict[str, int] = {}
-
-        # Weight cadence tracking
-        self.last_weight_block: int = 0
-
-        # Eval count per hotkey for the current pack (resets on pack change)
-        self._eval_counts: Dict[str, int] = {}
-
-        # Timestamp of the most recent successful set_weights call
+        # Telemetry timestamps (set after each successful action)
         self._last_set_weights_at: Optional[int] = None
-
-        # Timestamp of the most recent completed full evaluation cycle
         self._last_eval_at: Optional[int] = None
 
-        # UTC date of the most recent completed eval cycle (legacy daily scheduling)
-        self._last_eval_date: Optional[datetime.date] = None
+        # Tempo gate: which block we last attempted set_weights at
+        self._last_set_weights_block: int = 0
 
-        # Block-based window tracking (replaces _last_eval_date for consensus protocol)
-        self._last_eval_window: int = -1
-        self._window_config = WindowConfig(
-            window_length=config.eval_interval_blocks,
-            global_anchor=config.global_anchor_block,
-            publish_pct=config.window_publish_pct,
-            aggregate_pct=config.window_aggregate_pct,
-        )
-        # Which window's aggregation has completed (persisted in eval state).
-        # Guards one-shot aggregation per window — survives restarts.
-        self._consensus_window: int = -1
-        # Logical consensus anchor (Issue 1): the only window allowed to
-        # progress eval/submit/aggregation state. Decoupled from physical
-        # window derived from current block.
-        self._target_window: int = -1
-        # Submit idempotency marker for the target window.
-        self._target_submit_done: bool = False
-        # Sticky marker: quorum not yet met for current target window.
-        self._waiting_for_quorum: bool = False
+        # Idempotency: don't re-evaluate the same challenge epoch on retry
+        self._last_scored_challenge_epoch_id: Optional[int] = None
 
-        # Cycle log state — uploaded after each window phase completes
+        # Cycle log state — rolled per-eval to bundle the validator log
+        # captured during a single challenger evaluation
         self._cycle_eval_id: Optional[str] = None
         self._cycle_log_offset: int = 0
         self._cycle_log_block: int = 0
-        self._cycle_window_number: int = 0
 
-        # Consensus CAS store (IPFS + API)
-        def _sign_consensus_msg(msg: str) -> str:
-            sig = self.wallet.hotkey.sign(msg.encode())
-            return "0x" + (sig if isinstance(sig, bytes) else bytes(sig)).hex()
-
-        self._consensus_store = ConsensusStore(
-            ipfs=IPFSBackend(
-                api_url=config.ipfs_api_url,
-                gateway_urls=config.ipfs_gateway_urls,
-            ),
-            api=TrajRLAPIBackend(
-                base_url=config.consensus_api_url,
-                sign_fn=_sign_consensus_msg,
-                validator_hotkey=self.wallet.hotkey.ss58_address,
-            ),
-        )
-
-
-        # Miners disqualified during current window's evaluation (pre-eval, integrity)
-        # Reset at each new eval cycle. Included in ConsensusPayload.
-        self._disqualified_miners: Dict[str, str] = {}
-
-        # Winner Protection state
-        self._winner_state_path = str(config.winner_state_path)
-        self._winner_state = load_winner_state(self._winner_state_path)
-
-        # Load persisted evaluation state. Eval state is invalidated when the
-        # persisted spec_number disagrees with the current SPEC_NUMBER (any
-        # bump in scenario set or scoring methodology renders cached scores
-        # incomparable).
         self._load_eval_state()
 
         logger.info("Validator initialization complete!")
+
+    # ------------------------------------------------------------------
+    # Logging
+    # ------------------------------------------------------------------
+
+    def _setup_logging(self):
+        log_format = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+        self._validator_log_path = (
+            self.config.log_dir / f"validator_{int(time.time())}.log"
+        )
+        logging.basicConfig(
+            level=getattr(logging, self.config.log_level),
+            format=log_format,
+            handlers=[
+                logging.StreamHandler(),
+                logging.FileHandler(self._validator_log_path),
+            ],
+        )
+
+        # Per-miner log directory (kept for per-challenger eval traces)
+        self._miner_log_dir = self.config.log_dir / "miners"
+        self._miner_log_dir.mkdir(parents=True, exist_ok=True)
+        self._miner_loggers: Dict[str, logging.Logger] = {}
+
+    def _get_miner_logger(self, hotkey: str) -> logging.Logger:
+        """Get or create a per-miner file logger (INFO, no console)."""
+        if hotkey in self._miner_loggers:
+            return self._miner_loggers[hotkey]
+
+        mlog = logging.getLogger(f"trajectoryrl.miner.{hotkey[:16]}")
+        mlog.setLevel(logging.INFO)
+        mlog.propagate = False
+
+        log_format = "%(asctime)s | %(levelname)-8s | %(message)s"
+        fh = logging.FileHandler(
+            self._miner_log_dir / f"{hotkey[:16]}.log"
+        )
+        fh.setFormatter(logging.Formatter(log_format))
+        mlog.addHandler(fh)
+
+        self._miner_loggers[hotkey] = mlog
+        return mlog
 
     # ------------------------------------------------------------------
     # Metagraph sync helpers
@@ -313,13 +209,7 @@ class TrajectoryValidator:
         retries: int = _METAGRAPH_SYNC_RETRIES,
         caller: str = "",
     ) -> bool:
-        """Sync metagraph with retries.  Returns True if healthy (n > 0).
-
-        On each failed attempt the subtensor connection is rebuilt so that
-        transient network / websocket issues are recovered from automatically.
-        """
         label = f"[{caller}] " if caller else ""
-
         for attempt in range(1, retries + 1):
             try:
                 self.metagraph.sync(subtensor=self.subtensor)
@@ -337,38 +227,28 @@ class TrajectoryValidator:
             if n and n >= _METAGRAPH_MIN_NEURONS:
                 if attempt > 1:
                     logger.info(
-                        "%sMetagraph sync recovered on attempt %d/%d "
-                        "(n=%d, block=%s)",
+                        "%sMetagraph sync recovered on attempt %d/%d (n=%d)",
                         label, attempt, retries, n,
-                        getattr(self.metagraph, "block", "?"),
                     )
                 return True
 
             logger.warning(
-                "%sMetagraph sync returned n=%d (expected >= %d), "
-                "attempt %d/%d",
-                label, n, _METAGRAPH_MIN_NEURONS, attempt, retries,
+                "%sMetagraph sync returned n=%d, attempt %d/%d",
+                label, n, attempt, retries,
             )
             if attempt < retries:
                 time.sleep(_METAGRAPH_SYNC_DELAY)
                 self._reconnect_subtensor(label)
 
-        n = getattr(self.metagraph, "n", 0)
         logger.error(
-            "%sMETAGRAPH UNHEALTHY after %d attempts — n=%d, "
-            "block=%s. On-chain operations (set_weights, commitments) "
-            "will likely fail silently. Check subtensor endpoint: %s",
-            label, retries, n,
-            getattr(self.metagraph, "block", "?"),
+            "%sMETAGRAPH UNHEALTHY after %d attempts — n=%d. "
+            "On-chain set_weights will likely fail. Endpoint: %s",
+            label, retries, getattr(self.metagraph, "n", 0),
             self.config.network,
         )
         return False
 
     def _reconnect_subtensor(self, label: str = ""):
-        """Rebuild the subtensor connection to recover from stale websockets.
-
-        Returns the new ``self.subtensor`` on success, ``None`` on failure.
-        """
         try:
             logger.info("%sReconnecting subtensor (network=%s)...",
                         label, self.config.network)
@@ -384,345 +264,75 @@ class TrajectoryValidator:
             return None
 
     def _is_metagraph_healthy(self) -> bool:
-        """Quick check whether the cached metagraph has any neurons."""
         n = getattr(self.metagraph, "n", 0)
         return bool(n and n >= _METAGRAPH_MIN_NEURONS)
 
     # ------------------------------------------------------------------
-    # Evaluation state persistence
+    # Persistent eval state (v6 minimal)
     # ------------------------------------------------------------------
 
     def _load_eval_state(self):
-        """Load persisted evaluation state from disk.
+        """Load persisted state from disk.
 
-        Invalidates all state when the persisted ``spec_number`` no longer
-        matches the running ``SPEC_NUMBER`` — any spec bump implies cached
-        scores are incomparable with new ones. Accepts either ``spec_number``
-        (current) or ``scoring_version`` (legacy) JSON keys.
+        v6.0 keeps almost no per-miner state on the validator. The only
+        fields that matter across restarts are:
+          - ``last_scored_challenge_epoch_id`` so a restart mid-epoch
+            doesn't double-submit the same score.
+          - ``last_set_weights_at`` / ``last_eval_at`` for telemetry.
 
-        ``pack_first_seen`` is loaded from its own file
-        (``self.config.pack_first_seen_path``); for backward compatibility
-        with earlier internal layouts where the table lived inside
-        ``eval_state.json``, the legacy key is migrated on first load and
-        immediately persisted to the new path so subsequent restarts read
-        from the dedicated file.
+        Everything else (winner cache) lives in the dedicated
+        ``winner_state.json``.
         """
-        # pack_first_seen lives in its own file. Load it first so we can
-        # detect whether legacy migration is needed regardless of the
-        # eval_state.json outcome (spec_number mismatch must NOT wipe
-        # ownership locks — those are spec-agnostic). The companion
-        # last-seen-window dict drives the grace-period eviction logic;
-        # v1 files yield an empty side dict and the clock starts on the
-        # next eviction sweep.
-        self.pack_first_seen, self.pack_last_seen_window = load_pack_first_seen(
-            self.config.pack_first_seen_path
-        )
-
         path = self.config.eval_state_path
         if not path.exists():
             logger.debug("No persisted eval state found, starting fresh")
             return
         try:
             data = json.loads(path.read_text())
-
-            file_spec = data.get("spec_number", data.get("scoring_version", 1))
+            file_spec = data.get("spec_number", data.get("scoring_version", _spec_number()))
             if file_spec != _spec_number():
                 logger.info(
-                    "Eval state spec_number mismatch (%d != %d), "
-                    "invalidating all eval state",
+                    "Eval state spec_number mismatch (%s != %d), "
+                    "resetting per-spec idempotency markers",
                     file_spec, _spec_number(),
                 )
-                self._migrate_legacy_pack_first_seen(data)
                 return
 
-            self.scenario_scores = data.get("scenario_scores", {})
-            self._eval_pack_hash = data.get("eval_pack_hash", {})
-            self.last_eval_block = {
-                k: int(v) for k, v in data.get("last_eval_block", {}).items()
-            }
-            self.last_eval_window = {
-                k: int(v) for k, v in data.get("last_eval_window_per_hotkey", {}).items()
-            }
-            self._last_eval_window = data.get("last_eval_window", -1)
-
-            self._migrate_legacy_pack_first_seen(data)
-
-            self._consensus_window = data.get("consensus_window", -1)
-            self._target_window = int(
-                data.get("target_window", self._consensus_window + 1)
+            self._last_scored_challenge_epoch_id = data.get(
+                "last_scored_challenge_epoch_id"
             )
-            self._target_submit_done = bool(data.get("target_submit_done", False))
-            self._waiting_for_quorum = bool(data.get("waiting_for_quorum", False))
-
-            # Heal legacy false-positive from pre-PR197 validator binaries:
-            # the old aggregation-phase gate could latch _waiting_for_quorum
-            # on a freshly-bumped target where the validator had not yet
-            # submitted. That combination is unreachable after the fix, so
-            # treat it as a corrupt carryover and clear it — otherwise the
-            # main-loop tempo refresh would keep burning until the next
-            # quorum success flips the flag back.
-            if self._waiting_for_quorum and not self._target_submit_done:
-                logger.warning(
-                    "Eval state heal: clearing waiting_for_quorum on "
-                    "target_window=%d with target_submit_done=False "
-                    "(legacy pre-PR197 false-positive)",
-                    self._target_window,
-                )
-                self._waiting_for_quorum = False
-                self._save_eval_state()
-
-            integrity_cache = data.get("integrity_cache")
-            if integrity_cache:
-                self.integrity_judge.load_cache(integrity_cache)
-
-            logger.debug(
-                f"Loaded eval state: {len(self.scenario_scores)} hotkeys"
+            self._last_set_weights_at = data.get("last_set_weights_at")
+            self._last_eval_at = data.get("last_eval_at")
+            self._last_set_weights_block = int(
+                data.get("last_set_weights_block", 0) or 0
             )
         except Exception as e:
-            logger.warning(f"Failed to load eval state: {e}, starting fresh")
-
-    def _migrate_legacy_pack_first_seen(self, eval_state_data: dict) -> None:
-        """One-time migration of legacy ``pack_first_seen`` from eval_state.json.
-
-        Earlier internal builds wrote the ownership table into the same
-        file as eval state. New code reads from a dedicated path; if
-        that file is empty but the legacy key carries entries, decode
-        them and immediately rewrite to the new path. After this, the
-        legacy key stops being written by ``_save_eval_state`` so
-        future restarts see only the new file.
-        """
-        if self.pack_first_seen:
-            return
-        legacy = eval_state_data.get("pack_first_seen")
-        if not legacy:
-            return
-        migrated = _decode_pack_first_seen_table(legacy)
-        if not migrated:
-            return
-        self.pack_first_seen = migrated
-        # Legacy files predate the grace-window tracker; start every
-        # entry's clock on the next eviction sweep so we don't surprise
-        # operators with mass evictions immediately after the upgrade.
-        self.pack_last_seen_window = {}
-        try:
-            save_pack_first_seen(
-                self.pack_first_seen,
-                self.pack_last_seen_window,
-                self.config.pack_first_seen_path,
-            )
-            logger.info(
-                "Migrated %d pack_first_seen entries from eval_state.json "
-                "to %s",
-                len(self.pack_first_seen),
-                self.config.pack_first_seen_path,
-            )
-        except Exception as e:
-            logger.warning(
-                "pack_first_seen legacy migration: failed to persist new "
-                "file (%s); will retry on next save",
-                e,
-            )
+            logger.warning("Failed to load eval state from %s: %s", path, e)
 
     def _save_eval_state(self):
-        """Persist evaluation state to disk for restart recovery.
-
-        ``pack_first_seen`` is persisted to its own file (see
-        ``self.config.pack_first_seen_path``); failures there are
-        independent of the main eval-state write so a single bad disk
-        does not lose both.
-        """
-        # Emit both keys for backward-compat with older validator binaries.
-        spec = _spec_number()
-        data = {
-            "scoring_version": spec,
-            "spec_number": spec,
-            "scenario_scores": self.scenario_scores,
-            "eval_pack_hash": self._eval_pack_hash,
-            "last_eval_block": self.last_eval_block,
-            "last_eval_window": self._last_eval_window,
-            "last_eval_window_per_hotkey": self.last_eval_window,
-            "consensus_window": self._consensus_window,
-            "target_window": self._target_window,
-            "target_submit_done": self._target_submit_done,
-            "waiting_for_quorum": self._waiting_for_quorum,
-            "integrity_cache": self.integrity_judge.dump_cache(),
-        }
+        path = self.config.eval_state_path
         try:
-            self.config.eval_state_path.parent.mkdir(parents=True, exist_ok=True)
-            self.config.eval_state_path.write_text(
-                json.dumps(data, indent=2, sort_keys=True)
-            )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "spec_number": _spec_number(),
+                "scoring_version": _spec_number(),  # legacy mirror
+                "last_scored_challenge_epoch_id": (
+                    self._last_scored_challenge_epoch_id
+                ),
+                "last_set_weights_at": self._last_set_weights_at,
+                "last_eval_at": self._last_eval_at,
+                "last_set_weights_block": self._last_set_weights_block,
+            }
+            path.write_text(json.dumps(data, indent=2))
         except Exception as e:
-            logger.warning(f"Failed to save eval state: {e}")
-
-        try:
-            save_pack_first_seen(
-                self.pack_first_seen,
-                self.pack_last_seen_window,
-                self.config.pack_first_seen_path,
-            )
-        except Exception as e:
-            logger.warning(f"Failed to save pack_first_seen: {e}")
-
-    def _drop_miner_eval_state(self, hotkey: str):
-        """Remove all per-miner eval state and persist.
-
-        Invariant: eval_state only contains miners that successfully
-        completed an evaluation. Any pre-evaluation gate failure
-        (duplicate pack_hash, NCD copy, pre-eval rejection, pack
-        fetch / integrity failure, ...) must wipe the hotkey here so
-        stale data from a previous cycle cannot leak into scoring or
-        survive across restarts.
-        """
-        changed = False
-        for store in (
-            self.scenario_scores,
-            self._eval_pack_hash,
-            self.last_eval_block,
-            self.last_eval_window,
-            self._eval_counts,
-            self.latest_token_usage,
-            self.latest_model_usage,
-        ):
-            if hotkey in store:
-                store.pop(hotkey, None)
-                changed = True
-        if changed:
-            self._save_eval_state()
-
-    def _wipe_top_n_for_recheck(self, window_number: int) -> List[str]:
-        """Clear cached scores for the top-N miners by mean scenario score
-        so they are forced to re-evaluate this window.
-
-        Anti-cheese: a one-off lucky cached score gets re-verified before
-        influencing consensus. Selection is from the in-memory
-        ``scenario_scores`` cache directly — not filtered to this window's
-        active set, so a top miner briefly absent from the snapshot still
-        has its stale cached score wiped.
-
-        Returns the hotkeys whose state was wiped (for logging / tests).
-        """
-        if TOP_N_RECHECK <= 0:
-            return []
-
-        candidates = [
-            (hk, sum(sc.values()) / len(sc))
-            for hk, sc in self.scenario_scores.items()
-            if sc
-        ]
-        if not candidates:
-            return []
-
-        candidates.sort(key=lambda x: (-x[1], x[0]))
-        top = candidates[:TOP_N_RECHECK]
-
-        for hk, _ in top:
-            for store in (
-                self.scenario_scores,
-                self._eval_pack_hash,
-                self.last_eval_block,
-                self.last_eval_window,
-                self._eval_counts,
-                self.latest_token_usage,
-                self.latest_model_usage,
-            ):
-                store.pop(hk, None)
-        self._save_eval_state()
-
-        logger.info(
-            "Top-%d re-check (window %d): wiped cache for %s",
-            TOP_N_RECHECK, window_number,
-            ", ".join(f"{hk[:8]}(mean={m:.4f})" for hk, m in top),
-        )
-        return [hk for hk, _ in top]
+            logger.warning("Failed to save eval state to %s: %s", path, e)
 
     # ------------------------------------------------------------------
-    # Eval state update
-    # ------------------------------------------------------------------
-
-    def _update_eval_results(
-        self,
-        hotkey: str,
-        pack_hash: str,
-        scenario_scores: Optional[Dict[str, float]] = None,
-    ):
-        """Record per-scenario quality scores.
-
-        Resets data when pack_hash changes (new pack = new observations).
-        """
-        if self._eval_pack_hash.get(hotkey) != pack_hash:
-            self._get_miner_logger(hotkey).info(
-                f"Pack changed "
-                f"({self._eval_pack_hash.get(hotkey, 'none')[:8]} -> {pack_hash[:8]}), "
-                f"resetting eval data"
-            )
-            self.scenario_scores[hotkey] = {}
-            self.latest_token_usage.pop(hotkey, None)
-            self.latest_model_usage.pop(hotkey, None)
-            self._eval_pack_hash[hotkey] = pack_hash
-
-        if scenario_scores:
-            if hotkey not in self.scenario_scores:
-                self.scenario_scores[hotkey] = {}
-            self.scenario_scores[hotkey].update(scenario_scores)
-
-    # ------------------------------------------------------------------
-    # Setup helpers
-    # ------------------------------------------------------------------
-
-    def _setup_logging(self):
-        log_format = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
-        self._validator_log_path = self.config.log_dir / f"validator_{int(time.time())}.log"
-        logging.basicConfig(
-            level=getattr(logging, self.config.log_level),
-            format=log_format,
-            handlers=[
-                logging.StreamHandler(),
-                logging.FileHandler(self._validator_log_path),
-            ],
-        )
-
-        # Per-miner log directory
-        self._miner_log_dir = self.config.log_dir / "miners"
-        self._miner_log_dir.mkdir(parents=True, exist_ok=True)
-        self._miner_loggers: Dict[str, logging.Logger] = {}
-
-    def _get_miner_logger(self, hotkey: str) -> logging.Logger:
-        """Get or create a per-miner file logger (INFO level, no console output)."""
-        if hotkey in self._miner_loggers:
-            return self._miner_loggers[hotkey]
-
-        mlog = logging.getLogger(f"trajectoryrl.miner.{hotkey[:16]}")
-        mlog.setLevel(logging.INFO)
-        mlog.propagate = False  # don't bubble up to root / console
-
-        log_format = "%(asctime)s | %(levelname)-8s | %(message)s"
-        fh = logging.FileHandler(
-            self._miner_log_dir / f"{hotkey[:16]}.log"
-        )
-        fh.setFormatter(logging.Formatter(log_format))
-        mlog.addHandler(fh)
-
-        self._miner_loggers[hotkey] = mlog
-        return mlog
-
-    
-
-    # ------------------------------------------------------------------
-    # Static helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def compute_epoch_seed(epoch: int, netuid: int = 11) -> int:
-        raw = f"trajectoryrl-{netuid}-epoch-{epoch}".encode()
-        return int(hashlib.sha256(raw).hexdigest()[:8], 16)
-
-    # ------------------------------------------------------------------
-    # Main loop
+    # Heartbeat
     # ------------------------------------------------------------------
 
     async def _heartbeat_loop(self):
-        """Send validator heartbeat every 10 minutes, independent of eval cycle."""
+        """Send heartbeat every ~10 min."""
         while True:
             try:
                 await heartbeat(
@@ -730,1866 +340,42 @@ class TrajectoryValidator:
                     last_set_weights_at=self._last_set_weights_at,
                     last_eval_at=self._last_eval_at,
                     bench_image_hash=self._sandbox_harness.bench_image_hash,
-                    scenario_image_hash=self._sandbox_harness.scenario_image_hash,
+                    harness_image_hash=self._sandbox_harness.scenario_image_hash,
                     bench_version=self._sandbox_harness.sandbox_version,
+                    llm_model=self.config.llm_model,
+                    llm_base_url=self.config.llm_base_url,
                 )
             except Exception as e:
                 logger.warning("Heartbeat error: %s", e)
-            await asyncio.sleep(600)
-
-    def _check_own_commitment_on_chain(self, window_number: int) -> bool:
-        """Check if this validator's consensus commitment exists on-chain for the given window."""
-        my_hotkey = self.wallet.hotkey.ss58_address
-        try:
-            raw_commitments = self.subtensor.get_all_commitments(
-                netuid=self.config.netuid,
-            )
-        except Exception as e:
-            logger.warning(
-                "Window %d: failed to read on-chain commitments for self-check: %s",
-                window_number, e,
-            )
-            return False
-
-        if not raw_commitments:
-            return False
-
-        raw = raw_commitments.get(my_hotkey)
-        if not raw or not is_consensus_commitment(raw):
-            return False
-
-        parsed = parse_consensus_commitment(raw)
-        if parsed is None:
-            return False
-
-        _, on_chain_window, _, _ = parsed
-        return on_chain_window == window_number
-
-    async def _submit_consensus_payload(self, window: EvaluationWindow) -> bool:
-        """Build and upload consensus payload to CAS, then write pointer on-chain.
-
-        Returns True if the on-chain commitment was written successfully,
-        False otherwise (caller may retry).
-        """
-        payload = self._build_local_consensus_payload(window)
-        if payload is None:
-            logger.warning(
-                "Window %d: no evaluation data to submit", window.window_number
-            )
-            return False
-
-        content_address = await self._consensus_store.upload_payload(payload)
-        if content_address is None:
-            logger.error(
-                "Window %d: failed to upload consensus payload",
-                window.window_number,
-            )
-            return False
-
-        MAX_COMMITMENT_BYTES = 128
-
-        commitment_str = format_consensus_commitment(
-            protocol_version=self.config.consensus_protocol_version,
-            window_number=window.window_number,
-            content_address=content_address,
-            spec_number=_spec_number(),
-        )
-
-        if len(commitment_str.encode("utf-8")) > MAX_COMMITMENT_BYTES:
-            ipfs_cid, _ = decode_dual_address(content_address)
-            fallback_address = ipfs_cid or content_address
-            commitment_str = format_consensus_commitment(
-                protocol_version=self.config.consensus_protocol_version,
-                window_number=window.window_number,
-                content_address=fallback_address,
-                spec_number=_spec_number(),
-            )
-            logger.warning(
-                "Window %d: commitment too long with dual address, "
-                "using IPFS-only (%d bytes)",
-                window.window_number, len(commitment_str.encode("utf-8")),
-            )
-
-        try:
-            self.subtensor.set_commitment(
-                wallet=self.wallet,
-                netuid=self.config.netuid,
-                data=commitment_str,
-            )
-            logger.info(
-                "Window %d: consensus pointer written on-chain "
-                "(address=%s, %d miners, commitment=%s, %d bytes)",
-                window.window_number, content_address[:24],
-                len(payload.scores), commitment_str[:60],
-                len(commitment_str.encode("utf-8")),
-            )
-            return True
-        except Exception as e:
-            logger.error(
-                "Window %d: failed to write consensus pointer on-chain: %s",
-                window.window_number, e,
-            )
-            return False
-
-    def _build_local_consensus_payload(
-        self, window: EvaluationWindow,
-    ) -> Optional[ConsensusPayload]:
-        """Build a ConsensusPayload from in-memory evaluation data.
-
-        Used as a fallback when this validator's submission is absent from
-        CAS/chain during aggregation.  Returns None if no eval data exists.
-        """
-        scores_by_hotkey: Dict[str, float] = {}
-        disqualified_by_hotkey: Dict[str, str] = {}
-
-        # Aggregate continuous quality scores from judge overall_score.
-        # Winner-take-all downstream, so the mean is just used to rank miners.
-        for hotkey, scenario_s in self.scenario_scores.items():
-            if scenario_s:
-                score = sum(scenario_s.values()) / len(scenario_s)
-                scores_by_hotkey[hotkey] = round(score, 4)
-
-        for hotkey, reason in getattr(self, "_disqualified_miners", {}).items():
-            disqualified_by_hotkey[hotkey] = reason
-
-        if not scores_by_hotkey and not disqualified_by_hotkey:
-            return None
-
-        bench_ver = self._sandbox_harness.sandbox_version
-
-        return ConsensusPayload(
-            protocol_version=self.config.consensus_protocol_version,
-            window_number=window.window_number,
-            validator_hotkey=self.wallet.hotkey.ss58_address,
-            bench_version=bench_ver,
-            scores=scores_by_hotkey,
-            timestamp=int(time.time()),
-            spec_number=_spec_number(),
-            disqualified=disqualified_by_hotkey,
-        )
-
-    async def _run_consensus_aggregation(self, window: EvaluationWindow):
-        """Read on-chain consensus pointers, download payloads, filter, aggregate.
-
-        All on-chain commitments are downloaded regardless of their
-        ``spec_number`` value; the target spec_number for filtering is
-        derived from the on-chain stake distribution by the filter pipeline
-        (see ``consensus_filter.select_target_spec_number``).
-        """
-        if not self._is_metagraph_healthy():
-            logger.warning(
-                "Window %d: metagraph unhealthy (n=%d) before consensus "
-                "aggregation — re-syncing...",
-                window.window_number, getattr(self.metagraph, "n", 0),
-            )
-            self._sync_metagraph(caller="consensus_aggregation")
-
-        # Quorum gate: bail if not enough validator stake has committed for
-        # this window. The main loop's aggregation phase enforces this gate
-        # externally (validator.py ~1503-1548), but `_aggregate_on_startup`
-        # and `_full_cycle_on_startup` invoke us directly with no upstream
-        # check — so without this gate, a single stale on-chain submission
-        # (e.g. our own pointer left behind by a prior failed cycle) is
-        # enough to bump _consensus_window, which then forces target_window
-        # past the actual physical window and locks the validator out of
-        # the real eval. See 2026-05-01 window-1123 incident.
-        meets, ratio, submitted_stake, total_stake = self._compute_quorum_status(
-            window.window_number,
-        )
-        if not meets:
-            logger.warning(
-                "Window %d: aggregation skipped — quorum not met "
-                "(submitted_stake=%.4f, total_validator_stake=%.4f, "
-                "ratio=%.4f, threshold=%.4f)",
-                window.window_number, submitted_stake, total_stake, ratio,
-                float(getattr(self.config, "quorum_threshold", 0.5)),
-            )
-            return
-
-        chain_commitments = fetch_validator_consensus_commitments(
-            self.subtensor, self.config.netuid, self.metagraph,
-        )
-        if not chain_commitments:
-            logger.warning(
-                "Window %d: no consensus commitments on chain, using local results",
-                window.window_number,
-            )
-            return
-
-        submissions = []
-        download_failed = 0
-        for vc in chain_commitments:
-            pointer = ConsensusPointer(
-                protocol_version=vc.protocol_version,
-                window_number=vc.window_number,
-                content_address=vc.content_address,
-                validator_hotkey=vc.validator_hotkey,
-            )
-            payload = await self._consensus_store.download_payload(
-                vc.content_address
-            )
-            if payload is not None:
-                submissions.append((pointer, payload))
-            else:
-                download_failed += 1
-
-        my_hotkey = self.wallet.hotkey.ss58_address
-        own_found = any(
-            p.validator_hotkey == my_hotkey for p, _ in submissions
-        )
-        if not own_found:
-            logger.info(
-                "Window %d: own submission not found in CAS downloads; "
-                "aggregating from other validators only",
-                window.window_number,
-            )
-
-        if not submissions:
-            total = len(chain_commitments)
-            logger.warning(
-                "Window %d: no usable submissions from %d commitments "
-                "(%d download-failed), using local results",
-                window.window_number, total, download_failed,
-            )
-            return
-
-        validator_stakes: Dict[str, float] = {}
-        for uid in range(len(self.metagraph.hotkeys)):
-            hotkey = self.metagraph.hotkeys[uid]
-            stake = float(self.metagraph.stake[uid])
-            if stake > 0:
-                validator_stakes[hotkey] = stake
-
-        min_stake = getattr(self.config, "min_validator_stake", 0.0)
-        zero_threshold = getattr(self.config, "zero_signal_threshold", 1.0)
-        validated, stats = run_filter_pipeline(
-            submissions=submissions,
-            expected_window=window.window_number,
-            validator_stakes=validator_stakes,
-            min_stake=min_stake,
-            local_spec_number=_spec_number(),
-            expected_protocol=self.config.consensus_protocol_version,
-            zero_signal_threshold=zero_threshold,
-        )
-
-        if not validated:
-            logger.warning(
-                "Window %d: all submissions filtered out (%s), using local results",
-                window.window_number, stats.summary(),
-            )
-            return
-
-        consensus_scores, disqualified = compute_consensus_scores(validated)
-
-        # Build hotkey → UID mapping (used by winner selection and logging).
-        hk_to_uid: Dict[str, int] = {}
-        for uid in range(len(self.metagraph.hotkeys)):
-            hk_to_uid[self.metagraph.hotkeys[uid]] = uid
-
-        # No pre-eval gate here: the per-epoch snapshot already excluded
-        # failed miners from every validator's ``commitments``, so a
-        # failed miner cannot appear in ``consensus_scores``. Their
-        # rejection rows were submitted at eval-cycle start (see
-        # ``_dispatch_pre_eval_rejections``).
-
-        self._consensus_window = window.window_number
-
-        # Filter disqualified miners from consensus scores before winner selection
-        eligible_scores = {
-            hk: s for hk, s in consensus_scores.items() if hk not in disqualified
-        }
-
-        # Apply Winner Protection (stores winner_uid so set_weights
-        # can skip the metagraph lookup later). target_spec_number gates
-        # the cross-spec bypass: when the chain-derived target spec
-        # differs from the persisted winner's spec, the δ threshold is
-        # skipped and the new spec's best miner takes over immediately.
-        winner_hk, updated_state = select_winner_with_protection(
-            consensus_scores=eligible_scores,
-            state=self._winner_state,
-            score_delta=self.config.score_delta,
-            hk_to_uid=hk_to_uid,
-            disable_winner_protection=self.config.disable_winner_protection,
-            target_spec_number=stats.target_spec_number,
-        )
-        self._winner_state = updated_state
-        save_winner_state(updated_state, self._winner_state_path)
-
-        logger.info("=" * 60)
-        logger.info(
-            "Window %d: CONSENSUS RESULTS — %d miners (%d eligible, %d disqualified), "
-            "%d validators (%s)",
-            window.window_number, len(consensus_scores),
-            len(eligible_scores), len(disqualified),
-            stats.passed, stats.summary(),
-        )
-        logger.info(f"Burn fraction: {BURN_FRACTION:.0%} to owner UID {OWNER_UID}")
-        if winner_hk:
-            winner_uid = hk_to_uid.get(winner_hk, -1)
-            logger.info(
-                "Winner: %s (UID %d, score=%.4f, weight=%.4f)",
-                winner_hk[:8], winner_uid,
-                consensus_scores.get(winner_hk, 0),
-                1.0 - BURN_FRACTION,
-            )
-        else:
-            logger.info("No winner — all miners disqualified or no scores")
-        logger.info("=" * 60)
-        for hk, score in sorted(consensus_scores.items(), key=lambda x: x[1], reverse=True):
-            uid = hk_to_uid.get(hk, -1)
-            status = "DISQ" if hk in disqualified else "OK"
-            marker = " <- WINNER" if hk == winner_hk else ""
-            logger.info(
-                "  Miner %d (%s): score=%.4f, status=%s%s",
-                uid, hk[:8], score, status, marker,
-            )
-
-        self._save_eval_state()
-
-    async def _aggregate_on_startup(self):
-        """Run consensus aggregation once at startup before entering the main loop.
-
-        Reads on-chain validator commitments to find the latest window with
-        submissions, then reuses ``_run_consensus_aggregation`` and
-        ``_set_winner_weights`` to compute the winner and set weights
-        immediately — without waiting for the normal window lifecycle.
-
-        On **success**, ``_consensus_window`` is left at the aggregated
-        ``target_window`` and persisted — same as a normal main-loop
-        aggregation — so restart cannot leave ``consensus_window=-1`` while
-        ``target_window`` / ``last_eval_window`` point at a completed window
-        (that combination deadlocked publish retries). On **failure**, the
-        pre-call ``_consensus_window`` is restored so a partial run does not
-        advance the guard incorrectly.
-        """
-        logger.info("=" * 60)
-        logger.info("aggregate_when_start enabled — running startup aggregation")
-        logger.info("=" * 60)
-
-        self._sync_metagraph(caller="aggregate_on_startup")
-
-        chain_commitments = fetch_validator_consensus_commitments(
-            self.subtensor, self.config.netuid, self.metagraph,
-        )
-        if not chain_commitments:
-            logger.warning(
-                "Startup aggregation: no consensus commitments on chain, skipping"
-            )
-            return
-
-        window_counts = Counter(vc.window_number for vc in chain_commitments)
-        target_window = max(window_counts.keys())
-        logger.info(
-            "Startup aggregation: found %d commitments across windows %s, "
-            "targeting latest window %d (%d submissions)",
-            len(chain_commitments), dict(window_counts),
-            target_window, window_counts[target_window],
-        )
-
-        synthetic_window = EvaluationWindow(
-            window_number=target_window,
-            window_start=self._window_config.global_anchor
-            + target_window * self._window_config.window_length,
-            block_offset=self._window_config.window_length - 1,
-            phase=WindowPhase.AGGREGATION,
-            blocks_into_phase=0,
-            blocks_remaining_in_phase=1,
-            publish_offset=self._window_config.publish_block,
-            aggregate_offset=self._window_config.aggregate_block,
-        )
-
-        saved_consensus_window = self._consensus_window
-        await self._run_consensus_aggregation(synthetic_window)
-        aggregation_succeeded = (self._consensus_window == target_window)
-
-        if not aggregation_succeeded:
-            self._consensus_window = saved_consensus_window
-        self._save_eval_state()
-
-        if aggregation_succeeded:
-            await self._set_winner_weights()
-            current_block = self.subtensor.get_current_block()
-            self.last_weight_block = current_block
-            logger.info(
-                "Startup aggregation complete: winner=%s, weights set at block %d",
-                self._winner_state.winner_hotkey
-                and self._winner_state.winner_hotkey[:8],
-                current_block,
-            )
-        else:
-            logger.warning(
-                "Startup aggregation: consensus aggregation did not produce "
-                "a result for window %d, skipping weight setting",
-                target_window,
-            )
-
-    async def _full_cycle_on_startup(self):
-        """Run a complete eval → propagation → aggregation cycle at startup.
-
-        Executes the three window phases sequentially regardless of the
-        current on-chain window phase, then sets winner weights.  The main
-        loop guards (``_last_eval_window``, ``_consensus_window``) are
-        updated so the loop will not re-run these phases for the same window.
-        """
-        logger.info("=" * 60)
-        logger.info("full_cycle_on_startup enabled — running full cycle")
-        logger.info("=" * 60)
-
-        current_block = self.subtensor.get_current_block()
-        window = compute_window(current_block, self._window_config)
-
-        # --- Phase 1: Evaluation ---
-        logger.info(
-            "Startup full cycle [1/3]: evaluation "
-            "(window=%d, block=%d)",
-            window.window_number, current_block,
-        )
-        await self._run_evaluation_cycle(current_block, window.window_number)
-        self._last_eval_at = int(time.time())
-        self._last_eval_window = window.window_number
-        self._last_eval_date = datetime.datetime.utcnow().date()
-        self.last_weight_block = self.subtensor.get_current_block()
-        self._save_eval_state()
-
-        # --- Phase 2: Propagation ---
-        logger.info(
-            "Startup full cycle [2/3]: propagation (window=%d)",
-            window.window_number,
-        )
-        ok = await self._submit_consensus_payload(window)
-        if ok:
-            logger.info(
-                "Startup full cycle: consensus payload submitted successfully"
-            )
-        else:
-            logger.warning(
-                "Startup full cycle: consensus payload submission failed, "
-                "aggregation will proceed with available data"
-            )
-
-        # --- Phase 3: Aggregation ---
-        logger.info(
-            "Startup full cycle [3/3]: aggregation (window=%d)",
-            window.window_number,
-        )
-        await self._run_consensus_aggregation(window)
-
-        if self._consensus_window == window.window_number:
-            await self._set_winner_weights()
-            current_block = self.subtensor.get_current_block()
-            self.last_weight_block = current_block
-            logger.info(
-                "Startup full cycle complete: winner=%s, weights set at block %d",
-                self._winner_state.winner_hotkey
-                and self._winner_state.winner_hotkey[:8],
-                current_block,
-            )
-        else:
-            logger.warning(
-                "Startup full cycle: aggregation did not produce a result "
-                "for window %d",
-                window.window_number,
-            )
-
-    def _ensure_target_window(self, physical_window: EvaluationWindow) -> int:
-        """Initialize target window from persisted state or physical window.
-
-        Stuck-state recovery (v0.6.3): if a saved target_window points at a
-        previous physical window AND that target was never aggregated (i.e.
-        consensus_window < target_window), the validator's main loop has no
-        path to advance — _should_start_target_evaluation requires
-        ``target == physical`` and the aggregation branch requires consensus
-        to have caught up. The validator sits idle until restarted with
-        edited state.
-
-        This happens cleanly when a validator container is killed mid-
-        aggregation phase (e.g. a Watchtower roll during the v0.6.0/0.6.1/
-        0.6.2 sequence on 2026-05-05 left every operator stuck on
-        target_window=1126 with consensus_window=-1 once physical advanced
-        to 1127). The previous window's aggregation can't be retried —
-        every other validator has moved on — so we forfeit the missed
-        window and advance to the current physical window.
-        """
-        if self._target_window < 0:
-            self._target_window = max(self._consensus_window + 1, 0)
-            if self._target_window < physical_window.window_number:
-                self._target_window = physical_window.window_number
-            self._target_submit_done = False
-            self._save_eval_state()
-        elif (
-            self._target_window < physical_window.window_number
-            and self._consensus_window < self._target_window
-        ):
-            stale = self._target_window
-            self._target_window = physical_window.window_number
-            self._target_submit_done = False
-            logger.warning(
-                "Stuck-state recovery: saved target_window=%d but physical "
-                "is %d and consensus_window=%d (target was never aggregated). "
-                "Advancing target to physical window — the missed window's "
-                "aggregation is forfeit.",
-                stale, physical_window.window_number, self._consensus_window,
-            )
-            self._save_eval_state()
-        return self._target_window
-
-    def _should_start_target_evaluation(
-        self,
-        physical_window: EvaluationWindow,
-        target_window: int,
-    ) -> bool:
-        """Return True if target window evaluation should start now."""
-        if target_window != physical_window.window_number:
-            return False
-        return target_window > self._last_eval_window
-
-    def _make_window_view(
-        self,
-        physical_window: EvaluationWindow,
-        window_number: int,
-    ) -> EvaluationWindow:
-        """Build an EvaluationWindow view for a logical target window."""
-        window_start = (
-            self._window_config.global_anchor
-            + window_number * self._window_config.window_length
-        )
-        return EvaluationWindow(
-            window_number=window_number,
-            window_start=window_start,
-            block_offset=physical_window.block_offset,
-            phase=physical_window.phase,
-            blocks_into_phase=physical_window.blocks_into_phase,
-            blocks_remaining_in_phase=physical_window.blocks_remaining_in_phase,
-            publish_offset=self._window_config.publish_block,
-            aggregate_offset=self._window_config.aggregate_block,
-        )
-
-    def _compute_quorum_status(
-        self, target_window: int
-    ) -> Tuple[bool, float, float, float]:
-        """Return quorum verdict and stake metrics for target window."""
-        chain_commitments = fetch_validator_consensus_commitments(
-            self.subtensor, self.config.netuid, self.metagraph,
-        )
-        # Total validator stake in subnet (permit + positive stake).
-        total_validator_stake = 0.0
-        for uid in range(len(self.metagraph.hotkeys)):
-            permitted = (
-                uid < len(self.metagraph.validator_permit)
-                and self.metagraph.validator_permit[uid]
-            )
-            if not permitted:
-                continue
-            stake = float(self.metagraph.stake[uid])
-            if stake > 0:
-                total_validator_stake += stake
-
-        if total_validator_stake <= 0:
-            return False, 0.0, 0.0, 0.0
-
-        hk_to_stake: Dict[str, float] = {}
-        for uid in range(len(self.metagraph.hotkeys)):
-            hotkey = self.metagraph.hotkeys[uid]
-            stake = float(self.metagraph.stake[uid])
-            permitted = (
-                uid < len(self.metagraph.validator_permit)
-                and self.metagraph.validator_permit[uid]
-            )
-            if permitted and stake > 0:
-                hk_to_stake[hotkey] = stake
-
-        target_commitments: List[ValidatorConsensusCommitment] = []
-        for vc in chain_commitments:
-            if vc.window_number == target_window:
-                target_commitments.append(vc)
-
-        stake_by_spec: Dict[int, float] = {}
-        seen_for_spec: set = set()
-        for vc in target_commitments:
-            if vc.validator_hotkey in seen_for_spec:
-                continue
-            stake = hk_to_stake.get(vc.validator_hotkey, 0.0)
-            if stake <= 0:
-                continue
-            seen_for_spec.add(vc.validator_hotkey)
-            stake_by_spec[vc.spec_number] = stake_by_spec.get(vc.spec_number, 0.0) + stake
-
-        effective_spec = _spec_number()
-        spec_total_stake = sum(stake_by_spec.values())
-        if spec_total_stake > 0 and stake_by_spec:
-            dominant_spec = max(stake_by_spec, key=lambda s: stake_by_spec[s])
-            dominant_share = stake_by_spec[dominant_spec] / spec_total_stake
-            if dominant_share > 0.5:
-                effective_spec = dominant_spec
-
-        submitted_stake = 0.0
-        seen_hotkeys = set()
-        for vc in target_commitments:
-            if vc.spec_number != effective_spec:
-                continue
-            if vc.validator_hotkey in seen_hotkeys:
-                continue
-            stake = hk_to_stake.get(vc.validator_hotkey, 0.0)
-            if stake <= 0:
-                continue
-            seen_hotkeys.add(vc.validator_hotkey)
-            submitted_stake += stake
-
-        ratio = submitted_stake / total_validator_stake
-        meets = ratio > float(getattr(self.config, "quorum_threshold", 0.5))
-        return meets, ratio, submitted_stake, total_validator_stake
-
-    async def _set_burn_weights(self, reason: str) -> None:
-        """Always set burn weights (no copy-owner fallback)."""
-        uids, weights = self._fallback_to_owner()
-        await self._do_set_weights(
-            uids, weights, label=f"[burn: {reason}] ",
-        )
-
-    async def run(self):
-        """Main validator loop with block-based window phases.
-
-        Window phases (per eval_interval_blocks window):
-          - evaluation (0% - 80%):   run trajrl-bench, compute scores
-          - propagation (80% - 90%): submit results to CAS, wait for others
-          - aggregation (90% - 100%): read submissions, consensus, select winner
-
-        Independent cadence:
-          - tempo (~72 min / 360 blocks): set_weights using latest consensus
-        """
-        self._start_time = time.time()
-
-        asyncio.create_task(self._heartbeat_loop())
-
-        logger.info("Starting validator main loop...")
-        logger.info(
-            f"Eval window: {self._window_config.window_length} blocks "
-            f"(~{self._window_config.window_length * 12 // 3600:.0f}h), "
-            f"anchor={self._window_config.global_anchor}, "
-            f"publish={self._window_config.publish_pct:.0%}, "
-            f"aggregate={self._window_config.aggregate_pct:.0%}"
-        )
-        logger.info(
-            f"Weight interval: {self.config.weight_interval_blocks} blocks "
-            f"(~{self.config.weight_interval_blocks * 12 // 60}min)"
-        )
-
-        startup_aggregation_enabled = (
-            self.config.full_cycle_on_startup or self.config.aggregate_when_start
-        )
-
-        # Pull sandbox image early so audit logs (bench_version) are accurate
-        # for startup aggregation. SPEC_NUMBER is a code-level constant and
-        # no longer derived from the bench image.
-        if startup_aggregation_enabled:
-            try:
-                await self._sandbox_harness.pull_latest()
-                logger.info(
-                    "spec_number=%d (bench_version=%s) — pulled before "
-                    "startup aggregation",
-                    _spec_number(),
-                    self._sandbox_harness.sandbox_version,
-                )
-            except Exception as e:
-                logger.warning(
-                    "Failed to pull sandbox image before startup aggregation: "
-                    "%s — bench_version audit field may be stale", e,
-                )
-
-        if startup_aggregation_enabled and self.config.full_cycle_on_startup:
-            try:
-                await self._full_cycle_on_startup()
-            except Exception as e:
-                logger.error(
-                    "Startup full cycle failed: %s — continuing to main loop",
-                    e, exc_info=True,
-                )
-        elif startup_aggregation_enabled and self.config.aggregate_when_start:
-            try:
-                await self._aggregate_on_startup()
-            except Exception as e:
-                logger.error(
-                    "Startup aggregation failed: %s — continuing to main loop",
-                    e, exc_info=True,
-                )
-
-        # --- Replay pending uploads from recent days ---
-        try:
-            await self._replay_pending_uploads()
-        except Exception as e:
-            logger.warning("Startup pending upload replay failed: %s", e, exc_info=True)
-
-        while True:
-            try:
-                current_block = self.subtensor.get_current_block()
-                window = compute_window(current_block, self._window_config)
-
-                # --- Pre-launch phase: fallback weights only ---
-                if current_block < EVAL_START_BLOCK:
-                    blocks_since_weights = current_block - self.last_weight_block
-                    if blocks_since_weights >= self.config.weight_interval_blocks:
-                        logger.info(
-                            f"Pre-launch phase (block {current_block} < "
-                            f"{EVAL_START_BLOCK}), setting fallback weights"
-                        )
-                        await self._set_fallback_weights()
-                        self.last_weight_block = current_block
-                    await asyncio.sleep(300)
-                    continue
-
-                target_window = self._ensure_target_window(window)
-                if target_window > window.window_number:
-                    logger.warning(
-                        "Target window %d is ahead of physical window %d; "
-                        "clamping to physical window",
-                        target_window, window.window_number,
-                    )
-                    self._target_window = window.window_number
-                    self._target_submit_done = self._check_own_commitment_on_chain(
-                        self._target_window
-                    )
-                    self._save_eval_state()
-                    target_window = self._target_window
-
-                if target_window <= self._consensus_window:
-                    self._target_window = self._consensus_window + 1
-                    self._target_submit_done = self._check_own_commitment_on_chain(
-                        self._target_window
-                    )
-                    self._save_eval_state()
-                    target_window = self._target_window
-
-                target_window_view = self._make_window_view(window, target_window)
-
-                # --- Target window: evaluation ---
-                if self._should_start_target_evaluation(window, target_window):
-                    logger.info("=" * 60)
-                    logger.info(
-                        f"Evaluation target_window={target_window} at block "
-                        f"{current_block} (phase={window.phase.value}, "
-                        f"offset={window.block_offset}/{self._window_config.window_length})"
-                    )
-                    logger.info("=" * 60)
-
-                    cycle_result = await self._run_evaluation_cycle(
-                        current_block, target_window,
-                    )
-                    if cycle_result is False:
-                        # Infrastructure failure inside the cycle (e.g. chain
-                        # query for commitments unreachable). Do NOT mark the
-                        # window as evaluated; the next loop iteration will
-                        # retry rather than lock us out of this ~24h window.
-                        logger.warning(
-                            "Eval cycle for target_window=%d aborted; "
-                            "leaving window unmarked so it can retry",
-                            target_window,
-                        )
-                    else:
-                        self._last_eval_at = int(time.time())
-                        self._last_eval_window = target_window
-                        self._last_eval_date = datetime.datetime.utcnow().date()
-                        self.last_weight_block = self.subtensor.get_current_block()
-                        self._target_submit_done = False
-
-                        self.pack_fetcher.cleanup_cache(
-                            self.config.pack_cache_max_size
-                        )
-                        self._save_eval_state()
-
-                    if self._cycle_eval_id is not None:
-                        asyncio.ensure_future(
-                            self._fire_upload_cycle_logs(
-                                self._cycle_eval_id,
-                                self._cycle_log_offset,
-                                self._cycle_log_block,
-                                self._cycle_window_number,
-                            )
-                        )
-
-                # --- Submit when target eval is done AND we're allowed to
-                # publish in this phase. The phase gate prevents the failure
-                # mode where eval terminates pathologically fast (e.g. chain
-                # query returns 0 due to ws timeout) and the validator
-                # immediately commits a stale/empty payload, locking itself
-                # out of the window. Holding submission until propagation
-                # phase (block_offset >= 80%) gives the cycle time to either
-                # produce real data or be retried.
-                #
-                # Two bypasses:
-                #   * ``target_already_passed`` — payload finished evaluating
-                #     after physical advanced (late eval); still need to
-                #     publish.
-                #   * non-evaluation phase — normal path.
-                target_already_passed = target_window < window.window_number
-                phase_allows_submit = (
-                    target_already_passed
-                    or window.phase != WindowPhase.EVALUATION
-                )
-                if (
-                    self._last_eval_window >= target_window
-                    and not self._target_submit_done
-                    and phase_allows_submit
-                ):
-                    if self._check_own_commitment_on_chain(target_window):
-                        self._target_submit_done = True
-                        self._save_eval_state()
-                    else:
-                        logger.info(
-                            "Target window %d: eval complete, submitting payload at block %d",
-                            target_window, current_block,
-                        )
-                        ok = await self._submit_consensus_payload(target_window_view)
-                        if ok:
-                            self._target_submit_done = True
-                            self._save_eval_state()
-                        else:
-                            logger.warning(
-                                "Target window %d: submission attempt failed; "
-                                "will retry next loop iteration",
-                                target_window,
-                            )
-
-                        if self._cycle_eval_id is not None:
-                            asyncio.ensure_future(
-                                self._fire_upload_cycle_logs(
-                                    self._cycle_eval_id,
-                                    self._cycle_log_offset,
-                                    self._cycle_log_block,
-                                    self._cycle_window_number,
-                                )
-                            )
-
-                # --- Aggregation phase: quorum gate on target window ---
-                # Only assess quorum on a target this validator has actually
-                # submitted for. A freshly-bumped target (e.g. consensus+1
-                # right after a successful aggregation) has no own commitment
-                # yet; checking quorum on it would trivially miss and latch
-                # _waiting_for_quorum=True, poisoning the upcoming eval phase
-                # via the main-loop tempo refresh's burn branch.
-                if (
-                    window.phase == WindowPhase.AGGREGATION
-                    and self._consensus_window < target_window
-                    and self._target_submit_done
-                ):
-                    logger.info(
-                        "Physical window %d in aggregation; checking quorum for target window %d",
-                        window.window_number, target_window,
-                    )
-                    meets, ratio, submitted_stake, total_stake = self._compute_quorum_status(
-                        target_window
-                    )
-
-                    if not meets:
-                        self._waiting_for_quorum = True
-                        logger.warning(
-                            "Target window %d quorum miss: submitted_stake=%.4f total_validator_stake=%.4f "
-                            "ratio=%.4f threshold=%.4f — setting burn weights",
-                            target_window,
-                            submitted_stake,
-                            total_stake,
-                            ratio,
-                            float(getattr(self.config, "quorum_threshold", 0.5)),
-                        )
-                        await self._set_burn_weights(
-                            reason=(
-                                f"quorum-miss target={target_window} "
-                                f"ratio={ratio:.4f}"
-                            )
-                        )
-                        self.last_weight_block = current_block
-                        self._save_eval_state()
-                    else:
-                        logger.info(
-                            "Target window %d quorum met: submitted_stake=%.4f total_validator_stake=%.4f "
-                            "ratio=%.4f — running consensus aggregation",
-                            target_window, submitted_stake, total_stake, ratio,
-                        )
-                        await self._run_consensus_aggregation(target_window_view)
-
-                        if self._consensus_window == target_window:
-                            await self._set_winner_weights()
-                            self.last_weight_block = current_block
-                            self._waiting_for_quorum = False
-                            self._target_window = window.window_number
-                            self._target_submit_done = self._check_own_commitment_on_chain(
-                                self._target_window
-                            )
-                            self._save_eval_state()
-                        else:
-                            logger.warning(
-                                "Target window %d aggregation did not produce consensus result",
-                                target_window,
-                            )
-
-                        if self._cycle_eval_id is not None:
-                            asyncio.ensure_future(
-                                self._fire_upload_cycle_logs(
-                                    self._cycle_eval_id,
-                                    self._cycle_log_offset,
-                                    self._cycle_log_block,
-                                    self._cycle_window_number,
-                                )
-                            )
-                            self._cycle_eval_id = None
-
-                # --- Tempo cadence: re-assert winner weights ---
-                current_block = self.subtensor.get_current_block()
-                blocks_since_weights = current_block - self.last_weight_block
-                if blocks_since_weights >= self.config.weight_interval_blocks:
-                    logger.info(
-                        f"Tempo weight refresh at block {current_block} "
-                        f"({blocks_since_weights} blocks since last, "
-                        f"window={window.window_number} phase={window.phase.value})"
-                    )
-                    if self._waiting_for_quorum and self._consensus_window < self._target_window:
-                        await self._set_burn_weights(
-                            reason=(
-                                f"tempo-refresh waiting target={self._target_window}"
-                            )
-                        )
-                    else:
-                        await self._set_winner_weights()
-                    self.last_weight_block = current_block
-
-                await asyncio.sleep(300)
-
-            except KeyboardInterrupt:
-                logger.info("Received interrupt, shutting down...")
-                self._save_eval_state()
-                if self._cycle_eval_id is not None:
-                    await self._fire_upload_cycle_logs(
-                        self._cycle_eval_id,
-                        self._cycle_log_offset,
-                        self._cycle_log_block,
-                        self._cycle_window_number,
-                    )
-                    self._cycle_eval_id = None
-                break
-            except Exception as e:
-                logger.error(f"Error in main loop: %s", e, exc_info=True)
-                await asyncio.sleep(60)
-
-    
-    # ------------------------------------------------------------------
-    # LLM key check
-    # ------------------------------------------------------------------
-
-    def _check_llm_keys(self) -> bool:
-        """Return True if an LLM API key is configured."""
-        return bool(self.config.llm_api_key)
-
-    async def _prefetch_packs(
-        self,
-        active_commitments: Dict[int, MinerCommitment],
-    ) -> None:
-        """Warm PackFetcher's disk cache for every unique pack_hash.
-
-        Each unique `pack_hash` triggers a single `verify_submission` call;
-        the fetched content is dropped on the floor — it lives in
-        PackFetcher's per-hash disk cache so the later `_evaluate_miner`
-        path hits a cached entry instead of re-downloading. Failed fetches
-        are logged and skipped; they will surface again during
-        `_evaluate_miner`.
-        """
-        seen: set = set()
-        for uid, commitment in active_commitments.items():
-            ph = commitment.pack_hash
-            if ph in seen:
-                continue
-            seen.add(ph)
-            result = await self.pack_fetcher.verify_submission(
-                commitment.pack_url, ph,
-            )
-            if not result.valid or result.pack_content is None:
-                logger.warning(
-                    f"Pack prefetch failed: uid={uid} "
-                    f"({commitment.hotkey[:8]}…): {result.error or 'unknown'}"
-                )
+            await asyncio.sleep(_HEARTBEAT_INTERVAL)
 
     # ------------------------------------------------------------------
-    # Evaluation cycle
+    # Validator-side metadata for outgoing scores
     # ------------------------------------------------------------------
-
-    async def _run_evaluation_cycle(
-        self, current_block: int, window_number: int,
-    ):
-        """Run one evaluation cycle.
-
-        The log offset is saved to instance state so the main loop can
-        upload after each window phase (evaluation, submission,
-        aggregation), progressively capturing more context.  The server
-        is expected to handle duplicate/overlapping uploads.
-        """
-        cycle_start = time.time()
-        cycle_eval_id = time.strftime("%Y%m%d_%H%M") + f"_w{window_number}"
-
-        self._cycle_eval_id = cycle_eval_id
-        self._cycle_log_offset = self._get_validator_log_offset()
-        self._cycle_log_block = current_block
-        self._cycle_window_number = window_number
-
-        return await self._execute_evaluation_cycle(
-            current_block, window_number, cycle_eval_id, cycle_start,
-        )
-
-    async def _execute_evaluation_cycle(
-        self,
-        current_block: int,
-        window_number: int,
-        cycle_eval_id: str,
-        cycle_start: float,
-    ):
-        """Execute the full evaluation cycle logic.
-
-        Falls back to owner UID weights when LLM keys are missing or
-        all evaluations fail (likely LLM API errors).
-        """
-        if not self._check_llm_keys():
-            logger.warning(
-                "LLM_API_KEY not set. "
-                "Skipping evaluation, setting fallback weights to owner UID.",
-            )
-            await self._set_fallback_weights(
-                reason="No LLM API key configured"
-            )
-            return
-
-        # Re-assert the current winner's weights before starting this eval
-        # cycle, so the validator is active on-chain from the start.
-        logger.info("Setting winner weights before starting eval cycle")
-        await self._set_winner_weights()
-        self.last_weight_block = current_block
-
-        self._disqualified_miners = {}
-
-        # Pull latest sandbox image before eval (gets new scenarios + version)
-        try:
-            await self._sandbox_harness.pull_latest()
-        except docker.errors.DockerException as e:
-            logger.error(
-                "Docker is not available — cannot run sandbox evaluations. "
-                "If running inside Docker, ensure docker.sock is mounted. "
-                "Run:\n"
-                "  docker compose -f docker/docker-compose.validator.yml "
-                "--env-file .env.validator up -d\n"
-                "Skipping this eval cycle. Error: %s", e,
-            )
-            return
-        # spec_number is a validator-side constant (see config.SPEC_NUMBER);
-        # bench_version is logged purely for audit.
-        logger.info("spec_number=%d (bench_version=%s)",
-                    _spec_number(),
-                    self._sandbox_harness.sandbox_version)
-
-        # Epoch seed for context variation
-        epoch = current_block // self.config.eval_interval_blocks
-        epoch_seed = self.compute_epoch_seed(epoch, self.config.netuid)
-        logger.debug(
-            f"Eval cycle: block={current_block}, seed={epoch_seed}"
-        )
-
-        # 1. Sync metagraph (with retries + reconnect)
-        logger.debug("Syncing metagraph...")
-        mg_healthy = self._sync_metagraph(caller="eval_cycle")
-        logger.info(
-            "Metagraph synced: n=%d neurons, block=%s, healthy=%s",
-            getattr(self.metagraph, "n", 0),
-            getattr(self.metagraph, "block", "?"),
-            mg_healthy,
-        )
-        if not mg_healthy:
-            logger.error(
-                "Metagraph has 0 neurons — cannot evaluate or set weights. "
-                "Skipping eval cycle. This usually means the subtensor "
-                "endpoint is unreachable or returning stale data."
-            )
-            return
-
-        # 2. Acquire the window-N active-set snapshot.
-        #
-        # Each window has exactly one snapshot
-        # (``active_set_window_{N}.json``) frozen by
-        # ``/api/v2/validators/epoch_snapshot``. The endpoint absorbs
-        # the on-chain commitment scan and the per-miner pre-eval
-        # pipeline; its bytes are byte-identical across validators for
-        # a given epoch. The snapshot is the source of truth for the
-        # remainder of the cycle: cross-validator consistency comes
-        # from the API freeze, restart consistency from the local file.
-        #
-        # On the first cycle inside a window the file is absent, so we
-        # fetch from the API and persist immediately. On subsequent
-        # cycles (same window) the file hits and we avoid the HTTP
-        # round-trip entirely.
-        window = compute_window(current_block, self._window_config)
-        snapshot = await self._acquire_window_snapshot(window, current_block)
-        if snapshot is None:
-            # Snapshot acquisition failed (chain query unreachable even after
-            # reconnect retry). Returning False signals the outer loop NOT to
-            # mark this window as evaluated, so the next iteration can retry
-            # instead of locking the validator out of this ~24h window.
-            return False
-
-        # Surface pre-eval failures from the snapshot as rejection
-        # submissions (no eval is run for these miners). The snapshot
-        # itself comes back to us only after the eval cycle has run;
-        # firing here ensures the dashboard sees the rejection rows
-        # at the same offset every window.
-        self._dispatch_pre_eval_rejections(
-            snapshot, current_block, window.window_number,
-        )
-
-        # Per-validator runtime filters (validator_permit, blacklist)
-        # are dynamic and applied on top of the frozen snapshot every
-        # cycle so that permit / blacklist changes take effect without
-        # invalidating the snapshot itself.
-        active_commitments = self._filter_active_commitments_runtime(
-            snapshot.commitments,
-        )
-        logger.info(
-            f"Window {window.window_number} snapshot: "
-            f"{len(snapshot.commitments)} eligible, "
-            f"{len(snapshot.pre_eval_failed)} pre-eval rejected, "
-            f"{len(active_commitments)} after runtime filter"
-        )
-
-        if not active_commitments:
-            logger.warning("No active miners with valid commitments!")
-            await self._set_fallback_weights()
-            return
-
-        # Anti-cheese: force re-eval of the local top-N so a one-off lucky
-        # cached score doesn't keep influencing consensus. Gated on
-        # non-empty active set — when the runtime filter removes every
-        # miner the cycle short-circuits to fallback/burn anyway, so
-        # wiping cache here would just discard signal we'd want for the
-        # next window's consensus payload.
-        self._wipe_top_n_for_recheck(window.window_number)
-
-        # 4. Evaluate miners (scenarios selected by sandbox image).
-        # Pack-hash dedup is handled inside the loop via `pack_first_seen`
-        # ownership lock: the first hotkey to register a given pack_hash
-        # owns it permanently (for this validator instance). Subsequent
-        # submitters of the same pack_hash are treated as copies, get
-        # weight 0, and skip the LLM eval entirely.
-        eval_scenarios: List[str] = []  # not used in S1 — sandbox picks scenario
-        evaluated_count = 0
-        attempted_count = 0
-        skipped_interval_count = 0
-        rejected_pre_eval_count = len(snapshot.pre_eval_failed)
-        copy_rejected_count = 0
-        total_eligible = len(active_commitments)
-        logger.info(
-            f"=== Eval cycle: {total_eligible} eligible miners ==="
-        )
-
-        await self._prefetch_packs(active_commitments)
-
-        # Iterate by chain commit_block ascending so the earliest
-        # committer of a duplicated pack_hash is processed first and
-        # claim_owner records them as the canonical owner. Even if a
-        # later iteration order would observe the same final state
-        # (claim_owner is order-independent under the new semantics),
-        # ascending order also avoids wasting an eval round-trip on a
-        # copy that is about to be demoted in the same cycle.
-        eval_order = sorted(
-            active_commitments.items(),
-            key=lambda item: (item[1].block_number, item[1].hotkey),
-        )
-
-        miner_idx = 0
-        for uid, commitment in eval_order:
-            hotkey = commitment.hotkey
-            miner_idx += 1
-
-            # Ownership lock: earliest chain commit_block wins (Issue 4
-            # anti-snipe). Passing the on-chain block keeps the recorded
-            # ordering deterministic across validators rather than
-            # tied to local observation time.
-            ph = commitment.pack_hash
-            owner_hk, _owner_blk = claim_owner(
-                self.pack_first_seen, ph, hotkey, commitment.block_number,
-            )
-            if owner_hk != hotkey:
-                copy_rejected_count += 1
-                detail = (
-                    f"pack_hash {ph[:12]} owned by {owner_hk[:8]}; "
-                    f"treating as copy"
-                )
-                self._get_miner_logger(hotkey).info(
-                    f"[{miner_idx}/{total_eligible}] Miner {uid} ({hotkey[:8]}): "
-                    f"{detail} — skipping eval"
-                )
-                asyncio.ensure_future(
-                    submit_eval(
-                        self.wallet,
-                        miner_hotkey=hotkey,
-                        miner_uid=uid,
-                        block_height=current_block,
-                        score=0.0,
-                        weight=0.0,
-                        qualified=False,
-                        pack_url=commitment.pack_url,
-                        pack_hash=commitment.pack_hash,
-                        llm_base_url=self.config.llm_base_url,
-                        llm_model=self.config.llm_model,
-                        judge_model=self._judge_model,
-                        rejected=True,
-                        rejection_stage="integrity_check",
-                        rejection_detail=detail,
-                        spec_number=_spec_number(),
-                        epoch_number=window_number,
-                        **self._harness_metadata(),
-                    )
-                )
-                self._disqualified_miners[hotkey] = (
-                    f"copy_of:{owner_hk}"
-                )
-                self._drop_miner_eval_state(hotkey)
-                continue
-
-            # No per-miner pre-eval call here: the epoch_snapshot already
-            # encodes pre-eval verdicts. Failed entries are surfaced via
-            # ``snapshot.pre_eval_failed`` and rejection-submitted at the
-            # cycle's start (see ``_dispatch_pre_eval_rejections``); only
-            # passed entries reach this loop.
-            needs_eval = self._needs_evaluation(
-                hotkey, commitment.pack_hash, window_number
-            )
-            if not needs_eval:
-                skipped_interval_count += 1
-                last_w = self.last_eval_window.get(hotkey)
-                self._get_miner_logger(hotkey).info(
-                    f"[{miner_idx}/{total_eligible}] Skipping, "
-                    f"pack_hash unchanged "
-                    f"(last evaluated in window {last_w})"
-                )
-                continue
-
-            attempted_count += 1
-            logger.info(
-                f"[{miner_idx}/{total_eligible}] Evaluating miner {uid} "
-                f"({hotkey[:8]}) ..."
-            )
-            eval_dir, vlog_offset, mlog_offset = self._prepare_eval_log_capture(cycle_eval_id, hotkey)
-            eval_start = time.time()
-            eval_result = await self._evaluate_miner(
-                uid, commitment, epoch_seed,
-                block_height=current_block,
-            )
-            eval_elapsed = time.time() - eval_start
-
-            # Upload eval logs to dashboard (fire-and-forget)
-            asyncio.ensure_future(
-                self._fire_upload_eval_logs(
-                    cycle_eval_id, uid, commitment, eval_scenarios, eval_result,
-                    eval_dir, vlog_offset, mlog_offset, current_block,
-                    window_number,
-                )
-            )
-
-            if eval_result is not None:
-                pack_changed = self._eval_pack_hash.get(hotkey) != commitment.pack_hash
-                if pack_changed:
-                    self._eval_counts[hotkey] = 0
-                self._eval_counts[hotkey] = self._eval_counts.get(hotkey, 0) + 1
-                eval_count = self._eval_counts[hotkey]
-
-                raw_q = eval_result.get("qualified") or {}
-                raw_jd = eval_result.get("judge_details") or {}
-                scenario_scores_map = {}
-                for sname, qv in raw_q.items():
-                    jd = raw_jd.get(sname) or {}
-                    overall = jd.get("overall_score")
-                    if overall is not None:
-                        scenario_scores_map[sname] = float(overall)
-                    else:
-                        logger.warning(
-                            "Miner %d scenario %s: missing overall_score "
-                            "in judge_details, defaulting to 0.0",
-                            uid, sname,
-                        )
-                        scenario_scores_map[sname] = 0.0
-
-                self._update_eval_results(
-                    hotkey, commitment.pack_hash,
-                    scenario_scores=scenario_scores_map,
-                )
-                self.last_eval_block[hotkey] = current_block
-                self.last_eval_window[hotkey] = window_number
-                evaluated_count += 1
-                q = eval_result.get("qualified", {})
-                passed = sum(1 for v in q.values() if v)
-                elapsed_str = f" ({eval_elapsed:.1f}s)" if eval_elapsed else ""
-                logger.info(
-                    f"[{miner_idx}/{total_eligible}] Miner {uid} done: "
-                    f"{passed}/{len(q)} scenarios passed"
-                    f"{elapsed_str} "
-                    f"({evaluated_count} evaluated so far)"
-                )
-
-                # Store latest token & model usage for metadata reporting
-                if eval_result.get("token_usage"):
-                    self.latest_token_usage[hotkey] = eval_result["token_usage"]
-                if eval_result.get("model_usage"):
-                    self.latest_model_usage[hotkey] = eval_result["model_usage"]
-
-                # Submit eval result to dashboard (fire-and-forget)
-                asyncio.ensure_future(
-                    self._fire_submit_eval(
-                        uid, commitment, eval_result, eval_count, pack_changed,
-                        current_block, window_number,
-                    )
-                )
-
-                self._track_uid_change(uid, hotkey)
-
-                # Persist per-miner so a crash mid-cycle doesn't lose
-                # work already paid for in LLM tokens.
-                self._save_eval_state()
-
-            else:
-                elapsed_str = f" ({eval_elapsed:.1f}s)" if eval_elapsed else ""
-                logger.info(
-                    f"[{miner_idx}/{total_eligible}] Miner {uid} eval returned None"
-                    f"{elapsed_str} "
-                    f"(pack fetch/integrity failed)"
-                )
-                self._drop_miner_eval_state(hotkey)
-
-            # Mid-eval tempo refresh: re-assert the current winner's weights
-            # to keep the validator active on-chain without recomputing.
-            mid_block = self.subtensor.get_current_block()
-            if mid_block - self.last_weight_block >= self.config.weight_interval_blocks:
-                logger.info(
-                    f"Mid-eval tempo refresh at block {mid_block} "
-                    f"({mid_block - self.last_weight_block} blocks since last set_weights)"
-                )
-                await self._set_winner_weights()
-                self.last_weight_block = mid_block
-
-        # End-of-cycle eviction: drop pack_first_seen entries whose
-        # pack_hash has been absent from every active commitment for
-        # `EVICTION_GRACE_WINDOWS` consecutive wall-clock windows.
-        # This bounds the table's growth and enables a "resurrection"
-        # path for long-orphaned packs while shielding original authors
-        # from a single short outage costing them ownership (see
-        # trajectoryrl.utils.pack_ownership).
-        active_hashes = {c.pack_hash for c in active_commitments.values()}
-        evicted = evict_orphans(
-            self.pack_first_seen,
-            self.pack_last_seen_window,
-            active_hashes,
-            current_window=window_number,
-        )
-        if evicted:
-            logger.info(
-                f"pack_first_seen eviction: {len(evicted)} orphaned entries removed "
-                f"after {EVICTION_GRACE_WINDOWS}-window grace at window {window_number}"
-            )
-
-        parts = [f"{evaluated_count} evaluated"]
-        if rejected_pre_eval_count:
-            parts.append(f"{rejected_pre_eval_count} pre-eval rejected")
-        if copy_rejected_count:
-            parts.append(f"{copy_rejected_count} copy rejected")
-        if skipped_interval_count:
-            parts.append(f"{skipped_interval_count} skipped (interval)")
-        failed_count = attempted_count - evaluated_count
-        if failed_count > 0:
-            parts.append(f"{failed_count} failed")
-        cycle_elapsed = time.time() - cycle_start
-        cycle_min = cycle_elapsed / 60
-        logger.info(
-            f"Eval cycle complete ({cycle_min:.1f}min): {total_eligible} eligible, "
-            + ", ".join(parts)
-        )
-
-        # All attempted evaluations failed — likely a validator-side
-        # issue.  Mark unhealthy so the next cycle ignores cached results.
-        if attempted_count > 0 and evaluated_count == 0:
-            logger.error(
-                f"All {attempted_count} miner evaluations failed. "
-                "Possible LLM API key issue or service outage. "
-                "Setting fallback weights to owner UID."
-            )
-            await self._set_fallback_weights(
-                reason="All evaluations failed (LLM error)"
-            )
-            return
-
-        # 5. Re-assert winner weights after eval completes
-        await self._set_winner_weights()
-
-    def _needs_evaluation(
-        self, hotkey: str, pack_hash: str, current_window: int
-    ) -> bool:
-        """Return True iff the miner needs (re-)evaluation in this window.
-
-        Dedup is keyed purely on ``pack_hash``. Since
-        ``_filter_active_commitments`` drops commitments older than
-        ``inactivity_blocks`` (~2 windows), an unchanged ``pack_hash``
-        transitively means the miner is still actively re-submitting the
-        same pack — safe to reuse cached scenario scores.
-
-        ``current_window`` is accepted for symmetry / future use; it is
-        not part of the gating decision.
-        """
-        del current_window  # signature only; kept for caller clarity
-
-        if self._eval_pack_hash.get(hotkey) != pack_hash:
-            self._get_miner_logger(hotkey).info(
-                f"pack_hash changed, marking for eval"
-            )
-            return True
-
-        if not self.scenario_scores.get(hotkey):
-            return True
-
-        return False
-
-    def _filter_active_commitments(
-        self,
-        commitments: Dict[int, MinerCommitment],
-        current_block: int,
-    ) -> Dict[int, MinerCommitment]:
-        """Filter commitments to active, non-validator miners.
-
-        Excludes:
-        - UIDs with validator_permit
-        - Blacklisted coldkeys
-        - Stale submissions (commitment older than ``inactivity_blocks``)
-        """
-        blacklist = set(self.config.coldkey_blacklist)
-        max_age = self.config.inactivity_blocks
-        active: Dict[int, MinerCommitment] = {}
-        for uid, commitment in commitments.items():
-            if uid < len(self.metagraph.validator_permit) and self.metagraph.validator_permit[uid]:
-                continue
-            if blacklist:
-                coldkey = self.metagraph.coldkeys[uid] if uid < len(self.metagraph.coldkeys) else None
-                if coldkey in blacklist:
-                    self._get_miner_logger(commitment.hotkey).info(
-                        f"Skipping eval (coldkey {coldkey} is blacklisted)"
-                    )
-                    continue
-            age = current_block - commitment.block_number
-            if age > max_age:
-                self._get_miner_logger(commitment.hotkey).info(
-                    f"Stale submission: {age} blocks old > "
-                    f"{max_age} block limit (~48h), skipping"
-                )
-                continue
-            active[uid] = commitment
-        return active
-
-    def _filter_active_commitments_runtime(
-        self,
-        commitments: Dict[int, MinerCommitment],
-    ) -> Dict[int, MinerCommitment]:
-        """Apply per-validator runtime filters on top of a snapshot.
-
-        The snapshot already enforces the deterministic filters
-        (``commit_block < window_start`` and stale-age vs window_start).
-        This method layers on the per-validator dynamic filters that
-        intentionally do NOT participate in cross-validator consistency:
-
-        * ``validator_permit`` — current metagraph state (a permit can
-          appear or disappear mid-window).
-        * coldkey blacklist — operator-local policy.
-        """
-        blacklist = set(self.config.coldkey_blacklist)
-        active: Dict[int, MinerCommitment] = {}
-        for uid, commitment in commitments.items():
-            if uid < len(self.metagraph.validator_permit) and self.metagraph.validator_permit[uid]:
-                continue
-            if blacklist:
-                coldkey = (
-                    self.metagraph.coldkeys[uid]
-                    if uid < len(self.metagraph.coldkeys) else None
-                )
-                if coldkey in blacklist:
-                    self._get_miner_logger(commitment.hotkey).info(
-                        f"Skipping eval (coldkey {coldkey} is blacklisted)"
-                    )
-                    continue
-            active[uid] = commitment
-        return active
-
-    async def _acquire_window_snapshot(
-        self,
-        window: EvaluationWindow,
-        current_block: int,
-    ) -> Optional[EvalSnapshot]:
-        """Load or fetch the active-set snapshot for ``window``.
-
-        Order of operations:
-
-        1. Try to load ``active_set_window_{N}.json``. A successful
-           load is the fast path for any non-first cycle in window N
-           (and for restart recovery within the same window).
-        2. On miss, fetch the snapshot from
-           ``/api/v2/validators/epoch_snapshot``. The endpoint freezes
-           an immutable per-epoch snapshot that already absorbs the
-           on-chain commitment scan and the per-miner pre-eval pipeline,
-           so the validator no longer queries the chain or calls
-           ``/api/v2/miners/pre-eval`` here. Persist the result so
-           subsequent cycles in the same window hit the cache.
-
-        Returns the snapshot, or None if the API is unreachable / the
-        snapshot has not been built yet (caller should retry next
-        cycle without locking the validator out of this window).
-        """
-        snapshot = load_snapshot(self.config.active_set_dir, window.window_number)
-        if snapshot is not None:
-            return snapshot
-
-        logger.info(
-            "Window %d: fetching epoch_snapshot from API "
-            "(window_start=%d, current_block=%d)",
-            window.window_number, window.window_start, current_block,
-        )
-        try:
-            api_response = await fetch_epoch_snapshot(
-                epoch_number=window.window_number,
-                wallet=self.wallet,
-            )
-        except SnapshotNotReady:
-            logger.warning(
-                "Window %d: epoch_snapshot not yet built by sync worker — "
-                "will retry on next cycle",
-                window.window_number,
-            )
-            return None
-        if api_response is None:
-            # Network/auth failure. Returning None without persisting
-            # lets the next loop iteration retry instead of being
-            # locked by a poisoned cache file for the rest of the
-            # ~24h window.
-            logger.error(
-                "Window %d: epoch_snapshot fetch failed; "
-                "skipping snapshot persistence so the next cycle can retry",
-                window.window_number,
-            )
-            return None
-
-        snapshot = take_snapshot_from_api(
-            api_response,
-            window_number=window.window_number,
-        )
-        save_snapshot(snapshot, self.config.active_set_dir)
-        return snapshot
-
-    def _dispatch_pre_eval_rejections(
-        self,
-        snapshot: EvalSnapshot,
-        current_block: int,
-        window_number: int,
-    ) -> None:
-        """Submit rejection rows for snapshot entries flagged ``failed``.
-
-        The epoch_snapshot endpoint already ran the pre-eval pipeline
-        for each (hotkey, pack_hash); failed entries arrive with a
-        ``pre_eval_status='failed'`` and the verdict reason. We surface
-        each as a rejection submission (``rejected=True``,
-        ``score=weight=0``) so downstream consumers see the same shape
-        of row that the legacy per-miner ``pre_eval`` path produced.
-
-        Idempotency: this is invoked once per eval cycle. Re-running
-        the same cycle would re-submit identical rows — the dashboard
-        deduplicates by ``(validator_hotkey, miner_hotkey,
-        epoch_number)`` so duplicate sends are safe.
-        """
-        if not snapshot.pre_eval_failed:
-            return
-        self._disqualified_miners = getattr(self, "_disqualified_miners", {})
-        for entry in snapshot.pre_eval_failed.values():
-            reason = entry.pre_eval_reason or "unknown"
-            stage = "integrity_check" if reason == "hardcoded" else "pack_fetch"
-            detail = f"pre-eval rejected: {reason}"
-            self._get_miner_logger(entry.hotkey).info(
-                "Window %d: pre-eval failed (reason=%s) — submitting rejection",
-                window_number, reason,
-            )
-            asyncio.ensure_future(
-                submit_eval(
-                    self.wallet,
-                    miner_hotkey=entry.hotkey,
-                    miner_uid=entry.uid,
-                    block_height=current_block,
-                    score=0.0,
-                    weight=0.0,
-                    qualified=False,
-                    pack_url=entry.pack_url,
-                    pack_hash=entry.pack_hash,
-                    llm_base_url=self.config.llm_base_url,
-                    llm_model=self.config.llm_model,
-                    judge_model=self._judge_model,
-                    rejected=True,
-                    rejection_stage=stage,
-                    rejection_detail=detail,
-                    spec_number=_spec_number(),
-                    epoch_number=window_number,
-                    **self._harness_metadata(),
-                )
-            )
-            self._disqualified_miners[entry.hotkey] = (
-                f"pre_eval_rejected:{reason}"
-            )
-            self._drop_miner_eval_state(entry.hotkey)
-
-    # ------------------------------------------------------------------
-    # UID re-registration tracking
-    # ------------------------------------------------------------------
-
-    def _track_uid_change(
-        self,
-        miner_uid: int,
-        hotkey: str,
-    ) -> None:
-        """Detect re-registration for a miner hotkey."""
-        prev_uid = self._hotkey_uid_map.get(hotkey)
-        if prev_uid is not None and prev_uid != miner_uid:
-            self._get_miner_logger(hotkey).info(
-                f"Previously at UID {prev_uid}; "
-                f"re-registration detected"
-            )
-        self._hotkey_uid_map[hotkey] = miner_uid
-
-    # ------------------------------------------------------------------
-    # Episode detail logging (file-only, no console output)
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Miner evaluation
-    # ------------------------------------------------------------------
-
-    async def _evaluate_miner(
-        self,
-        miner_uid: int,
-        commitment: MinerCommitment,
-        epoch_seed: int,
-        block_height: int = 0,
-    ) -> Optional[Dict]:
-        """Evaluate a single miner via trajrl-bench sandbox.
-
-        Delegates the real work to ``evaluate_miner_s1`` (shared with
-        ``scripts/eval_miners.py``). This method only:
-        - Resolves the per-miner file logger and the wallet-derived salt.
-        - Maps the helper's outcome back into the validator pipeline dict
-          shape and updates ``_disqualified_miners`` for non-pack-verify
-          skips (matching pre-refactor behavior).
-
-        Returns:
-            Dict with keys "qualified", "judge_details", ... or ``None``
-            if pre-evaluation checks fail.
-        """
-        mlog = self._get_miner_logger(commitment.hotkey)
-        mlog.info(
-            f"Evaluating miner {miner_uid} "
-            f"(hotkey={commitment.hotkey[:8]}, hash={commitment.pack_hash[:12]}...)"
-        )
-
-        outcome = await evaluate_miner_s1(
-            harness=self._sandbox_harness,
-            pack_fetcher=self.pack_fetcher,
-            commitment=commitment,
-            epoch_seed=epoch_seed,
-            validator_salt=self._default_validator_salt(),
-            mlog=mlog,
-        )
-
-        if not outcome.success:
-            # Match pre-refactor semantics: pack-verify failures return
-            # None silently; SKILL.md and harness errors mark the miner
-            # as disqualified for this evaluation cycle.
-            if outcome.skip_reason and outcome.skip_reason != SKIP_PACK_VERIFY:
-                self._disqualified_miners[commitment.hotkey] = outcome.skip_reason
-            return None
-
-        # Defensive: judge_details is built in-place by evaluate_miner_s1 today
-        # so this normally cannot raise, but a future contract drift (renamed
-        # field, missing scenario, None outcome) must not crash the whole cycle
-        # — that would silently kill all subsequent miners until restart.
-        scenario_qualified = {
-            sn: bool((d or {}).get("qualification_gate", False))
-            for sn, d in (outcome.judge_details or {}).items()
-            if isinstance(d, dict)
-        }
-
-        return {
-            "qualified": scenario_qualified,
-            "token_usage": {},
-            "model_usage": {},
-            "judge_details": outcome.judge_details,
-            "session_keys": {},
-            "session_files": {},
-            # S1-specific: full SandboxEvaluationResult for eval log upload.
-            # Not serialized — consumed by _fire_upload_eval_logs and dropped.
-            "_s1_sandbox_result": outcome.sandbox_result,
-        }
 
     def _default_validator_salt(self) -> str:
-        """Derive a stable validator salt from the wallet hotkey."""
-        import hashlib
         data = f"{self.wallet.hotkey.ss58_address}:{self.config.netuid}"
         return hashlib.sha256(data.encode()).hexdigest()[:16]
 
-    # ------------------------------------------------------------------
-    # Eval submission
-    # ------------------------------------------------------------------
-
     def _harness_metadata(self) -> Dict[str, str]:
-        """Return bench + scenario image hashes and bench version for submit payloads."""
+        """bench/harness image hashes + bench version for outgoing payloads."""
         h = self._sandbox_harness
         meta: Dict[str, str] = {}
         if h.bench_image_hash != "unknown":
             meta["bench_image_hash"] = h.bench_image_hash
         if h.scenario_image_hash != "unknown":
-            meta["scenario_image_hash"] = h.scenario_image_hash
+            meta["harness_image_hash"] = h.scenario_image_hash
         if h.sandbox_version != "unknown":
             meta["bench_version"] = h.sandbox_version
         return meta
 
-    async def _fire_submit_eval(
-        self,
-        uid: int,
-        commitment: "MinerCommitment",
-        eval_result: Dict,
-        eval_count: int,
-        pack_changed: bool,
-        block_height: int,
-        window_number: int,
-    ) -> None:
-        """Build and fire the /api/scores/submit payload for one miner eval.
-
-        Fire-and-forget: any error is logged and discarded.
-        """
-        hotkey = commitment.hotkey
-
-        raw_qualified = eval_result.get("qualified") or {}
-        raw_judge_details = eval_result.get("judge_details") or {}
-
-        def _scenario_score(sname: str, qualified_val: bool) -> float:
-            jd = raw_judge_details.get(sname) or {}
-            overall = jd.get("overall_score")
-            if overall is not None:
-                return float(overall)
-            logger.warning(
-                "Scenario %s: missing overall_score in judge_details, "
-                "defaulting to 0.0", sname,
-            )
-            return 0.0
-
-        # Aggregate raw score: Σ per-scenario quality (range [0, N] for
-        # N scenarios). Each per-scenario quality is passed/total ∈ [0, 1]
-        # from the verifier's ctrf.json; equal-weighted sum is the
-        # session score per Ning's 2026-05-04 design.
-        raw_score = sum(
-            _scenario_score(s, q) for s, q in raw_qualified.items()
-        )
-
-        # Per-scenario results
-        scenario_results: Dict[str, Any] = {}
-        for sname, q in raw_qualified.items():
-            entry: Dict[str, Any] = {
-                "score": round(_scenario_score(sname, q), 4),
-                "weight": 1.0,
-                "qualified": q,
-            }
-            tu = (eval_result.get("token_usage") or {}).get(sname)
-            if tu:
-                entry["token_usage"] = tu
-            mu = (eval_result.get("model_usage") or {}).get(sname)
-            if mu:
-                entry["model_usage"] = mu
-            jd = (eval_result.get("judge_details") or {}).get(sname)
-            if jd:
-                entry["judge"] = jd
-            scenario_results[sname] = entry
-
-        # Log the full eval summary to the per-miner file for debugging.
-        mlog = self._get_miner_logger(hotkey)
-        mlog.info(
-            f"=== eval summary (uid={uid}, eval#{eval_count}) ==="
-        )
-        mlog.info(
-            f"  score={raw_score:.4f} pack_changed={pack_changed}"
-        )
-        mlog.info(
-            # Intentionally no pack_url — it's reveal-time-protected.
-            f"  pack_hash={commitment.pack_hash}"
-        )
-        for sname, sr in scenario_results.items():
-            jd = sr.get("judge", {})
-            mlog.info(
-                f"  {sname}: qualified={sr.get('qualified')} "
-                f"judge_score={jd.get('overall_score', '?')} "
-                f"verdict={jd.get('verdict', '?')} "
-                f"grounded={jd.get('grounded', '?')} "
-                f"safety={jd.get('safety_passed', '?')} "
-                f"correctness={jd.get('correctness_passed', '?')}"
-            )
-            tu = sr.get("token_usage")
-            if tu:
-                mlog.info(
-                    f"    tokens: in={tu.get('input_tokens', 0)} "
-                    f"out={tu.get('output_tokens', 0)} "
-                    f"cache_r={tu.get('cache_read_tokens', 0)} "
-                    f"cache_w={tu.get('cache_write_tokens', 0)}"
-                )
-            mu = sr.get("model_usage")
-            if mu:
-                for m in mu:
-                    mlog.info(
-                        f"    model={m.get('model', '?')} "
-                        f"cost=${m.get('cost_usd', 0):.4f} "
-                        f"calls={m.get('count', 0)}"
-                    )
-        mlog.info("=== end eval summary ===")
-
-        await submit_eval(
-            self.wallet,
-            miner_hotkey=hotkey,
-            miner_uid=uid,
-            block_height=block_height,
-            score=round(raw_score, 4),
-            weight=0.0,
-            # Qualified = miner produced *some* real output (≥1 scenario
-            # passed ≥1 test). The previous all-pass gate was too strict
-            # under the N=3 shell_verifier contract: scenarios like
-            # break-filter-js-from-html require non-obvious bypass
-            # payloads (e.g. parser-discrepancy XSS) that virtually no
-            # pack ships, so the all-pass gate flagged every miner as
-            # unqualified — including ones cleanly hitting 5/6 on
-            # cancel-async-tasks. Relax to any-pass; tighten back when
-            # the scenario pool is bigger and more uniformly tractable.
-            qualified=bool(raw_qualified) and any(raw_qualified.values()),
-            pack_url=commitment.pack_url,
-            pack_hash=commitment.pack_hash,
-            eval_count=eval_count,
-            scenario_results=scenario_results,
-            # Report the testee model (the LLM that ran the SKILL.md) in
-            # llm_model. judge_model carries the LLM-judge model for
-            # backward-compat / future use; with v0.6.0+ shell_verifier
-            # there is no LLM judge in the eval pipeline, but the field
-            # is preserved so operators can pin an evaluator model when
-            # we re-introduce a judge for a subset of scenarios.
-            llm_base_url=self.config.llm_base_url,
-            llm_model=self.config.llm_model,
-            judge_model=self._judge_model,
-            spec_number=_spec_number(),
-            epoch_number=window_number,
-            **self._harness_metadata(),
-        )
-
     # ------------------------------------------------------------------
-    # Eval log upload
+    # Eval log capture / upload (kept verbatim from v5.x — same contract)
     # ------------------------------------------------------------------
 
     _MAX_LOG_ARCHIVE_BYTES = 10 * 1024 * 1024  # 10 MB
 
     def _get_validator_log_offset(self) -> int:
-        """Return the current byte offset of the main validator log file."""
         try:
             return (
                 self._validator_log_path.stat().st_size
@@ -2598,20 +384,9 @@ class TrajectoryValidator:
         except OSError:
             return 0
 
-    def _prepare_eval_log_capture(self, eval_id: str, hotkey: str) -> Tuple[Path, int, int]:
-        """Prepare for log capture before an eval run.
-
-        Creates a unique eval directory, truncates mock-tools JSONL log
-        files, and records file offsets for the main validator log and the
-        per-miner log so only new content is captured.
-
-        Args:
-            eval_id: Cycle-level eval identifier (e.g. "20260329_1430_w42").
-            hotkey: Miner hotkey.
-
-        Returns:
-            (eval_dir, validator_log_offset, miner_log_offset) tuple.
-        """
+    def _prepare_eval_log_capture(
+        self, eval_id: str, hotkey: str,
+    ) -> Tuple[Path, int, int]:
         eval_dir = self.config.log_dir / "evals" / eval_id / hotkey[:16]
         eval_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2646,23 +421,6 @@ class TrajectoryValidator:
         validator_log_offset: int,
         miner_log_offset: int,
     ) -> Optional[bytes]:
-        """Snapshot log files into *eval_dir* and package as tar.gz.
-
-        Copies the main validator log segment, per-miner log segment, and
-        per-scenario JSONL files into the eval directory so they persist
-        locally for debugging, then creates an in-memory tar.gz archive
-        for upload.
-
-        Args:
-            hotkey: Miner hotkey (used to locate per-miner log).
-            eval_scenarios: Scenario names evaluated in this run.
-            eval_dir: Unique eval directory created by _prepare_eval_log_capture.
-            validator_log_offset: Main validator log byte offset before eval.
-            miner_log_offset: Per-miner log byte offset before eval.
-
-        Returns:
-            Gzipped tar archive bytes, or None on failure / over-size.
-        """
         import io
         import shutil
         import tarfile
@@ -2706,20 +464,16 @@ class TrajectoryValidator:
         self,
         eval_id: str,
         uid: int,
-        commitment: "MinerCommitment",
+        commitment: MinerCommitment,
         eval_scenarios: List[str],
         eval_result: Optional[Dict],
         eval_dir: Path,
         validator_log_offset: int,
         miner_log_offset: int,
         block_height: int,
-        window_number: int,
+        challenge_epoch_id: int,
     ) -> None:
         """Collect and upload eval logs. Fire-and-forget."""
-
-        # If this was an S1 eval, write the sandbox artifacts (transcripts,
-        # evaluation.json, JUDGE.md, fixtures) into eval_dir so they're
-        # included in the tar.gz uploaded to the dashboard.
         s1_result = eval_result.get("_s1_sandbox_result") if eval_result else None
         if s1_result is not None:
             try:
@@ -2734,7 +488,7 @@ class TrajectoryValidator:
         if log_archive:
             meta = {
                 "eval_id": eval_id,
-                "window_number": window_number,
+                "challenge_epoch_id": challenge_epoch_id,
                 "miner_hotkey": commitment.hotkey,
                 "miner_uid": uid,
                 "block_height": block_height,
@@ -2757,7 +511,7 @@ class TrajectoryValidator:
                 block_height=block_height,
                 pack_hash=commitment.pack_hash,
                 log_archive=log_archive,
-                epoch_number=window_number,
+                epoch_number=challenge_epoch_id,
             )
             if ok:
                 try:
@@ -2770,9 +524,9 @@ class TrajectoryValidator:
         eval_id: str,
         cycle_log_offset: int,
         block_height: int,
-        window_number: int,
+        challenge_epoch_id: int,
     ) -> None:
-        """Upload the full eval cycle validator log. Fire-and-forget."""
+        """Upload the validator log segment for one challenger cycle."""
         import io
         import tarfile
 
@@ -2805,7 +559,7 @@ class TrajectoryValidator:
 
             meta = {
                 "eval_id": eval_id,
-                "window_number": window_number,
+                "challenge_epoch_id": challenge_epoch_id,
                 "block_height": block_height,
                 "type": "cycle",
             }
@@ -2822,7 +576,7 @@ class TrajectoryValidator:
                 eval_id=eval_id,
                 block_height=block_height,
                 log_archive=archive,
-                epoch_number=window_number,
+                epoch_number=challenge_epoch_id,
             )
             if ok:
                 try:
@@ -2832,12 +586,8 @@ class TrajectoryValidator:
         except Exception as e:
             logger.warning("Cycle log upload error: %s", e)
 
-    # ------------------------------------------------------------------
-    # Log replay (startup)
-    # ------------------------------------------------------------------
-
     async def _replay_pending_uploads(self):
-        """Re-upload logs from the last 2 days that have metadata but no .uploaded marker."""
+        """Re-upload eval/cycle logs from the last 2 days that lack a marker."""
         evals_root = self.config.log_dir / "evals"
         if not evals_root.exists():
             return
@@ -2859,7 +609,6 @@ class TrajectoryValidator:
 
             eval_id = eval_id_dir.name
 
-            # --- Per-miner eval logs with persisted metadata ---
             for miner_dir in sorted(eval_id_dir.iterdir()):
                 if not miner_dir.is_dir():
                     continue
@@ -2883,7 +632,9 @@ class TrajectoryValidator:
                     block_height=meta.get("block_height", 0),
                     pack_hash=meta.get("pack_hash", "unknown"),
                     log_archive=archive_path.read_bytes(),
-                    epoch_number=meta.get("window_number"),
+                    epoch_number=meta.get(
+                        "challenge_epoch_id", meta.get("window_number")
+                    ),
                 )
                 if ok:
                     eval_uploaded += 1
@@ -2892,7 +643,6 @@ class TrajectoryValidator:
                     except OSError:
                         pass
 
-            # --- Cycle logs with persisted metadata ---
             if (eval_id_dir / ".cycle_uploaded").exists():
                 continue
             cycle_meta_path = eval_id_dir / "cycle_upload_meta.json"
@@ -2910,7 +660,9 @@ class TrajectoryValidator:
                 eval_id=meta.get("eval_id", eval_id),
                 block_height=meta.get("block_height", 0),
                 log_archive=cycle_archive_path.read_bytes(),
-                epoch_number=meta.get("window_number"),
+                epoch_number=meta.get(
+                    "challenge_epoch_id", meta.get("window_number")
+                ),
             )
             if ok:
                 cycle_uploaded += 1
@@ -2926,7 +678,406 @@ class TrajectoryValidator:
             )
 
     # ------------------------------------------------------------------
-    # Weight setting
+    # Challenger evaluation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _challenge_seed(challenge_epoch_id: int, netuid: int = 11) -> int:
+        raw = f"trajectoryrl-{netuid}-challenge-{challenge_epoch_id}".encode()
+        return int(hashlib.sha256(raw).hexdigest()[:8], 16)
+
+    @staticmethod
+    def _epoch_has_budget(
+        resp: Dict[str, Any],
+        epoch: Dict[str, Any],
+        challenge_epoch_id: int,
+    ) -> bool:
+        """Mid-epoch start gate based on server-reported elapsed progress.
+
+        Returns False (skip) when more than ``_EVAL_LATEST_START_RATIO``
+        of the epoch has already passed; True otherwise. When the server
+        cannot report ``elapsed_blocks`` (chain RPC down), or epoch
+        length is missing/zero, the gate is bypassed and the caller
+        proceeds — the daemon has no better signal locally.
+        """
+        elapsed_blocks = resp.get("elapsed_blocks")
+        if elapsed_blocks is None:
+            return True
+
+        # Prefer the explicit epoch_length_blocks field; fall back to
+        # end_block - start_block. The two should agree but the latter
+        # is the safer ground truth.
+        start_block = epoch.get("start_block")
+        end_block = epoch.get("end_block")
+        try:
+            length = int(epoch.get("epoch_length_blocks") or 0)
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0:
+            try:
+                length = int((end_block or 0) - (start_block or 0))
+            except (TypeError, ValueError):
+                length = 0
+        if length <= 0:
+            return True
+
+        progress = elapsed_blocks / length
+        if progress > _EVAL_LATEST_START_RATIO:
+            logger.info(
+                "Skipping epoch %s: elapsed %d/%d blocks (%.0f%%) "
+                "past latest-start cutoff %.0f%%; waiting for next epoch.",
+                challenge_epoch_id, elapsed_blocks, length,
+                progress * 100, _EVAL_LATEST_START_RATIO * 100,
+            )
+            return False
+        return True
+
+    @staticmethod
+    def _commitment_from_epoch(epoch_block: Dict[str, Any]) -> Optional[MinerCommitment]:
+        """Build a ``MinerCommitment`` from the API ``epoch`` block.
+
+        Returns None when the block is missing required fields. UID is
+        unknown at this layer (not in the v6 epoch block); ``-1`` is a
+        sentinel that surfaces in eval logs but does not affect scoring.
+        """
+        if not isinstance(epoch_block, dict):
+            return None
+
+        hotkey = epoch_block.get("challenger_hotkey")
+        pack_hash = epoch_block.get("challenger_pack_hash")
+        pack_url = epoch_block.get("challenger_pack_url") or epoch_block.get("pack_url")
+        if not hotkey or not pack_hash or not pack_url:
+            return None
+
+        try:
+            uid = int(epoch_block.get("challenger_uid", -1))
+        except (TypeError, ValueError):
+            uid = -1
+
+        try:
+            block_number = int(
+                epoch_block.get("start_block")
+                or epoch_block.get("created_block")
+                or 0
+            )
+        except (TypeError, ValueError):
+            block_number = 0
+
+        return MinerCommitment(
+            uid=uid,
+            hotkey=hotkey,
+            pack_hash=pack_hash,
+            pack_url=pack_url,
+            block_number=block_number,
+            raw=f"{pack_hash}|{pack_url}",
+        )
+
+    async def _evaluate_challenger(
+        self,
+        commitment: MinerCommitment,
+        challenge_epoch_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Run a single trajrl-bench evaluation on the active challenger."""
+        mlog = self._get_miner_logger(commitment.hotkey)
+        mlog.info(
+            f"Evaluating challenger uid={commitment.uid} "
+            f"hotkey={commitment.hotkey[:8]} "
+            f"hash={commitment.pack_hash[:12]}... "
+            f"epoch_id={challenge_epoch_id}"
+        )
+
+        outcome = await evaluate_miner_s1(
+            harness=self._sandbox_harness,
+            pack_fetcher=self.pack_fetcher,
+            commitment=commitment,
+            epoch_seed=self._challenge_seed(challenge_epoch_id, self.config.netuid),
+            validator_salt=self._default_validator_salt(),
+            mlog=mlog,
+        )
+
+        if not outcome.success:
+            return {
+                "success": False,
+                "skip_reason": outcome.skip_reason,
+            }
+
+        scenario_qualified = {
+            sn: bool((d or {}).get("qualification_gate", False))
+            for sn, d in (outcome.judge_details or {}).items()
+            if isinstance(d, dict)
+        }
+
+        return {
+            "success": True,
+            "qualified": scenario_qualified,
+            "judge_details": outcome.judge_details,
+            "_s1_sandbox_result": outcome.sandbox_result,
+        }
+
+    @staticmethod
+    def _summarize_eval(
+        eval_result: Dict[str, Any],
+    ) -> Tuple[float, bool, Dict[str, Any]]:
+        """Collapse the per-scenario eval into (score, qualified, scenario_results).
+
+        score = Σ per-scenario quality (passed/total ∈ [0, 1] each)
+        qualified = at least one scenario passed at least one test (any-pass).
+        """
+        raw_qualified = eval_result.get("qualified") or {}
+        raw_judge = eval_result.get("judge_details") or {}
+
+        def _scenario_score(sname: str) -> float:
+            jd = raw_judge.get(sname) or {}
+            overall = jd.get("overall_score")
+            if overall is not None:
+                try:
+                    return float(overall)
+                except (TypeError, ValueError):
+                    pass
+            return 0.0
+
+        raw_score = sum(_scenario_score(s) for s in raw_qualified)
+
+        scenario_results: Dict[str, Any] = {}
+        for sname, q in raw_qualified.items():
+            entry: Dict[str, Any] = {
+                "score": round(_scenario_score(sname), 4),
+                "weight": 1.0,
+                "qualified": bool(q),
+            }
+            jd = raw_judge.get(sname)
+            if jd:
+                entry["judge"] = jd
+            scenario_results[sname] = entry
+
+        qualified = bool(raw_qualified) and any(raw_qualified.values())
+        return round(raw_score, 4), qualified, scenario_results
+
+    # ------------------------------------------------------------------
+    # Eval loop
+    # ------------------------------------------------------------------
+
+    async def _eval_loop(self):
+        """Two-poll tick on the v6 daemon hot path:
+
+        - ``GET /api/v2/epoch/current`` for the eval task (challenger pack).
+        - ``GET /api/v2/winner/current`` for the local-derivation inputs
+          that drive the winner cache (and therefore ``set_weights``).
+
+        These are independent endpoints with distinct caching contracts;
+        we run them on the same ~30 s tick so a single sleep cycles both.
+        """
+        logger.info("Eval loop started (poll interval %ds)", _EPOCH_POLL_INTERVAL)
+        while True:
+            try:
+                await self._eval_loop_tick()
+            except Exception as e:
+                logger.exception("Eval loop tick failed: %s", e)
+            await asyncio.sleep(_EPOCH_POLL_INTERVAL)
+
+    async def _eval_loop_tick(self):
+        # 1) Refresh the winner cache from /api/v2/winner/current. The
+        #    server's `winner` field is advisory; derive_winner_state
+        #    runs the same stake-weighted aggregation locally and warns
+        #    on divergence.
+        try:
+            await self._refresh_winner_cache()
+        except Exception as e:
+            logger.warning("Winner cache refresh failed: %s", e)
+
+        # 2) Poll the active challenge epoch. The `winner` block on this
+        #    response is intentionally ignored — see
+        #    fetch_current_winner / derive_winner_state.
+        resp = await fetch_current_epoch()
+        if resp is None:
+            return
+
+        epoch = resp.get("epoch")
+        if not epoch:
+            return  # no in-progress epoch; keep polling
+
+        try:
+            challenge_epoch_id = int(epoch.get("challenge_epoch_id"))
+        except (TypeError, ValueError):
+            logger.warning("epoch missing or invalid challenge_epoch_id: %r", epoch)
+            return
+
+        if self._last_scored_challenge_epoch_id == challenge_epoch_id:
+            return  # idempotent: already evaluated this epoch
+
+        # Mid-epoch budget gate (docs/API.md "Mid-epoch start"). Use the
+        # server-reported elapsed/total progress ratio rather than a
+        # hard-coded eval-duration budget. When the server can't report
+        # `elapsed_blocks` (chain RPC down) the gate is bypassed — the
+        # daemon has no better signal, and a post-finalize submit will
+        # 409 cleanly.
+        if not self._epoch_has_budget(resp, epoch, challenge_epoch_id):
+            return
+
+        commitment = self._commitment_from_epoch(epoch)
+        if commitment is None:
+            logger.warning(
+                "epoch %s missing challenger fields; skipping",
+                challenge_epoch_id,
+            )
+            return
+
+        await self._score_challenger(challenge_epoch_id, commitment)
+
+    async def _refresh_winner_cache(self):
+        """Pull /api/v2/winner/current, run local derivation, persist cache."""
+        winner_resp = await fetch_current_winner()
+        if winner_resp is None:
+            return  # transport error; keep the previous cache + TTL countdown
+
+        new_winner = derive_winner_state(winner_resp)
+        self._winner_state = new_winner
+        try:
+            save_winner_state(self._winner_state, self._winner_state_path)
+        except Exception as e:
+            logger.warning("Failed to persist winner cache: %s", e)
+
+    async def _score_challenger(
+        self, challenge_epoch_id: int, commitment: MinerCommitment,
+    ):
+        eval_id = (
+            datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            + f"_e{challenge_epoch_id}"
+        )
+
+        # Begin cycle log capture
+        self._cycle_eval_id = eval_id
+        self._cycle_log_offset = self._get_validator_log_offset()
+        block_height = 0
+        try:
+            block_height = int(self.subtensor.get_current_block() or 0)
+        except Exception as e:
+            logger.debug("Could not read current block for eval: %s", e)
+        self._cycle_log_block = block_height
+
+        # Per-miner log capture
+        eval_dir, vlog_offset, mlog_offset = self._prepare_eval_log_capture(
+            eval_id, commitment.hotkey,
+        )
+
+        eval_result = await self._evaluate_challenger(commitment, challenge_epoch_id)
+
+        rejected = False
+        rejection_detail: Optional[str] = None
+        score = 0.0
+        qualified = False
+        scenario_results: Dict[str, Any] = {}
+
+        if eval_result is None or not eval_result.get("success"):
+            rejected = True
+            rejection_detail = (
+                eval_result.get("skip_reason") if eval_result else "evaluation_skipped"
+            )
+            # Pack-verify failures from the helper are silent skips in
+            # v5.x; in v6 we still surface them as rejected so the server
+            # has an explicit verdict for this validator-epoch pair.
+            if rejection_detail == SKIP_PACK_VERIFY:
+                rejection_detail = "pack_verify_failed"
+        else:
+            score, qualified, scenario_results = self._summarize_eval(eval_result)
+
+        ok = await submit_challenge_score(
+            self.wallet,
+            challenge_epoch_id=challenge_epoch_id,
+            score=score,
+            qualified=qualified,
+            rejected=rejected if rejected else None,
+            rejection_detail=rejection_detail if rejected else None,
+            scenario_results=scenario_results or None,
+            spec_number=_spec_number(),
+            llm_base_url=self.config.llm_base_url,
+            llm_model=self.config.llm_model,
+            **self._harness_metadata(),
+        )
+
+        if ok:
+            self._last_scored_challenge_epoch_id = challenge_epoch_id
+            self._last_eval_at = int(time.time())
+            self._save_eval_state()
+
+        # Fire-and-forget log uploads
+        eval_scenarios = list(scenario_results.keys()) if scenario_results else []
+        try:
+            await self._fire_upload_eval_logs(
+                eval_id, commitment.uid, commitment, eval_scenarios,
+                eval_result, eval_dir, vlog_offset, mlog_offset,
+                block_height, challenge_epoch_id,
+            )
+        except Exception as e:
+            logger.warning("Eval log upload failed: %s", e)
+
+        try:
+            await self._fire_upload_cycle_logs(
+                eval_id, self._cycle_log_offset, self._cycle_log_block,
+                challenge_epoch_id,
+            )
+        except Exception as e:
+            logger.warning("Cycle log upload failed: %s", e)
+
+    # ------------------------------------------------------------------
+    # Weight loop
+    # ------------------------------------------------------------------
+
+    def _should_set_weights(self, current_block: int) -> bool:
+        """Tempo-gated check: enough blocks elapsed since last set_weights."""
+        if self._last_set_weights_block <= 0:
+            return True
+        elapsed = current_block - self._last_set_weights_block
+        return elapsed >= self.config.weight_interval_blocks
+
+    async def _weight_loop(self):
+        """Periodically drive on-chain set_weights from the winner cache."""
+        logger.info(
+            "Weight loop started (check interval %ds, tempo gate %d blocks)",
+            _WEIGHT_CHECK_INTERVAL, self.config.weight_interval_blocks,
+        )
+        while True:
+            try:
+                await self._weight_loop_tick()
+            except Exception as e:
+                logger.exception("Weight loop tick failed: %s", e)
+            await asyncio.sleep(_WEIGHT_CHECK_INTERVAL)
+
+    async def _weight_loop_tick(self):
+        try:
+            current_block = int(self.subtensor.get_current_block() or 0)
+        except Exception as e:
+            logger.warning(
+                "Could not read current block for set_weights gate: %s", e,
+            )
+            return
+
+        if not self._should_set_weights(current_block):
+            return
+
+        if not self._winner_state.is_seated:
+            await self._set_fallback_weights(reason="No winner seated yet")
+            self._last_set_weights_block = current_block
+            self._save_eval_state()
+            return
+
+        if not self._winner_state.is_fresh(WINNER_FALLBACK_TTL_SECONDS):
+            logger.error(
+                "Winner cache stale (>%ds since last server refresh); "
+                "refusing set_weights and burning to owner UID",
+                WINNER_FALLBACK_TTL_SECONDS,
+            )
+            await self._set_burn_weights(reason="winner_cache_stale")
+            self._last_set_weights_block = current_block
+            self._save_eval_state()
+            return
+
+        await self._set_winner_weights()
+        self._last_set_weights_block = current_block
+        self._save_eval_state()
+
+    # ------------------------------------------------------------------
+    # set_weights
     # ------------------------------------------------------------------
 
     async def _do_set_weights(
@@ -2936,10 +1087,7 @@ class TrajectoryValidator:
         *,
         label: str = "",
     ) -> bool:
-        """Call subtensor.set_weights with retry on failure.
-
-        Returns True if weights were set successfully.
-        """
+        """Call subtensor.set_weights with retry on failure."""
         for attempt in range(1, _SET_WEIGHTS_MAX_RETRIES + 1):
             try:
                 result = self.subtensor.set_weights(
@@ -2974,9 +1122,7 @@ class TrajectoryValidator:
 
             if attempt < _SET_WEIGHTS_MAX_RETRIES:
                 delay = _SET_WEIGHTS_RETRY_DELAY * attempt
-                logger.info(
-                    "%sRetrying set_weights in %ds...", label, delay,
-                )
+                logger.info("%sRetrying set_weights in %ds...", label, delay)
                 await asyncio.sleep(delay)
 
         logger.error(
@@ -2986,22 +1132,12 @@ class TrajectoryValidator:
         return False
 
     async def _set_winner_weights(self):
-        """Set on-chain weights from persisted WinnerState.
-
-        Reads winner_uid directly from the persisted state — no metagraph
-        lookup required.  The UID is captured at consensus aggregation time
-        when the metagraph is known to be healthy.
-        """
+        """Drive set_weights from the cached winner."""
         winner_hk = self._winner_state.winner_hotkey
         winner_uid = self._winner_state.winner_uid
 
         if not winner_hk or winner_uid is None:
-            reason = (
-                "No winner in WinnerState"
-                if not winner_hk
-                else f"Winner {winner_hk[:8]} has no UID in state"
-            )
-            await self._set_fallback_weights(reason=reason)
+            await self._set_fallback_weights(reason="No winner in cache")
             return
 
         if winner_uid == OWNER_UID:
@@ -3017,10 +1153,7 @@ class TrajectoryValidator:
         )
 
     def _fallback_owner_weights(self) -> Optional[Tuple[list, list]]:
-        """Read on-chain weights set by OWNER_UID and return (uids, weights).
-
-        Returns None if the owner has no weights or the read fails.
-        """
+        """Read on-chain weights set by OWNER_UID and return (uids, weights)."""
         if not self._is_metagraph_healthy():
             logger.warning(
                 "Cannot read owner weights: metagraph unhealthy (n=%d). "
@@ -3028,14 +1161,10 @@ class TrajectoryValidator:
                 getattr(self.metagraph, "n", 0),
             )
             if not self._sync_metagraph(caller="fallback_owner_weights"):
-                logger.error(
-                    "Metagraph still unhealthy after retry — cannot read "
-                    "owner weight row. Falling back to owner-only weight."
-                )
                 return None
 
         try:
-            W = self.metagraph.W  # (n, n) weight matrix
+            W = self.metagraph.W
             if OWNER_UID >= W.shape[0]:
                 logger.warning(
                     "OWNER_UID %d out of range (metagraph size %d)",
@@ -3044,8 +1173,8 @@ class TrajectoryValidator:
                 return None
 
             owner_weights = W[OWNER_UID]
-            uids = []
-            weights = []
+            uids: list = []
+            weights: list = []
             for uid, w in enumerate(owner_weights.tolist()):
                 if w > 0:
                     uids.append(uid)
@@ -3072,15 +1201,7 @@ class TrajectoryValidator:
         return [OWNER_UID], [1.0]
 
     async def _set_fallback_weights(self, reason: str = "No eligible miners"):
-        """Set weights when no miners qualify.
-
-        Fallback order:
-        1. Copy on-chain weights from OWNER_UID (UID 74).
-        2. If that fails, set weight=1.0 to OWNER_UID only (burns emissions).
-
-        The validator must always call set_weights every tempo to avoid
-        deregistration.
-        """
+        """Set weights when no winner exists. Always call set_weights."""
         try:
             _ = self.wallet.hotkey
         except Exception:
@@ -3090,7 +1211,7 @@ class TrajectoryValidator:
         if not self._is_metagraph_healthy():
             logger.error(
                 "METAGRAPH UNHEALTHY (n=%d) during fallback weight setting. "
-                "Attempting reconnect before set_weights. Reason: %s",
+                "Reason: %s",
                 getattr(self.metagraph, "n", 0), reason,
             )
             self._sync_metagraph(caller="fallback_weights")
@@ -3099,20 +1220,41 @@ class TrajectoryValidator:
         if copied is not None:
             uids, weights = copied
             logger.info(
-                "%s — copying weights from owner UID %d "
-                "(%d entries, uids=%s)",
-                reason, OWNER_UID, len(uids), uids,
+                "%s — copying weights from owner UID %d (%d entries)",
+                reason, OWNER_UID, len(uids),
             )
         else:
             uids, weights = self._fallback_to_owner()
             logger.info(
-                "%s — setting fallback weight to "
-                "owner UID %d (uids=%s, weights=%s)",
+                "%s — burning to owner UID %d (uids=%s, weights=%s)",
                 reason, OWNER_UID, uids, weights,
             )
 
         await self._do_set_weights(
             uids, weights, label=f"[fallback: {reason}] ",
+        )
+
+    async def _set_burn_weights(self, reason: str) -> None:
+        uids, weights = self._fallback_to_owner()
+        await self._do_set_weights(
+            uids, weights, label=f"[burn: {reason}] ",
+        )
+
+    # ------------------------------------------------------------------
+    # Run
+    # ------------------------------------------------------------------
+
+    async def run(self):
+        """Run eval loop, weight loop, and heartbeat loop concurrently."""
+        try:
+            await self._replay_pending_uploads()
+        except Exception as e:
+            logger.warning("Startup log replay failed: %s", e)
+
+        await asyncio.gather(
+            self._eval_loop(),
+            self._weight_loop(),
+            self._heartbeat_loop(),
         )
 
 

@@ -665,6 +665,8 @@ Submit a validator heartbeat with running version, Docker image digests, and san
 | `bench_image_hash` | string | No | Docker image digest of the `trajrl-bench` sandbox image (e.g. `"sha256:a1b2c3..."`) |
 | `harness_image_hash` | string | No | Docker image digest of the `hermes-agent` harness image (e.g. `"sha256:d4e5f6..."`) |
 | `bench_version` | string | No | Version string reported by the trajrl-bench CLI inside the sandbox container (e.g. `"v1.2.0"`) |
+| `llm_model` | string | No | LLM model identifier the validator is configured to use for evals (e.g. `"gpt-5"`, `"claude-sonnet-4-6"`) |
+| `llm_base_url` | string | No | Base URL of the OpenAI-compatible LLM endpoint the validator routes eval calls through (e.g. `"https://api.openai.com/v1"`) |
 
 ### Request Example
 
@@ -678,7 +680,9 @@ Submit a validator heartbeat with running version, Docker image digests, and san
   "last_eval_at": 1709999900,
   "bench_image_hash": "sha256:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
   "harness_image_hash": "sha256:f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5",
-  "bench_version": "v1.2.0"
+  "bench_version": "v1.2.0",
+  "llm_model": "gpt-5",
+  "llm_base_url": "https://api.openai.com/v1"
 }
 ```
 
@@ -695,7 +699,9 @@ Submit a validator heartbeat with running version, Docker image digests, and san
     "lastEvalAt": "2025-03-09T10:28:20.000Z",
     "benchImageHash": "sha256:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
     "harnessImageHash": "sha256:f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5",
-    "benchVersion": "v1.2.0"
+    "benchVersion": "v1.2.0",
+    "llmModel": "gpt-5",
+    "llmBaseUrl": "https://api.openai.com/v1"
   }
 }
 ```
@@ -717,7 +723,7 @@ Submit a validator heartbeat with running version, Docker image digests, and san
 1. Validate request body fields
 2. Verify validator signature
 3. Extract requester IPv4 address (from `x-forwarded-for` or `x-real-ip` headers)
-4. Upsert validator heartbeat record to the database (unique key: `hotkey`), updating `version`, `last_seen`, `ip`, `last_set_weights_at`, `last_eval_at`, `bench_image_hash`, `harness_image_hash`, and `bench_version` (if provided)
+4. Upsert validator heartbeat record to the database (unique key: `hotkey`), updating `version`, `last_seen`, `ip`, `last_set_weights_at`, `last_eval_at`, `bench_image_hash`, `harness_image_hash`, `bench_version`, `llm_model`, and `llm_base_url` (if provided)
 5. Return success response
 
 ## POST /api/v2/consensus/payload
@@ -989,35 +995,52 @@ Snapshots are cached in PostgreSQL (`epoch_summary.eval_snapshot` JSONB) — onc
 
 The endpoints in this section implement the **winner-challenger model**. Sections marked **(validator critical-path)** are the ones a v6 daemon must call. Sections marked **(public read)** are observability-only — websites, dashboards, and operators consume them; the daemon does not.
 
+The v6 design pushes winner derivation to the validator: the server publishes per-vote inputs (with `validator_stake` frozen at score POST) via `GET /api/v2/winner/current`, and each daemon runs its own copy of the consensus algorithm against those inputs. The server's `winner_state` row is a published claim used for cross-checking and observability, not a directive — what binds the network's `set_weights` is the convergent local derivation across honest validators, not the server's `winner_state` row in isolation.
+
 ### v6 daemon main loop
 
+There are **two** server-published reads on the daemon hot path, with distinct purposes:
+
+1. **`GET /api/v2/epoch/current`** — the in-progress challenge to evaluate (challenger pack identity, block window, time budget).
+2. **`GET /api/v2/winner/current`** — the canonical inputs for the seated winner. The daemon **derives the winner locally** from the per-validator submissions returned here and uses the local result to drive `set_weights`. This is what makes winner state decentralized: every validator independently re-runs the same aggregation against the same server-published votes-with-frozen-stakes, so a server bug, server-side tamper attempt, or split server cannot silently dictate weights.
+
 ```
+# challenge-eval loop (every ~30 s):
 loop forever:
   resp = GET /api/v2/epoch/current
   if 404:                                       // no epoch in progress
     sleep 30s, continue
-  // resp.winner is the canonical seated winner. Daemons MUST overwrite
-  // their local winner cache with resp.winner on every successful poll —
-  // this is the only endpoint that exposes seated-winner state to v6
-  // daemons.
-  cache.winner = resp.winner   // null on cold start
-  if already submitted for resp.challenge_epoch_id:
-    sleep until resp.end_block, continue
-  fetch pack(resp.challenger_pack_hash), run eval
-  POST /api/v2/epoch/{resp.challenge_epoch_id}/score  // body has `challenger` block;
-                                                       // optional `winner` block under dual-eval
+  if already submitted for resp.epoch.challenge_epoch_id:
+    sleep until resp.epoch.end_block, continue
+  fetch pack(resp.epoch.challenger_pack_hash), run eval
+  POST /api/v2/epoch/{resp.epoch.challenge_epoch_id}/score
   on 409 "epoch is finalized": this epoch is closed; next loop
 
-# set_weights cadence (independent loop):
-  winner = cache.winner                          // refreshed by main loop above
-  if winner is null:                             // cold start, no epoch finalized yet
+# winner-derivation loop (every ~30 s, can share the same tick):
+  w = GET /api/v2/winner/current
+  if w.epoch is null:                           // cold start, no finalized epoch yet
+    cache.winner = null
+  else:
+    derived = local_aggregate(
+                w.submissions,                  // votes + frozen validator_stake
+                metagraph_at(w.epoch.start_block),  // chain-deterministic
+                CONSENSUS_CONFIG)               // versioned in daemon code
+    if derived.uid != w.winner?.uid:
+      log_alarm("server winner ≠ locally-derived"); proceed with derived
+    cache.winner = derived
+
+# set_weights cadence (independent loop, e.g. each Bittensor tempo):
+  winner = cache.winner                         // refreshed by winner-derivation loop above
+  if winner is null:                            // cold start
     skip set_weights this round
-  if cache age > WINNER_FALLBACK_TTL (24 h):     // main loop hasn't refreshed
-    refuse set_weights + alarm                   // server has been unreachable too long
+  if cache age > WINNER_FALLBACK_TTL (24 h):    // server been unreachable too long
+    refuse set_weights + alarm
   set_weights(winner.uid)
 ```
 
-There is no dedicated `winner_state` HTTP endpoint — `GET /api/v2/epoch/current` is the single source of truth for both the in-progress epoch and the seated winner. One GET per tick keeps both fresh.
+The two server endpoints have distinct caching contracts. `/api/v2/epoch/current` answers "what's the active challenge right now?" — its `epoch` block is the only piece daemons act on. `/api/v2/winner/current` answers "what evidence has been finalized into the current seat?" — daemons consume the `submissions[]` array and re-derive locally rather than trusting the `winner` field.
+
+> **Migration note**: the `winner` field returned by `/api/v2/epoch/current` is retained as a non-authoritative convenience for the website and other observability consumers; v6 daemons should ignore it and read seated-winner state through `/api/v2/winner/current` so the local-derivation contract is preserved.
 
 ### v6 signature prefixes
 
@@ -1053,8 +1076,8 @@ None — public read.
     "challenger_hotkey":    "5...",
     "challenger_pack_hash": "abc...",
     "start_block":          5300000,
-    "end_block":            5300100,
-    "epoch_length_blocks":  100,
+    "end_block":            5300150,
+    "epoch_length_blocks":  150,
     "status":               "in_progress",
     "created_at":           "2026-05-09T01:00:00.000Z"
   },
@@ -1070,9 +1093,9 @@ None — public read.
   // Server's chain-time view at request time. Daemons use this to decide
   // whether an eval can finish in the remaining window. Null on chain RPC
   // failure — daemon should fall back to its own block reading.
-  "current_block":    5300050,
-  "elapsed_blocks":   50,
-  "remaining_blocks": 50
+  "current_block":    5300075,
+  "elapsed_blocks":   75,
+  "remaining_blocks": 75
 }
 ```
 
@@ -1111,15 +1134,11 @@ if remaining_secs < EXPECTED_EVAL_SECONDS + SAFETY_MARGIN:
 
 When `current_block` is `null` (server's chain RPC down), the daemon uses its own chain reading; same math.
 
-#### Winner-cache contract for v6 daemons
+#### Winner block — non-authoritative convenience
 
-The `winner` block here is **authoritative**: every successful poll returns the latest committed `winner_state`. Daemons that maintain a local winner cache for `set_weights` should **overwrite the cache with `winner` on each successful poll**. This unifies the daemon's polling loop:
+The `winner` block here is **not authoritative for v6 daemons**. It mirrors the server's `winner_state` row and is retained as a convenience for the website and other observability consumers (so a single GET serves both "active challenge" and "current seat" to a casual reader). v6 daemons must instead read seated-winner state through `GET /api/v2/winner/current`, which returns the per-validator votes + frozen `validator_stake` snapshots that drive **local** aggregation on the daemon — the contract that makes winner derivation decentralized rather than server-dictated.
 
-- One GET per tick (~30 s) keeps both `epoch` and `winner` fresh.
-- `WINNER_FALLBACK_TTL` (24 h) becomes the staleness alarm threshold for "main loop has been unable to reach the server."
-- This is the only endpoint that exposes seated-winner state to v6 daemons.
-
-Cold-start handling: when `winner` is `null`, daemons must skip `set_weights` until a finalized epoch seats the first winner.
+Reading the seat from this endpoint will *usually* match the daemon's locally-derived winner because both sides run the same algorithm against the same data, but the daemon's authority is the local derivation, not the server's claim. See the "v6 daemon main loop" section above for the two-loop polling structure.
 
 #### 404 response
 
@@ -1257,11 +1276,17 @@ trajectoryrl-challenge-score:{validator_hotkey}:{timestamp}:{challenge_epoch_id}
 
 #### Storage
 
-Inserts into `challenge_scores` (migration 067). One row per `(challenge_epoch_id, validator_hotkey)` enforced by `UNIQUE`. Columns split into `challenger_*` (always populated, including `challenger_scenario_results` JSONB) and `winner_*` (NULL in single-eval, populated in dual-eval, including `winner_scenario_results` JSONB; CHECK enforces all-or-nothing on the four winner essentials). The `score_submit_log` table is never written by this endpoint.
+Inserts into `challenge_scores` (migration 067; `validator_stake` added in 070). One row per `(challenge_epoch_id, validator_hotkey)` enforced by `UNIQUE`. Columns split into `challenger_*` (always populated, including `challenger_scenario_results` JSONB) and `winner_*` (NULL in single-eval, populated in dual-eval, including `winner_scenario_results` JSONB; CHECK enforces all-or-nothing on the four winner essentials). The `score_submit_log` table is never written by this endpoint.
+
+In addition to the validator-supplied payload, the server stamps:
+- `block_height` — chain block at receipt (null if chain RPC is unreachable).
+- `validator_stake` — snapshot of `nodes.stake` for the submitting validator at receipt. Frozen on the row so finalize-pipeline aggregation can be replayed deterministically without re-reading the live `nodes` table (which `sync-metagraph` rewrites continuously). Null only if the validator has no row in `nodes` at submit time, which is the same graceful-degradation fallback the on-chain validator check uses.
 
 #### Aggregation
 
 At `end_block`, scheduler tick triggers `finalizeEpoch` which `SELECT`s `challenger_*` columns from `challenge_scores` for this epoch, applies the filter pipeline (drop rejected, below-min-stake, inactive, duplicate-hotkey), runs stake-weighted aggregation, then either updates `winner_state` (winner replaced/held) or marks the epoch `aborted_quorum`. Late submissions arriving after `finalizeEpoch` runs are rejected at the API layer (409 from the `in_progress` check). Dual-eval aggregation (using `winner_*` columns to derive a fresh per-epoch winner-score baseline) is a future finalize.ts change — the schema is already shaped for it.
+
+The current `finalizeEpoch` still loads the stake snapshot from `nodes` at finalize time (see comment in `loadStakeSnapshotAt`). The per-row `validator_stake` is captured to make audit / replay deterministic now; switching the live aggregator over to the captured per-row stake is a separate follow-up.
 
 ---
 
@@ -1324,122 +1349,105 @@ Recent winner transitions from `winner_history` (default `limit=20`, max `200`).
 
 Recent `validator_activity` rows for a specific validator (default `limit=20`, max `200`). Each row is a per-epoch participation record (`participated: true | false`). Useful for ops to spot validators trending toward `INACTIVE_THRESHOLD_EPOCHS` exclusion. **Validators do not call this** — own-state introspection should come from the daemon's local logs.
 
-### `POST /api/v2/epoch/{challenge_epoch_id}/score`
+### `GET /api/v2/winner/current` (validator critical-path)
 
-Validator-side score submission for a single challenge epoch. Distinct from the v5.2 `/api/v2/scores/submit` path: the v6 daemon **must** use this endpoint, the v5.2 daemon **must** keep using the old one. The two paths are independent in code, schema, and signature prefix.
+The canonical source of seated-winner data on the v6 daemon hot path. Returns the **raw inputs** the daemon needs to derive the winner **locally**: the latest finalized epoch's metadata, every participating validator's vote, and the per-row `validator_stake` snapshot that froze each vote's weight at score-submission time. Validators apply their own copy of the consensus algorithm to these inputs and use the locally-derived winner to drive `set_weights` — the server's published `winner` field is shown for cross-checking but is not authoritative.
 
-The wire contract is built around the **winner-challenger** model and is forward-compatible with **dual-eval**: in v6.0 a validator only evaluates the challenger (`challenger` block required, `winner` block omitted); when dual-eval lands, validators include both blocks in the same submission.
+This is what makes winner state **decentralized in v6**: the server's role narrows to publishing immutable per-vote inputs (with stake frozen at submit), not dictating the verdict. A buggy or compromised server cannot silently change weights as long as enough independent validators run their own derivation.
 
 #### Method
-`POST`
+`GET`
 
-#### Path parameter
-- `challenge_epoch_id` (positive integer) — the id returned by `GET /api/v2/epoch/current`. Server resolves this to a `challenge_epochs` row and stamps the **challenger** identity (`challenger_hotkey`, `challenger_pack_hash`) from it; the validator does **not** supply these.
-
-#### Headers
-`Content-Type: application/json`
-
-#### Request body
-
-```jsonc
-{
-  "validator_hotkey": "5...",
-  "timestamp":        1746700000,
-  "signature":        "0x...",
-  "version":          "v6.0.0",
-  "spec_number":      1,
-
-  // REQUIRED — every submission must include the challenger verdict.
-  "challenger": {
-    "score":             0.91,
-    "qualified":         true,
-    "rejected":          false,          // optional, default false
-    "rejection_detail":  null,           // optional free-text
-    "scenario_results":  { ... }         // optional JSONB; per-side audit blob
-  },
-
-  // OPTIONAL — present iff the validator ran dual-eval against the
-  // currently-seated winner. When present, `pack_hash` is what the
-  // validator actually evaluated and is server-validated against
-  // `winner_state.winner_pack_hash`.
-  "winner": {
-    "pack_hash":         "abc...",
-    "score":             0.85,
-    "qualified":         true,
-    "rejected":          false,
-    "rejection_detail":  null,
-    "scenario_results":  { ... }
-  },
-
-  // shared audit
-  "llm_base_url":       "http://...",
-  "llm_model":          "...",
-  "judge_model":        "...",
-  "bench_image_hash":   "...",
-  "harness_image_hash": "...",
-  "bench_version":      "..."
-}
-```
-
-Required: `validator_hotkey`, `timestamp`, `signature`, `version`, `challenger.score`, `challenger.qualified`.
-
-Rejection (per side): set `rejected=true`, `score=0`, `qualified=false`, optionally `rejection_detail` for free-form context. There is no enumerated rejection-stage anymore — under v6 the validator's pack-integrity work happens server-side before the row reaches `pending_eval`, so a rejection from the validator is "I couldn't run the eval" and a one-line text suffices.
-
-#### Signature
-
-Signed message (Ed25519, hotkey-bound):
-```
-trajectoryrl-challenge-score:{validator_hotkey}:{timestamp}:{challenge_epoch_id}
-```
-
-`challenge_epoch_id` is in the signed payload — a signature for epoch N cannot be replayed against epoch M. Distinct prefix from `trajectoryrl-submit` (v5.2) so v5.2 sigs don't cross-validate. Timestamp must be within 5 minutes of server clock.
-
-#### Server-side validations
-
-| Check | On failure |
-|---|---|
-| `challenge_epoch_id` path is positive integer | 400 |
-| `challenger.score` is finite, in `[0, 100]`; `challenger.qualified` is boolean | 400 |
-| `challenger.rejected=true` ⇒ `score=0, qualified=false` | 400 |
-| If `winner` present: `winner.pack_hash` non-empty; same shape rules as `challenger` | 400 |
-| `validator_hotkey` is on-chain validator | 403 |
-| Signature verifies (when `VALIDATE_VALIDATOR_IDENTITY=true`) | 401 |
-| `challenge_epochs(id)` exists | 404 |
-| `challenge_epochs.status = 'in_progress'` | 409 — eval window closed |
-| If `winner` present: `winner_state.winner_pack_hash` is non-NULL **and** equals `winner.pack_hash` | 409 |
-| No prior submission for `(challenge_epoch_id, validator_hotkey)` | 409 — duplicate |
-
-`challenger_hotkey` and `challenger_pack_hash` are **never** read from the request body. Server stamps them from `challenge_epochs(id)`. This eliminates the "validator evaluated the wrong pack but reported the right epoch_id" attack vector. For dual-eval, `winner_hotkey` is similarly server-stamped from `winner_state` (only `winner.pack_hash` is taken from the validator, and only to verify it matches the seated winner).
+#### Auth
+None — public read.
 
 #### Success response (200)
 
 ```jsonc
 {
   "success": true,
-  "challenge_epoch_id": 1234,
-  "validator_hotkey":   "5...",
 
-  "challenger": {
-    "hotkey":    "5...",
-    "pack_hash": "abc..."
-  },
-
-  // null in single-eval; populated when winner block was supplied
+  // The server's claim of the currently seated winner — derived from the same
+  // submissions[] below by the server's finalize.ts. Returned for cross-check
+  // only; daemons MUST treat this as advisory and use their own locally-derived
+  // result for set_weights. Null on cold start.
   "winner": {
-    "hotkey":    "5...",
-    "pack_hash": "abc..."
+    "hotkey":         "5...",
+    "uid":            1,
+    "pack_hash":      "def...",
+    "pack_url":       "https://.../pack.json",
+    "score":          0.92,
+    "since_epoch_id": 100
   },
 
-  "block_height": 5300000
+  // The latest `status='finalized'` epoch — the round whose votes are below.
+  // Aborted-quorum epochs are intentionally skipped (no verdict produced).
+  // Null until the first finalized epoch exists.
+  //
+  // Named `finalized_epoch` rather than `epoch` to disambiguate from
+  // `/api/v2/epoch/current.epoch`, which is the *in-progress* challenge
+  // (votes still being collected, no verdict yet). The two endpoints
+  // describe two different epoch tenses; the field name says which.
+  "finalized_epoch": {
+    "challenge_epoch_id":   201,
+    "challenger_hotkey":    "5...",
+    "challenger_pack_hash": "abc...",
+    "challenger_pack_url":  "https://.../pack.json",   // null if miner_submissions row has none
+    "outcome":              "winner_held",             // "winner_held" | "winner_replaced"
+    "winner_replaced":      false,                     // boolean projection of outcome — true iff the challenger took the seat. Carried explicitly so daemons and observability consumers don't have to string-compare on `outcome`.
+    "finalized_at":         "2026-05-09T01:30:00.000Z"
+  },
+
+  // The per-validator votes that produced the verdict. Ordered by descending
+  // stake-at-receipt. Each row carries both pack hashes so it is self-contained
+  // for audit (the row asserts "this validator scored these specific packs"):
+  //   - `challenger_pack_hash` is server-stamped from challenge_epochs(id) at
+  //     score POST and equals the top-level `finalized_epoch.challenger_pack_hash`.
+  //     Mismatch on any row would indicate a server-side stamping bug.
+  //   - `winner_pack_hash` is null in v6.0 single-eval. Under dual-eval it is
+  //     server-validated at POST against winner_state.winner_pack_hash, so
+  //     once dual-eval lands every populated row will agree on this value too.
+  "submissions": [
+    {
+      "validator_hotkey":     "5...",
+      "validator_stake":      18234.5,    // snapshot of nodes.stake at score POST; null for rows pre-migration-070
+      "challenger_pack_hash": "abc...",
+      "challenger_score":     91.2,
+      "challenger_qualified": true,
+      "challenger_rejected":  false,
+      "winner_pack_hash":     null,       // dual-eval only
+      "winner_score":         null,
+      "winner_qualified":     null,
+      "winner_rejected":      null
+    }
+  ]
 }
 ```
 
-`block_height` is server-stamped from chain RPC at receipt; `null` if chain is unavailable.
+#### Local-derivation contract for v6 daemons
 
-#### Storage
+The daemon does not trust `response.winner`. It runs its own copy of `aggregate(submissions, stakeSnapshot, config)` (the same algorithm the server runs in `finalize.ts`) against:
 
-Inserts into `challenge_scores` (migration 067). One row per `(challenge_epoch_id, validator_hotkey)` enforced by `UNIQUE`. Columns split into `challenger_*` (always populated, including `challenger_scenario_results` JSONB) and `winner_*` (NULL in single-eval, populated in dual-eval, including `winner_scenario_results` JSONB; CHECK enforces all-or-nothing on the four winner essentials). The `score_submit_log` table is never written by this endpoint.
+1. **`response.submissions`** — the votes-with-frozen-stakes returned here. The `validator_stake` field is the authoritative per-row weight; the daemon must not substitute the live metagraph value for that validator (it would have drifted between score POST and now).
+2. **The on-chain metagraph at the relevant block** — for global denominators (total active stake, eligibility, deregistration, inactive-flag tracking), each daemon reads its own deterministic metagraph view. Because Bittensor blocks are deterministic across validators, every honest daemon sees the same metagraph and reaches the same denominators.
+3. **The consensus config** — `MIN_STAKE_FRACTION`, `QUORUM_FRACTION`, `WINNER_PROTECTION_DELTA`, etc. — pinned in the daemon's release; not fetched from the server.
 
-#### Aggregation
+If `derived.uid != response.winner.uid`, the daemon proceeds with `derived` and emits a divergence alarm. Persistent divergence across many validators is a server-bug or attack signal, not a network-consensus problem — the locally-derived winners on each validator stay convergent regardless.
 
-At `end_block`, scheduler tick triggers `finalizeEpoch` which `SELECT`s `challenger_*` columns from `challenge_scores` for this epoch, applies the filter pipeline (drop rejected, below-min-stake, inactive, duplicate-hotkey), runs stake-weighted aggregation, then either updates `winner_state` (winner replaced/held) or marks the epoch `aborted_quorum`. Late submissions arriving after `finalizeEpoch` runs are rejected at the API layer (409 from the `in_progress` check). Dual-eval aggregation (using `winner_*` columns to derive a fresh per-epoch winner-score baseline) is a future finalize.ts change — the schema is already shaped for it.
+> **Known doc gap (follow-up)**: validators need `finalized_epoch.start_block` to align their metagraph snapshot with the epoch the votes were cast for. The current response only carries `finalized_at`. Adding `start_block`/`end_block` to the `finalized_epoch` block is a small additive change tracked separately; for now daemons can resolve `challenge_epoch_id` via `GET /api/epoch/{id}`.
+
+#### Stake-weight reproducibility
+
+`submissions[].validator_stake` is the per-row snapshot of `nodes.stake` taken at score-submission time and stored on `challenge_scores` (migration 070). Because `nodes.stake` is rewritten continuously by `sync-metagraph`, replaying aggregation against the live `nodes` table will not reproduce the original weights — the captured per-row stake is what guarantees every validator's local derivation reaches the same numbers. Pre-migration-070 rows have `validator_stake = null`; until those age out of the latest finalized epoch, daemons should fall back to their own metagraph stake for that hotkey at the epoch's `start_block` (and log the fallback for telemetry).
+
+#### Cold-start behaviour
+
+| Pre-condition | Response |
+|---|---|
+| `winner_state` empty AND no finalized epoch | `winner: null`, `finalized_epoch: null`, `submissions: []`. Daemons skip `set_weights` until the first finalized epoch produces a verdict. |
+| `winner_state` empty AND a finalized epoch exists (rare; should not happen in steady state) | `winner: null`, `finalized_epoch: {...}`, `submissions: [...]`. Daemon still derives locally; if its derivation reaches a winner the server hasn't seated, that's a server-side staleness signal (alarm). |
+| Steady state | All three populated; daemon derives, cross-checks, drives `set_weights` from local result. |
+
+#### Polling cadence
+
+Recommend the same ~30 s tick as `/api/v2/epoch/current` — the two reads can share one timer. Local derivation is cheap; the daemon should re-derive on every successful poll, not cache the locally-derived winner across polls (otherwise a later finalize-time fix on the server would not propagate). Cache the *raw response* if you need network-failure tolerance, with `WINNER_FALLBACK_TTL` (24 h) as the staleness alarm threshold.
