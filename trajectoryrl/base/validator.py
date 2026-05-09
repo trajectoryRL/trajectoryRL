@@ -745,7 +745,7 @@ class TrajectoryValidator:
 
         hotkey = epoch_block.get("challenger_hotkey")
         pack_hash = epoch_block.get("challenger_pack_hash")
-        pack_url = epoch_block.get("challenger_pack_url") or epoch_block.get("pack_url")
+        pack_url = epoch_block.get("challenger_pack_url")
         if not hotkey or not pack_hash or not pack_url:
             return None
 
@@ -885,10 +885,13 @@ class TrajectoryValidator:
         except Exception as e:
             logger.warning("Winner cache refresh failed: %s", e)
 
-        # 2) Poll the active challenge epoch. The `winner` block on this
-        #    response is intentionally ignored — see
-        #    fetch_current_winner / derive_winner_state.
-        resp = await fetch_current_epoch()
+        # 2) Poll the active challenge epoch. Sign the request with the
+        #    validator wallet so the response includes
+        #    `epoch.challenger_pack_url` (gated to validators-or-24h per
+        #    docs/API.md). The `winner` block on this response is
+        #    intentionally ignored — see fetch_current_winner /
+        #    derive_winner_state.
+        resp = await fetch_current_epoch(self.wallet)
         if resp is None:
             return
 
