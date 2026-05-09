@@ -59,6 +59,10 @@ def _default_cycle_logs_url() -> str:
     return f"{_api_base_url()}/api/validators/logs/cycle"
 
 
+def _default_scenario_progress_url_template() -> str:
+    return f"{_api_base_url()}/api/v2/epoch/{{challenge_epoch_id}}/scenario_progress"
+
+
 def _sign(prefix: str, hotkey_kp, timestamp: int, *extras: str) -> Tuple[str, str, str]:
     """Build a signed message for a v2 endpoint.
 
@@ -426,6 +430,96 @@ async def submit_challenge_score(
         return False
     except Exception as e:
         logger.warning("Challenge score submit error: %s", e)
+        return False
+
+
+async def submit_scenario_progress(
+    wallet,
+    *,
+    challenge_epoch_id: int,
+    miner_hotkey: str,
+    miner_uid: int,
+    scenario_name: str,
+    scenario_index: int,
+    total_scenarios: int,
+    quality: float,
+    cost_usd: Optional[float] = None,
+    duration_s: Optional[float] = None,
+    timed_out: Optional[bool] = None,
+    submit_url_template: Optional[str] = None,
+    timeout: float = 10.0,
+) -> bool:
+    """Post a partial per-scenario result for the in-progress epoch.
+
+    Implements ``POST /api/v2/epoch/{challenge_epoch_id}/scenario_progress``.
+    Decorative / UX-only — drives the live ``/challenge`` page and is
+    discarded once the canonical eval bundle uploads. The per-eval log
+    archive at ``/api/validators/logs/upload`` remains the source of
+    truth.
+
+    Signing prefix is ``trajectoryrl-scenario-progress`` and binds the
+    epoch id + scenario name into the message, so signatures are not
+    interchangeable across scenarios or epochs.
+    """
+    try:
+        hotkey_kp = wallet.hotkey
+    except Exception:
+        logger.debug("Skipping scenario_progress: wallet hotkey not available")
+        return False
+
+    timestamp = int(time.time())
+    hotkey_addr, _msg, signature = _sign(
+        "trajectoryrl-scenario-progress",
+        hotkey_kp,
+        timestamp,
+        str(challenge_epoch_id),
+        scenario_name,
+    )
+
+    payload: Dict[str, Any] = {
+        "validator_hotkey": hotkey_addr,
+        "miner_hotkey": miner_hotkey,
+        "miner_uid": miner_uid,
+        "scenario_name": scenario_name,
+        "scenario_index": scenario_index,
+        "total_scenarios": total_scenarios,
+        "quality": quality,
+        "timestamp": timestamp,
+        "signature": signature,
+        "version": __version__,
+    }
+    if cost_usd is not None:
+        payload["cost_usd"] = cost_usd
+    if duration_s is not None:
+        payload["duration_s"] = duration_s
+    if timed_out is not None:
+        payload["timed_out"] = timed_out
+
+    submit_url_template = (
+        submit_url_template or _default_scenario_progress_url_template()
+    )
+    submit_url = submit_url_template.format(challenge_epoch_id=challenge_epoch_id)
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(submit_url, json=payload, timeout=timeout)
+        if resp.status_code == 200:
+            logger.debug(
+                "Scenario progress submitted (epoch=%d, scenario=%s, q=%.3f)",
+                challenge_epoch_id, scenario_name, quality,
+            )
+            return True
+        # 404 is expected before the server endpoint is rolled out — log
+        # at debug to avoid spamming until the web side ships.
+        log_level = logging.DEBUG if resp.status_code == 404 else logging.WARNING
+        logger.log(
+            log_level,
+            "Scenario progress submit failed: %d %s",
+            resp.status_code, resp.text[:200],
+        )
+        return False
+    except Exception as e:
+        logger.debug("Scenario progress submit error: %s", e)
         return False
 
 
