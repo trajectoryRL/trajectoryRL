@@ -128,11 +128,11 @@ class ValidatorConfig:
     inactivity_blocks: int = 14400  # ~48 hours at 12s/block
 
     # Weight cadence — minimum blocks between set_weights attempts.
-    # 50 blocks ≈ 10 min at 12s/block. Must be ≥ the subnet's
-    # `weights_set_rate_limit` chain parameter; otherwise the chain
-    # rejects the extra calls. Tunable on the operator side if the
-    # subnet's rate limit changes.
-    weight_interval_blocks: int = 50
+    # Mirrors the SN11 chain `weights_set_rate_limit` parameter (100
+    # blocks ≈ 20 min at 12s/block). Setting this lower than the chain
+    # value just gets calls rejected; setting it equal keeps the
+    # daemon firing at the earliest moment the chain accepts.
+    weight_interval_blocks: int = 100
 
     # Startup aggregation: run consensus aggregation before entering main loop.
     # Default on: lets a restarted validator catch up to the latest agreed
