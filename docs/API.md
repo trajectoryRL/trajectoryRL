@@ -1051,6 +1051,7 @@ Each endpoint signs a different prefix string — signatures are not interchange
 | `POST /api/v2/epoch/{id}/score` | `trajectoryrl-challenge-score` | `{validator_hotkey}:{timestamp}:{challenge_epoch_id}` |
 | `POST /api/v2/validators/heartbeat` | `trajectoryrl-heartbeat` | `{validator_hotkey}:{timestamp}` |
 | `POST /api/validators/logs/upload` / `cycle` | `trajectoryrl-logs` | `{validator_hotkey}:{timestamp}` |
+| `GET /api/v2/epoch/current` (optional auth, unlocks pack URLs) | `trajectoryrl-epoch-current` | `{validator_hotkey}:{timestamp}` |
 
 The legacy v5.2 path `POST /api/v2/scores/submit` uses `trajectoryrl-submit` and is **not** the v6 score path; v6 daemons must not call it.
 
@@ -1064,9 +1065,26 @@ Returns the single in-progress challenge epoch. The daemon's main-loop poll targ
 `GET`
 
 #### Auth
-None — public read.
+Public read by default. Pack-URL fields (`epoch.challenger_pack_url`, `winner.pack_url`) are gated and only included when **either**:
 
-#### Success response (200)
+1. The request is signed by an on-chain validator (see "Optional signed auth" below), **or**
+2. The current epoch was opened more than **24 hours** ago (`Date.now() − epoch.created_at > 24h`). After the grace window the live challenger pack is treated as no longer competition-sensitive and the URLs become public.
+
+When neither condition holds, the response omits `epoch.challenger_pack_url` entirely and the `winner` block is returned without `pack_url`. All other fields (hotkey, pack_hash, scores, blocks) are always public.
+
+#### Optional signed auth (query string)
+
+To unlock pack URLs immediately, validators add the following query parameters:
+
+| Param | Type | Description |
+|---|---|---|
+| `hotkey` | string | Validator hotkey (must be `is_validator = true` in the synced `nodes` table, i.e. on-chain stake ≥ vpermit threshold) |
+| `timestamp` | number | Unix seconds; must be within ±5 min of server time |
+| `signature` | string | sr25519 signature over `"trajectoryrl-epoch-current:{hotkey}:{timestamp}"` |
+
+Any of: missing param, malformed timestamp, signature verification failure, or non-validator hotkey causes the request to **soft-fall-through** to the time-gate path (no error response — the URLs simply remain hidden until the 24h window expires). The endpoint never returns 401/403 for a malformed signature; this preserves the public-read contract for unsigned callers.
+
+#### Success response (200) — pack URLs hidden (default)
 
 ```jsonc
 {
@@ -1082,11 +1100,11 @@ None — public read.
     "created_at":           "2026-05-09T01:00:00.000Z"
   },
   // Canonical seated winner. Null on cold start (no epoch has finalized yet).
+  // `pack_url` is OMITTED in this default response.
   "winner": {
     "hotkey":         "5...",
     "uid":            1,
     "pack_hash":      "def...",
-    "pack_url":       "https://.../pack.json",
     "score":          "0.92",
     "since_epoch_id": "100"
   },
@@ -1099,15 +1117,46 @@ None — public read.
 }
 ```
 
+#### Success response (200) — pack URLs unlocked (validator-signed or >24h)
+
+```jsonc
+{
+  "success": true,
+  "epoch": {
+    "challenge_epoch_id":   1234,
+    "challenger_hotkey":    "5...",
+    "challenger_pack_hash": "abc...",
+    "challenger_pack_url":  "https://.../pack.json",   // null if miner_submissions row has none
+    "start_block":          5300000,
+    "end_block":            5300150,
+    "epoch_length_blocks":  150,
+    "status":               "in_progress",
+    "created_at":           "2026-05-09T01:00:00.000Z"
+  },
+  "winner": {
+    "hotkey":         "5...",
+    "uid":            1,
+    "pack_hash":      "def...",
+    "pack_url":       "https://.../pack.json",
+    "score":          "0.92",
+    "since_epoch_id": "100"
+  },
+  "current_block":    5300075,
+  "elapsed_blocks":   75,
+  "remaining_blocks": 75
+}
+```
+
 | Field | Meaning |
 |---|---|
 | `epoch.challenge_epoch_id` | Server-assigned BIGINT. The daemon passes this to `POST /api/v2/epoch/{id}/score`. Distinct from `epoch_number` (chain-tempo label) — the two have different semantics under v6. |
 | `epoch.challenger_hotkey` | The miner whose pack is being scored this epoch. Server-stamped — validator does not need to verify it independently. |
 | `epoch.challenger_pack_hash` | SHA-256 of the canonical pack JSON. The daemon uses this to fetch and verify the pack before scoring. |
+| `epoch.challenger_pack_url` | **Gated field** — only present when pack URLs are unlocked (validator-signed or >24h). Pulled from `miner_submissions.pack_url` for the row backing this epoch's challenger. May be `null` if the miner row has none. |
 | `epoch.start_block` / `epoch.end_block` | The chain-block window. The eval window closes at `end_block`; submissions arriving after `finalizeEpoch` runs (≈ next scheduler tick after `end_block`) are rejected with 409. |
 | `epoch.epoch_length_blocks` | Convenience: `end_block − start_block`. Tells the daemon "an epoch lasts this many blocks" without subtracting. |
 | `epoch.status` | Always `"in_progress"` for rows returned here. (`"finalized"` and `"aborted_quorum"` rows are not returned by this endpoint — fetch them via `GET /api/epoch/{id}`.) |
-| `winner` | The canonical seated winner from `winner_state`. Includes `pack_url` (the URL the consensus agreed on, frozen at finalize time — does not drift if the miner re-uploads). `null` on cold start. |
+| `winner` | The canonical seated winner from `winner_state`. `null` on cold start. `pack_url` is **gated** identically to `epoch.challenger_pack_url`; all other fields are always public. The URL, when present, is the URL the consensus agreed on (frozen at finalize time — does not drift if the miner re-uploads). |
 | `current_block` | Server-stamped chain block at the moment of this response. `null` if chain RPC is unreachable. |
 | `elapsed_blocks` | `current_block − start_block`, clamped at 0. `null` if `current_block` is null. |
 | `remaining_blocks` | `end_block − current_block`, clamped at 0. `null` if `current_block` is null. **Use this to decide whether to start an eval** (see "Mid-epoch start" below). |
@@ -1241,7 +1290,7 @@ trajectoryrl-challenge-score:{validator_hotkey}:{timestamp}:{challenge_epoch_id}
 | `challenger.rejected=true` ⇒ `score=0, qualified=false` | 400 |
 | If `winner` present: `winner.pack_hash` non-empty; same shape rules as `challenger` | 400 |
 | `validator_hotkey` is on-chain validator | 403 |
-| Signature verifies (when `VALIDATE_VALIDATOR_IDENTITY=true`) | 401 |
+| Signature verifies (default ON; skipped only when `VALIDATE_VALIDATOR_IDENTITY=false` for staging/local) | 401 |
 | `challenge_epochs(id)` exists | 404 |
 | `challenge_epochs.status = 'in_progress'` | 409 — eval window closed |
 | If `winner` present: `winner_state.winner_pack_hash` is non-NULL **and** equals `winner.pack_hash` | 409 |
@@ -1430,7 +1479,7 @@ The daemon does not trust `response.winner`. It runs its own copy of `aggregate(
 
 1. **`response.submissions`** — the votes-with-frozen-stakes returned here. The `validator_stake` field is the authoritative per-row weight; the daemon must not substitute the live metagraph value for that validator (it would have drifted between score POST and now).
 2. **The on-chain metagraph at the relevant block** — for global denominators (total active stake, eligibility, deregistration, inactive-flag tracking), each daemon reads its own deterministic metagraph view. Because Bittensor blocks are deterministic across validators, every honest daemon sees the same metagraph and reaches the same denominators.
-3. **The consensus config** — `MIN_STAKE_FRACTION`, `QUORUM_FRACTION`, `WINNER_PROTECTION_DELTA`, etc. — pinned in the daemon's release; not fetched from the server.
+3. **The consensus config** — `MIN_VALIDATOR_STAKE`, `QUORUM_FRACTION`, `WINNER_PROTECTION_DELTA`, etc. — pinned in the daemon's release; not fetched from the server.
 
 If `derived.uid != response.winner.uid`, the daemon proceeds with `derived` and emits a divergence alarm. Persistent divergence across many validators is a server-bug or attack signal, not a network-consensus problem — the locally-derived winners on each validator stay convergent regardless.
 

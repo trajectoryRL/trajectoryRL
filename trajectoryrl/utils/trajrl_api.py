@@ -139,14 +139,29 @@ async def heartbeat(
 
 
 async def fetch_current_epoch(
+    wallet=None,
     *,
     epoch_url: Optional[str] = None,
     timeout: float = 15.0,
 ) -> Optional[Dict[str, Any]]:
     """Fetch the active challenge epoch from trajrl.com.
 
-    Public read endpoint — no signing required. Returns the parsed
-    response dict::
+    Public read with **optional signed auth** to unlock pack URLs.
+
+    Per ``docs/API.md`` § ``GET /api/v2/epoch/current``, ``pack_url``
+    fields (``epoch.challenger_pack_url`` and ``winner.pack_url``) are
+    gated: they are returned only when the request is signed by an
+    on-chain validator, OR when the epoch was opened more than 24 h
+    ago. The endpoint soft-falls-through on any signature problem
+    (malformed param, bad signature, non-validator hotkey) — the URLs
+    just stay hidden, no 401/403 is returned.
+
+    Pass a ``wallet`` to sign the request and unlock the URLs while
+    the epoch is fresh; without it the daemon will only see the public
+    fields and ``_commitment_from_epoch`` will skip evals it can't
+    fetch a pack for.
+
+    Returns the parsed response dict::
 
         {
           "epoch": { "challenge_epoch_id", "challenger_hotkey",
@@ -173,10 +188,26 @@ async def fetch_current_epoch(
     or response without an epoch block). Returns ``None`` on transport /
     parse errors so callers can simply retry on the next poll.
     """
-    epoch_url = epoch_url or _default_epoch_current_url()
+    params: Optional[Dict[str, str]] = None
+    if wallet is not None:
+        try:
+            hotkey_kp = wallet.hotkey
+        except Exception:
+            hotkey_kp = None
+        if hotkey_kp is not None:
+            timestamp = int(time.time())
+            hotkey_addr, _msg, signature = _sign(
+                "trajectoryrl-epoch-current", hotkey_kp, timestamp
+            )
+            params = {
+                "hotkey": hotkey_addr,
+                "timestamp": str(timestamp),
+                "signature": signature,
+            }
+
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.get(epoch_url, timeout=timeout)
+            resp = await client.get(epoch_url, params=params, timeout=timeout)
     except Exception as e:
         logger.warning("fetch_current_epoch error: %s", e)
         return None
