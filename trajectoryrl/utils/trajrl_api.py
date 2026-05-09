@@ -188,6 +188,7 @@ async def fetch_current_epoch(
     or response without an epoch block). Returns ``None`` on transport /
     parse errors so callers can simply retry on the next poll.
     """
+    epoch_url = epoch_url or _default_epoch_current_url()
     params: Optional[Dict[str, str]] = None
     if wallet is not None:
         try:
