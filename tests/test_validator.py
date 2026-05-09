@@ -422,6 +422,46 @@ class TestEpochBudgetGate:
 
 
 # ---------------------------------------------------------------------------
+# Adaptive sleep until next epoch
+# ---------------------------------------------------------------------------
+
+
+class TestSleepUntilNextEpoch:
+    def test_positive_remaining_returns_seconds(self):
+        from trajectoryrl.base.validator import TrajectoryValidator
+        # 50 blocks * 12s/block = 600s
+        out = TrajectoryValidator._sleep_until_next_epoch({"remaining_blocks": 50})
+        assert out == 600.0
+
+    def test_zero_remaining_returns_none(self):
+        from trajectoryrl.base.validator import TrajectoryValidator
+        # already at end_block → caller short-ticks
+        assert TrajectoryValidator._sleep_until_next_epoch({"remaining_blocks": 0}) is None
+
+    def test_null_remaining_returns_none(self):
+        from trajectoryrl.base.validator import TrajectoryValidator
+        # server chain RPC down → caller short-ticks
+        assert (
+            TrajectoryValidator._sleep_until_next_epoch({"remaining_blocks": None})
+            is None
+        )
+
+    def test_string_remaining_int_coerced(self):
+        from trajectoryrl.base.validator import TrajectoryValidator
+        # JSON deserialisers may surface integers as strings depending on
+        # transport — accept and coerce.
+        out = TrajectoryValidator._sleep_until_next_epoch({"remaining_blocks": "10"})
+        assert out == 120.0
+
+    def test_garbage_remaining_returns_none(self):
+        from trajectoryrl.base.validator import TrajectoryValidator
+        assert (
+            TrajectoryValidator._sleep_until_next_epoch({"remaining_blocks": "abc"})
+            is None
+        )
+
+
+# ---------------------------------------------------------------------------
 # fetch_current_epoch — propagates remaining_blocks for the budget gate
 # ---------------------------------------------------------------------------
 
