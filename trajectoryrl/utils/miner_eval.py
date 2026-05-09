@@ -25,11 +25,15 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 from .commitments import MinerCommitment
 from .github import PackFetcher
-from .sandbox_harness import SandboxEvaluationResult, TrajectorySandboxHarness
+from .sandbox_harness import (
+    SandboxEvaluationResult,
+    TrajectorySandboxHarness,
+    _EpisodeResult,
+)
 
 
 # Skip-reason taxonomy — kept stable for callers that branch on these values
@@ -60,6 +64,7 @@ async def evaluate_miner_s1(
     epoch_seed: int,
     validator_salt: str = "",
     mlog: Optional[logging.Logger] = None,
+    on_episode_done: Optional[Callable[[_EpisodeResult, int, int], None]] = None,
 ) -> MinerEvalOutcome:
     """Evaluate a single miner's pack via trajrl-bench (Season 1).
 
@@ -163,6 +168,7 @@ async def evaluate_miner_s1(
             epoch_seed=epoch_seed,
             pack_hash=commitment.pack_hash,
             validator_salt=validator_salt,
+            on_episode_done=on_episode_done,
         )
     except Exception as e:
         log.error("S1 evaluation failed: %s", e, exc_info=True)

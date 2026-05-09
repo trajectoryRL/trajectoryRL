@@ -36,7 +36,7 @@ import tarfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import docker
 from docker.models.containers import Container
@@ -614,7 +614,17 @@ class TrajectorySandboxHarness:
         epoch_seed: int,
         pack_hash: str = "",
         validator_salt: str = "",
+        on_episode_done: Optional[Callable[[_EpisodeResult, int, int], None]] = None,
     ) -> SandboxEvaluationResult:
+        """Run the multi-scenario session.
+
+        ``on_episode_done`` is an optional sync callback invoked from the
+        executor thread after each scenario completes, with
+        ``(episode, scenario_index, total_scenarios)``. Used by the
+        validator to fire-and-forget per-scenario progress to the
+        platform server (drives the live /challenge page). Failures in
+        the callback are caught and logged; they never abort the eval.
+        """
         salt = validator_salt or hashlib.sha256(
             f"{self.config.wallet_hotkey}:{self.config.netuid}".encode()
         ).hexdigest()[:16]
@@ -630,6 +640,7 @@ class TrajectorySandboxHarness:
             session_result = await loop.run_in_executor(
                 None, lambda: self._run_eval_sync(
                     skill_md, epoch_seed, salt, pack_hash,
+                    on_episode_done=on_episode_done,
                 ),
             )
         except Exception as e:
@@ -648,6 +659,7 @@ class TrajectorySandboxHarness:
 
     def _run_eval_sync(
         self, skill_md: str, epoch_seed: int, salt: str, pack_hash: str,
+        on_episode_done: Optional[Callable[[_EpisodeResult, int, int], None]] = None,
     ) -> _SessionResult:
         """One container per scenario, one episode each.
 
@@ -701,6 +713,7 @@ class TrajectorySandboxHarness:
             session_id, [s["name"] for s in scenario_specs],
         )
 
+        total = len(scenario_specs)
         for cell_index, spec in enumerate(scenario_specs):
             episode = self._run_episode(
                 session_id=session_id,
@@ -709,6 +722,14 @@ class TrajectorySandboxHarness:
                 spec=spec,
             )
             session_result.episodes.append(episode)
+            if on_episode_done is not None:
+                try:
+                    on_episode_done(episode, cell_index, total)
+                except Exception as e:
+                    logger.warning(
+                        "on_episode_done callback failed for %s: %s",
+                        episode.scenario, e,
+                    )
 
         session_result.compute_scores()
         return session_result
