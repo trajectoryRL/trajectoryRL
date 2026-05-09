@@ -25,13 +25,38 @@ from trajectoryrl import __version__
 
 logger = logging.getLogger(__name__)
 
-_BASE_URL = os.getenv("TRAJECTORYRL_API_BASE_URL", "https://trajrl.com")
-DEFAULT_HEARTBEAT_URL = f"{_BASE_URL}/api/v2/validators/heartbeat"
-DEFAULT_EPOCH_CURRENT_URL = f"{_BASE_URL}/api/v2/epoch/current"
-DEFAULT_EPOCH_SCORE_URL_TEMPLATE = f"{_BASE_URL}/api/v2/epoch/{{challenge_epoch_id}}/score"
-DEFAULT_WINNER_CURRENT_URL = f"{_BASE_URL}/api/v2/winner/current"
-DEFAULT_LOGS_UPLOAD_URL = f"{_BASE_URL}/api/validators/logs/upload"
-DEFAULT_CYCLE_LOGS_URL = f"{_BASE_URL}/api/validators/logs/cycle"
+def _api_base_url() -> str:
+    """Resolve API base URL at call time.
+
+    Important: validator config loads `.env.validator` during startup, which
+    happens after this module is imported. Resolving lazily avoids freezing
+    the default URL (`https://trajrl.com`) too early.
+    """
+    return os.getenv("TRAJECTORYRL_API_BASE_URL", "https://trajrl.com").rstrip("/")
+
+
+def _default_heartbeat_url() -> str:
+    return f"{_api_base_url()}/api/v2/validators/heartbeat"
+
+
+def _default_epoch_current_url() -> str:
+    return f"{_api_base_url()}/api/v2/epoch/current"
+
+
+def _default_epoch_score_url_template() -> str:
+    return f"{_api_base_url()}/api/v2/epoch/{{challenge_epoch_id}}/score"
+
+
+def _default_winner_current_url() -> str:
+    return f"{_api_base_url()}/api/v2/winner/current"
+
+
+def _default_logs_upload_url() -> str:
+    return f"{_api_base_url()}/api/validators/logs/upload"
+
+
+def _default_cycle_logs_url() -> str:
+    return f"{_api_base_url()}/api/validators/logs/cycle"
 
 
 def _sign(prefix: str, hotkey_kp, timestamp: int, *extras: str) -> Tuple[str, str, str]:
@@ -52,7 +77,7 @@ def _sign(prefix: str, hotkey_kp, timestamp: int, *extras: str) -> Tuple[str, st
 async def heartbeat(
     wallet,
     *,
-    heartbeat_url: str = DEFAULT_HEARTBEAT_URL,
+    heartbeat_url: Optional[str] = None,
     last_set_weights_at: Optional[int] = None,
     last_eval_at: Optional[int] = None,
     bench_image_hash: Optional[str] = None,
@@ -82,6 +107,7 @@ async def heartbeat(
         "timestamp": timestamp,
         "signature": signature,
     }
+    heartbeat_url = heartbeat_url or _default_heartbeat_url()
     if last_set_weights_at is not None:
         payload["last_set_weights_at"] = last_set_weights_at
     if last_eval_at is not None:
@@ -114,7 +140,7 @@ async def heartbeat(
 
 async def fetch_current_epoch(
     *,
-    epoch_url: str = DEFAULT_EPOCH_CURRENT_URL,
+    epoch_url: Optional[str] = None,
     timeout: float = 15.0,
 ) -> Optional[Dict[str, Any]]:
     """Fetch the active challenge epoch from trajrl.com.
@@ -147,6 +173,7 @@ async def fetch_current_epoch(
     or response without an epoch block). Returns ``None`` on transport /
     parse errors so callers can simply retry on the next poll.
     """
+    epoch_url = epoch_url or _default_epoch_current_url()
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(epoch_url, timeout=timeout)
@@ -199,7 +226,7 @@ async def fetch_current_epoch(
 
 async def fetch_current_winner(
     *,
-    winner_url: str = DEFAULT_WINNER_CURRENT_URL,
+    winner_url: Optional[str] = None,
     timeout: float = 15.0,
 ) -> Optional[Dict[str, Any]]:
     """Fetch the seated-winner inputs from trajrl.com.
@@ -234,6 +261,7 @@ async def fetch_current_winner(
     Returns ``None`` on transport / parse errors so callers can simply
     retry on the next poll.
     """
+    winner_url = winner_url or _default_winner_current_url()
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(winner_url, timeout=timeout)
@@ -285,7 +313,7 @@ async def submit_challenge_score(
     bench_image_hash: Optional[str] = None,
     harness_image_hash: Optional[str] = None,
     bench_version: Optional[str] = None,
-    submit_url_template: str = DEFAULT_EPOCH_SCORE_URL_TEMPLATE,
+    submit_url_template: Optional[str] = None,
     timeout: float = 30.0,
 ) -> bool:
     """Post the validator's signed score for one challenge epoch.
@@ -347,6 +375,7 @@ async def submit_challenge_score(
     if bench_version is not None:
         payload["bench_version"] = bench_version
 
+    submit_url_template = submit_url_template or _default_epoch_score_url_template()
     submit_url = submit_url_template.format(challenge_epoch_id=challenge_epoch_id)
 
     try:
@@ -378,12 +407,13 @@ async def upload_eval_logs(
     pack_hash: str,
     log_archive: bytes,
     epoch_number: Optional[int] = None,
-    upload_url: str = DEFAULT_LOGS_UPLOAD_URL,
+    upload_url: Optional[str] = None,
 ) -> bool:
     """Upload eval log archive to the dashboard API.
 
     Fire-and-forget: failures are logged and silently discarded.
     """
+    upload_url = upload_url or _default_logs_upload_url()
     try:
         hotkey_kp = wallet.hotkey
     except Exception:
@@ -445,12 +475,13 @@ async def upload_cycle_logs(
     block_height: int,
     log_archive: bytes,
     epoch_number: Optional[int] = None,
-    upload_url: str = DEFAULT_CYCLE_LOGS_URL,
+    upload_url: Optional[str] = None,
 ) -> bool:
     """Upload eval cycle log archive to the dashboard API.
 
     Fire-and-forget: failures are logged and silently discarded.
     """
+    upload_url = upload_url or _default_cycle_logs_url()
     try:
         hotkey_kp = wallet.hotkey
     except Exception:
