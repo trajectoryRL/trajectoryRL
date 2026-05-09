@@ -75,6 +75,7 @@ _METAGRAPH_SYNC_RETRIES = 3
 _METAGRAPH_SYNC_DELAY = 10  # seconds between retries
 _METAGRAPH_MIN_NEURONS = 1
 
+# Total set_weights attempts per tick: 1 initial + 2 retries on failure.
 _SET_WEIGHTS_MAX_RETRIES = 3
 _SET_WEIGHTS_RETRY_DELAY = 12  # seconds; roughly 1 block interval
 
@@ -87,7 +88,7 @@ _SET_WEIGHTS_RETRY_DELAY = 12  # seconds; roughly 1 block interval
 # fallback used only when the server response is indeterminate: 404,
 # transient HTTP error, or remaining_blocks null.
 _EPOCH_POLL_INTERVAL = 30
-_WEIGHT_CHECK_INTERVAL = 300
+_WEIGHT_CHECK_INTERVAL = 60
 _HEARTBEAT_INTERVAL = 600
 
 # Mid-epoch budget gate. We don't pin an absolute eval-duration budget
@@ -913,6 +914,8 @@ class TrajectoryValidator:
         - ``float`` → caller uses that long sleep (sleep until the
           active epoch ends, derived from ``remaining_blocks``).
         """
+        tick_started_at = time.monotonic()
+
         # 1) Refresh the winner cache from /api/v2/winner/current. The
         #    server's `winner` field is advisory; derive_winner_state
         #    runs the same stake-weighted aggregation locally and warns
@@ -963,11 +966,17 @@ class TrajectoryValidator:
             return None
 
         await self._score_challenger(challenge_epoch_id, commitment)
-        # After the eval, let the next short tick re-poll: it'll catch
-        # `already_scored` and switch to the long sleep with up-to-date
-        # remaining_blocks. Avoids reasoning about how much time the
-        # eval consumed.
-        return None
+
+        # Eval just finished — return the long sleep computed from the
+        # response we already have, minus the wall-clock spent inside
+        # this tick (poll + eval). Skips a redundant /epoch/current +
+        # /winner/current round trip whose only purpose was to discover
+        # `already_scored` and pick up a fresher `remaining_blocks`.
+        long_sleep = self._sleep_until_next_epoch(resp)
+        if long_sleep is None:
+            return None
+        elapsed = time.monotonic() - tick_started_at
+        return max(0.0, long_sleep - elapsed)
 
     async def _refresh_winner_cache(self):
         """Pull /api/v2/winner/current, run local derivation, persist cache."""
