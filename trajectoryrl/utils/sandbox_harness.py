@@ -824,7 +824,7 @@ class TrajectorySandboxHarness:
                 f"hermes chat -q {_shell_quote(harness_prompt)} "
                 f"-m {_shell_quote(self._testee_model)} "
                 "-t terminal,file,code_execution,memory "
-                "--quiet --yolo --max-turns 15; "
+                "--quiet --yolo; "
                 "chat_rc=$?; "
                 "hermes sessions export /workspace/turns.jsonl "
                 "2>/workspace/turns_export.err; "
