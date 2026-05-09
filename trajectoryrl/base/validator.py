@@ -78,10 +78,17 @@ _METAGRAPH_MIN_NEURONS = 1
 _SET_WEIGHTS_MAX_RETRIES = 3
 _SET_WEIGHTS_RETRY_DELAY = 12  # seconds; roughly 1 block interval
 
-# Daemon cadence (v6.0)
-_EPOCH_POLL_INTERVAL = 30        # seconds between GET /api/v2/epoch/current
-_WEIGHT_CHECK_INTERVAL = 300     # seconds between weight-set attempts
-_HEARTBEAT_INTERVAL = 600        # seconds between heartbeats
+# Daemon cadence (v6.0).
+#
+# Eval-tick polling is adaptive: in steady state we poll
+# /epoch/current + /winner/current once per epoch boundary, sleeping
+# `remaining_blocks * 12s` (Bittensor block time) until the active
+# epoch is about to end. _EPOCH_POLL_INTERVAL is the short-tick
+# fallback used only when the server response is indeterminate: 404,
+# transient HTTP error, or remaining_blocks null.
+_EPOCH_POLL_INTERVAL = 30
+_WEIGHT_CHECK_INTERVAL = 300
+_HEARTBEAT_INTERVAL = 600
 
 # Mid-epoch budget gate. We don't pin an absolute eval-duration budget
 # (operator-tunable env vars would just shift mis-configuration risk
@@ -745,7 +752,7 @@ class TrajectoryValidator:
 
         hotkey = epoch_block.get("challenger_hotkey")
         pack_hash = epoch_block.get("challenger_pack_hash")
-        pack_url = epoch_block.get("challenger_pack_url") or epoch_block.get("pack_url")
+        pack_url = epoch_block.get("challenger_pack_url")
         if not hotkey or not pack_hash or not pack_url:
             return None
 
@@ -858,24 +865,54 @@ class TrajectoryValidator:
     # ------------------------------------------------------------------
 
     async def _eval_loop(self):
-        """Two-poll tick on the v6 daemon hot path:
+        """Two-poll tick on the v6 daemon hot path with adaptive sleep:
 
         - ``GET /api/v2/epoch/current`` for the eval task (challenger pack).
         - ``GET /api/v2/winner/current`` for the local-derivation inputs
           that drive the winner cache (and therefore ``set_weights``).
 
-        These are independent endpoints with distinct caching contracts;
-        we run them on the same ~30 s tick so a single sleep cycles both.
+        Both endpoints are independent and share one tick. In steady
+        state the loop polls **once per epoch** — after scoring (or
+        skipping) the active epoch we sleep until ~`remaining_blocks`
+        before its end, then wake to pick up the next one. Only when
+        the response is indeterminate (404, transient error, or
+        chain-RPC null) do we fall back to ``_EPOCH_POLL_INTERVAL``
+        (30 s) short-tick.
         """
-        logger.info("Eval loop started (poll interval %ds)", _EPOCH_POLL_INTERVAL)
+        logger.info("Eval loop started (short-tick %ds)", _EPOCH_POLL_INTERVAL)
         while True:
+            sleep_for: float = _EPOCH_POLL_INTERVAL
             try:
-                await self._eval_loop_tick()
+                tick_sleep = await self._eval_loop_tick()
+                if tick_sleep is not None and tick_sleep > _EPOCH_POLL_INTERVAL:
+                    sleep_for = tick_sleep
             except Exception as e:
                 logger.exception("Eval loop tick failed: %s", e)
-            await asyncio.sleep(_EPOCH_POLL_INTERVAL)
+            await asyncio.sleep(sleep_for)
 
-    async def _eval_loop_tick(self):
+    @staticmethod
+    def _sleep_until_next_epoch(resp: Dict[str, Any]) -> Optional[float]:
+        """Seconds until the active epoch's ``end_block``, or None when
+        the server didn't report a positive ``remaining_blocks`` (chain
+        RPC down or already past end_block — caller short-ticks).
+        """
+        rb = resp.get("remaining_blocks")
+        try:
+            rb_int = int(rb) if rb is not None else 0
+        except (TypeError, ValueError):
+            return None
+        if rb_int <= 0:
+            return None
+        return float(rb_int * 12)  # Bittensor block time
+
+    async def _eval_loop_tick(self) -> Optional[float]:
+        """Single eval-tick. Returns the sleep duration the caller
+        should use before the next tick.
+
+        - ``None`` → caller uses short tick (``_EPOCH_POLL_INTERVAL``).
+        - ``float`` → caller uses that long sleep (sleep until the
+          active epoch ends, derived from ``remaining_blocks``).
+        """
         # 1) Refresh the winner cache from /api/v2/winner/current. The
         #    server's `winner` field is advisory; derive_winner_state
         #    runs the same stake-weighted aggregation locally and warns
@@ -885,34 +922,37 @@ class TrajectoryValidator:
         except Exception as e:
             logger.warning("Winner cache refresh failed: %s", e)
 
-        # 2) Poll the active challenge epoch. The `winner` block on this
-        #    response is intentionally ignored — see
-        #    fetch_current_winner / derive_winner_state.
-        resp = await fetch_current_epoch()
+        # 2) Poll the active challenge epoch. Sign the request with the
+        #    validator wallet so the response includes
+        #    `epoch.challenger_pack_url` (gated to validators-or-24h per
+        #    docs/API.md). The `winner` block on this response is
+        #    intentionally ignored — see fetch_current_winner /
+        #    derive_winner_state.
+        resp = await fetch_current_epoch(self.wallet)
         if resp is None:
-            return
+            return None  # transient → short tick
 
         epoch = resp.get("epoch")
         if not epoch:
-            return  # no in-progress epoch; keep polling
+            return None  # 404 / between epochs → short tick
 
         try:
             challenge_epoch_id = int(epoch.get("challenge_epoch_id"))
         except (TypeError, ValueError):
             logger.warning("epoch missing or invalid challenge_epoch_id: %r", epoch)
-            return
+            return None
 
+        # Already scored: sleep until this epoch ends so the next tick
+        # naturally lands on the new epoch. Falls back to short tick if
+        # the server didn't report remaining_blocks.
         if self._last_scored_challenge_epoch_id == challenge_epoch_id:
-            return  # idempotent: already evaluated this epoch
+            return self._sleep_until_next_epoch(resp)
 
-        # Mid-epoch budget gate (docs/API.md "Mid-epoch start"). Use the
-        # server-reported elapsed/total progress ratio rather than a
-        # hard-coded eval-duration budget. When the server can't report
-        # `elapsed_blocks` (chain RPC down) the gate is bypassed — the
-        # daemon has no better signal, and a post-finalize submit will
-        # 409 cleanly.
+        # Mid-epoch budget gate (docs/API.md "Mid-epoch start"). When
+        # there isn't enough chain time left, skip and sleep until the
+        # next epoch opens.
         if not self._epoch_has_budget(resp, epoch, challenge_epoch_id):
-            return
+            return self._sleep_until_next_epoch(resp)
 
         commitment = self._commitment_from_epoch(epoch)
         if commitment is None:
@@ -920,9 +960,14 @@ class TrajectoryValidator:
                 "epoch %s missing challenger fields; skipping",
                 challenge_epoch_id,
             )
-            return
+            return None
 
         await self._score_challenger(challenge_epoch_id, commitment)
+        # After the eval, let the next short tick re-poll: it'll catch
+        # `already_scored` and switch to the long sleep with up-to-date
+        # remaining_blocks. Avoids reasoning about how much time the
+        # eval consumed.
+        return None
 
     async def _refresh_winner_cache(self):
         """Pull /api/v2/winner/current, run local derivation, persist cache."""

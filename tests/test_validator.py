@@ -422,6 +422,46 @@ class TestEpochBudgetGate:
 
 
 # ---------------------------------------------------------------------------
+# Adaptive sleep until next epoch
+# ---------------------------------------------------------------------------
+
+
+class TestSleepUntilNextEpoch:
+    def test_positive_remaining_returns_seconds(self):
+        from trajectoryrl.base.validator import TrajectoryValidator
+        # 50 blocks * 12s/block = 600s
+        out = TrajectoryValidator._sleep_until_next_epoch({"remaining_blocks": 50})
+        assert out == 600.0
+
+    def test_zero_remaining_returns_none(self):
+        from trajectoryrl.base.validator import TrajectoryValidator
+        # already at end_block → caller short-ticks
+        assert TrajectoryValidator._sleep_until_next_epoch({"remaining_blocks": 0}) is None
+
+    def test_null_remaining_returns_none(self):
+        from trajectoryrl.base.validator import TrajectoryValidator
+        # server chain RPC down → caller short-ticks
+        assert (
+            TrajectoryValidator._sleep_until_next_epoch({"remaining_blocks": None})
+            is None
+        )
+
+    def test_string_remaining_int_coerced(self):
+        from trajectoryrl.base.validator import TrajectoryValidator
+        # JSON deserialisers may surface integers as strings depending on
+        # transport — accept and coerce.
+        out = TrajectoryValidator._sleep_until_next_epoch({"remaining_blocks": "10"})
+        assert out == 120.0
+
+    def test_garbage_remaining_returns_none(self):
+        from trajectoryrl.base.validator import TrajectoryValidator
+        assert (
+            TrajectoryValidator._sleep_until_next_epoch({"remaining_blocks": "abc"})
+            is None
+        )
+
+
+# ---------------------------------------------------------------------------
 # fetch_current_epoch — propagates remaining_blocks for the budget gate
 # ---------------------------------------------------------------------------
 
@@ -504,6 +544,100 @@ class TestFetchCurrentEpochResponseShape:
             "elapsed_blocks": None,
             "remaining_blocks": None,
         }
+
+    @pytest.mark.asyncio
+    async def test_signed_request_adds_query_params(self, monkeypatch):
+        """When a wallet is passed, fetch_current_epoch should attach
+        hotkey/timestamp/signature query params for the pack-URL gate."""
+        from trajectoryrl.utils import trajrl_api
+
+        captured: Dict[str, Any] = {}
+
+        class _FakeResp:
+            status_code = 200
+            text = ""
+
+            def json(self):
+                return {
+                    "success": True,
+                    "epoch": {
+                        "challenge_epoch_id": 1,
+                        "challenger_hotkey": "5G",
+                        "challenger_pack_hash": "f" * 64,
+                        "challenger_pack_url": "https://x/p.json",
+                        "start_block": 0, "end_block": 100,
+                        "epoch_length_blocks": 100, "status": "in_progress",
+                    },
+                    "current_block": 50,
+                    "elapsed_blocks": 50,
+                    "remaining_blocks": 50,
+                }
+
+        class _FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, url, **kw):
+                captured["url"] = url
+                captured["params"] = kw.get("params")
+                return _FakeResp()
+
+        monkeypatch.setattr(trajrl_api.httpx, "AsyncClient", lambda: _FakeClient())
+
+        class _FakeWallet:
+            class _Kp:
+                ss58_address = "5GabcWalletHotkey"
+
+                def sign(self, msg: bytes) -> bytes:
+                    return b"S" + msg[:31].ljust(31, b"\x00")
+
+            hotkey = _Kp()
+
+        out = await trajrl_api.fetch_current_epoch(_FakeWallet())
+        assert out is not None
+        params = captured["params"]
+        assert params is not None
+        assert params["hotkey"] == "5GabcWalletHotkey"
+        assert "timestamp" in params and int(params["timestamp"]) > 0
+        assert params["signature"].startswith("0x")
+
+    @pytest.mark.asyncio
+    async def test_unsigned_request_omits_query_params(self, monkeypatch):
+        """No wallet → no query params (server falls back to time-gated path)."""
+        from trajectoryrl.utils import trajrl_api
+
+        captured: Dict[str, Any] = {}
+
+        class _FakeResp:
+            status_code = 200
+            text = ""
+
+            def json(self):
+                return {
+                    "success": True,
+                    "epoch": None,
+                    "current_block": None,
+                    "elapsed_blocks": None,
+                    "remaining_blocks": None,
+                }
+
+        class _FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, url, **kw):
+                captured["params"] = kw.get("params")
+                return _FakeResp()
+
+        monkeypatch.setattr(trajrl_api.httpx, "AsyncClient", lambda: _FakeClient())
+        await trajrl_api.fetch_current_epoch()  # no wallet
+        assert captured["params"] is None
 
 
 # ---------------------------------------------------------------------------

@@ -154,7 +154,7 @@ The decentralization guarantee follows from these two non-overlapping responsibi
 
 1. The `submissions[]` array from `/api/v2/winner/current` — votes with frozen `validator_stake`. Authoritative for per-vote weight; the daemon must not substitute the live metagraph value for that validator.
 2. The deterministic on-chain metagraph snapshot at the finalized epoch's `start_block` — for the global denominators (total active stake, deregistration, eligibility). Every honest validator reads the same chain and reaches the same snapshot.
-3. The consensus config (`MIN_STAKE_FRACTION`, `QUORUM_FRACTION`, `WINNER_PROTECTION_DELTA`, …) — pinned in the validator's release; not fetched from the server.
+3. The consensus config (`MIN_VALIDATOR_STAKE`, `QUORUM_FRACTION`, `WINNER_PROTECTION_DELTA`, …) — pinned in the validator's release; not fetched from the server.
 
 When the daemon's locally-derived winner matches the server's published `winner_state` (the steady state), they agree silently. When they diverge, the daemon proceeds with its local result and emits an alarm; widespread divergence across independent validators is an operational signal that the server-side `finalize.ts` or the server's input feed has drifted — but `set_weights` continues to track the convergent local result.
 
@@ -417,7 +417,7 @@ The on-chain layer (YC3 + commit-reveal + bond dynamics) is unchanged from v5.x.
 
    Apply submission filter pipeline:
      - drop rows with rejected = true
-     - drop submissions from validators below MIN_STAKE_FRACTION
+     - drop submissions from validators below MIN_VALIDATOR_STAKE
      - drop submissions from validators marked inactive
      - drop submissions from validators absent in B-snapshot
 
@@ -455,7 +455,7 @@ raw challenge_scores rows for challenge_epoch_id
    challenger_* columns always present, winner_* columns NULL in single-eval)
   │
   ├─ [1] reject if challenger.rejected = true
-  ├─ [2] reject if validator stake < MIN_STAKE_FRACTION at B-snapshot
+  ├─ [2] reject if validator stake < MIN_VALIDATOR_STAKE at B-snapshot
   ├─ [3] reject if validator marked inactive at B
   ├─ [4] reject if validator missing from B-snapshot active set
   ├─ [5] reject if signature invalid (re-checked at finalize)
@@ -698,7 +698,7 @@ Bootstrap:     70/20/10 split among top-3 qualified
 | `WINNER_PROTECTION_MARGIN` (δ) | 0.03 (3%) | Yes |
 | `MINER_COOLDOWN_EPOCHS` | 5 | Yes |
 | `INACTIVE_THRESHOLD_EPOCHS` | 3 | Yes |
-| `MIN_STAKE_FRACTION` | 0.001 | Yes |
+| `MIN_VALIDATOR_STAKE` | 10000.0 | Yes |
 | `EMPTY_QUEUE_RECHECK_BLOCKS` | 60 | Yes |
 | `WINNER_FALLBACK_TTL` | 24 h | Yes (validator daemon side) |
 | `MINER_SUBMIT_COOLDOWN_SECONDS` (Channel B) | 3600 (60 min) | Yes |
