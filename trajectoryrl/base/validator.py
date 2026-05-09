@@ -26,7 +26,6 @@ import datetime
 import hashlib
 import json
 import logging
-import os
 import time
 
 from pathlib import Path
@@ -795,31 +794,29 @@ class TrajectoryValidator:
             f"epoch_id={challenge_epoch_id}"
         )
 
-        # Per-scenario streaming hook for the live /challenge page.
-        # Off by default; enable with TRAJRL_SCENARIO_STREAMING=1 once
-        # the platform server's /scenario_progress endpoint is live.
-        # The eval runs inside run_in_executor so the callback fires on
-        # a worker thread; schedule the async POST back on the main loop
-        # via run_coroutine_threadsafe (fire-and-forget).
-        on_episode_done = None
-        if os.getenv("TRAJRL_SCENARIO_STREAMING") == "1":
-            loop = asyncio.get_running_loop()
+        # Per-scenario streaming hook for the live /challenge page. The
+        # eval runs inside run_in_executor so the callback fires on a
+        # worker thread; schedule the async POST back on the main loop
+        # via run_coroutine_threadsafe (fire-and-forget). The submit is
+        # bounded by a 10s timeout, 404s log at debug, other errors at
+        # warning — none affect eval correctness.
+        loop = asyncio.get_running_loop()
 
-            def on_episode_done(episode, scenario_index, total_scenarios):
-                coro = submit_scenario_progress(
-                    self.wallet,
-                    challenge_epoch_id=challenge_epoch_id,
-                    miner_hotkey=commitment.hotkey,
-                    miner_uid=commitment.uid,
-                    scenario_name=episode.scenario,
-                    scenario_index=scenario_index,
-                    total_scenarios=total_scenarios,
-                    quality=episode.quality,
-                    cost_usd=episode.cost_usd,
-                    duration_s=episode.duration_s,
-                    timed_out=episode.timed_out,
-                )
-                asyncio.run_coroutine_threadsafe(coro, loop)
+        def on_episode_done(episode, scenario_index, total_scenarios):
+            coro = submit_scenario_progress(
+                self.wallet,
+                challenge_epoch_id=challenge_epoch_id,
+                miner_hotkey=commitment.hotkey,
+                miner_uid=commitment.uid,
+                scenario_name=episode.scenario,
+                scenario_index=scenario_index,
+                total_scenarios=total_scenarios,
+                quality=episode.quality,
+                cost_usd=episode.cost_usd,
+                duration_s=episode.duration_s,
+                timed_out=episode.timed_out,
+            )
+            asyncio.run_coroutine_threadsafe(coro, loop)
 
         outcome = await evaluate_miner_s1(
             harness=self._sandbox_harness,
