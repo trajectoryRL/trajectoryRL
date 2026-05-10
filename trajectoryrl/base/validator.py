@@ -502,6 +502,7 @@ class TrajectoryValidator:
                 "miner_uid": uid,
                 "block_height": block_height,
                 "pack_hash": commitment.pack_hash,
+                "spec_number": _spec_number(),
                 "type": "eval",
             }
             try:
@@ -521,6 +522,7 @@ class TrajectoryValidator:
                 pack_hash=commitment.pack_hash,
                 log_archive=log_archive,
                 epoch_number=challenge_epoch_id,
+                spec_number=_spec_number(),
             )
             if ok:
                 try:
@@ -570,6 +572,7 @@ class TrajectoryValidator:
                 "eval_id": eval_id,
                 "challenge_epoch_id": challenge_epoch_id,
                 "block_height": block_height,
+                "spec_number": _spec_number(),
                 "type": "cycle",
             }
             try:
@@ -586,6 +589,7 @@ class TrajectoryValidator:
                 block_height=block_height,
                 log_archive=archive,
                 epoch_number=challenge_epoch_id,
+                spec_number=_spec_number(),
             )
             if ok:
                 try:
@@ -644,6 +648,7 @@ class TrajectoryValidator:
                     epoch_number=meta.get(
                         "challenge_epoch_id", meta.get("window_number")
                     ),
+                    spec_number=meta.get("spec_number"),
                 )
                 if ok:
                     eval_uploaded += 1
@@ -672,6 +677,7 @@ class TrajectoryValidator:
                 epoch_number=meta.get(
                     "challenge_epoch_id", meta.get("window_number")
                 ),
+                spec_number=meta.get("spec_number"),
             )
             if ok:
                 cycle_uploaded += 1
@@ -816,6 +822,7 @@ class TrajectoryValidator:
                 cost_usd=episode.cost_usd,
                 duration_s=episode.duration_s,
                 timed_out=episode.timed_out,
+                spec_number=_spec_number(),
             )
             asyncio.run_coroutine_threadsafe(coro, loop)
 

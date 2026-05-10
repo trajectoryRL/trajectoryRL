@@ -446,6 +446,7 @@ async def submit_scenario_progress(
     cost_usd: Optional[float] = None,
     duration_s: Optional[float] = None,
     timed_out: Optional[bool] = None,
+    spec_number: Optional[int] = None,
     submit_url_template: Optional[str] = None,
     timeout: float = 10.0,
 ) -> bool:
@@ -494,6 +495,8 @@ async def submit_scenario_progress(
         payload["duration_s"] = duration_s
     if timed_out is not None:
         payload["timed_out"] = timed_out
+    if spec_number is not None:
+        payload["spec_number"] = spec_number
 
     submit_url_template = (
         submit_url_template or _default_scenario_progress_url_template()
@@ -533,6 +536,7 @@ async def upload_eval_logs(
     pack_hash: str,
     log_archive: bytes,
     epoch_number: Optional[int] = None,
+    spec_number: Optional[int] = None,
     upload_url: Optional[str] = None,
 ) -> bool:
     """Upload eval log archive to the dashboard API.
@@ -563,6 +567,8 @@ async def upload_eval_logs(
     }
     if epoch_number is not None:
         form_data["epoch_number"] = str(epoch_number)
+    if spec_number is not None:
+        form_data["spec_number"] = str(spec_number)
 
     try:
         async with httpx.AsyncClient() as client:
@@ -601,6 +607,7 @@ async def upload_cycle_logs(
     block_height: int,
     log_archive: bytes,
     epoch_number: Optional[int] = None,
+    spec_number: Optional[int] = None,
     upload_url: Optional[str] = None,
 ) -> bool:
     """Upload eval cycle log archive to the dashboard API.
@@ -628,6 +635,8 @@ async def upload_cycle_logs(
     }
     if epoch_number is not None:
         form_data["epoch_number"] = str(epoch_number)
+    if spec_number is not None:
+        form_data["spec_number"] = str(spec_number)
 
     try:
         async with httpx.AsyncClient() as client:
