@@ -461,6 +461,7 @@ Like `/api/scores/submit`, this is fire-and-forget — failures must be silently
 | `block_height` | string | Yes | Block height of this eval (string-encoded number; links to the corresponding `submit_eval` record) |
 | `pack_hash` | string | Yes | SHA-256 hash of the pack being evaluated. Each upload must correspond to exactly one pack. |
 | `epoch_number` | string | No | Optional epoch number (string-encoded non-negative integer) this log belongs to. When supplied, the server stores it as-is on the `eval_logs` row. When omitted/empty, the server derives it from the latest synced `block_height` in `sync_state`. |
+| `spec_number` | string | No | Optional validator-side `SPEC_NUMBER` (string-encoded non-negative integer) — the active scoring contract under which this eval ran. Stored on the `eval_logs` row so server-side stats can bucket logs by spec. Omitted by older validator releases; the column stays NULL. |
 | `timestamp` | string | Yes | Unix timestamp in seconds (string-encoded number) |
 | `signature` | string | Yes | Validator's signature over `"trajectoryrl-logs:{validator_hotkey}:{timestamp}"` |
 | `log_archive` | file | Yes | `.tar.gz` archive containing all log files for this eval run. Max 10 MB. |
@@ -561,6 +562,7 @@ Like `/api/scores/submit`, this is fire-and-forget.
 | `eval_id` | string | Yes | Eval cycle identifier in `YYYYMMDD_HHMMSS` format (same value shared with per-miner uploads of this cycle) |
 | `block_height` | string | Yes | Block height at cycle start (string-encoded number) |
 | `epoch_number` | string | No | Optional epoch number (string-encoded non-negative integer) this cycle belongs to. When supplied, the server stores it as-is on the `eval_logs` row. When omitted/empty, the server derives it from the latest synced `block_height` in `sync_state`. |
+| `spec_number` | string | No | Optional validator-side `SPEC_NUMBER` (string-encoded non-negative integer) — the active scoring contract for this cycle. Stored on the `eval_logs` row so server-side stats can bucket cycle logs by spec. Omitted by older validator releases; the column stays NULL. |
 | `timestamp` | string | Yes | Unix timestamp in seconds (string-encoded number) |
 | `signature` | string | Yes | Validator's signature over `"trajectoryrl-logs:{validator_hotkey}:{timestamp}"` |
 | `log_archive` | file | Yes | `.tar.gz` archive containing the cycle log. Max 10 MB. |
