@@ -346,6 +346,7 @@ async def submit_challenge_score(
     spec_number: Optional[int] = None,
     llm_base_url: Optional[str] = None,
     llm_model: Optional[str] = None,
+    judge_model: Optional[str] = None,
     bench_image_hash: Optional[str] = None,
     harness_image_hash: Optional[str] = None,
     bench_version: Optional[str] = None,
@@ -404,6 +405,8 @@ async def submit_challenge_score(
         payload["llm_base_url"] = llm_base_url
     if llm_model is not None:
         payload["llm_model"] = llm_model
+    if judge_model is not None:
+        payload["judge_model"] = judge_model
     if bench_image_hash is not None:
         payload["bench_image_hash"] = bench_image_hash
     if harness_image_hash is not None:
