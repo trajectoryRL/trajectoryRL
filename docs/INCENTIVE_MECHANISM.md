@@ -215,10 +215,21 @@ Challenge Epoch  (length = EPOCH_LENGTH_BLOCKS, default 150 ≈ 30 min)
 │                         exposes via GET /api/v2/epoch/current
 ├── B → B+L               Validators fetch pack, run season eval,
 │                         POST /api/v2/epoch/{challenge_epoch_id}/score
-└── end_block (B+L)       Hard deadline, server finalizes
+└── Two finalise paths:
+    ├── all whitelisted validators submitted AND
+    │   elapsed >= EPOCH_MIN_BLOCKS    Early finalise (dynamic epoch)
+    └── end_block (B+L)                Hard deadline (always)
 ```
 
 `EPOCH_LENGTH_BLOCKS` is bench-driven — set it long enough that a typical validator finishes the full evaluation under realistic LLM latency, with margin. Acceptable range: ~30 min to several days.
+
+### Dynamic Epoch (Early Finalise)
+
+An epoch can finalise before its `end_block` deadline once every operator-curated whitelist validator has submitted, provided at least `EPOCH_MIN_BLOCKS` (default 30) blocks have elapsed since `start_block`. The hard deadline still applies as the upper bound.
+
+The whitelist source is a boolean column `nodes.whitelisted` on the platform side, manually managed by the operator. The effective gate set is `whitelisted = true AND is_validator = true AND deregistered = false`, so a deregistered hotkey drops out automatically. An empty effective whitelist disables early finalise — the epoch runs to its hard deadline.
+
+The trigger state is server-internal — `GET /api/v2/epoch/current` does not expose whitelist size or submission counts. Daemons see early finalise only as "the next `/api/v2/epoch/current` poll returns a new epoch id" or as a `409 epoch is finalized` response on `POST /score`. The required daemon adjustment is to cap the poll sleep at a daemon-side maximum (e.g. 30 s) so the new epoch is observed within that bound; do not derive long sleeps from `remaining_blocks * 12s`. See [API.md → Dynamic Epoch (early finalise)](API.md#dynamic-epoch-early-finalise).
 
 ### Empty Queue
 

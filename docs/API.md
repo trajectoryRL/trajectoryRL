@@ -1159,7 +1159,16 @@ Any of: missing param, malformed timestamp, signature verification failure, or n
 | `winner` | The canonical seated winner from `winner_state`. `null` on cold start. `pack_url` is **gated** identically to `epoch.challenger_pack_url`; all other fields are always public. The URL, when present, is the URL the consensus agreed on (frozen at finalize time — does not drift if the miner re-uploads). |
 | `current_block` | Server-stamped chain block at the moment of this response. `null` if chain RPC is unreachable. |
 | `elapsed_blocks` | `current_block − start_block`, clamped at 0. `null` if `current_block` is null. |
-| `remaining_blocks` | `end_block − current_block`, clamped at 0. `null` if `current_block` is null. **Use this to decide whether to start an eval** (see "Mid-epoch start" below). |
+| `remaining_blocks` | `end_block − current_block`, clamped at 0. `null` if `current_block` is null. **Use this to decide whether to start an eval** (see "Mid-epoch start" below). Treat as an upper bound — under dynamic epoch (see below), the actual close may fire earlier. |
+
+#### Dynamic Epoch (early finalise)
+
+An epoch can finalise before its `end_block` deadline once every operator-curated whitelist validator has submitted, provided `EPOCH_MIN_BLOCKS` (default 30) blocks have elapsed since `start_block`. The hard deadline still applies as the upper bound. The whitelist source is server-side (`nodes.whitelisted`) and not exposed via this endpoint.
+
+Daemon implications:
+
+- Treat `remaining_blocks * 12s` as an **upper bound** for sleeps, not a guarantee. Cap your poll interval at a daemon-side maximum (e.g. 30 s) so you observe the next epoch within that bound after an early finalise.
+- A POST landing on a closed epoch returns `409 epoch is finalized` — handle by re-fetching `/api/v2/epoch/current` immediately and proceeding to the new epoch, rather than waiting for the next scheduled poll.
 
 #### Mid-epoch start
 
