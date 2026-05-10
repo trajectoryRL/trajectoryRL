@@ -1,7 +1,7 @@
 """TrajectoryRL Validator — v6.0 winner-challenger daemon.
 
 Architecture (Season 1 — trajrl-bench, v6.0 IM):
-    1. Polls ``GET /api/v2/epoch/current`` (~60 s) for the active
+    1. Polls ``GET /api/v2/epoch/current`` (~10 s) for the active
        challenger and the seated winner.
     2. Refreshes the local winner cache from the server response on every
        successful poll.
@@ -88,7 +88,7 @@ _SET_WEIGHTS_RETRY_DELAY = 12  # seconds; roughly 1 block interval
 # can finalise early once every whitelisted validator has submitted,
 # so a long sleep would overshoot the early-finalise boundary and the
 # next epoch wouldn't be observed until the (now-stale) sleep elapses.
-_EPOCH_POLL_INTERVAL = 60
+_EPOCH_POLL_INTERVAL = 10
 _WEIGHT_CHECK_INTERVAL = 60
 _HEARTBEAT_INTERVAL = 600
 
@@ -874,7 +874,7 @@ class TrajectoryValidator:
           that drive the winner cache (and therefore ``set_weights``).
 
         Both endpoints are independent and share one tick. The loop
-        polls at a fixed cadence of ``_EPOCH_POLL_INTERVAL`` (60 s)
+        polls at a fixed cadence of ``_EPOCH_POLL_INTERVAL`` (10 s)
         regardless of how much time is left in the current epoch — see
         the comment on ``_EPOCH_POLL_INTERVAL`` for why we no longer
         derive a long sleep from ``remaining_blocks``.

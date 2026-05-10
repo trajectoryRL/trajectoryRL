@@ -229,7 +229,7 @@ An epoch can finalise before its `end_block` deadline once every operator-curate
 
 The whitelist source is a boolean column `nodes.whitelisted` on the platform side, manually managed by the operator. The effective gate set is `whitelisted = true AND is_validator = true AND deregistered = false`, so a deregistered hotkey drops out automatically. An empty effective whitelist disables early finalise — the epoch runs to its hard deadline.
 
-The trigger state is server-internal — `GET /api/v2/epoch/current` does not expose whitelist size or submission counts. Daemons see early finalise only as "the next `/api/v2/epoch/current` poll returns a new epoch id" or as a `409 epoch is finalized` response on `POST /score`. The required daemon adjustment is to cap the poll sleep at a daemon-side maximum (e.g. 30 s) so the new epoch is observed within that bound; do not derive long sleeps from `remaining_blocks * 12s`. See [API.md → Dynamic Epoch (early finalise)](API.md#dynamic-epoch-early-finalise).
+The trigger state is server-internal — `GET /api/v2/epoch/current` does not expose whitelist size or submission counts. Daemons see early finalise only as "the next `/api/v2/epoch/current` poll returns a new epoch id" or as a `409 epoch is finalized` response on `POST /score`. The required daemon adjustment is to cap the poll sleep at a daemon-side maximum (e.g. 10 s) so the new epoch is observed within that bound; do not derive long sleeps from `remaining_blocks * 12s`. See [API.md → Dynamic Epoch (early finalise)](API.md#dynamic-epoch-early-finalise).
 
 ### Empty Queue
 
@@ -546,7 +546,7 @@ The v6.0 validator daemon is intentionally thin. It carries no per-miner evaluat
 
 ```
 # Eval loop — drives the per-epoch challenger evaluation
-loop every ~30 s:
+loop every ~10 s:
     resp = GET /api/v2/epoch/current
     if resp.epoch and not already_scored(resp.epoch.challenge_epoch_id):
         pack = fetch_and_verify(resp.epoch.challenger_pack_hash)
@@ -555,7 +555,7 @@ loop every ~30 s:
         mark already_scored(resp.epoch.challenge_epoch_id)
 
 # Winner-derivation loop — produces the locally-derived seated winner used by set_weights
-loop every ~30 s (can share a tick with the eval loop):
+loop every ~10 s (can share a tick with the eval loop):
     w = GET /api/v2/winner/current
     if w.finalized_epoch is null:
         cache.winner = null                            # cold start, no finalized epoch yet
@@ -607,7 +607,7 @@ All read endpoints are public; write endpoints require hotkey signature. Validat
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| `GET` | `/api/v2/epoch/current` | **(critical)** In-progress challenge: `{ epoch: { challenge_epoch_id, challenger_hotkey, challenger_pack_hash, start_block, end_block, status } }`. Also returns a non-authoritative `winner` block (mirror of `winner_state`) for observability — daemons must **not** drive `set_weights` from this field; use `/api/v2/winner/current` instead. 404 when no epoch is in progress. Polling cadence ~30 s. |
+| `GET` | `/api/v2/epoch/current` | **(critical)** In-progress challenge: `{ epoch: { challenge_epoch_id, challenger_hotkey, challenger_pack_hash, start_block, end_block, status } }`. Also returns a non-authoritative `winner` block (mirror of `winner_state`) for observability — daemons must **not** drive `set_weights` from this field; use `/api/v2/winner/current` instead. 404 when no epoch is in progress. Polling cadence ~10 s. |
 | `GET` | `/api/v2/winner/current` | **(critical)** Latest finalized epoch's per-validator votes (`challenger_score`, `challenger_qualified`, `winner_*` for dual-eval) with each vote's `validator_stake` snapshotted at score POST. Also returns the server's `winner_state` claim as `winner` (advisory only). v6 daemons consume `submissions[]`, run a local copy of the consensus aggregation, and use the locally-derived winner to drive `set_weights`. This is the endpoint that makes v6 winner derivation decentralized — see [Decentralized Winner Derivation in v6](#decentralized-winner-derivation-in-v6). |
 | `POST` | `/api/v2/epoch/{challenge_epoch_id}/score` | **(critical)** Validator v6 score submission. Path carries the epoch id; body carries a `challenger` block (required) and a `winner` block (optional, dual-eval). Signed prefix: `trajectoryrl-challenge-score:{validator_hotkey}:{timestamp}:{challenge_epoch_id}` — replay-safe across epochs. Server stamps `challenger_hotkey`/`challenger_pack_hash` from `challenge_epochs(id)` and `validator_stake` from `nodes` at receipt; writes to `challenge_scores`. Distinct path / prefix from the legacy v5.2 `/api/v2/scores/submit`. |
 | `POST` | `/api/v2/validators/heartbeat` | **(critical)** Validator liveness + running version + bench/harness image digests. |
@@ -653,7 +653,7 @@ miner_submissions row inserted with eval_status = 'pending_pre_eval'
                                   → seat winner / hold
                                   → eval_status = 'completed'
 
-every ~30 s (winner-derivation loop, can share a tick with the eval loop):
+every ~10 s (winner-derivation loop, can share a tick with the eval loop):
    validator GET /api/v2/winner/current  (returns latest finalized_epoch + per-validator submissions)
    → local_aggregate(submissions, on_chain_metagraph_at(finalized_epoch.start_block), CONSENSUS_CONFIG)
    → cache.winner = derived          (server's response.winner is advisory only)
