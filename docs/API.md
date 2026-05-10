@@ -1005,18 +1005,18 @@ There are **two** server-published reads on the daemon hot path, with distinct p
 2. **`GET /api/v2/winner/current`** — the canonical inputs for the seated winner. The daemon **derives the winner locally** from the per-validator submissions returned here and uses the local result to drive `set_weights`. This is what makes winner state decentralized: every validator independently re-runs the same aggregation against the same server-published votes-with-frozen-stakes, so a server bug, server-side tamper attempt, or split server cannot silently dictate weights.
 
 ```
-# challenge-eval loop (every ~30 s):
+# challenge-eval loop (every ~10 s):
 loop forever:
   resp = GET /api/v2/epoch/current
   if 404:                                       // no epoch in progress
-    sleep 30s, continue
+    sleep 10s, continue
   if already submitted for resp.epoch.challenge_epoch_id:
     sleep until resp.epoch.end_block, continue
   fetch pack(resp.epoch.challenger_pack_hash), run eval
   POST /api/v2/epoch/{resp.epoch.challenge_epoch_id}/score
   on 409 "epoch is finalized": this epoch is closed; next loop
 
-# winner-derivation loop (every ~30 s, can share the same tick):
+# winner-derivation loop (every ~10 s, can share the same tick):
   w = GET /api/v2/winner/current
   if w.epoch is null:                           // cold start, no finalized epoch yet
     cache.winner = null
@@ -1159,7 +1159,16 @@ Any of: missing param, malformed timestamp, signature verification failure, or n
 | `winner` | The canonical seated winner from `winner_state`. `null` on cold start. `pack_url` is **gated** identically to `epoch.challenger_pack_url`; all other fields are always public. The URL, when present, is the URL the consensus agreed on (frozen at finalize time — does not drift if the miner re-uploads). |
 | `current_block` | Server-stamped chain block at the moment of this response. `null` if chain RPC is unreachable. |
 | `elapsed_blocks` | `current_block − start_block`, clamped at 0. `null` if `current_block` is null. |
-| `remaining_blocks` | `end_block − current_block`, clamped at 0. `null` if `current_block` is null. **Use this to decide whether to start an eval** (see "Mid-epoch start" below). |
+| `remaining_blocks` | `end_block − current_block`, clamped at 0. `null` if `current_block` is null. **Use this to decide whether to start an eval** (see "Mid-epoch start" below). Treat as an upper bound — under dynamic epoch (see below), the actual close may fire earlier. |
+
+#### Dynamic Epoch (early finalise)
+
+An epoch can finalise before its `end_block` deadline once every operator-curated whitelist validator has submitted, provided `EPOCH_MIN_BLOCKS` (default 30) blocks have elapsed since `start_block`. The hard deadline still applies as the upper bound. The whitelist source is server-side (`nodes.whitelisted`) and not exposed via this endpoint.
+
+Daemon implications:
+
+- Treat `remaining_blocks * 12s` as an **upper bound** for sleeps, not a guarantee. Cap your poll interval at a daemon-side maximum (e.g. 10 s) so you observe the next epoch within that bound after an early finalise.
+- A POST landing on a closed epoch returns `409 epoch is finalized` — handle by re-fetching `/api/v2/epoch/current` immediately and proceeding to the new epoch, rather than waiting for the next scheduled poll.
 
 #### Mid-epoch start
 
@@ -1196,14 +1205,14 @@ Reading the seat from this endpoint will *usually* match the daemon's locally-de
 ```
 
 Returned when:
-- The previous epoch has finalized but the scheduler hasn't yet opened the next one (≤ `SCHEDULER_POLL_INTERVAL_MS` ≈ 30 s gap).
+- The previous epoch has finalized but the scheduler hasn't yet opened the next one (≤ `SCHEDULER_POLL_INTERVAL_MS` ≈ 10 s gap).
 - The challenger queue is empty (no `pending_eval` rows pass the cooldown / attempt filter).
 
 Validators **must treat 404 as a normal state**, sleep, and retry. It is not an error condition.
 
 #### Polling cadence
 
-Recommend 30 s between polls. The scheduler ticks at most every `SCHEDULER_POLL_INTERVAL_MS` (default 30 s), so polling faster yields no fresher data. Each poll returns the same `challenge_epoch_id` for the entire epoch duration (`end_block − start_block` blocks; default 100 ≈ 20 min).
+Recommend 10 s between polls. The scheduler ticks at most every `SCHEDULER_POLL_INTERVAL_MS` (default 10 s), so polling faster yields no fresher data. Each poll returns the same `challenge_epoch_id` for the entire epoch duration (`end_block − start_block` blocks; default 100 ≈ 20 min).
 
 #### Idempotency
 
@@ -1497,4 +1506,4 @@ If `derived.uid != response.winner.uid`, the daemon proceeds with `derived` and 
 
 #### Polling cadence
 
-Recommend the same ~30 s tick as `/api/v2/epoch/current` — the two reads can share one timer. Local derivation is cheap; the daemon should re-derive on every successful poll, not cache the locally-derived winner across polls (otherwise a later finalize-time fix on the server would not propagate). Cache the *raw response* if you need network-failure tolerance, with `WINNER_FALLBACK_TTL` (24 h) as the staleness alarm threshold.
+Recommend the same ~10 s tick as `/api/v2/epoch/current` — the two reads can share one timer. Local derivation is cheap; the daemon should re-derive on every successful poll, not cache the locally-derived winner across polls (otherwise a later finalize-time fix on the server would not propagate). Cache the *raw response* if you need network-failure tolerance, with `WINNER_FALLBACK_TTL` (24 h) as the staleness alarm threshold.
