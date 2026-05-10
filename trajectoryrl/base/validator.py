@@ -1071,6 +1071,7 @@ class TrajectoryValidator:
             spec_number=_spec_number(),
             llm_base_url=self.config.llm_base_url,
             llm_model=self.config.llm_model,
+            judge_model=self.config.judge_model or None,
             **self._harness_metadata(),
         )
 
