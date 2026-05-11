@@ -65,6 +65,37 @@ SANDBOX_SCENARIOS: tuple[str, ...] = (
 
 
 # ---------------------------------------------------------------------------
+# Exec-stream helpers
+# ---------------------------------------------------------------------------
+
+def _drain_exec_stream_with_deadline(
+    stream,
+    timeout: float,
+    on_deadline: Callable[[], None] | None = None,
+) -> tuple[list[bytes], bool]:
+    """Drain a docker exec_start stream subject to a wall-clock deadline.
+
+    Returns ``(chunks, timed_out)``. If ``on_deadline`` is provided it
+    is invoked once when the deadline fires.
+    """
+    chunks: list[bytes] = []
+    timed_out = False
+    deadline = time.time() + timeout
+    try:
+        for chunk in stream:
+            if chunk:
+                chunks.append(chunk)
+            if time.time() > deadline:
+                timed_out = True
+                if on_deadline is not None:
+                    on_deadline()
+                break
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("exec stream raised: %s", exc)
+    return chunks, timed_out
+
+
+# ---------------------------------------------------------------------------
 # Result types
 # ---------------------------------------------------------------------------
 
@@ -969,20 +1000,9 @@ class TrajectorySandboxHarness:
             )["Id"]
 
             stream = self.client.api.exec_start(exec_id, stream=True, demux=False)
-            transcript_chunks: list[bytes] = []
-            stream_deadline = time.time() + timeout
-            try:
-                for chunk in stream:
-                    if chunk:
-                        transcript_chunks.append(chunk)
-                    if time.time() > stream_deadline:
-                        episode.timed_out = True
-                        break
-            except Exception as e:
-                logger.warning(
-                    "[%s] %s exec stream broke: %s",
-                    session_id, scenario, e,
-                )
+            transcript_chunks, episode.timed_out = (
+                _drain_exec_stream_with_deadline(stream, timeout=timeout)
+            )
             episode.transcript = b"".join(transcript_chunks).decode(
                 "utf-8", errors="replace",
             )
