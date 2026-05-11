@@ -129,9 +129,14 @@ def _drain_exec_stream_with_deadline(
 
     chunks: list[bytes] = []
     timed_out = False
-    deadline = time.time() + timeout
+    # Anchor the deadline on ``time.monotonic()`` so an NTP correction
+    # or manual clock adjustment during the call cannot make the
+    # deadline unreachable. ``time.time()`` can jump arbitrarily;
+    # ``time.monotonic()`` is guaranteed by the standard library to
+    # only move forward.
+    deadline = time.monotonic() + timeout
     while True:
-        remaining = deadline - time.time()
+        remaining = deadline - time.monotonic()
         if remaining <= 0:
             timed_out = True
             if on_deadline is not None:
