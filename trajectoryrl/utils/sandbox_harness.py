@@ -32,6 +32,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import queue
 import secrets
 import tarfile
@@ -174,6 +175,20 @@ def _pick_episode_timeout(spec: dict, config_default: float) -> float:
     Returning a float so the caller can pass it straight to the
     deadline arithmetic.
     """
+    pinned = spec.get("agent_timeout_s")
+    # ``pinned > 0`` already excludes NaN by Python's float-compare
+    # semantics (any comparison with NaN returns False), but spell
+    # the guard out so a future refactor of this predicate doesn't
+    # quietly drop it. A NaN that slipped through would propagate
+    # into ``time.monotonic() + NaN`` and produce a deadline no clock
+    # reading can clear — the same deadlock pattern this module
+    # already had to fix once.
+    if (
+        pinned is not None
+        and not (isinstance(pinned, float) and math.isnan(pinned))
+        and pinned > 0
+    ):
+        return float(pinned)
     return float(config_default)
 
 
