@@ -32,8 +32,10 @@ import hashlib
 import io
 import json
 import logging
+import queue
 import secrets
 import tarfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -72,26 +74,85 @@ def _drain_exec_stream_with_deadline(
     stream,
     timeout: float,
     on_deadline: Callable[[], None] | None = None,
+    poll_interval_s: float = 1.0,
 ) -> tuple[list[bytes], bool]:
     """Drain a docker exec_start stream subject to a wall-clock deadline.
 
-    Returns ``(chunks, timed_out)``. If ``on_deadline`` is provided it
-    is invoked once when the deadline fires.
+    The docker-py exec_start iterator parks on ``next()`` whenever the
+    container produces no stdout (e.g. a Hermes process blocked on an
+    LLM API call that never returns). A naive ``for chunk in stream``
+    deadline check therefore only re-fires between chunks and never
+    triggers on a fully-silent hang. Drain the iterator in a daemon
+    thread and poll a bounded queue from the caller so the deadline
+    check runs on every poll-tick.
+
+    Args:
+        stream: Iterable producing ``bytes`` chunks. May block
+            indefinitely between chunks.
+        timeout: Wall-clock deadline in seconds from the call.
+        on_deadline: Optional callback fired once when the deadline
+            trips. Used by the caller to ``pkill`` the in-container
+            process so the stream socket releases.
+        poll_interval_s: Upper bound on a single ``Queue.get`` wait.
+            Smaller → faster shutdown past the deadline; larger →
+            fewer idle wakeups. Default 1.0 s.
+
+    Returns:
+        ``(chunks, timed_out)``. ``chunks`` holds the bytes received
+        before the iterator ended, the deadline fired, or it raised.
+        ``timed_out`` is True iff the deadline fired before the
+        iterator finished on its own.
+
+    Lifecycle note:
+        The reader is a daemon thread that exits naturally when the
+        underlying ``stream`` raises or terminates. Callers should
+        pair invocation with eventual closure of the stream source
+        (in the harness: the ``finally`` block's ``sandbox.stop()``
+        releases the docker socket and the reader returns) — otherwise
+        the daemon thread sits on ``next(stream)`` until process exit.
     """
+    chunk_q: queue.Queue = queue.Queue()
+    sentinel = object()
+
+    def _reader() -> None:
+        try:
+            for c in stream:
+                chunk_q.put(c)
+        except Exception as exc:  # noqa: BLE001
+            chunk_q.put(exc)
+        finally:
+            chunk_q.put(sentinel)
+
+    threading.Thread(
+        target=_reader, daemon=True, name="exec-stream-drain",
+    ).start()
+
     chunks: list[bytes] = []
     timed_out = False
     deadline = time.time() + timeout
-    try:
-        for chunk in stream:
-            if chunk:
-                chunks.append(chunk)
-            if time.time() > deadline:
-                timed_out = True
-                if on_deadline is not None:
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            timed_out = True
+            if on_deadline is not None:
+                try:
                     on_deadline()
-                break
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("exec stream raised: %s", exc)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "exec-stream on_deadline callback failed: %s", exc,
+                    )
+            break
+        try:
+            item = chunk_q.get(timeout=min(remaining, poll_interval_s))
+        except queue.Empty:
+            continue
+        if item is sentinel:
+            break
+        if isinstance(item, Exception):
+            logger.warning("exec stream raised: %s", item)
+            break
+        if item:
+            chunks.append(item)
     return chunks, timed_out
 
 
@@ -1000,8 +1061,28 @@ class TrajectorySandboxHarness:
             )["Id"]
 
             stream = self.client.api.exec_start(exec_id, stream=True, demux=False)
+
+            def _kill_hermes() -> None:
+                # Releases the blocked exec_start socket so we can
+                # proceed to teardown instead of waiting on the
+                # finally-block's container.stop().
+                #
+                # ``-f hermes`` matches by cmdline pattern, which is
+                # intentionally broad: it kills both the ``hermes chat``
+                # python process and the ``bash -c '... hermes chat ...'``
+                # wrapper that exec was registered under. The agent user
+                # in the sandbox-agent image is the only thing in the
+                # container, so collateral on other processes is not a
+                # concern.
+                sandbox.exec_run(
+                    ["pkill", "-KILL", "-f", "hermes"],
+                    user="root",
+                )
+
             transcript_chunks, episode.timed_out = (
-                _drain_exec_stream_with_deadline(stream, timeout=timeout)
+                _drain_exec_stream_with_deadline(
+                    stream, timeout=timeout, on_deadline=_kill_hermes,
+                )
             )
             episode.transcript = b"".join(transcript_chunks).decode(
                 "utf-8", errors="replace",
