@@ -445,7 +445,8 @@ async def submit_scenario_progress(
     scenario_name: str,
     scenario_index: int,
     total_scenarios: int,
-    quality: float,
+    quality: float = 0.0,
+    state: str = "complete",
     cost_usd: Optional[float] = None,
     duration_s: Optional[float] = None,
     timed_out: Optional[bool] = None,
@@ -453,13 +454,27 @@ async def submit_scenario_progress(
     submit_url_template: Optional[str] = None,
     timeout: float = 10.0,
 ) -> bool:
-    """Post a partial per-scenario result for the in-progress epoch.
+    """Post a per-scenario progress event for the in-progress epoch.
 
     Implements ``POST /api/v2/epoch/{challenge_epoch_id}/scenario_progress``.
     Decorative / UX-only — drives the live ``/challenge`` page and is
     discarded once the canonical eval bundle uploads. The per-eval log
     archive at ``/api/validators/logs/upload`` remains the source of
     truth.
+
+    ``state`` is one of:
+
+    - ``"running"`` — sandbox is up, ``hermes chat`` running. ``quality``
+      is omitted by the server until the scenario completes.
+    - ``"verifying"`` — chat finished, verifier container running.
+    - ``"complete"`` (default for backward compat with v0.6.10 and
+      below) — verifier produced a score. ``quality`` is the final
+      score for this scenario.
+
+    Older server builds that don't understand ``state`` should ignore
+    the extra field (Next.js JSON body parsing tolerates unknown
+    properties), so the validator can roll out ahead of the web
+    update.
 
     Signing prefix is ``trajectoryrl-scenario-progress`` and binds the
     epoch id + scenario name into the message, so signatures are not
@@ -488,6 +503,7 @@ async def submit_scenario_progress(
         "scenario_index": scenario_index,
         "total_scenarios": total_scenarios,
         "quality": quality,
+        "state": state,
         "timestamp": timestamp,
         "signature": signature,
         "version": __version__,
