@@ -17,6 +17,7 @@ from trajectoryrl.utils.sandbox_harness import (
     _EpisodeResult,
     _parse_ctrf_correctness,
     _parse_session_cost,
+    _pick_episode_timeout,
     _SessionResult,
 )
 
@@ -676,8 +677,6 @@ class TestDrainExecStreamWithDeadline:
 # ---------------------------------------------------------------------------
 # _pick_episode_timeout — per-scenario agent timeout from task.toml.
 # ---------------------------------------------------------------------------
-
-from trajectoryrl.utils.sandbox_harness import _pick_episode_timeout
 
 
 class TestPickEpisodeTimeout:
