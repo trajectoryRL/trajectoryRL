@@ -622,3 +622,52 @@ class TestDrainExecStreamWithDeadline:
             assert chunks == []
         finally:
             never_ends.set()
+
+    @pytest.mark.timeout(3)
+    def test_deadline_survives_wall_clock_jumping_backwards(self, monkeypatch):
+        """Wall-clock time can jump backwards under NTP correction or
+        manual clock adjustment. A deadline computed from ``time.time()``
+        becomes unreachable when the clock jumps back, leaving the
+        helper waiting on a deadline that never arrives.
+
+        Simulate it by monkeypatching ``time.time`` in the harness
+        module to return monotonically *decreasing* values. A correct
+        helper anchors its deadline on ``time.monotonic()`` (which
+        cannot regress) so the deadline still fires; a helper that
+        anchors on ``time.time()`` will park past the configured
+        timeout and pytest-timeout will fail this test at 3 s."""
+        never_ends = threading.Event()
+
+        def stream():
+            never_ends.wait()
+            yield b""  # pragma: no cover
+
+        from trajectoryrl.utils import sandbox_harness
+
+        fake_now = [1_000_000.0]
+
+        def receding_clock() -> float:
+            # Each call rewinds the wall clock by 0.5 s — much faster
+            # than any plausible NTP correction, but the direction is
+            # what matters for the test.
+            fake_now[0] -= 0.5
+            return fake_now[0]
+
+        monkeypatch.setattr(sandbox_harness.time, "time", receding_clock)
+
+        try:
+            start = time.monotonic()
+            chunks, timed_out = _drain_exec_stream_with_deadline(
+                stream(), timeout=0.3,
+            )
+            elapsed = time.monotonic() - start
+
+            assert timed_out is True
+            assert chunks == []
+            assert elapsed < 1.5, (
+                f"deadline took {elapsed:.2f}s under a receding wall clock; "
+                "helper likely still anchored on time.time() instead of "
+                "time.monotonic()"
+            )
+        finally:
+            never_ends.set()
