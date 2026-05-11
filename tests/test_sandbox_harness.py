@@ -8,19 +8,17 @@ import threading
 import time
 
 import pytest
-from dataclasses import dataclass, field
 
 from trajectoryrl.utils.config import ValidatorConfig
 from trajectoryrl.utils.sandbox_harness import (
-    TrajectorySandboxHarness,
     SandboxEvaluationResult,
-    _SessionResult,
+    TrajectorySandboxHarness,
+    _drain_exec_stream_with_deadline,
     _EpisodeResult,
     _parse_ctrf_correctness,
     _parse_session_cost,
-    _drain_exec_stream_with_deadline,
+    _SessionResult,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -389,8 +387,8 @@ def _make_harness(sandbox_image: str = "", tmp_path=None) -> TrajectorySandboxHa
     The helpers we test only touch ``self.config`` + cached attribute
     state; we never call ``self.client``.
     """
-    from pathlib import Path
     import tempfile
+    from pathlib import Path
 
     if tmp_path is None:
         tmp_path = Path(tempfile.mkdtemp())
