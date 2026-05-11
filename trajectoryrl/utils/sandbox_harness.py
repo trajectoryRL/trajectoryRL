@@ -161,6 +161,22 @@ def _drain_exec_stream_with_deadline(
     return chunks, timed_out
 
 
+def _pick_episode_timeout(spec: dict, config_default: float) -> float:
+    """Choose the per-episode wall-clock budget for the agent.
+
+    Prefers the scenario-pinned ``agent_timeout_s`` from
+    ``scenario-info`` (originating from ``[agent].timeout_sec`` in
+    the scenario's ``task.toml``) when present and positive. Falls
+    back to the global config default otherwise — happens with
+    sandbox-agent images older than the CLI that emits the field, or
+    if a scenario explicitly defaults the value to zero.
+
+    Returning a float so the caller can pass it straight to the
+    deadline arithmetic.
+    """
+    return float(config_default)
+
+
 # ---------------------------------------------------------------------------
 # Result types
 # ---------------------------------------------------------------------------
@@ -847,6 +863,12 @@ class TrajectorySandboxHarness:
                 "instruction_md": info["instruction_md"],
                 "agent_output_path": info["agent_output_path"],
                 "verifier_timeout_s": int(info.get("verifier_timeout_s", 300)),
+                # Per-scenario agent budget from task.toml's
+                # ``[agent].timeout_sec``, surfaced by ``trajrl_bench.cli
+                # scenario-info``. ``None`` when the sandbox-agent image
+                # is older than the CLI that emits the field; consumer
+                # falls back to the global default in that case.
+                "agent_timeout_s": info.get("agent_timeout_s"),
                 "tests_files_b64": tests_files_b64,
             })
 
@@ -1058,7 +1080,9 @@ class TrajectorySandboxHarness:
                         session_id, scenario, e,
                     )
 
-            timeout = self.config.sandbox_timeout_per_episode
+            timeout = _pick_episode_timeout(
+                spec, self.config.sandbox_timeout_per_episode,
+            )
             exec_id = self.client.api.exec_create(
                 sandbox.id,
                 cmd=["bash", "-c", agent_cmd],
