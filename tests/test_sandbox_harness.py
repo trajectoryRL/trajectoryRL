@@ -671,3 +671,63 @@ class TestDrainExecStreamWithDeadline:
             )
         finally:
             never_ends.set()
+
+
+# ---------------------------------------------------------------------------
+# _pick_episode_timeout — per-scenario agent timeout from task.toml.
+# ---------------------------------------------------------------------------
+
+from trajectoryrl.utils.sandbox_harness import _pick_episode_timeout
+
+
+class TestPickEpisodeTimeout:
+    """The scenario-info payload now carries ``agent_timeout_s`` per
+    scenario (trajrl-bench PR #42). The harness should prefer that
+    value when present and fall back to the global config default
+    otherwise — so a path-tracing scenario that pins 900 s gets 900 s
+    even when the validator's global is 600 s, and an older
+    sandbox-agent image still works.
+    """
+
+    def test_uses_scenario_pinned_timeout_when_present(self):
+        spec = {
+            "name": "path-tracing",
+            "agent_timeout_s": 900,
+        }
+        assert _pick_episode_timeout(spec, config_default=600) == 900.0
+
+    def test_falls_back_to_config_default_when_missing(self):
+        spec = {"name": "old-bench-no-agent-field"}
+        assert _pick_episode_timeout(spec, config_default=600) == 600.0
+
+    def test_falls_back_to_config_default_when_none(self):
+        spec = {"name": "x", "agent_timeout_s": None}
+        assert _pick_episode_timeout(spec, config_default=600) == 600.0
+
+    def test_falls_back_to_config_default_when_zero_or_negative(self):
+        # A 0 or negative agent_timeout_s would defeat the purpose
+        # of having a deadline. Treat it as "not set" and fall back.
+        for bad in (0, -1, -900):
+            spec = {"name": "x", "agent_timeout_s": bad}
+            assert _pick_episode_timeout(spec, config_default=600) == 600.0, (
+                f"agent_timeout_s={bad} should have fallen back"
+            )
+
+    def test_falls_back_to_config_default_when_nan(self):
+        # NaN would propagate into ``time.monotonic() + timeout`` and
+        # produce a NaN deadline that no clock reading can clear,
+        # giving us back the deadlock we just fixed via a different
+        # door. Reject explicitly so a future refactor of the
+        # validation predicate cannot accidentally let it through.
+        spec = {"name": "x", "agent_timeout_s": float("nan")}
+        assert _pick_episode_timeout(spec, config_default=600) == 600.0
+
+    def test_returns_float_for_deadline_arithmetic(self):
+        # The caller passes the result directly into
+        # ``time.monotonic() + timeout``; a non-float (e.g. an int
+        # from JSON) is fine numerically but a returned float is the
+        # documented contract.
+        spec = {"name": "x", "agent_timeout_s": 123}
+        result = _pick_episode_timeout(spec, config_default=600)
+        assert isinstance(result, float)
+        assert result == 123.0
