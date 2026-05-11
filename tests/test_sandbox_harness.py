@@ -4,6 +4,9 @@ Tests the result mapping, config wiring, and SKILL.md extraction
 without requiring Docker or real LLM API calls.
 """
 
+import threading
+import time
+
 import pytest
 from dataclasses import dataclass, field
 
@@ -15,6 +18,7 @@ from trajectoryrl.utils.sandbox_harness import (
     _EpisodeResult,
     _parse_ctrf_correctness,
     _parse_session_cost,
+    _drain_exec_stream_with_deadline,
 )
 
 
@@ -442,3 +446,181 @@ class TestScenarioImageRef:
         h = _make_harness()
         h._scenario_info = {"name": "cancel-async-tasks"}
         assert h._scenario_image_ref() == ""
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the exec-stream timeout helper.
+#
+# These pin down the contract that ``_drain_exec_stream_with_deadline``
+# returns within ``timeout + slack`` even when the stream iterator blocks
+# silently — the wild-caught case being a Hermes process parked on a
+# stuck LLM API call that emits no stdout. The naive
+# ``for chunk in stream: ... if deadline: break`` pattern parks in
+# ``next()`` and never re-checks the deadline.
+# ---------------------------------------------------------------------------
+
+class TestDrainExecStreamWithDeadline:
+
+    def test_returns_all_chunks_when_iterator_completes(self):
+        def stream():
+            yield b"hello "
+            yield b"world"
+
+        chunks, timed_out = _drain_exec_stream_with_deadline(
+            stream(), timeout=5.0,
+        )
+
+        assert b"".join(chunks) == b"hello world"
+        assert timed_out is False
+
+    @pytest.mark.timeout(3)
+    def test_fires_deadline_when_iterator_blocks_silently(self):
+        """An iterator that emits nothing and never returns — Hermes
+        blocked on a stalled API call — must still trip the deadline
+        within ``timeout + small slack``. The pre-fix inline code
+        deadlocks here because the deadline check sat inside the
+        ``for chunk in stream`` body and never re-runs without a
+        chunk to wake it."""
+        never_ends = threading.Event()
+
+        def stream():
+            never_ends.wait()  # blocks forever
+            yield b"won't get here"  # pragma: no cover
+
+        try:
+            start = time.monotonic()
+            chunks, timed_out = _drain_exec_stream_with_deadline(
+                stream(), timeout=0.5,
+            )
+            elapsed = time.monotonic() - start
+
+            assert timed_out is True
+            assert chunks == []
+            # Slack budget for thread wake-up jitter on CI. Anything
+            # past this strongly suggests an in-loop deadline check
+            # reintroduced the deadlock.
+            assert elapsed < 1.5, (
+                f"deadline took {elapsed:.2f}s; deadlock likely reintroduced"
+            )
+        finally:
+            never_ends.set()
+
+    def test_zero_timeout_returns_immediately_as_timed_out(self):
+        """A 0-timeout call (or one past deadline at entry) must
+        return ``timed_out=True`` even if the iterator is empty —
+        the pre-fix in-loop check never executes the body on an
+        empty iterator and so leaves ``timed_out`` at its False
+        default. Pins the deadline-check-runs-first contract."""
+        chunks, timed_out = _drain_exec_stream_with_deadline(
+            iter([]), timeout=0,
+        )
+        assert chunks == []
+        assert timed_out is True
+
+    @pytest.mark.timeout(3)
+    def test_collects_chunks_before_deadline_when_iterator_then_blocks(self):
+        emitted_one = threading.Event()
+        never_ends = threading.Event()
+
+        def stream():
+            yield b"partial-output"
+            emitted_one.set()
+            never_ends.wait()
+            yield b"never"  # pragma: no cover
+
+        try:
+            chunks, timed_out = _drain_exec_stream_with_deadline(
+                stream(), timeout=0.5,
+            )
+
+            assert emitted_one.is_set(), (
+                "first chunk should have been produced before deadline"
+            )
+            assert b"".join(chunks) == b"partial-output"
+            assert timed_out is True
+        finally:
+            never_ends.set()
+
+    def test_iterator_exception_is_caught_and_reported(self):
+        def stream():
+            yield b"head"
+            raise ConnectionResetError("docker socket closed")
+
+        chunks, timed_out = _drain_exec_stream_with_deadline(
+            stream(), timeout=5.0,
+        )
+
+        # Pre-exception chunks are still surfaced; an iterator that
+        # ends early via exception is not the same thing as a timeout.
+        assert b"".join(chunks) == b"head"
+        assert timed_out is False
+
+    @pytest.mark.timeout(3)
+    def test_invokes_on_deadline_callback_exactly_once_on_timeout(self):
+        """The callback exists so the caller can release the blocked
+        exec socket (pkill the in-container process). It must fire
+        exactly once at deadline — never zero times, never twice.
+        Pre-fix the deadline never fires on a silent iterator so the
+        callback is never invoked: this test fails by callback
+        invocation count = 0."""
+        called: list[float] = []
+        never_ends = threading.Event()
+
+        def stream():
+            never_ends.wait()
+            yield b""  # pragma: no cover
+
+        try:
+            _drain_exec_stream_with_deadline(
+                stream(),
+                timeout=0.3,
+                on_deadline=lambda: called.append(time.monotonic()),
+            )
+
+            assert len(called) == 1, (
+                f"on_deadline must fire exactly once; fired {len(called)}"
+            )
+        finally:
+            never_ends.set()
+
+    def test_does_not_invoke_callback_when_iterator_completes_in_time(self):
+        called: list[bool] = []
+
+        def stream():
+            yield b"done"
+
+        _drain_exec_stream_with_deadline(
+            stream(),
+            timeout=5.0,
+            on_deadline=lambda: called.append(True),
+        )
+
+        assert called == [], "on_deadline must not fire on clean completion"
+
+    @pytest.mark.timeout(3)
+    def test_callback_failure_does_not_leak_out(self):
+        """The on_deadline callback runs in-process; if it raises
+        (e.g. pkill against a torn-down container), the helper must
+        swallow the exception so the caller still gets the partial
+        transcript and proceeds to teardown. Pre-fix this never
+        gets exercised because the callback isn't called; once the
+        fix lets the deadline fire, a raising callback would tear
+        down the helper without this safety net."""
+        never_ends = threading.Event()
+
+        def stream():
+            never_ends.wait()
+            yield b""  # pragma: no cover
+
+        def boom() -> None:
+            raise RuntimeError("docker SDK lost the container")
+
+        try:
+            chunks, timed_out = _drain_exec_stream_with_deadline(
+                stream(), timeout=0.3, on_deadline=boom,
+            )
+
+            assert timed_out is True
+            assert chunks == []
+        finally:
+            never_ends.set()
