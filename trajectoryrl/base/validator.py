@@ -801,30 +801,77 @@ class TrajectoryValidator:
             f"epoch_id={challenge_epoch_id}"
         )
 
-        # Per-scenario streaming hook for the live /challenge page. The
-        # eval runs inside run_in_executor so the callback fires on a
-        # worker thread; schedule the async POST back on the main loop
-        # via run_coroutine_threadsafe (fire-and-forget). The submit is
+        # Per-scenario streaming hooks for the live /challenge page. The
+        # eval runs inside run_in_executor so callbacks fire on a worker
+        # thread; we schedule the async POST back on the main loop via
+        # run_coroutine_threadsafe (fire-and-forget). Submits are
         # bounded by a 10s timeout, 404s log at debug, other errors at
         # warning — none affect eval correctness.
+        #
+        # Three lifecycle events per scenario:
+        #   start  → state="running"   (sandbox up, hermes chat about to run)
+        #   chat-end → state="verifying" (chat done, verifier about to run)
+        #   done   → state="complete"  (verifier scored — final quality)
         loop = asyncio.get_running_loop()
 
-        def on_episode_done(episode, scenario_index, total_scenarios):
+        def _post_progress(scenario_name, scenario_index, total_scenarios,
+                           state, *, quality=0.0, cost_usd=None,
+                           duration_s=None, timed_out=None):
             coro = submit_scenario_progress(
                 self.wallet,
                 challenge_epoch_id=challenge_epoch_id,
                 miner_hotkey=commitment.hotkey,
                 miner_uid=commitment.uid,
-                scenario_name=episode.scenario,
+                scenario_name=scenario_name,
                 scenario_index=scenario_index,
                 total_scenarios=total_scenarios,
+                quality=quality,
+                state=state,
+                cost_usd=cost_usd,
+                duration_s=duration_s,
+                timed_out=timed_out,
+                spec_number=_spec_number(),
+            )
+            asyncio.run_coroutine_threadsafe(coro, loop)
+
+        def on_episode_start(scenario_name, scenario_index, total_scenarios):
+            _post_progress(scenario_name, scenario_index, total_scenarios,
+                           "running")
+
+        def on_episode_verifying(scenario_name, scenario_index, total_scenarios):
+            _post_progress(scenario_name, scenario_index, total_scenarios,
+                           "verifying")
+
+        def on_episode_done(episode, scenario_index, total_scenarios):
+            _post_progress(
+                episode.scenario, scenario_index, total_scenarios,
+                "complete",
                 quality=episode.quality,
                 cost_usd=episode.cost_usd,
                 duration_s=episode.duration_s,
                 timed_out=episode.timed_out,
-                spec_number=_spec_number(),
             )
-            asyncio.run_coroutine_threadsafe(coro, loop)
+
+        # Per-scenario abort gate: if the epoch has moved on while we
+        # were grinding through earlier scenarios, bail out and let the
+        # validator pick up the new challenger. Saves ~20-30 min of
+        # compute on a session whose submission would 409 anyway.
+        # Synchronous fetch of the current epoch via the existing
+        # trajrl_api helper, executed on the harness's worker thread.
+        def is_epoch_still_current(pack_hash):
+            from ..utils.trajrl_api import fetch_current_epoch  # local import — avoid cycle
+            fut = asyncio.run_coroutine_threadsafe(fetch_current_epoch(), loop)
+            cur = fut.result(timeout=8.0)
+            if cur is None:
+                return True  # transient — assume still current to avoid false-aborts
+            epoch = cur.get("epoch") or {}
+            if epoch.get("status") != "in_progress":
+                return False
+            cur_pack = epoch.get("challenger_pack_hash") or ""
+            # pack_hash here is the full hex sha256 from the chain commitment;
+            # the API also returns the full hex. Compare on first 12 chars to
+            # tolerate any historical truncation.
+            return cur_pack.startswith(pack_hash[:12])
 
         outcome = await evaluate_miner_s1(
             harness=self._sandbox_harness,
@@ -833,7 +880,10 @@ class TrajectoryValidator:
             epoch_seed=self._challenge_seed(challenge_epoch_id, self.config.netuid),
             validator_salt=self._default_validator_salt(),
             mlog=mlog,
+            on_episode_start=on_episode_start,
+            on_episode_verifying=on_episode_verifying,
             on_episode_done=on_episode_done,
+            is_epoch_still_current=is_epoch_still_current,
         )
 
         if not outcome.success:

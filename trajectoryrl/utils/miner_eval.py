@@ -64,7 +64,10 @@ async def evaluate_miner_s1(
     epoch_seed: int,
     validator_salt: str = "",
     mlog: Optional[logging.Logger] = None,
+    on_episode_start: Optional[Callable[[str, int, int], None]] = None,
+    on_episode_verifying: Optional[Callable[[str, int, int], None]] = None,
     on_episode_done: Optional[Callable[[_EpisodeResult, int, int], None]] = None,
+    is_epoch_still_current: Optional[Callable[[str], bool]] = None,
 ) -> MinerEvalOutcome:
     """Evaluate a single miner's pack via trajrl-bench (Season 1).
 
@@ -168,7 +171,10 @@ async def evaluate_miner_s1(
             epoch_seed=epoch_seed,
             pack_hash=commitment.pack_hash,
             validator_salt=validator_salt,
+            on_episode_start=on_episode_start,
+            on_episode_verifying=on_episode_verifying,
             on_episode_done=on_episode_done,
+            is_epoch_still_current=is_epoch_still_current,
         )
     except Exception as e:
         log.error("S1 evaluation failed: %s", e, exc_info=True)

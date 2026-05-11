@@ -617,16 +617,36 @@ class TrajectorySandboxHarness:
         epoch_seed: int,
         pack_hash: str = "",
         validator_salt: str = "",
+        on_episode_start: Optional[Callable[[str, int, int], None]] = None,
+        on_episode_verifying: Optional[Callable[[str, int, int], None]] = None,
         on_episode_done: Optional[Callable[[_EpisodeResult, int, int], None]] = None,
+        is_epoch_still_current: Optional[Callable[[str], bool]] = None,
     ) -> SandboxEvaluationResult:
         """Run the multi-scenario session.
 
-        ``on_episode_done`` is an optional sync callback invoked from the
-        executor thread after each scenario completes, with
-        ``(episode, scenario_index, total_scenarios)``. Used by the
-        validator to fire-and-forget per-scenario progress to the
-        platform server (drives the live /challenge page). Failures in
-        the callback are caught and logged; they never abort the eval.
+        Callbacks (all optional, all invoked from the executor thread,
+        all best-effort — exceptions are caught and logged):
+
+        - ``on_episode_start(scenario_name, scenario_index, total)`` —
+          fires after the sandbox container is up but *before*
+          ``hermes chat`` runs. Used by the validator to mark the
+          scenario as ``running`` on the live /challenge page.
+        - ``on_episode_verifying(scenario_name, scenario_index, total)``
+          — fires after ``hermes chat`` finishes (or times out) and
+          before the verifier container runs. Marks the scenario as
+          ``verifying`` on the live page.
+        - ``on_episode_done(episode, scenario_index, total)`` — fires
+          after verifier finishes, with the scored ``_EpisodeResult``.
+          Marks the scenario ``complete`` on the live page.
+
+        ``is_epoch_still_current(pack_hash) -> bool`` is an optional
+        callback consulted at the top of each scenario loop iteration
+        (except the first). If it returns False, the remaining
+        scenarios are aborted and the session ends early — the
+        submission would 409 anyway since the epoch has moved on, and
+        the validator should immediately pick up the new challenger.
+        Transient failures inside the callback should return True so
+        we don't false-abort on a momentary API hiccup.
         """
         salt = validator_salt or hashlib.sha256(
             f"{self.config.wallet_hotkey}:{self.config.netuid}".encode()
@@ -643,7 +663,10 @@ class TrajectorySandboxHarness:
             session_result = await loop.run_in_executor(
                 None, lambda: self._run_eval_sync(
                     skill_md, epoch_seed, salt, pack_hash,
+                    on_episode_start=on_episode_start,
+                    on_episode_verifying=on_episode_verifying,
                     on_episode_done=on_episode_done,
+                    is_epoch_still_current=is_epoch_still_current,
                 ),
             )
         except Exception as e:
@@ -662,7 +685,10 @@ class TrajectorySandboxHarness:
 
     def _run_eval_sync(
         self, skill_md: str, epoch_seed: int, salt: str, pack_hash: str,
+        on_episode_start: Optional[Callable[[str, int, int], None]] = None,
+        on_episode_verifying: Optional[Callable[[str, int, int], None]] = None,
         on_episode_done: Optional[Callable[[_EpisodeResult, int, int], None]] = None,
+        is_epoch_still_current: Optional[Callable[[str], bool]] = None,
     ) -> _SessionResult:
         """One container per scenario, one episode each.
 
@@ -729,11 +755,49 @@ class TrajectorySandboxHarness:
 
         total = len(scenario_specs)
         for cell_index, spec in enumerate(scenario_specs):
+            # Pre-scenario epoch-current check. Skip on the first
+            # scenario — the session-start gate in validator.py already
+            # verified the pack was current when this session was
+            # picked up. For scenarios 2..N, the epoch may have ended
+            # while we were grinding through earlier scenarios; in that
+            # case the final submission will 409, and we should bail
+            # immediately to free compute for the new challenger.
+            if cell_index > 0 and is_epoch_still_current is not None:
+                try:
+                    still_current = is_epoch_still_current(pack_hash)
+                except Exception as e:
+                    # Transient API failure: assume current to avoid
+                    # false-aborts on a momentary 5xx / timeout.
+                    logger.debug(
+                        "is_epoch_still_current callback failed: %s "
+                        "(assuming still current)", e,
+                    )
+                    still_current = True
+                if not still_current:
+                    logger.info(
+                        "[%s] pack %s no longer the current challenger "
+                        "after %d/%d scenarios; aborting remaining %d "
+                        "scenarios to catch up to new epoch",
+                        session_id, pack_hash[:12], cell_index, total,
+                        total - cell_index,
+                    )
+                    break
+
             episode = self._run_episode(
                 session_id=session_id,
                 episode_index=cell_index,
                 skill_md=skill_md,
                 spec=spec,
+                on_chat_start=(
+                    (lambda sc=spec["name"], idx=cell_index, tot=total:
+                        on_episode_start(sc, idx, tot))
+                    if on_episode_start is not None else None
+                ),
+                on_chat_end=(
+                    (lambda sc=spec["name"], idx=cell_index, tot=total:
+                        on_episode_verifying(sc, idx, tot))
+                    if on_episode_verifying is not None else None
+                ),
             )
             session_result.episodes.append(episode)
             if on_episode_done is not None:
@@ -754,6 +818,8 @@ class TrajectorySandboxHarness:
         episode_index: int,
         skill_md: str,
         spec: dict,
+        on_chat_start: Optional[Callable[[], None]] = None,
+        on_chat_end: Optional[Callable[[], None]] = None,
     ) -> _EpisodeResult:
         """Run one cell: spin up the scenario container, exec hermes,
         extract output, run verifier, tear down.
@@ -763,6 +829,13 @@ class TrajectorySandboxHarness:
         scenarios. Container CMD is ``tail -f /dev/null`` (inherited
         from the sandbox-agent base) so the container stays alive
         until we ``stop`` it.
+
+        ``on_chat_start`` is invoked right before ``docker exec hermes
+        chat`` begins (mark scenario as ``running`` on the live page).
+        ``on_chat_end`` is invoked right after the chat exec returns
+        and before the verifier container runs (mark scenario as
+        ``verifying``). Both are best-effort — exceptions are caught
+        and logged.
         """
         scenario = spec["name"]
         scenario_image = spec["image"]
@@ -868,6 +941,17 @@ class TrajectorySandboxHarness:
                 "exit $chat_rc"
             )
 
+            # Notify dashboard the scenario is entering the active
+            # ``running`` state (hermes chat about to start).
+            if on_chat_start is not None:
+                try:
+                    on_chat_start()
+                except Exception as e:
+                    logger.warning(
+                        "[%s] %s on_chat_start callback failed: %s",
+                        session_id, scenario, e,
+                    )
+
             timeout = self.config.sandbox_timeout_per_episode
             exec_id = self.client.api.exec_create(
                 sandbox.id,
@@ -910,6 +994,17 @@ class TrajectorySandboxHarness:
                 session_id, scenario, chat_exit, episode.timed_out,
                 len(episode.transcript),
             )
+
+            # Notify dashboard the scenario is entering ``verifying``
+            # (hermes chat done; verifier container about to run).
+            if on_chat_end is not None:
+                try:
+                    on_chat_end()
+                except Exception as e:
+                    logger.warning(
+                        "[%s] %s on_chat_end callback failed: %s",
+                        session_id, scenario, e,
+                    )
 
             episode.turns_log = _read_container_text(
                 sandbox, "/workspace/turns.jsonl",
