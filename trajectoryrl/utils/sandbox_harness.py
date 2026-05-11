@@ -2,8 +2,9 @@
 
 Single-container architecture (2026-05):
   - Sandbox+agent container (``ghcr.io/trajectoryrl/sandbox-agent``)
-    holds the puzzle filesystem and runs Hermes as the ``agent`` user.
-  - The validator drives episodes via ``docker exec -u agent`` per
+    holds the puzzle filesystem and runs Hermes as the ``hermes`` user
+    (uid 10000, baked in by the upstream hermes-agent image).
+  - The validator drives episodes via ``docker exec -u hermes`` per
     episode — no testee container, no SSH boundary.
   - One verifier container per episode runs ``tests/test.sh`` against
     the agent's output and writes a binary 0/1 reward.
@@ -45,12 +46,6 @@ from docker.types import LogConfig
 from ..utils.config import ValidatorConfig
 
 logger = logging.getLogger(__name__)
-
-
-# Hermes runtime user inside the sandbox-agent image. Must match the
-# ``useradd ... -u 10000 agent`` line in
-# ``trajrl-bench/docker/Dockerfile.sandbox-agent``.
-_AGENT_UID = 10000
 
 
 # Scenarios run per session, in order. Every validator runs the full set
@@ -387,7 +382,7 @@ class TrajectorySandboxHarness:
          - Run a fresh container of the scenario image (which layers
            on sandbox-agent and ships /app preloaded).
          - Drop SKILL.md + INSTRUCTION.md into /workspace (read-only).
-         - ``docker exec -u agent`` runs ``hermes chat`` against
+         - ``docker exec -u hermes`` runs ``hermes chat`` against
            /workspace + /app. Wraps chat + ``hermes sessions export``
            in one bash invocation so turns.jsonl is atomic per episode.
          - Extract ``agent_output_path`` from the container.
@@ -670,7 +665,7 @@ class TrajectorySandboxHarness:
           1. ``docker run scenario-<name>:<tag>`` (CMD = tail -f /dev/null
              from the sandbox-agent base; container stays alive).
           2. Drop SKILL.md + INSTRUCTION.md into /workspace.
-          3. ``docker exec -u agent`` runs hermes chat against /app.
+          3. ``docker exec -u hermes`` runs hermes chat against /app.
           4. Extract ``agent_output_path``.
           5. Run the verifier in a fresh container of the same scenario
              image (clean filesystem to test against).
@@ -812,21 +807,21 @@ class TrajectorySandboxHarness:
 
             # Drop SKILL.md + INSTRUCTION.md into /workspace.
             _put_file(sandbox, "/workspace/SKILL.md", skill_md)
-            sandbox.exec_run(["chown", "root:agent", "/workspace/SKILL.md"])
+            sandbox.exec_run(["chown", "root:hermes", "/workspace/SKILL.md"])
             sandbox.exec_run(["chmod", "440", "/workspace/SKILL.md"])
             _put_file(sandbox, "/workspace/INSTRUCTION.md", instruction_md)
-            sandbox.exec_run(["chown", "root:agent", "/workspace/INSTRUCTION.md"])
+            sandbox.exec_run(["chown", "root:hermes", "/workspace/INSTRUCTION.md"])
             sandbox.exec_run(["chmod", "440", "/workspace/INSTRUCTION.md"])
             sandbox.exec_run(["mkdir", "-p", "/workspace/learned"])
             sandbox.exec_run([
-                "chown", "-R", "agent:agent", "/workspace/learned",
+                "chown", "-R", "hermes:hermes", "/workspace/learned",
             ])
             # Per-episode hermes state already starts clean here (fresh
-            # container), but ensure /opt/data is agent-owned so the
+            # container), but ensure /opt/data is hermes-owned so the
             # config + session DB land in the right place.
             sandbox.exec_run([
                 "sh", "-c",
-                "mkdir -p /opt/data && chown -R agent:agent /opt/data",
+                "mkdir -p /opt/data && chown -R hermes:hermes /opt/data",
             ])
 
             harness_prompt = (
@@ -858,7 +853,7 @@ class TrajectorySandboxHarness:
             exec_id = self.client.api.exec_create(
                 sandbox.id,
                 cmd=["bash", "-c", agent_cmd],
-                user="agent",
+                user="hermes",
                 workdir="/workspace",
                 stdout=True, stderr=False,
                 environment={
@@ -866,7 +861,7 @@ class TrajectorySandboxHarness:
                     "OPENAI_API_KEY":     self._testee_api_key,
                     "ANTHROPIC_API_KEY":  self._testee_api_key,
                     "HERMES_BUNDLED_SKILLS": "/nonexistent",
-                    "HOME": "/home/agent",
+                    "HOME": "/opt/data",
                 },
             )["Id"]
 
