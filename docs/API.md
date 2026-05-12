@@ -1208,7 +1208,7 @@ Reading the seat from this endpoint will *usually* match the daemon's locally-de
 
 Returned when:
 - The previous epoch has finalized but the scheduler hasn't yet opened the next one (≤ `SCHEDULER_POLL_INTERVAL_MS` ≈ 10 s gap).
-- The challenger queue is empty (no `pending_eval` rows pass the cooldown / attempt filter).
+- The challenger queue is empty (no `pending_eval` rows pass the per-miner queue gate — i.e., every queued row's miner already has an older row of theirs in `pending_eval`).
 
 Validators **must treat 404 as a normal state**, sleep, and retry. It is not an error condition.
 
@@ -1375,7 +1375,7 @@ FIFO challenger queue snapshot. Returned in the order the scheduler will pick fr
 }
 ```
 
-`eligible_now=false` rows are still in the queue but currently filtered out by the per-miner cooldown — a miner_hotkey that was challenger in any `challenge_epoch` within the last `MINER_COOLDOWN_HOURS` (default 12 h) is held back from being picked again. There is no retry mechanism for quorum-aborted submissions: a single `aborted_quorum` finalize moves the row to `eval_status='exhausted'`, dropping it from the queue. The miner can submit a new `pack_hash` to re-enter.
+`eligible_now=false` rows are still in the queue but currently filtered out by the per-miner queue gate: a miner_hotkey can hold at most one row in `pending_eval` at a time. Any other row of the same miner that is also in `pending_eval` (older `submitted_at`) takes the slot; this row waits until the earlier one drains (completed / exhausted / failed / skipped), at which point it becomes eligible immediately — there is no wall-clock cooldown. There is also no retry mechanism for quorum-aborted submissions: a single `aborted_quorum` finalize moves the row to `eval_status='exhausted'`, dropping it from the queue. The miner can submit a new `pack_hash` to re-enter.
 
 ### `GET /api/epoch/{id}` (public read)
 

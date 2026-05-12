@@ -19,7 +19,7 @@ The core loop:
 3. **Challenge Epoch**: Each epoch the queue head is dispatched to validators as the active challenger. Validators evaluate it independently and post stake-signed scores back to the platform.
 4. **Stake-Weighted Aggregation**: The platform finalizes the epoch by computing the consensus score (stake-weighted average) and consensus qualified flag (stake-weighted majority), gated by a stake quorum.
 5. **Winner Protection**: A challenger replaces the seated winner only if it qualifies and beats the seated winner's score by ≥ δ.
-6. **Weight Setting**: Validators read the canonical winner from the platform and call `set_weights` every tempo (winner-take-all in steady state, top-3 in bootstrap).
+6. **Weight Setting**: Validators read the canonical winner from the platform and call `set_weights` every tempo. The seated winner takes 100% of miner alpha; when no seat exists (cold start, deregistered or banned winner) weight is set to the subnet owner UID and the chain burns the emission.
 
 For the current season's scoring method, pack schema, and evaluation specifics, see [SCORING_AND_EVALUATION.md](SCORING_AND_EVALUATION.md).
 
@@ -89,27 +89,16 @@ Validators and the server enforce:
 
 ## Winner-Take-All with Winner Protection
 
-### Core Rule: Winner Takes All (Steady State)
+### Core Rule: Winner Takes All
 
-**Winner** = seated winner in `winner_state`, refreshed only at challenge-epoch finalize. In steady state (≥ `bootstrap_threshold` active miners, default 10):
+**Winner** = seated winner in `winner_state`, refreshed only at challenge-epoch finalize. There is one mode:
 
 ```
 weight[winner] = 1.0
 weight[others] = 0.0
 ```
 
-### Bootstrap Phase (Early Adoption)
-
-When active miners < `bootstrap_threshold` (default 10), validators distribute among qualified miners by their most recent consensus scores:
-
-```
-weight[1st] = 0.70
-weight[2nd] = 0.20
-weight[3rd] = 0.10
-weight[others] = 0.0
-```
-
-Once the 10th active miner exists, the validator switches to winner-take-all.
+The v5.x bootstrap top-3 split (70/20/10 below a `bootstrap_threshold`) has been retired in v6.0. The challenge-epoch model evaluates exactly one challenger per epoch, so there is no per-epoch ranking to distribute weight across; "top-3" had no well-defined meaning under the new aggregation. The cold-start case (no seat yet) is handled by the burn rule below, not by a separate bootstrap reward curve.
 
 ### Always Set Weights
 
@@ -160,17 +149,10 @@ When the daemon's locally-derived winner matches the server's published `winner_
 
 ### Reward Distribution
 
-**Steady state** (≥ 10 miners):
 ```
-Miner C (seated winner):        100% of miner alpha
-All other miners:                  0%
-```
-
-**Bootstrap** (< 10 miners):
-```
-1st (qualified, best score): 70%
-2nd (qualified):              20%
-3rd (qualified):              10%
+Seated winner:        100% of miner alpha
+All other miners:       0%
+No seated winner:     burned to subnet owner UID
 ```
 
 ---
@@ -190,7 +172,7 @@ Network Emissions (post-halving Dec 2025):
 Alpha Emissions (subnet-specific):
 ├─ 1 alpha/block, 360 blocks/tempo, ~20 tempos/day
 ├─ Total ~7,200 alpha/day per subnet
-├─ 41% to miners (winner-take-all in steady state, top-3 in bootstrap)
+├─ 41% to miners (winner-take-all; burned to owner UID when no seat)
 ├─ 41% to validators and stakers
 └─ 18% to subnet owner
 ```
@@ -199,7 +181,7 @@ Alpha is swappable to TAO via the subnet liquidity pool.
 
 ### Competitive Strategy
 
-Steady-state winner-take-all creates extreme risk/reward. Bootstrap top-3 lowers the barrier for early miners. For mining strategy details see [MINER_OPERATIONS.md](MINER_OPERATIONS.md).
+Winner-take-all creates extreme risk/reward — there is no second place. For mining strategy details see [MINER_OPERATIONS.md](MINER_OPERATIONS.md).
 
 ---
 
@@ -390,7 +372,7 @@ The on-chain layer (YC3 + commit-reveal + bond dynamics) is unchanged from v5.x.
    pick queue head:
      SELECT FROM miner_submissions
        WHERE eval_status = 'pending_eval'
-         AND no recent epoch with same hotkey within MINER_COOLDOWN_EPOCHS
+         AND no OTHER row of the same miner_hotkey is also in pending_eval
        ORDER BY submitted_at ASC
        LIMIT 1
 
@@ -576,7 +558,7 @@ loop every ~5 min:
         elif cache_age > WINNER_FALLBACK_TTL:
             refuse + alarm                             # server been unreachable too long
         else:
-            set_weights(uid = cache.winner.uid)        # bootstrap rule below threshold
+            set_weights(uid = cache.winner.uid)        # winner-take-all
 ```
 
 The eval loop produces at most one signed score per `challenge_epoch_id`. The winner-derivation loop re-derives on every successful poll — it does **not** cache the derived winner across polls (otherwise a later finalize-time fix on the server would not propagate); what it caches for fault-tolerance is the *raw* `/api/v2/winner/current` response. The weight loop is independent and tempo-gated. A separate heartbeat task (~10 min) reports liveness, version, and bench/harness image digests via `POST /api/v2/validators/heartbeat`.
@@ -662,21 +644,17 @@ every ~10 s (winner-derivation loop, can share a tick with the eval loop):
 every Bittensor tempo (set_weights cadence):
    validator uses cache.winner from the loop above
    → if cache age > WINNER_FALLBACK_TTL: refuse + alarm
-   → set_weights(winner_uid = 1.0 in steady state, top-3 in bootstrap)
+   → set_weights(winner_uid = 1.0, or burn to subnet owner UID when no seat)
    → YC3 aggregates on-chain
 ```
 
 ### Weights
 
 ```
-Steady state (≥ 10 active miners):
-  weight[seated_winner] = 1.0
-  weight[others]        = 0.0
+weight[seated_winner] = 1.0
+weight[others]        = 0.0
 
-Bootstrap (< 10 active miners):
-  weight[1st] = 0.70
-  weight[2nd] = 0.20
-  weight[3rd] = 0.10
+No seated winner → all weight to subnet owner UID (burned).
 ```
 
 Where seated_winner satisfies:
@@ -691,8 +669,8 @@ Where seated_winner satisfies:
 ### Rewards
 
 ```
-Steady state:  100% of miner alpha → seated winner
-Bootstrap:     70/20/10 split among top-3 qualified
+Seated winner:     100% of miner alpha
+No seated winner:  burned to subnet owner UID
 ```
 
 ### Key Parameters
@@ -702,13 +680,11 @@ Bootstrap:     70/20/10 split among top-3 qualified
 | `EPOCH_LENGTH_BLOCKS` | 150 (≈ 30 min) | Yes (bench-driven; 30 min – several days) |
 | `QUORUM_FRACTION` | 0.50 | Yes |
 | `WINNER_PROTECTION_MARGIN` (δ) | 0.03 (3%) | Yes |
-| `MINER_COOLDOWN_EPOCHS` | 5 | Yes |
 | `INACTIVE_THRESHOLD_EPOCHS` | 3 | Yes |
 | `MIN_VALIDATOR_STAKE` | 10000.0 | Yes |
 | `EMPTY_QUEUE_RECHECK_BLOCKS` | 60 | Yes |
 | `WINNER_FALLBACK_TTL` | 24 h | Yes (validator daemon side) |
 | `MINER_SUBMIT_COOLDOWN_SECONDS` (Channel B) | 3600 (60 min) | Yes |
-| `bootstrap_threshold` | 10 active miners | Yes |
 | `inactivity_blocks` | 14400 (~48 h) | Yes |
 | `EVICTION_GRACE_WINDOWS` (`pack_first_seen`) | 7 windows (~7 d) | No (server constant) |
 | `yuma_version` | 3 | Subnet owner (chain) |
