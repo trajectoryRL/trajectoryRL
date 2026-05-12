@@ -69,7 +69,7 @@ def _spec_number() -> int:
 logger = logging.getLogger(__name__)
 
 OWNER_UID = 74
-BURN_FRACTION = 0.95  # 95% of miner emissions burned via owner UID
+BURN_FRACTION = 0.75  # 75% of miner emissions burned via owner UID
 
 _METAGRAPH_SYNC_RETRIES = 3
 _METAGRAPH_SYNC_DELAY = 10  # seconds between retries
