@@ -463,6 +463,9 @@ async def submit_scenario_progress(
     duration_s: Optional[float] = None,
     timed_out: Optional[bool] = None,
     spec_number: Optional[int] = None,
+    harness_name: Optional[str] = None,
+    harness_version: Optional[str] = None,
+    llm_model: Optional[str] = None,
     submit_url_template: Optional[str] = None,
     timeout: float = 10.0,
 ) -> bool:
@@ -528,6 +531,16 @@ async def submit_scenario_progress(
         payload["timed_out"] = timed_out
     if spec_number is not None:
         payload["spec_number"] = spec_number
+    # Per-scenario eval env: which agent harness + testee LLM ran this
+    # scenario. Same across scenarios under today's one-harness-per-
+    # validator setup, but stamped per scenario so a future validator
+    # that mixes harnesses is recorded accurately.
+    if harness_name is not None:
+        payload["harness_name"] = harness_name
+    if harness_version is not None:
+        payload["harness_version"] = harness_version
+    if llm_model is not None:
+        payload["llm_model"] = llm_model
 
     submit_url_template = (
         submit_url_template or _default_scenario_progress_url_template()

@@ -838,6 +838,9 @@ class TrajectoryValidator:
                 duration_s=duration_s,
                 timed_out=timed_out,
                 spec_number=_spec_number(),
+                harness_name=self._sandbox_harness.harness_name,
+                harness_version=self._sandbox_harness.harness_version,
+                llm_model=self.config.llm_model,
             )
             asyncio.run_coroutine_threadsafe(coro, loop)
 
