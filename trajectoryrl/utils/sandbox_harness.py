@@ -517,14 +517,6 @@ class TrajectorySandboxHarness:
         self.scenario_image_hash: str = "unknown"
         self.scenario_image_hashes: Dict[str, str] = {}
 
-        # Refreshed on first eval after construction so a stale local
-        # ``:latest`` cache from before the watchtower flip can't pin
-        # the validator to a build that's incompatible with current
-        # validator code (anchor: 2026-05-11 Hermes 0.13 cutover where
-        # validators on new ``-u hermes`` code hit OLD locally-cached
-        # images with no hermes user → all-zero scores).
-        self._initial_pull_done: bool = False
-
     @property
     def client(self) -> docker.DockerClient:
         if self._docker_client is None:
@@ -813,16 +805,20 @@ class TrajectorySandboxHarness:
         Each scenario contributes a correctness ratio (passed/total) in
         [0, 1]; final_score is the equal-weighted sum across scenarios.
         """
-        # First eval after harness construction refreshes the local
-        # ``:latest`` cache so a stale image from before a release
-        # window can't pin us to a build that's incompatible with the
-        # validator's current code path. Pull is idempotent — if local
-        # already matches registry, this is a fast no-op. Failures are
-        # logged + swallowed by ``_pull_sync`` (falls back to cached).
-        if not self._initial_pull_done:
-            logger.info("First eval after startup: refreshing bench images")
-            self._pull_sync()
-            self._initial_pull_done = True
+        # Refresh the sandbox-agent + scenario images at the start of
+        # *every* eval session. The pull is idempotent — when the local
+        # image already matches the registry it's just a manifest check,
+        # a fast no-op — so it's cheap next to a 25-40 min eval. Doing it
+        # per-cycle (rather than once-per-process) means a transient pull
+        # failure self-heals on the next cycle instead of pinning the
+        # validator to a stale image until it restarts (anchor: 2026-05-11
+        # Hermes 0.13 cutover all-zero scores; 2026-05-12 a 3rd-party
+        # validator stuck on a stale bench image after a failed pull),
+        # and a trajrl-bench-only release propagates without a validator
+        # restart. Failures are logged + swallowed by ``_pull_sync``
+        # (falls back to cached for that cycle).
+        logger.info("Refreshing bench images before eval")
+        self._pull_sync()
 
         # Pre-load metadata for every scenario so we fail early on a
         # missing one. Each ``_load_scenario_info`` call also primes the
