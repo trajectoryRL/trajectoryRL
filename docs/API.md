@@ -307,7 +307,7 @@ This endpoint handles two types of submissions:
 | `eval_count` | number | No | Number of evals accumulated for the current pack; omitted for rejections |
 | `scenario_results` | object | No | Per-scenario eval results keyed by scenario name (see below); omitted for rejections |
 | `llm_base_url` | string | No | LLM API base URL used by the validator |
-| `llm_model` | string | No | LLM model identifier used by the validator (e.g. `"claude-sonnet-4-6"`) |
+| `llm_model` | string | No | LLM model identifier used by the validator (e.g. `"qwen/qwen3.5-35b-a3b"`) |
 | `rejected` | boolean | No | `true` if the eval was aborted before any episode ran (pre-eval rejection). Omit or set `false` for normal eval results |
 | `rejection_stage` | string | No | Required when `rejected` is `true`. Stage at which the eval was rejected: `"pack_fetch"` \| `"schema_validation"` \| `"integrity_check"` |
 | `rejection_detail` | string | No | Human-readable description of the rejection reason (e.g. `"hard-coded responses detected"`) |
@@ -365,8 +365,8 @@ Keyed by scenario name. Each value contains:
   "pack_url": "https://example.com/pack1.zip",
   "pack_hash": "abc123def456...",
   "eval_count": 5,
-  "llm_base_url": "https://api.anthropic.com",
-  "llm_model": "claude-sonnet-4-6",
+  "llm_base_url": "https://openrouter.ai/api/v1",
+  "llm_model": "qwen/qwen3.5-35b-a3b",
   "spec_number": 1,
   "scoring_version": 1,
   "bench_image_hash": "sha256:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
@@ -667,8 +667,8 @@ Submit a validator heartbeat with running version, Docker image digests, and san
 | `bench_image_hash` | string | No | Docker image digest of the `trajrl-bench` sandbox image (e.g. `"sha256:a1b2c3..."`) |
 | `harness_image_hash` | string | No | Docker image digest of the `hermes-agent` harness image (e.g. `"sha256:d4e5f6..."`) |
 | `bench_version` | string | No | Version string reported by the trajrl-bench CLI inside the sandbox container (e.g. `"v1.2.0"`) |
-| `llm_model` | string | No | LLM model identifier the validator is configured to use for evals (e.g. `"gpt-5"`, `"claude-sonnet-4-6"`) |
-| `llm_base_url` | string | No | Base URL of the OpenAI-compatible LLM endpoint the validator routes eval calls through (e.g. `"https://api.openai.com/v1"`) |
+| `llm_model` | string | No | LLM model identifier the validator is configured to use for evals (e.g. `"qwen/qwen3.5-35b-a3b"`) |
+| `llm_base_url` | string | No | Base URL of the OpenAI-compatible LLM endpoint the validator routes eval calls through (e.g. `"https://openrouter.ai/api/v1"`) |
 
 ### Request Example
 
@@ -683,8 +683,8 @@ Submit a validator heartbeat with running version, Docker image digests, and san
   "bench_image_hash": "sha256:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
   "harness_image_hash": "sha256:f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5",
   "bench_version": "v1.2.0",
-  "llm_model": "gpt-5",
-  "llm_base_url": "https://api.openai.com/v1"
+  "llm_model": "qwen/qwen3.5-35b-a3b",
+  "llm_base_url": "https://openrouter.ai/api/v1"
 }
 ```
 
@@ -702,8 +702,8 @@ Submit a validator heartbeat with running version, Docker image digests, and san
     "benchImageHash": "sha256:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
     "harnessImageHash": "sha256:f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5",
     "benchVersion": "v1.2.0",
-    "llmModel": "gpt-5",
-    "llmBaseUrl": "https://api.openai.com/v1"
+    "llmModel": "qwen/qwen3.5-35b-a3b",
+    "llmBaseUrl": "https://openrouter.ai/api/v1"
   }
 }
 ```
@@ -1275,9 +1275,13 @@ The wire contract is built around the **winner-challenger** model and is forward
   "judge_model":        "...",
   "bench_image_hash":   "...",
   "harness_image_hash": "...",
-  "bench_version":      "..."
+  "bench_version":      "...",
+  "harness_name":       "Hermes",
+  "harness_version":    "0.13.0"
 }
 ```
+
+`harness_name` / `harness_version` are the human-readable identity of the agent harness baked into the sandbox image (from `<harness> --version`, surfaced by `trajrl_bench.cli scenarios`). Both optional — older sandbox images don't report them. The dashboard live page renders them on the Challenger / Winner cards.
 
 Required: `validator_hotkey`, `timestamp`, `signature`, `version`, `challenger.score`, `challenger.qualified`.
 

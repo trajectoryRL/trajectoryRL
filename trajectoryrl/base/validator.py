@@ -367,7 +367,8 @@ class TrajectoryValidator:
         return hashlib.sha256(data.encode()).hexdigest()[:16]
 
     def _harness_metadata(self) -> Dict[str, str]:
-        """bench/harness image hashes + bench version for outgoing payloads."""
+        """bench/harness image hashes, bench version, and agent-harness
+        name+version for outgoing payloads."""
         h = self._sandbox_harness
         meta: Dict[str, str] = {}
         if h.bench_image_hash != "unknown":
@@ -376,6 +377,10 @@ class TrajectoryValidator:
             meta["harness_image_hash"] = h.scenario_image_hash
         if h.sandbox_version != "unknown":
             meta["bench_version"] = h.sandbox_version
+        if h.harness_name:
+            meta["harness_name"] = h.harness_name
+        if h.harness_version:
+            meta["harness_version"] = h.harness_version
         return meta
 
     # ------------------------------------------------------------------
@@ -831,6 +836,9 @@ class TrajectoryValidator:
                 duration_s=duration_s,
                 timed_out=timed_out,
                 spec_number=_spec_number(),
+                harness_name=self._sandbox_harness.harness_name,
+                harness_version=self._sandbox_harness.harness_version,
+                llm_model=self.config.llm_model,
             )
             asyncio.run_coroutine_threadsafe(coro, loop)
 

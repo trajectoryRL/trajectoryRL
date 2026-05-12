@@ -8,8 +8,12 @@ from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_LLM_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
-DEFAULT_LLM_MODEL = "glm-5.1"
+# Default eval LLM: Qwen3.5-35B-A3B via OpenRouter — the same vendor
+# serves the testee and the judge (GLM-5.1) without juggling keys. See
+# .env.validator.example. Override per-validator with LLM_BASE_URL /
+# LLM_MODEL.
+DEFAULT_LLM_BASE_URL = "https://openrouter.ai/api/v1"
+DEFAULT_LLM_MODEL = "qwen/qwen3.5-35b-a3b"
 
 # Image channel drives the tag of the sandbox-agent image pulled by the
 # validator at runtime. Compose files set this per-channel (latest,

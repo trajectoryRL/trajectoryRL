@@ -413,6 +413,14 @@ class TrajectorySandboxHarness:
         self.sandbox_scenarios: list[str] = []
         self._scenario_info: dict | None = None
 
+        # Agent harness baked into the sandbox image, reported by
+        # ``cli scenarios`` (``<harness> --version`` probe). Surfaced in
+        # outgoing heartbeats + challenge-score payloads so the dashboard
+        # can show "Hermes 0.13.0" etc. ``None`` if the probe fails or
+        # the image is too old to report it.
+        self.harness_name: Optional[str] = None
+        self.harness_version: Optional[str] = None
+
         self.bench_image_hash: str = "unknown"
         self.scenario_image_hash: str = "unknown"
         self.scenario_image_hashes: Dict[str, str] = {}
@@ -528,8 +536,13 @@ class TrajectorySandboxHarness:
             )
             self.sandbox_version = info.get("version", "unknown")
             self.sandbox_scenarios = info.get("scenarios", [])
-            logger.info("Sandbox version: %s, scenarios: %s",
-                        self.sandbox_version, self.sandbox_scenarios)
+            hn = info.get("harness_name")
+            hv = info.get("harness_version")
+            self.harness_name = hn if isinstance(hn, str) and hn else None
+            self.harness_version = hv if isinstance(hv, str) and hv else None
+            logger.info("Sandbox version: %s, harness: %s %s, scenarios: %s",
+                        self.sandbox_version, self.harness_name or "?",
+                        self.harness_version or "?", self.sandbox_scenarios)
         except Exception as e:
             logger.warning("Failed to query sandbox version: %s", e)
 
