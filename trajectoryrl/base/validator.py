@@ -351,8 +351,6 @@ class TrajectoryValidator:
                     bench_image_hash=self._sandbox_harness.bench_image_hash,
                     harness_image_hash=self._sandbox_harness.scenario_image_hash,
                     bench_version=self._sandbox_harness.sandbox_version,
-                    harness_name=self._sandbox_harness.harness_name,
-                    harness_version=self._sandbox_harness.harness_version,
                     llm_model=self.config.llm_model,
                     llm_base_url=self.config.llm_base_url,
                 )

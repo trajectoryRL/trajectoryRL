@@ -667,8 +667,6 @@ Submit a validator heartbeat with running version, Docker image digests, and san
 | `bench_image_hash` | string | No | Docker image digest of the `trajrl-bench` sandbox image (e.g. `"sha256:a1b2c3..."`) |
 | `harness_image_hash` | string | No | Docker image digest of the `hermes-agent` harness image (e.g. `"sha256:d4e5f6..."`) |
 | `bench_version` | string | No | Version string reported by the trajrl-bench CLI inside the sandbox container (e.g. `"v1.2.0"`) |
-| `harness_name` | string | No | Human-readable name of the agent harness baked into the sandbox image (e.g. `"Hermes"`). Reported by `trajrl_bench.cli scenarios` via a `<harness> --version` probe |
-| `harness_version` | string | No | Version of the agent harness (e.g. `"0.13.0"`) |
 | `llm_model` | string | No | LLM model identifier the validator is configured to use for evals (e.g. `"qwen/qwen3.5-35b-a3b"`) |
 | `llm_base_url` | string | No | Base URL of the OpenAI-compatible LLM endpoint the validator routes eval calls through (e.g. `"https://openrouter.ai/api/v1"`) |
 
@@ -685,8 +683,6 @@ Submit a validator heartbeat with running version, Docker image digests, and san
   "bench_image_hash": "sha256:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
   "harness_image_hash": "sha256:f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5",
   "bench_version": "v1.2.0",
-  "harness_name": "Hermes",
-  "harness_version": "0.13.0",
   "llm_model": "qwen/qwen3.5-35b-a3b",
   "llm_base_url": "https://openrouter.ai/api/v1"
 }
