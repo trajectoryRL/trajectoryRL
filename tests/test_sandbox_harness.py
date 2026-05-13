@@ -805,3 +805,176 @@ class TestPostMortemExport:
 
         # Must not raise.
         _post_mortem_export(sandbox)
+
+
+# ---------------------------------------------------------------------------
+# _gather_turns_log — dispatch logic between timeout and normal-exit paths.
+# ---------------------------------------------------------------------------
+
+
+class TestGatherTurnsLog:
+    """``_gather_turns_log`` is the integration seam between ``_run_episode``
+    and the post-mortem recovery flow. The dispatch is small but the
+    consequences of getting it wrong are large: the wrong branch means
+    either a missing transcript on timeout (the bug this PR fixes) or
+    a redundant export call on the happy path that could in principle
+    clobber a fresher in-band export with a slightly older recovery one.
+
+    These tests verify the dispatch by mocking the two collaborators
+    (``_post_mortem_export`` and ``_read_container_text``) and recording
+    call order — so they exercise the same wiring ``_run_episode`` does,
+    without needing a real Docker client or a live sandbox.
+    """
+
+    def test_post_mortem_runs_before_read_on_timeout(self, monkeypatch):
+        """On the timeout path, the recovery export must run before
+        the read — otherwise the read sees the empty turns.jsonl that
+        the in-band (killed) export left behind, and we get back the
+        same zero-length string that the bug currently produces."""
+        from unittest.mock import MagicMock
+
+        from trajectoryrl.utils import sandbox_harness
+
+        calls: list[tuple] = []
+
+        def fake_post_mortem(sb):
+            calls.append(("post_mortem", sb))
+
+        def fake_read(sb, path):
+            calls.append(("read", path))
+            return "recovered turns content"
+
+        monkeypatch.setattr(
+            sandbox_harness, "_post_mortem_export", fake_post_mortem,
+        )
+        monkeypatch.setattr(
+            sandbox_harness, "_read_container_text", fake_read,
+        )
+
+        sandbox = MagicMock()
+        result = sandbox_harness._gather_turns_log(sandbox, timed_out=True)
+
+        # Post-mortem first, read second, with the well-known path.
+        assert [c[0] for c in calls] == ["post_mortem", "read"]
+        assert calls[0] == ("post_mortem", sandbox)
+        assert calls[1] == ("read", "/workspace/turns.jsonl")
+        assert result == "recovered turns content"
+
+    def test_post_mortem_skipped_on_normal_exit(self, monkeypatch):
+        """On the normal-exit path the agent's bash wrapper has already
+        run its in-band ``hermes sessions export``. Re-running it here
+        would be redundant work plus a small risk: if hermes has any
+        race window between session save and session export, a second
+        export from a different process could capture a slightly older
+        snapshot than the in-band one. Skip on the happy path."""
+        from unittest.mock import MagicMock
+
+        from trajectoryrl.utils import sandbox_harness
+
+        calls: list[tuple] = []
+
+        def fake_post_mortem(sb):
+            calls.append(("post_mortem", sb))
+
+        def fake_read(sb, path):
+            calls.append(("read", path))
+            return "in-band export content"
+
+        monkeypatch.setattr(
+            sandbox_harness, "_post_mortem_export", fake_post_mortem,
+        )
+        monkeypatch.setattr(
+            sandbox_harness, "_read_container_text", fake_read,
+        )
+
+        sandbox = MagicMock()
+        result = sandbox_harness._gather_turns_log(sandbox, timed_out=False)
+
+        # No post-mortem on normal path; read happens with the same path.
+        assert "post_mortem" not in [c[0] for c in calls]
+        assert calls == [("read", "/workspace/turns.jsonl")]
+        assert result == "in-band export content"
+
+
+# ---------------------------------------------------------------------------
+# End-to-end-ish: timeout → recover → write produces non-empty turns.jsonl.
+# ---------------------------------------------------------------------------
+
+
+class TestTimedOutRecoveryE2E:
+    """Closes the loop on the timeout-recovery PR: the helper recovers
+    a populated ``turns_log``, that flows through the episode result,
+    and ``write_artifacts`` produces a non-empty ``turns.jsonl`` on
+    disk where the bug condition left it MISSING.
+
+    This is end-to-end across the seam without needing a real Docker
+    client — mocks the two collaborators of ``_gather_turns_log``,
+    everything downstream is real code paths.
+    """
+
+    def test_recovered_turns_log_lands_on_disk_after_timeout(
+        self, tmp_path, monkeypatch,
+    ):
+        from unittest.mock import MagicMock
+
+        from trajectoryrl.utils import sandbox_harness
+
+        # Simulate the post-mortem export: when it runs against the
+        # session store, the subsequent read returns the recovered
+        # content. Mirrors real hermes behavior: session data is on
+        # disk; the export turns it into the well-known file.
+        state = {"exported": False}
+        recovered = (
+            '{"role":"user","content":"go"}\n'
+            '{"role":"assistant","content":"writing /app/out.html"}\n'
+        )
+
+        def fake_post_mortem(sb):
+            state["exported"] = True
+
+        def fake_read(sb, path):
+            if path == "/workspace/turns.jsonl" and state["exported"]:
+                return recovered
+            return ""
+
+        monkeypatch.setattr(
+            sandbox_harness, "_post_mortem_export", fake_post_mortem,
+        )
+        monkeypatch.setattr(
+            sandbox_harness, "_read_container_text", fake_read,
+        )
+
+        # Mirror _run_episode's gather step on the timeout path.
+        sandbox = MagicMock()
+        turns_log = sandbox_harness._gather_turns_log(sandbox, timed_out=True)
+        assert turns_log == recovered  # sanity: recovery actually happened
+
+        # Build the session result the way _run_episode would, with the
+        # recovered turns_log set on the episode.
+        sr = _SessionResult(episodes=[
+            _EpisodeResult(
+                episode_index=0,
+                scenario="demo-scenario",
+                quality=0.0,
+                timed_out=True,
+                turns_log=turns_log,
+                judge_result={
+                    "reward": 0, "passed": 0, "total": 1,
+                    "verifier_stdout": "", "ctrf": None,
+                },
+            ),
+        ])
+        sr.compute_scores()
+        result = SandboxEvaluationResult(sr)
+        out = tmp_path / "artifacts"
+        result.write_artifacts(out)
+
+        # The artifact reviewers depend on must exist with content.
+        # Pre-recovery, this file was MISSING from real timeout runs
+        ep_dir = out / "episodes" / "scenario_demo-scenario"
+        turns_file = ep_dir / "turns.jsonl"
+        assert turns_file.exists(), (
+            "turns.jsonl missing after timeout recovery — recovered "
+            "content didn't make it through write_artifacts"
+        )
+        assert turns_file.read_text() == recovered
