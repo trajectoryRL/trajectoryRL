@@ -192,6 +192,49 @@ def _pick_episode_timeout(spec: dict, config_default: float) -> float:
     return float(config_default)
 
 
+def _post_mortem_export(sandbox) -> None:
+    """Re-run ``hermes sessions export`` against the persistent session
+    store after the agent's bash wrapper has been killed.
+
+    Without this, when ``_kill_hermes`` (the timeout handler) sends
+    ``pkill -KILL -f hermes`` it matches both the python ``hermes
+    chat`` process *and* the ``bash -c '... hermes ...'`` wrapper —
+    the wrapper dies before reaching its in-band
+    ``hermes sessions export`` step, leaving ``/workspace/turns.jsonl``
+    empty and making timeout-killed runs completely undebuggable.
+
+    The hermes session store is persistent on disk under the hermes
+    user's home directory, so ``hermes sessions export`` still works
+    after the chat process is gone. We invoke it from outside the
+    killed wrapper, writing to the same ``/workspace/turns.jsonl``
+    path the caller's ``_read_container_text`` already expects.
+
+    Best-effort: if the container is gone, docker is disconnected,
+    or hermes itself errors out, swallow the exception. This runs
+    on an already-failing path; propagating would crash
+    ``_run_episode`` and lose every other artifact still available
+    (verifier output, evaluation.json).
+    """
+    try:
+        sandbox.exec_run(
+            [
+                "bash",
+                "-c",
+                # Append (not overwrite) to turns_export.err so we
+                # don't clobber whatever the in-band export wrote
+                # before it died.
+                "hermes sessions export /workspace/turns.jsonl "
+                "2>>/workspace/turns_export.err; "
+                "echo \"export_rc=$? path=post_mortem\" "
+                ">>/workspace/turns_export.err",
+            ],
+            user="hermes",
+            workdir="/workspace",
+        )
+    except Exception as e:
+        logger.warning("post-mortem hermes sessions export failed: %s", e)
+
+
 # ---------------------------------------------------------------------------
 # Result types
 # ---------------------------------------------------------------------------
@@ -1159,6 +1202,16 @@ class TrajectorySandboxHarness:
                         "[%s] %s on_chat_end callback failed: %s",
                         session_id, scenario, e,
                     )
+
+            # On the timeout path, ``_kill_hermes`` matched the bash
+            # wrapper by cmdline and killed it before the in-band
+            # ``hermes sessions export`` step. Re-run the export here
+            # from outside the killed wrapper — the session store is
+            # persistent, so the data is still recoverable. No-op on
+            # the normal path (overwrites the in-band export's result
+            # with an equivalent one).
+            if episode.timed_out:
+                _post_mortem_export(sandbox)
 
             episode.turns_log = _read_container_text(
                 sandbox, "/workspace/turns.jsonl",
