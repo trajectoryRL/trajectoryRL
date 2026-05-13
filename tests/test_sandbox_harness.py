@@ -881,23 +881,32 @@ class TestGatherTurnsLog:
     without needing a real Docker client or a live sandbox.
     """
 
-    def test_post_mortem_runs_before_read_on_timeout(self, monkeypatch):
-        """On the timeout path, the recovery export must run before
-        the read — otherwise the read sees the empty turns.jsonl that
-        the in-band (killed) export left behind, and we get back the
-        same zero-length string that the bug currently produces."""
+    def test_post_mortem_runs_as_fallback_when_initial_read_empty(self, monkeypatch):
+        """When the initial read on the timeout path returns empty —
+        meaning the in-band export inside the bash wrapper didn't
+        produce data (kill went through some other path, container
+        restart mid-export, older sandbox image, etc.) — the
+        post-mortem export runs as the fallback recovery, and a
+        second read picks up whatever it produced.
+
+        Sequence: read (empty) → post_mortem → read (populated).
+        """
         from unittest.mock import MagicMock
 
         from trajectoryrl.utils import sandbox_harness
 
         calls: list[tuple] = []
+        # First read returns empty (the bug state). Post-mortem flips
+        # the gate so the second read returns the recovered content.
+        state = {"exported": False}
 
         def fake_post_mortem(sb):
             calls.append(("post_mortem", sb))
+            state["exported"] = True
 
         def fake_read(sb, path):
             calls.append(("read", path))
-            return "recovered turns content"
+            return "recovered turns content" if state["exported"] else ""
 
         monkeypatch.setattr(
             sandbox_harness, "_post_mortem_export", fake_post_mortem,
@@ -909,10 +918,11 @@ class TestGatherTurnsLog:
         sandbox = MagicMock()
         result = sandbox_harness._gather_turns_log(sandbox, timed_out=True)
 
-        # Post-mortem first, read second, with the well-known path.
-        assert [c[0] for c in calls] == ["post_mortem", "read"]
-        assert calls[0] == ("post_mortem", sandbox)
-        assert calls[1] == ("read", "/workspace/turns.jsonl")
+        # Read first (returns empty), then post-mortem, then read again.
+        assert [c[0] for c in calls] == ["read", "post_mortem", "read"]
+        assert calls[0] == ("read", "/workspace/turns.jsonl")
+        assert calls[1] == ("post_mortem", sandbox)
+        assert calls[2] == ("read", "/workspace/turns.jsonl")
         assert result == "recovered turns content"
 
     def test_post_mortem_skipped_when_in_band_already_populated(self, monkeypatch):

@@ -238,21 +238,35 @@ def _post_mortem_export(sandbox) -> None:
 def _gather_turns_log(sandbox, timed_out: bool) -> str:
     """Read the agent's session export from ``/workspace/turns.jsonl``.
 
-    On the timeout path the in-band ``hermes sessions export`` inside
-    the agent's bash wrapper gets killed before it runs; we re-run
-    the export from outside the wrapper first via
-    ``_post_mortem_export``. The session store is persistent on disk,
-    so the export still works after the chat process is gone.
+    Read-first-then-fallback dispatch on the timeout path:
 
-    On the normal-exit path the in-band export has already populated
-    ``turns.jsonl`` and we just read it. We deliberately do NOT call
-    ``_post_mortem_export`` here — re-exporting on the normal path
-    would be redundant and risks clobbering a fresher export with a
-    slightly older one if hermes has any race window between session
-    save and session export.
+    1. Read ``turns.jsonl`` once. With the narrow-kill fix in place
+       the bash wrapper survives the timeout kill and runs its
+       in-band ``hermes sessions export`` naturally, so this read
+       returns the full session in the common case.
+    2. If the read returned empty, run ``_post_mortem_export`` as a
+       fallback (kill went through something other than the wrapper,
+       container restart mid-export, image without the in-band
+       export step, etc.) and read again.
+
+    Skipping post-mortem when the initial read is populated avoids
+    two problems: (a) a race against any in-band export still
+    finishing — two processes writing to the same file truncate and
+    overwrite each other — and (b) redundant work, since both
+    exports produce identical bytes from the same SQLite session
+    store.
+
+    On the normal-exit path the wrapper has already completed its
+    in-band export; just read.
     """
     if timed_out:
-        _post_mortem_export(sandbox)
+        turns_log = _read_container_text(sandbox, "/workspace/turns.jsonl")
+        if not turns_log:
+            _post_mortem_export(sandbox)
+            turns_log = _read_container_text(
+                sandbox, "/workspace/turns.jsonl",
+            )
+        return turns_log
     return _read_container_text(sandbox, "/workspace/turns.jsonl")
 
 
