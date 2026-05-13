@@ -316,6 +316,61 @@ class TestWriteArtifacts:
         assert not (ep0 / "ctrf.json").exists()
         assert not (ep0 / "verifier_stdout.txt").exists()
 
+    def test_writes_turns_jsonl_when_turns_log_populated(self, tmp_path):
+        """When the episode carries a populated ``turns_log`` (in-band
+        export ran, or post-mortem recovery succeeded), the writer
+        produces ``turns.jsonl`` on disk with that content. This is
+        the artifact reviewers and the cost parser depend on."""
+        sr = _SessionResult(episodes=[
+            _EpisodeResult(
+                episode_index=0,
+                scenario="demo-scenario",
+                quality=0.0,
+                turns_log='{"role":"user","content":"hi"}\n',
+                judge_result={
+                    "reward": 0, "passed": 0, "total": 1,
+                    "verifier_stdout": "", "ctrf": None,
+                },
+            ),
+        ])
+        sr.compute_scores()
+        result = SandboxEvaluationResult(sr)
+        out = tmp_path / "artifacts"
+        result.write_artifacts(out)
+
+        ep_dir = out / "episodes" / "scenario_demo-scenario"
+        assert (ep_dir / "turns.jsonl").exists()
+        assert (ep_dir / "turns.jsonl").read_text() == (
+            '{"role":"user","content":"hi"}\n'
+        )
+
+    def test_skips_turns_jsonl_when_turns_log_empty(self, tmp_path):
+        """When ``turns_log`` is empty the writer silently omits the
+        file — this is the on-disk symptom of the timeout-export bug
+        before recovery is in place. Documented here so a future
+        refactor that always writes an empty file (or always-writes-
+        even-empty) gets caught.
+        """
+        sr = _SessionResult(episodes=[
+            _EpisodeResult(
+                episode_index=0,
+                scenario="demo-scenario",
+                quality=0.0,
+                turns_log="",  # pre-recovery state: the bug condition
+                judge_result={
+                    "reward": 0, "passed": 0, "total": 1,
+                    "verifier_stdout": "", "ctrf": None,
+                },
+            ),
+        ])
+        sr.compute_scores()
+        result = SandboxEvaluationResult(sr)
+        out = tmp_path / "artifacts"
+        result.write_artifacts(out)
+
+        ep_dir = out / "episodes" / "scenario_demo-scenario"
+        assert not (ep_dir / "turns.jsonl").exists()
+
 
 class TestEvalResultCostAggregation:
     def test_sums_billed_scenarios(self):
