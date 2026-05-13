@@ -915,6 +915,62 @@ class TestGatherTurnsLog:
         assert calls[1] == ("read", "/workspace/turns.jsonl")
         assert result == "recovered turns content"
 
+    def test_post_mortem_skipped_when_in_band_already_populated(self, monkeypatch):
+        """When the bash wrapper survives the timeout kill (which it
+        does once the kill targets only the chat process, not the
+        wrapper), it runs its in-band ``hermes sessions export``
+        naturally. By the time ``_gather_turns_log`` runs, the
+        ``/workspace/turns.jsonl`` file is already populated.
+
+        Running post-mortem export at that point is two problems:
+
+        1. Two writers to the same path. The bash wrapper may still
+           be flushing its export when post-mortem kicks off; both
+           processes open ``/workspace/turns.jsonl`` for writing,
+           and the second one truncates and overwrites — last
+           writer wins, possibly leaving a partial result if either
+           is killed mid-write.
+
+        2. Redundant work. Both exports produce identical bytes from
+           the same SQLite session store; the second one wastes
+           container exec round-trips for no semantic difference.
+
+        Read-first dispatch: try the read first; only run post-mortem
+        if the initial read returned empty (some other path broke
+        the in-band flow). When the initial read returns content,
+        the post-mortem step is skipped entirely.
+        """
+        from unittest.mock import MagicMock
+
+        from trajectoryrl.utils import sandbox_harness
+
+        calls: list[tuple] = []
+
+        def fake_post_mortem(sb):
+            calls.append(("post_mortem", sb))
+
+        def fake_read(sb, path):
+            calls.append(("read", path))
+            return "in-band export already populated this"
+
+        monkeypatch.setattr(
+            sandbox_harness, "_post_mortem_export", fake_post_mortem,
+        )
+        monkeypatch.setattr(
+            sandbox_harness, "_read_container_text", fake_read,
+        )
+
+        sandbox = MagicMock()
+        result = sandbox_harness._gather_turns_log(sandbox, timed_out=True)
+
+        assert "post_mortem" not in [c[0] for c in calls], (
+            "Post-mortem ran even though the initial read returned "
+            "content. Racing against any in-band export still in "
+            "progress; the second writer may overwrite the first."
+        )
+        assert calls == [("read", "/workspace/turns.jsonl")]
+        assert result == "in-band export already populated this"
+
     def test_post_mortem_skipped_on_normal_exit(self, monkeypatch):
         """On the normal-exit path the agent's bash wrapper has already
         run its in-band ``hermes sessions export``. Re-running it here
