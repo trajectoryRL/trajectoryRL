@@ -235,6 +235,27 @@ def _post_mortem_export(sandbox) -> None:
         logger.warning("post-mortem hermes sessions export failed: %s", e)
 
 
+def _gather_turns_log(sandbox, timed_out: bool) -> str:
+    """Read the agent's session export from ``/workspace/turns.jsonl``.
+
+    On the timeout path the in-band ``hermes sessions export`` inside
+    the agent's bash wrapper gets killed before it runs; we re-run
+    the export from outside the wrapper first via
+    ``_post_mortem_export``. The session store is persistent on disk,
+    so the export still works after the chat process is gone.
+
+    On the normal-exit path the in-band export has already populated
+    ``turns.jsonl`` and we just read it. We deliberately do NOT call
+    ``_post_mortem_export`` here — re-exporting on the normal path
+    would be redundant and risks clobbering a fresher export with a
+    slightly older one if hermes has any race window between session
+    save and session export.
+    """
+    if timed_out:
+        _post_mortem_export(sandbox)
+    return _read_container_text(sandbox, "/workspace/turns.jsonl")
+
+
 # ---------------------------------------------------------------------------
 # Result types
 # ---------------------------------------------------------------------------
@@ -1203,18 +1224,8 @@ class TrajectorySandboxHarness:
                         session_id, scenario, e,
                     )
 
-            # On the timeout path, ``_kill_hermes`` matched the bash
-            # wrapper by cmdline and killed it before the in-band
-            # ``hermes sessions export`` step. Re-run the export here
-            # from outside the killed wrapper — the session store is
-            # persistent, so the data is still recoverable. No-op on
-            # the normal path (overwrites the in-band export's result
-            # with an equivalent one).
-            if episode.timed_out:
-                _post_mortem_export(sandbox)
-
-            episode.turns_log = _read_container_text(
-                sandbox, "/workspace/turns.jsonl",
+            episode.turns_log = _gather_turns_log(
+                sandbox, episode.timed_out,
             )
             episode.turns_export_err = _read_container_text(
                 sandbox, "/workspace/turns_export.err",
