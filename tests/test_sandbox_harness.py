@@ -730,3 +730,78 @@ class TestPickEpisodeTimeout:
         result = _pick_episode_timeout(spec, config_default=600)
         assert isinstance(result, float)
         assert result == 123.0
+
+
+# ---------------------------------------------------------------------------
+# _post_mortem_export — recover transcript when timeout killed in-band export.
+# ---------------------------------------------------------------------------
+
+
+class TestPostMortemExport:
+    """When the timeout handler kills the agent's bash wrapper via
+    ``pkill -KILL -f hermes`` before it reaches the in-band
+    ``hermes sessions export`` step, ``turns.jsonl`` is left empty and
+    the run becomes undebuggable (zero-byte transcript).
+
+    The post-mortem export runs ``hermes sessions export`` again from
+    outside the killed wrapper. Hermes session storage is persistent
+    on disk, so the export still works after the chat process is
+    gone.
+
+    The tests below verify the helper exists, invokes the right
+    command, and swallows exceptions so a follow-on failure here
+    doesn't mask whatever caused the original timeout.
+    """
+
+    def test_invokes_hermes_sessions_export(self):
+        """Calls ``hermes sessions export`` via ``sandbox.exec_run``,
+        writing to ``/workspace/turns.jsonl`` so the existing
+        ``_read_container_text`` call later in ``_run_episode``
+        finds the recovered data at the path it already expects."""
+        from unittest.mock import MagicMock
+
+        from trajectoryrl.utils.sandbox_harness import _post_mortem_export
+
+        sandbox = MagicMock()
+        _post_mortem_export(sandbox)
+
+        sandbox.exec_run.assert_called_once()
+        cmd = sandbox.exec_run.call_args[0][0]
+        # Expect ["bash", "-c", "<script with hermes sessions export>"]
+        assert cmd[0] == "bash"
+        assert cmd[1] == "-c"
+        assert "hermes sessions export" in cmd[2]
+        assert "/workspace/turns.jsonl" in cmd[2]
+
+    def test_runs_as_hermes_user_in_workspace(self):
+        """``hermes sessions`` reads its store from the hermes user's
+        home directory; running export as root or a different user
+        would miss the session data. ``/workspace`` is also where the
+        in-band export writes, matching the path the caller reads."""
+        from unittest.mock import MagicMock
+
+        from trajectoryrl.utils.sandbox_harness import _post_mortem_export
+
+        sandbox = MagicMock()
+        _post_mortem_export(sandbox)
+
+        kwargs = sandbox.exec_run.call_args[1]
+        assert kwargs.get("user") == "hermes"
+        assert kwargs.get("workdir") == "/workspace"
+
+    def test_swallows_exec_run_exception(self):
+        """Post-mortem export is a recovery step on an already-failing
+        path. If the container is gone, docker is disconnected, or
+        hermes itself errors out, propagating the exception would
+        crash ``_run_episode`` and lose every other artifact we
+        could still gather (verifier output, evaluation.json). Best
+        effort: try, log, move on."""
+        from unittest.mock import MagicMock
+
+        from trajectoryrl.utils.sandbox_harness import _post_mortem_export
+
+        sandbox = MagicMock()
+        sandbox.exec_run.side_effect = RuntimeError("docker disconnected")
+
+        # Must not raise.
+        _post_mortem_export(sandbox)
