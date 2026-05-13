@@ -730,3 +730,70 @@ class TestPickEpisodeTimeout:
         result = _pick_episode_timeout(spec, config_default=600)
         assert isinstance(result, float)
         assert result == 123.0
+
+
+# ---------------------------------------------------------------------------
+# _kill_chat_process — release blocked exec socket without killing the
+# bash wrapper that runs the in-band session export.
+# ---------------------------------------------------------------------------
+
+
+class TestKillChatProcess:
+    """The timeout handler must kill the agent's hermes chat process so
+    the docker exec_start socket releases, but must NOT kill the bash
+    wrapper that runs the in-band ``hermes sessions export`` after
+    chat returns.
+
+    The previous implementation ran ``pkill -KILL -f hermes``. The
+    ``-f`` flag matches the full command line, which catches both the
+    python ``hermes`` chat process *and* the
+    ``bash -c '...; hermes chat ...; hermes sessions export ...'``
+    wrapper that exec was registered under — because the wrapper's
+    argv contains the string "hermes" in its script body. Killing
+    the wrapper destroys the in-band export step, leaving
+    ``turns.jsonl`` empty after every timeout.
+
+    The hermes binary is a setuptools entry-point script that the
+    kernel reports with ``comm=hermes`` (verified via ``ps -eo comm``
+    inside the sandbox-agent image). Process-name match (``pkill
+    hermes`` without ``-f``) targets only that process; the wrapper's
+    ``comm`` is ``bash`` and survives. The wrapper's ``wait`` returns
+    with exit-status 137, the script continues past the kill point,
+    and the in-band export runs naturally.
+    """
+
+    def test_uses_narrow_process_name_match_not_cmdline(self):
+        """The ``-f`` flag is the bug — matches the wrapper's script
+        body which contains the string "hermes". Process-name match
+        (no ``-f``) targets only the hermes process whose ``comm`` is
+        literally "hermes"; the wrapper's ``comm`` is "bash" and is
+        spared."""
+        from unittest.mock import MagicMock
+
+        from trajectoryrl.utils.sandbox_harness import _kill_chat_process
+
+        sandbox = MagicMock()
+        _kill_chat_process(sandbox)
+
+        sandbox.exec_run.assert_called_once()
+        cmd = sandbox.exec_run.call_args[0][0]
+        assert "-f" not in cmd, (
+            f"-f flag matches by cmdline, which kills the bash wrapper "
+            f"because its argv contains 'hermes'. Got: {cmd}"
+        )
+        assert "hermes" in cmd
+        assert "-KILL" in cmd
+
+    def test_runs_as_root(self):
+        """The hermes process runs as a non-root user inside the
+        sandbox. Killing it from outside the bash wrapper requires
+        root."""
+        from unittest.mock import MagicMock
+
+        from trajectoryrl.utils.sandbox_harness import _kill_chat_process
+
+        sandbox = MagicMock()
+        _kill_chat_process(sandbox)
+
+        kwargs = sandbox.exec_run.call_args[1]
+        assert kwargs.get("user") == "root"
