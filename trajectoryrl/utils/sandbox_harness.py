@@ -192,6 +192,45 @@ def _pick_episode_timeout(spec: dict, config_default: float) -> float:
     return float(config_default)
 
 
+def _kill_chat_process(sandbox) -> None:
+    """Kill the hermes chat process so the blocked exec_start socket
+    releases. Uses process-name match (not cmdline match) so the
+    surrounding bash wrapper survives and runs its in-band session
+    export step.
+
+    Background: ``hermes chat`` is invoked inside a bash wrapper that
+    looks like ``bash -c 'set +e; hermes chat ...; hermes sessions
+    export /workspace/turns.jsonl; exit $?'``. On timeout we want to
+    kill the python chat process so docker's exec_start unblocks and
+    the wrapper proceeds to its export step. We do NOT want to kill
+    the wrapper itself, because then the export never runs and
+    turns.jsonl ends up empty.
+
+    The previous implementation called ``pkill -KILL -f hermes``.
+    ``-f`` matches the full command line, which catches both the
+    python ``hermes`` chat process *and* the bash wrapper — the
+    wrapper's argv contains the literal string "hermes" in its
+    script body, so the pattern matches it too. The wrapper died
+    before reaching the export step on every timeout, leaving
+    ``turns.jsonl`` empty.
+
+    The hermes binary is a setuptools entry-point script whose
+    process ``comm`` is "hermes" (verified inside the sandbox-agent
+    image via ``ps -eo pid,ppid,comm``). The bash wrapper's
+    ``comm`` is "bash". ``pkill hermes`` without ``-f`` matches by
+    ``comm``, so it kills only the chat process. The wrapper's
+    ``wait`` returns with exit-status 137, the script continues past
+    the kill point, and the in-band export runs naturally.
+
+    Runs as root because the chat process is owned by the non-root
+    hermes user; pkill needs privilege to send it a signal.
+    """
+    sandbox.exec_run(
+        ["pkill", "-KILL", "hermes"],
+        user="root",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Result types
 # ---------------------------------------------------------------------------
@@ -1115,26 +1154,11 @@ class TrajectorySandboxHarness:
 
             stream = self.client.api.exec_start(exec_id, stream=True, demux=False)
 
-            def _kill_hermes() -> None:
-                # Releases the blocked exec_start socket so we can
-                # proceed to teardown instead of waiting on the
-                # finally-block's container.stop().
-                #
-                # ``-f hermes`` matches by cmdline pattern, which is
-                # intentionally broad: it kills both the ``hermes chat``
-                # python process and the ``bash -c '... hermes chat ...'``
-                # wrapper that exec was registered under. The agent user
-                # in the sandbox-agent image is the only thing in the
-                # container, so collateral on other processes is not a
-                # concern.
-                sandbox.exec_run(
-                    ["pkill", "-KILL", "-f", "hermes"],
-                    user="root",
-                )
-
             transcript_chunks, episode.timed_out = (
                 _drain_exec_stream_with_deadline(
-                    stream, timeout=timeout, on_deadline=_kill_hermes,
+                    stream,
+                    timeout=timeout,
+                    on_deadline=lambda: _kill_chat_process(sandbox),
                 )
             )
             episode.transcript = b"".join(transcript_chunks).decode(
