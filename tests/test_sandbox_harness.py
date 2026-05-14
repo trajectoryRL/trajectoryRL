@@ -316,6 +316,61 @@ class TestWriteArtifacts:
         assert not (ep0 / "ctrf.json").exists()
         assert not (ep0 / "verifier_stdout.txt").exists()
 
+    def test_writes_turns_jsonl_when_turns_log_populated(self, tmp_path):
+        """When the episode carries a populated ``turns_log`` (in-band
+        export ran, or post-mortem recovery succeeded), the writer
+        produces ``turns.jsonl`` on disk with that content. This is
+        the artifact reviewers and the cost parser depend on."""
+        sr = _SessionResult(episodes=[
+            _EpisodeResult(
+                episode_index=0,
+                scenario="demo-scenario",
+                quality=0.0,
+                turns_log='{"role":"user","content":"hi"}\n',
+                judge_result={
+                    "reward": 0, "passed": 0, "total": 1,
+                    "verifier_stdout": "", "ctrf": None,
+                },
+            ),
+        ])
+        sr.compute_scores()
+        result = SandboxEvaluationResult(sr)
+        out = tmp_path / "artifacts"
+        result.write_artifacts(out)
+
+        ep_dir = out / "episodes" / "scenario_demo-scenario"
+        assert (ep_dir / "turns.jsonl").exists()
+        assert (ep_dir / "turns.jsonl").read_text() == (
+            '{"role":"user","content":"hi"}\n'
+        )
+
+    def test_skips_turns_jsonl_when_turns_log_empty(self, tmp_path):
+        """When ``turns_log`` is empty the writer silently omits the
+        file — this is the on-disk symptom of the timeout-export bug
+        before recovery is in place. Documented here so a future
+        refactor that always writes an empty file (or always-writes-
+        even-empty) gets caught.
+        """
+        sr = _SessionResult(episodes=[
+            _EpisodeResult(
+                episode_index=0,
+                scenario="demo-scenario",
+                quality=0.0,
+                turns_log="",  # pre-recovery state: the bug condition
+                judge_result={
+                    "reward": 0, "passed": 0, "total": 1,
+                    "verifier_stdout": "", "ctrf": None,
+                },
+            ),
+        ])
+        sr.compute_scores()
+        result = SandboxEvaluationResult(sr)
+        out = tmp_path / "artifacts"
+        result.write_artifacts(out)
+
+        ep_dir = out / "episodes" / "scenario_demo-scenario"
+        assert not (ep_dir / "turns.jsonl").exists()
+
 
 class TestEvalResultCostAggregation:
     def test_sums_billed_scenarios(self):
@@ -797,3 +852,317 @@ class TestKillChatProcess:
 
         kwargs = sandbox.exec_run.call_args[1]
         assert kwargs.get("user") == "root"
+
+
+# ---------------------------------------------------------------------------
+# _post_mortem_export — recover transcript when timeout killed in-band export.
+# ---------------------------------------------------------------------------
+
+
+class TestPostMortemExport:
+    """When the timeout handler kills the agent's bash wrapper via
+    ``pkill -KILL -f hermes`` before it reaches the in-band
+    ``hermes sessions export`` step, ``turns.jsonl`` is left empty and
+    the run becomes undebuggable (zero-byte transcript).
+
+    The post-mortem export runs ``hermes sessions export`` again from
+    outside the killed wrapper. Hermes session storage is persistent
+    on disk, so the export still works after the chat process is
+    gone.
+
+    The tests below verify the helper exists, invokes the right
+    command, and swallows exceptions so a follow-on failure here
+    doesn't mask whatever caused the original timeout.
+    """
+
+    def test_invokes_hermes_sessions_export(self):
+        """Calls ``hermes sessions export`` via ``sandbox.exec_run``,
+        writing to ``/workspace/turns.jsonl`` so the existing
+        ``_read_container_text`` call later in ``_run_episode``
+        finds the recovered data at the path it already expects."""
+        from unittest.mock import MagicMock
+
+        from trajectoryrl.utils.sandbox_harness import _post_mortem_export
+
+        sandbox = MagicMock()
+        _post_mortem_export(sandbox)
+
+        sandbox.exec_run.assert_called_once()
+        cmd = sandbox.exec_run.call_args[0][0]
+        # Expect ["bash", "-c", "<script with hermes sessions export>"]
+        assert cmd[0] == "bash"
+        assert cmd[1] == "-c"
+        assert "hermes sessions export" in cmd[2]
+        assert "/workspace/turns.jsonl" in cmd[2]
+
+    def test_runs_as_hermes_user_in_workspace(self):
+        """``hermes sessions`` reads its store from the hermes user's
+        home directory; running export as root or a different user
+        would miss the session data. ``/workspace`` is also where the
+        in-band export writes, matching the path the caller reads."""
+        from unittest.mock import MagicMock
+
+        from trajectoryrl.utils.sandbox_harness import _post_mortem_export
+
+        sandbox = MagicMock()
+        _post_mortem_export(sandbox)
+
+        kwargs = sandbox.exec_run.call_args[1]
+        assert kwargs.get("user") == "hermes"
+        assert kwargs.get("workdir") == "/workspace"
+
+    def test_swallows_exec_run_exception(self):
+        """Post-mortem export is a recovery step on an already-failing
+        path. If the container is gone, docker is disconnected, or
+        hermes itself errors out, propagating the exception would
+        crash ``_run_episode`` and lose every other artifact we
+        could still gather (verifier output, evaluation.json). Best
+        effort: try, log, move on."""
+        from unittest.mock import MagicMock
+
+        from trajectoryrl.utils.sandbox_harness import _post_mortem_export
+
+        sandbox = MagicMock()
+        sandbox.exec_run.side_effect = RuntimeError("docker disconnected")
+
+        # Must not raise.
+        _post_mortem_export(sandbox)
+
+
+# ---------------------------------------------------------------------------
+# _gather_turns_log — dispatch logic between timeout and normal-exit paths.
+# ---------------------------------------------------------------------------
+
+
+class TestGatherTurnsLog:
+    """``_gather_turns_log`` is the integration seam between ``_run_episode``
+    and the post-mortem recovery flow. The dispatch is small but the
+    consequences of getting it wrong are large: the wrong branch means
+    either a missing transcript on timeout (the bug this PR fixes) or
+    a redundant export call on the happy path that could in principle
+    clobber a fresher in-band export with a slightly older recovery one.
+
+    These tests verify the dispatch by mocking the two collaborators
+    (``_post_mortem_export`` and ``_read_container_text``) and recording
+    call order — so they exercise the same wiring ``_run_episode`` does,
+    without needing a real Docker client or a live sandbox.
+    """
+
+    def test_post_mortem_runs_as_fallback_when_initial_read_empty(self, monkeypatch):
+        """When the initial read on the timeout path returns empty —
+        meaning the in-band export inside the bash wrapper didn't
+        produce data (kill went through some other path, container
+        restart mid-export, older sandbox image, etc.) — the
+        post-mortem export runs as the fallback recovery, and a
+        second read picks up whatever it produced.
+
+        Sequence: read (empty) → post_mortem → read (populated).
+        """
+        from unittest.mock import MagicMock
+
+        from trajectoryrl.utils import sandbox_harness
+
+        calls: list[tuple] = []
+        # First read returns empty (the bug state). Post-mortem flips
+        # the gate so the second read returns the recovered content.
+        state = {"exported": False}
+
+        def fake_post_mortem(sb):
+            calls.append(("post_mortem", sb))
+            state["exported"] = True
+
+        def fake_read(sb, path):
+            calls.append(("read", path))
+            return "recovered turns content" if state["exported"] else ""
+
+        monkeypatch.setattr(
+            sandbox_harness, "_post_mortem_export", fake_post_mortem,
+        )
+        monkeypatch.setattr(
+            sandbox_harness, "_read_container_text", fake_read,
+        )
+
+        sandbox = MagicMock()
+        result = sandbox_harness._gather_turns_log(sandbox, timed_out=True)
+
+        # Read first (returns empty), then post-mortem, then read again.
+        assert [c[0] for c in calls] == ["read", "post_mortem", "read"]
+        assert calls[0] == ("read", "/workspace/turns.jsonl")
+        assert calls[1] == ("post_mortem", sandbox)
+        assert calls[2] == ("read", "/workspace/turns.jsonl")
+        assert result == "recovered turns content"
+
+    def test_post_mortem_skipped_when_in_band_already_populated(self, monkeypatch):
+        """When the bash wrapper survives the timeout kill (which it
+        does once the kill targets only the chat process, not the
+        wrapper), it runs its in-band ``hermes sessions export``
+        naturally. By the time ``_gather_turns_log`` runs, the
+        ``/workspace/turns.jsonl`` file is already populated.
+
+        Running post-mortem export at that point is two problems:
+
+        1. Two writers to the same path. The bash wrapper may still
+           be flushing its export when post-mortem kicks off; both
+           processes open ``/workspace/turns.jsonl`` for writing,
+           and the second one truncates and overwrites — last
+           writer wins, possibly leaving a partial result if either
+           is killed mid-write.
+
+        2. Redundant work. Both exports produce identical bytes from
+           the same SQLite session store; the second one wastes
+           container exec round-trips for no semantic difference.
+
+        Read-first dispatch: try the read first; only run post-mortem
+        if the initial read returned empty (some other path broke
+        the in-band flow). When the initial read returns content,
+        the post-mortem step is skipped entirely.
+        """
+        from unittest.mock import MagicMock
+
+        from trajectoryrl.utils import sandbox_harness
+
+        calls: list[tuple] = []
+
+        def fake_post_mortem(sb):
+            calls.append(("post_mortem", sb))
+
+        def fake_read(sb, path):
+            calls.append(("read", path))
+            return "in-band export already populated this"
+
+        monkeypatch.setattr(
+            sandbox_harness, "_post_mortem_export", fake_post_mortem,
+        )
+        monkeypatch.setattr(
+            sandbox_harness, "_read_container_text", fake_read,
+        )
+
+        sandbox = MagicMock()
+        result = sandbox_harness._gather_turns_log(sandbox, timed_out=True)
+
+        assert "post_mortem" not in [c[0] for c in calls], (
+            "Post-mortem ran even though the initial read returned "
+            "content. Racing against any in-band export still in "
+            "progress; the second writer may overwrite the first."
+        )
+        assert calls == [("read", "/workspace/turns.jsonl")]
+        assert result == "in-band export already populated this"
+
+    def test_post_mortem_skipped_on_normal_exit(self, monkeypatch):
+        """On the normal-exit path the agent's bash wrapper has already
+        run its in-band ``hermes sessions export``. Re-running it here
+        would be redundant work plus a small risk: if hermes has any
+        race window between session save and session export, a second
+        export from a different process could capture a slightly older
+        snapshot than the in-band one. Skip on the happy path."""
+        from unittest.mock import MagicMock
+
+        from trajectoryrl.utils import sandbox_harness
+
+        calls: list[tuple] = []
+
+        def fake_post_mortem(sb):
+            calls.append(("post_mortem", sb))
+
+        def fake_read(sb, path):
+            calls.append(("read", path))
+            return "in-band export content"
+
+        monkeypatch.setattr(
+            sandbox_harness, "_post_mortem_export", fake_post_mortem,
+        )
+        monkeypatch.setattr(
+            sandbox_harness, "_read_container_text", fake_read,
+        )
+
+        sandbox = MagicMock()
+        result = sandbox_harness._gather_turns_log(sandbox, timed_out=False)
+
+        # No post-mortem on normal path; read happens with the same path.
+        assert "post_mortem" not in [c[0] for c in calls]
+        assert calls == [("read", "/workspace/turns.jsonl")]
+        assert result == "in-band export content"
+
+
+# ---------------------------------------------------------------------------
+# End-to-end-ish: timeout → recover → write produces non-empty turns.jsonl.
+# ---------------------------------------------------------------------------
+
+
+class TestTimedOutRecoveryE2E:
+    """Closes the loop on the timeout-recovery PR: the helper recovers
+    a populated ``turns_log``, that flows through the episode result,
+    and ``write_artifacts`` produces a non-empty ``turns.jsonl`` on
+    disk where the bug condition left it MISSING.
+
+    This is end-to-end across the seam without needing a real Docker
+    client — mocks the two collaborators of ``_gather_turns_log``,
+    everything downstream is real code paths.
+    """
+
+    def test_recovered_turns_log_lands_on_disk_after_timeout(
+        self, tmp_path, monkeypatch,
+    ):
+        from unittest.mock import MagicMock
+
+        from trajectoryrl.utils import sandbox_harness
+
+        # Simulate the post-mortem export: when it runs against the
+        # session store, the subsequent read returns the recovered
+        # content. Mirrors real hermes behavior: session data is on
+        # disk; the export turns it into the well-known file.
+        state = {"exported": False}
+        recovered = (
+            '{"role":"user","content":"go"}\n'
+            '{"role":"assistant","content":"writing /app/out.html"}\n'
+        )
+
+        def fake_post_mortem(sb):
+            state["exported"] = True
+
+        def fake_read(sb, path):
+            if path == "/workspace/turns.jsonl" and state["exported"]:
+                return recovered
+            return ""
+
+        monkeypatch.setattr(
+            sandbox_harness, "_post_mortem_export", fake_post_mortem,
+        )
+        monkeypatch.setattr(
+            sandbox_harness, "_read_container_text", fake_read,
+        )
+
+        # Mirror _run_episode's gather step on the timeout path.
+        sandbox = MagicMock()
+        turns_log = sandbox_harness._gather_turns_log(sandbox, timed_out=True)
+        assert turns_log == recovered  # sanity: recovery actually happened
+
+        # Build the session result the way _run_episode would, with the
+        # recovered turns_log set on the episode.
+        sr = _SessionResult(episodes=[
+            _EpisodeResult(
+                episode_index=0,
+                scenario="demo-scenario",
+                quality=0.0,
+                timed_out=True,
+                turns_log=turns_log,
+                judge_result={
+                    "reward": 0, "passed": 0, "total": 1,
+                    "verifier_stdout": "", "ctrf": None,
+                },
+            ),
+        ])
+        sr.compute_scores()
+        result = SandboxEvaluationResult(sr)
+        out = tmp_path / "artifacts"
+        result.write_artifacts(out)
+
+        # The artifact reviewers depend on must exist with content.
+        # Pre-recovery, this file was MISSING from real timeout runs
+        ep_dir = out / "episodes" / "scenario_demo-scenario"
+        turns_file = ep_dir / "turns.jsonl"
+        assert turns_file.exists(), (
+            "turns.jsonl missing after timeout recovery — recovered "
+            "content didn't make it through write_artifacts"
+        )
+        assert turns_file.read_text() == recovered
