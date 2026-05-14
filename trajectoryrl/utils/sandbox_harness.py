@@ -684,9 +684,26 @@ class TrajectorySandboxHarness:
             if not scenario_image:
                 continue
             try:
+                old_id: str | None = None
+                try:
+                    old_id = self.client.images.get(scenario_image).id
+                except docker.errors.ImageNotFound:
+                    pass
                 logger.info("Pulling scenario image: %s", scenario_image)
                 self.client.images.pull(scenario_image)
                 img = self.client.images.get(scenario_image)
+                if old_id and img.id and old_id != img.id:
+                    try:
+                        self.client.images.remove(old_id)
+                        logger.info(
+                            "Removed superseded scenario image %s (%s)",
+                            scenario_image, old_id[:19],
+                        )
+                    except docker.errors.APIError as e:
+                        logger.debug(
+                            "Skip rmi superseded %s (%s): %s",
+                            scenario_image, old_id[:19], e,
+                        )
                 digests = img.attrs.get("RepoDigests", [])
                 digest = digests[0].split("@", 1)[-1] if digests else img.id
                 self.scenario_image_hashes[scenario_name] = digest
