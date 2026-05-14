@@ -58,6 +58,7 @@ logger = logging.getLogger(__name__)
 SANDBOX_SCENARIOS: tuple[str, ...] = (
     "break-filter-js-from-html",
     "cancel-async-tasks",
+    "configure-git-webserver",
     "db-wal-recovery",
     "fix-git",
     "log-summary-date-ranges",
