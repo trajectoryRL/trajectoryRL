@@ -43,6 +43,10 @@ SKIP_INVALID_PACK = "invalid_pack_structure"  # pack JSON parsed but root / file
 SKIP_MISSING_SKILL_MD = "missing_skill_md"
 SKIP_EMPTY_SKILL_MD = "empty_skill_md"
 SKIP_S1_EVAL_ERROR = "s1_eval_error"
+# Harness gave up on remaining scenarios because the active challenge
+# epoch had moved on. The validator discards the partial session rather
+# than POSTing a score whose missing scenarios would be counted as 0.
+SKIP_EPOCH_CHANGED = "epoch_changed_mid_eval"
 
 
 @dataclass
@@ -191,6 +195,18 @@ async def evaluate_miner_s1(
             sandbox_result=result,
             skip_reason=SKIP_S1_EVAL_ERROR,
             skip_detail=result.error,
+        )
+
+    if result.aborted_mid_session:
+        log.info(
+            "S1 evaluation aborted mid-session: epoch moved on after "
+            "%d/%d scenarios; discarding partial result",
+            len(result.scenarios), len(harness.sandbox_scenarios),
+        )
+        return MinerEvalOutcome(
+            success=False,
+            sandbox_result=result,
+            skip_reason=SKIP_EPOCH_CHANGED,
         )
 
     # Step 3: Per-episode transcript tail logging (file-only via mlog)
