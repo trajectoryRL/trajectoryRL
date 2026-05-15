@@ -2,97 +2,100 @@
 
 **Applies to**: Season 1 (Self-Learning Agents)
 
-**Version**: 1.0
+**Version**: 2.0
 
-**Date**: 2026-04-21
+**Date**: 2026-05-14
 
-**Parent document**: [INCENTIVE_MECHANISM.md](INCENTIVE_MECHANISM.md) v5.0
+**Parent document**: [INCENTIVE_MECHANISM.md](INCENTIVE_MECHANISM.md)
 
-**Full design document**: [seasons/self_learning_s1.md](seasons/self_learning_s1.md) — architecture, mock strategy, episode design, scoring algorithm, scenarios, risk analysis
+**Full design document**: [seasons/self_learning_s1.md](seasons/self_learning_s1.md) — architecture, scoring algorithm, scenario set, versioning, anti-gaming
 
 ---
 
 ## Overview
 
-This document is the **concise spec** for Season 1's evaluation business logic: how packs are scored, what schema they must follow, what the evaluation benchmark looks like, and what measures prevent gaming at the scoring layer. For the comprehensive design rationale, three-container architecture details, fixture factory, chained continuity design, and scenario descriptions, see the [Season 1 Design Document](seasons/self_learning_s1.md).
+This is the **concise spec** for Season 1's evaluation business logic: how packs are scored, what schema they must follow, what the evaluation benchmark looks like, and which pre-eval / runtime checks gate weight assignment. For the full design rationale, sandbox architecture, and scenario list, see the [Season 1 Design Document](seasons/self_learning_s1.md).
 
 The underlying consensus protocol, reward distribution, and winner-take-all mechanics are defined in [INCENTIVE_MECHANISM.md](INCENTIVE_MECHANISM.md) and remain stable across seasons. This document may change when the competition format evolves.
+
+> **2026-05 architecture pivot.** Season 1 v1.0 of this doc described a 3-container (sandbox + testee + judge) agent-judge architecture with mock services. That design was deprecated 2026-05-03 and removed 2026-05-11. Current evaluation is one **unified scenario container** per scenario, scored by a fresh verifier container running `tests/test.sh` → `ctrf.json`. No agent judge, no mock services, no per-rep fixture variation.
 
 ---
 
 ## Competition Metric
 
-**Season 1** uses **quality-based competition**: an agent judge scores each episode, and the miner with the highest quality score wins.
+Season 1 uses **quality-based competition**: per-scenario `passed/total` from a programmatic verifier, summed across a fixed scenario set. Higher is better.
 
 ```
 score_direction = higher_is_better
 better(challenger, winner, δ) = challenger > winner × (1 + δ)
 ```
 
+Winner protection: `δ = 0.10` (challenger must score at least 10% higher than the reigning winner to displace).
+
 ---
 
-## Scoring: Agent Judge
+## Scoring
 
-Scoring uses an **agent judge** that independently explores the sandbox environment and grades the testee agent's work. The judge reads a natural-language rubric (`JUDGE.md` per scenario) and produces a quality score.
+### Per scenario
 
-### Evaluation Architecture
+The validator runs the testee agent inside a fresh scenario container (`FROM ghcr.io/trajectoryrl/sandbox-agent:tag` + scenario-specific deps), then runs a **fresh verifier container of the same image** with the agent's output (`agent_output_path` from `task.toml`) injected. The verifier executes `tests/test.sh`, which writes a pytest-json-ctrf-style `ctrf.json` and a binary `reward.txt`.
 
 ```
-Three-container architecture per episode:
-├── Sandbox container    (puzzle: mock services, fixtures, state)
-├── Testee agent         (solver: SSH into sandbox, reads INSTRUCTION.md)
-└── Judge agent          (grader: SSH into sandbox, reads JUDGE.md, inspects results)
+quality_scenario = passed / total          (from ctrf.json, ∈ [0, 1])
+quality_scenario = float(reward.txt)        (binary fallback when ctrf is missing)
 ```
 
-The testee agent receives a universal prompt: `"Read /workspace/INSTRUCTION.md and follow its instructions."` — framework-agnostic. INSTRUCTION.md bootstraps the agent into reading ENVIRONMENT.md (harness-provided services/endpoints) and SKILL.md (miner-authored domain knowledge).
+### Per session
 
-### Judge Workflow
+A miner's session runs every scenario in `SANDBOX_SCENARIOS`. The final score is the equal-weighted sum across scenarios:
 
-1. Testee agent completes its episode (or times out)
-2. Judge agent SSH's into the same sandbox
-3. Judge reads `JUDGE.md` which defines scoring criteria in natural language
-4. Judge inspects the sandbox state: filesystem changes, mock service state, tool call history
-5. Judge produces a structured score
+```
+final_score   = Σ quality_scenario           (∈ [0, N] for N active scenarios)
+mean_quality  = final_score / N              (∈ [0, 1], convenience aggregate)
+```
 
-**Judge isolation**: The judge never sees the miner's SKILL.md or any pack files. It only observes the *results* of the agent's work in the sandbox. This prevents prompt injection from pack content into the judge.
+Consensus uses `final_score`; `mean_quality` is reported alongside for human readability.
 
-**Grounding**: The judge verifies claims by inspecting actual sandbox state — not just reading the agent's transcript. A testee that claims "email sent" but didn't actually call the email API will be caught.
+**Cost** (USD, summed from per-turn cost in Hermes's `turns.jsonl`) is reported per scenario and per session but **never folded into the score** — it's a separate axis on the leaderboard.
 
-### Score Output
+No learning bonus, no split-half delta, no early-mean floor. With one episode per scenario the within-scenario delta concept doesn't apply.
+
+### Eval-result schema (per miner per session)
 
 ```json
 {
-    "quality_score": 0.82,
-    "criteria_results": {
-        "completeness": 0.9,
-        "correctness": 0.8,
-        "safety": 1.0,
-        "communication": 0.7
-    },
-    "qualified": true,
-    "justification": "Agent completed 4/5 required tasks correctly..."
+  "miner_uid": 42,
+  "pack_hash": "abc123…",
+  "spec_number": 11,
+  "final_score": 5.5,
+  "mean_quality": 0.611,
+  "qualified": true,
+  "scenario_qualities": {
+    "break-filter-js-from-html": 1.0,
+    "cancel-async-tasks": 0.5,
+    "configure-git-webserver": 0.5,
+    "db-wal-recovery": 1.0,
+    "fix-git": 1.0,
+    "log-summary-date-ranges": 0.0,
+    "nginx-request-logging": 0.5,
+    "path-tracing": 0.0,
+    "vulnerable-secret": 1.0
+  },
+  "scenario_costs_usd": { "...": 0.04 },
+  "total_cost_usd": 0.42
 }
 ```
 
-**Qualification gate**: A miner must achieve `qualified=True` across ALL episodes in the benchmark to compete on quality score. A single `qualified=False` on any episode disqualifies the miner.
-
-### Multi-Episode Evaluation
-
-Season 1 runs **4 repetitions** of each scenario with different data (same template, new content via validator-private salt). This tests learning continuity:
-
-- Rep 1-2: Baseline execution
-- Rep 3: Shared world with recurring element
-- Rep 4: Evolving fact that requires memory of prior reps
-
-The final quality score is computed from all repetitions, rewarding agents that improve over time.
+**`qualified`** is the any-pass flag: `True` iff at least one scenario produced `quality > 0`. It is **not** an all-or-nothing rubric gate — a session that scored on any scenario is qualified for consensus. The all-episodes qualification gate from the v1.0 agent-judge era no longer exists.
 
 ---
 
 ## Pack Schema
 
-A **PolicyBundle** is a JSON object containing all files and configuration needed to control agent behavior. Validators validate every submission against the schema before evaluation.
+A `pack.json` is a JSON object containing the files needed to evaluate the SKILL.md. Validators validate every submission against the schema before evaluation.
 
-### Required Fields
+### Required fields
 
 ```json
 {
@@ -106,88 +109,97 @@ A **PolicyBundle** is a JSON object containing all files and configuration neede
 | Field | Type | Required | Description |
 |-------|------|:--------:|-------------|
 | `schema_version` | int | Yes | Must be `1` |
-| `files` | dict | Yes | Filename → content string. **Must include `SKILL.md`** (Season 1) |
+| `files` | dict | Yes | Filename → content string. **Must include `SKILL.md`** |
 
+### Validation rules
 
-### Validation Rules
+- **`SKILL.md` required.** The `files` dict must contain `SKILL.md`.
+- **`SKILL.md` must not be empty.** Empty or whitespace-only SKILL.md is rejected.
+- **Size limit**: total pack JSON ≤ **32 KB** (`json.dumps(pack)` byte length). Prevents token bombs and scenario-stuffing.
+- **File content must be strings.** Every value in `files` is a string (no nested objects).
+- **Content-addressed.** `sha256(json.dumps(pack, sort_keys=True))` must match the `pack_hash` in the on-chain commitment.
 
-- **`SKILL.md` required** (Season 1): The `files` dict must contain `SKILL.md`, the primary knowledge document
-- **`SKILL.md` must not be empty**: Empty or whitespace-only SKILL.md is rejected
-- **Size limit**: Total pack JSON ≤ **32 KB** (`json.dumps(pack)` byte length). Prevents token bombs and scenario-stuffing
-- **File content must be strings**: Every value in `files` must be a string (no nested objects)
-- **Content-addressed**: `sha256(json.dumps(pack, sort_keys=True))` must match the `pack_hash` in the on-chain commitment
-
-For the reference miner implementation and local testing, see [MINER_OPERATIONS.md](MINER_OPERATIONS.md).
+For the reference miner workflow and local testing, see [MINER_OPERATIONS.md](MINER_OPERATIONS.md).
 
 ---
 
 ## Evaluation Dataset
 
-The current evaluation benchmark is defined by **trajrl-bench** image plus a manually maintained `spec_number` constant in the validator code (`trajectoryrl/utils/config.py::SPEC_NUMBER`). Scenarios live in [trajrl-bench](https://github.com/trajectoryRL/trajrl-bench) and include:
+The benchmark is defined by **`SANDBOX_SCENARIOS`** in `trajectoryrl/utils/sandbox_harness.py`, paired with a manually maintained **`SPEC_NUMBER`** constant in `trajectoryrl/utils/config.py`. Each scenario is a Terminal-Bench-style task that ships at `trajectoryRL/trajrl-bench:scenarios/<name>/`:
 
-- Natural-language `JUDGE.md` per scenario (scoring rubric)
-- Fixture logic (mock services, data generation)
-- `ENVIRONMENT.md` template (services, endpoints, workspace layout)
+```
+scenarios/<name>/
+  task.toml             # metadata, verifier_timeout, agent_output_path, docker_image
+  instruction.md        # static task statement (drop into /workspace each session)
+  environment/
+    Dockerfile          # FROM ghcr.io/trajectoryrl/sandbox-agent:tag + scenario deps
+  tests/
+    test.sh             # verifier — exits 0/1, writes reward.txt + ctrf.json
+    test_outputs.py     # pytest assertions
+  solution/
+    solve.sh            # reference solution (not used at eval time)
+  DESIGN.md             # provenance + license (for adopted scenarios)
+```
 
-Adding a new scenario means writing a new JUDGE.md + fixture logic in trajrl-bench — no validator code change required.
+Adding a scenario means publishing a new scenario image to GHCR, appending the name to `SANDBOX_SCENARIOS`, and bumping `SPEC_NUMBER`. **All scenarios run every evaluation cycle.** No subset selection or rotation within a cycle; rotation happens across `SPEC_NUMBER` bumps.
 
-All scenarios run every evaluation cycle. No subset selection or rotation. Whenever the scenario set, scoring methodology, or judge prompt changes in a way that breaks score comparability, validator maintainers bump `SPEC_NUMBER` in the next validator release. Bench bug fixes that preserve scoring semantics do **not** bump it. Aggregation picks the target `spec_number` from on-chain commitments themselves (stake-weighted majority), so the upgrade is self-coordinating: while most validators are still on the old `spec_number`, weights continue to flow to the previous winner; once majority stake migrates to the new `spec_number`, the new winner takes over automatically.
+Aggregation picks the target `spec_number` from on-chain commitments (stake-weighted majority), so upgrades are self-coordinating — see [INCENTIVE_MECHANISM.md § SPEC_NUMBER & target spec selection](INCENTIVE_MECHANISM.md#spec_number-and-target-spec-selection).
 
-See [seasons/self_learning_s1.md](seasons/self_learning_s1.md) for the full Season 1 design, scenario list, and learning-signal architecture.
+For the current active set, see [seasons/self_learning_s1.md § Current Scenarios](seasons/self_learning_s1.md#current-scenarios).
 
 ---
 
 ## Pack Requirements
 
-### Minimum Quality Thresholds
-
-To earn non-zero rewards:
+### Minimum quality thresholds
 
 | Requirement | Threshold |
 |-------------|-----------|
 | Schema validation | MUST pass |
 | Size limit | ≤ 32 KB |
-| Pack integrity analysis | No critical flags |
-| Qualification gate (judge) | qualified=True on ALL episodes |
+| Pack integrity (pre-eval filter) | No critical flags |
+| Qualification gate | `final_score > 0` (≥ 1 scenario passed any test) |
 
-Packs failing schema validation or exceeding the size limit receive **weight = 0**. Packs failing integrity analysis are **disqualified before episodes run**. Packs that pass integrity but fail qualification on any episode are **disqualified** from score competition (weight = 0).
+Packs failing schema or size validation receive **weight = 0**. Packs failing integrity analysis are **disqualified before evaluation runs**. Packs that pass integrity but score `final_score = 0` are **non-winners** (weight = 0); they still count as active commitments.
 
-### Pack Rejection Flow
+### Pack rejection flow
 
-| Failure | Qualified | Weight | Counts as Active? | Episodes Run? |
-|---------|:---------:|:------:|:------------------:|:---------------:|
+| Outcome | `qualified` | Weight | Counts as active? | Scenarios run? |
+|---------|:-----------:|:------:|:-----------------:|:--------------:|
 | **No commitment** on-chain (or unparseable) | N/A | 0.0 | No | Skipped |
 | **Pack URL inaccessible** (404, timeout, hash mismatch) | N/A | 0.0 | No | Skipped |
-| **Schema validation failure** (missing SKILL.md, empty SKILL.md, >32KB) | N/A | 0.0 | No | Skipped |
+| **Schema validation failure** (missing/empty SKILL.md, > 32 KB) | N/A | 0.0 | No | Skipped |
 | **Pack integrity failed** (gaming patterns detected) | N/A | 0.0 | No | Skipped |
-| **NCD similarity** ≥ threshold (later submitter excluded) | N/A | 0.0 | No | May run* |
-| **Episode timeout** (scenario exceeds timeout) | FAIL | 0.0 | Yes | Partial |
-| **Qualification failed** on any episode | FAIL | 0.0 | Yes | Full |
-| **All episodes qualify, not Winner** | PASS | 0.0 | Yes | Full |
-| **All episodes qualify, Winner** | PASS | 1.0 | Yes | Full |
+| **NCD similarity ≥ 0.80** (later submitter excluded) | N/A | 0.0 | No | May run* |
+| **All scenarios scored 0** | `False` | 0.0 | Yes | Full |
+| **`final_score > 0`, not Winner** | `True` | 0.0 | Yes | Full |
+| **`final_score > 0`, Winner (WTA + winner protection)** | `True` | 1.0 | Yes | Full |
 
-**Key rules**:
+*\* NCD copies are filtered before weight assignment; whether their session ran depends on the validator's per-cycle NCD pre-filter.*
 
-1. **Fail-fast**: Schema validation, pack integrity analysis, and verification are checked *before* running episodes. Integrity-failed packs never run episodes. Exact-copy miners (same `pack_hash`) are skipped during evaluation.
+### Key rules
 
-2. **"Active" means valid commitment**: A miner counts as "active" only if their on-chain commitment passes all pre-evaluation checks and at least one episode completes. This definition is used for the bootstrap threshold (need ≥10 *active* miners for winner-take-all).
+1. **Fail-fast pre-eval.** Schema validation, pack integrity, and verification run *before* sandboxed evaluation. Integrity-failed packs never run scenarios. Exact-copy miners (same `pack_hash`) are skipped during evaluation.
 
-3. **Partial failures disqualify**: If a pack passes integrity but fails qualification on 1 of N episodes, the miner is disqualified entirely. Quality is non-negotiable.
+2. **"Active" means valid commitment + completed session.** A miner counts as active only if their on-chain commitment passes pre-evaluation and at least one scenario session completes. Used for the bootstrap threshold for winner-take-all.
 
-4. **Weight = 0.0 vs. omitted**: Disqualified or non-winning miners still receive `weight = 0.0` in the weight vector (not omitted). Required by Bittensor's `set_weights` which covers all UIDs in the metagraph.
+3. **Qualification is any-pass, not all-pass.** The all-episodes qualification gate from the v1.0 agent-judge era is gone. Any non-zero `final_score` is qualified.
+
+4. **Weight = 0.0 vs. omitted.** Non-winning miners still appear in the weight vector with `weight = 0.0`. Required by Bittensor's `set_weights` which covers all UIDs in the metagraph.
 
 ---
 
 ## References
 
 - **Parent protocol**: [INCENTIVE_MECHANISM.md](INCENTIVE_MECHANISM.md) — consensus, rewards, anti-gaming core
-- **Season 1 design**: [seasons/self_learning_s1.md](seasons/self_learning_s1.md) — full architecture, learning signal, scenarios
-- **Miner Guide**: [MINER_OPERATIONS.md](MINER_OPERATIONS.md) — reference miner, local testing, submission workflow
-- **Validator Guide**: [VALIDATOR_OPERATIONS.md](VALIDATOR_OPERATIONS.md) — cost projections, sustainability
-- **Benchmark repo**: [trajrl-bench](https://github.com/trajectoryRL/trajrl-bench) — scenarios, JUDGE.md, fixtures
+- **Season 1 design**: [seasons/self_learning_s1.md](seasons/self_learning_s1.md) — architecture, scenarios, versioning, risks
+- **Miner Guide**: [MINER_GUIDE.md](MINER_GUIDE.md) — SKILL.md writing patterns, anti-gaming rules
+- **Miner Operations**: [MINER_OPERATIONS.md](MINER_OPERATIONS.md) — CLI workflow, local testing, eval-log retrieval
+- **Validator Operations**: [VALIDATOR_OPERATIONS.md](VALIDATOR_OPERATIONS.md) — cost projections, hosting requirements
+- **Benchmark repo**: [trajrl-bench](https://github.com/trajectoryRL/trajrl-bench) — scenarios, Dockerfiles, verifier code
 
 ---
 
-**Version**: 1.0
+**Version**: 2.0
 
-**Date**: 2026-04-21
+**Date**: 2026-05-14

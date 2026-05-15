@@ -1,32 +1,37 @@
 # Season 1 Miner Guide
 
 **Subnet**: SN11 (TrajectoryRL)
-**Scoring**: Agent judge, quality-based, split-half delta across 4 episodes
+**Scoring**: Programmatic verifier, quality-based, summed across the active scenario set
 
-> Season 1 replaces v4.0's cost-based competition with quality-based competition.
-> Miners ship a `SKILL.md`. The best agent behavior wins.
+> Mining means writing a **SKILL.md** — a scaffold that teaches a small open-source LLM how to solve scenario tasks. The best agent behavior wins; the artifact you ship *is* the deployed skill.
+
+> **Architecture note (2026-05).** This guide describes the current unified-container, shell-verifier architecture. Earlier revisions of this document described a 3-container (sandbox + testee + judge) agent-judge design with mock services — that design was removed 2026-05-11. If you find old guides referencing `JUDGE.md`, `/workspace/learned/`, 4-rep split-half delta, or `localhost:8090` mock services, they are stale.
 
 ---
 
 ## How It Works
 
-Three Docker containers, cleanly decoupled:
+One Docker container per scenario per miner. The scenario image bundles the puzzle, the testee runtime (Hermes), and the verifier:
 
-1. **Sandbox (puzzle)** — isolated Linux environment with shell, filesystem, mock services (email, Slack, Notion, calendar, Gitea), and scenario-specific files. No internet.
-2. **Testee agent (solver)** — SSHes into the sandbox as user `agent`, reads your `SKILL.md` and the episode's `INSTRUCTION.md`, explores and solves the task.
-3. **Judge agent (grader)** — SSHes into the sandbox (read-only grounding), reads the scenario's `JUDGE.md`, inspects mock state and any files the agent touched, writes `evaluation.json` with per-criterion scores.
+1. The validator runs `docker run scenario-<name>:<tag>` (CMD = `tail -f /dev/null`), drops your `SKILL.md` and the scenario's `INSTRUCTION.md` into `/workspace`, then `docker exec -u hermes` runs Hermes against the scenario.
+2. Hermes uses its built-in `terminal` / `file` / `execute_code` tools to read `/workspace/SKILL.md` + `/workspace/INSTRUCTION.md` and produce a deliverable at the scenario's `agent_output_path` (e.g. `/app/run.py`, `/app/setup.sh`, `/app/recovered.json`).
+3. The validator stops the agent container, then runs a **fresh verifier container of the same image** with your output injected. The verifier executes `tests/test.sh`, which writes `ctrf.json` (pytest results) and `reward.txt` (binary).
+4. Your scenario score = `passed / total` from `ctrf.json`. Fallback: `float(reward.txt)` (0 or 1).
 
-Per miner:
-1. Validator runs 4 episodes of the same scenario with different fixture data
-2. Judge scores each episode (0.0-1.0) based on the scenario's JUDGE.md rubric
-3. Final score: `mean_quality * (1 + 0.5 * max(0, delta))` — delta is a learning bonus for improving across episodes
-4. The best miner wins
+Each session runs every scenario in `SANDBOX_SCENARIOS`. Final score = sum of per-scenario qualities.
+
+```
+final_score   = Σ (passed_i / total_i)         ∈ [0, N]
+mean_quality  = final_score / N                ∈ [0, 1]
+```
+
+No mock services, no SSH boundary, no per-rep fixtures, no agent judge. The agent runs inside the scenario container; the verifier scores its output programmatically.
 
 ---
 
 ## Pack Format
 
-Your pack is a JSON file. The `files` dict is a folder; `SKILL.md` is the entry point. One pack = one contest.
+Your pack is a JSON file containing your `SKILL.md`. One pack = one contest.
 
 ```json
 {
@@ -37,298 +42,254 @@ Your pack is a JSON file. The `files` dict is a folder; `SKILL.md` is the entry 
 }
 ```
 
-Season 1 requires `SKILL.md` only. Future packs may include additional files that SKILL.md references. No `AGENTS.md`, no `tool_policy`.
+Season 1 requires `SKILL.md` only.
 
-### What's different from v4.0
-
-| | v4.0 (legacy) | Season 1 |
-|---|---|---|
-| File | `AGENTS.md` | `SKILL.md` |
-| Other files | `SOUL.md`, `tool_policy`, etc. | S1: SKILL.md only. Future: additional files SKILL.md references |
-| Interface | Tool-call API | Shell (SSH into sandbox, use `curl`) |
-| Scoring | Cost-based (cheapest wins) | Quality-based (best work wins) |
-| Agent control | Tool allowlist/denylist | No tool list -- agent has a shell, security is infrastructure-level |
-
-### Why no tool policy?
-
-In v4.0, the agent called specific tools through an API, so you could allow/deny individual tools. In S1, the agent has a **shell** -- it runs `curl`, `cat`, `python3`, whatever it wants. Security is enforced at the infrastructure level:
-
-- No internet (isolated Docker network)
-- Can't read scoring logic (root-owned, mode 700)
-- 3 min timeout per episode, capped CPU/memory
-- Only mock services at `localhost:8090`
+- `SKILL.md` must not be empty.
+- Total pack JSON ≤ 32 KB.
+- Content-addressed: `sha256(json.dumps(pack, sort_keys=True))` matches the on-chain `pack_hash`.
 
 ---
 
 ## Writing SKILL.md
 
-Your SKILL.md is a **self-learning system**. The agent runs 4 episodes of the same scenario with different data. Between episodes, `/workspace/learned/` persists. The competition rewards agents that capture learnings, detect patterns, and improve across episodes.
+Your `SKILL.md` is a static instruction document the agent reads before working on every scenario. The validator drops it at `/workspace/SKILL.md` (read-only). The agent has no other persistent memory — there is no `/workspace/learned/`, no cross-scenario state, no carryover between sessions.
 
-See [pskoett/self-improving-agent](https://clawhub.ai/pskoett/self-improving-agent) on ClawHub for a strong reference implementation.
+The competition rewards SKILL.md content that lifts the **Qwen3.5-35B-A3B testee** (default LLM) above its vanilla satisficing floor across a diverse scenario set. Vanilla Qwen3.5 tends to read the task, run one or two inspection commands, then stop without producing a deliverable. A well-written SKILL.md fixes that.
 
 ### What a winning SKILL.md looks like
 
-**1. Structured learning logs.** Don't just say "write notes." Define a logging system with categorized entries, metadata (priority, status, area), and a consistent naming scheme so the agent can retrieve what matters.
+**1. Directive operating procedure.** Tell the agent what to produce, in what order, and where to write it. Qwen3.5-A3B does not improvise the "write the answer to the deliverable file" step reliably — the SKILL.md must spell it out.
 
 ```markdown
-## Learning System
-
-After each episode, log what worked and what failed:
-- /workspace/learned/LEARNINGS.md — corrections, insights, patterns discovered
-- /workspace/learned/ERRORS.md — command failures, wrong assumptions, dead ends
-- /workspace/learned/PATTERNS.md — recurring structures across episodes
-
-Each entry: `[YYYY-MM-DD] area | priority | observation | action taken`
-Before starting, read all of /workspace/learned/ and apply prior knowledge.
+## Procedure
+1. Read INSTRUCTION.md to identify the deliverable path and the success criterion.
+2. Investigate the environment with `ls -la /app`, `cat` relevant files.
+3. Draft your solution.
+4. Write the deliverable to the path INSTRUCTION.md specifies. Do not stop earlier.
+5. If the deliverable is a script, verify it runs without error before declaring done.
 ```
 
-**2. Pattern recognition and promotion.** The agent sees the same scenario 4 times. Rep 3 reuses a structural pattern from rep 1. Rep 4 evolves a fact from earlier. Teach the agent to detect recurring patterns and flag stale information.
+**2. Domain-specific tactics, not scenario-specific playbooks.** General patterns that apply to the broad class of work (e.g. "debugging async Python", "fixing git history", "configuring a webserver") help. Hardcoded answers to specific benchmark scenarios are caught by the pre-eval filter.
 
 ```markdown
-## Pattern Detection
-
-- Track recurrence: if you see the same type of issue twice, extract the pattern
-- Timestamp everything — later episodes may contradict earlier facts
-- When a fact changes (e.g. on-call rotation, meeting time), mark old entries superseded
-- Promote high-confidence patterns to a summary section for quick retrieval
+## Async Python tactics
+- `asyncio.gather` with `return_exceptions=False` cancels siblings on the first
+  exception. To run-and-collect, wrap each coro in `asyncio.shield` or use
+  `asyncio.gather(..., return_exceptions=True)`.
+- When cancelling a task group, propagate `asyncio.CancelledError` after cleanup —
+  swallowing it leaves the parent's cancellation in an indeterminate state.
 ```
 
-**3. Safety rules.**
+**3. Disciplined verification.** Tell the agent to check its output against the success criterion before exiting. Most "0 / N" scenarios are agents that produced something but never confirmed it satisfied the task.
 
 ```markdown
-## Safety
-
-- Never share confidential info in public channels or external emails
-- Never post incident details to general channels
-- Never include internal details in client-facing communications
+## Self-check before exiting
+- Re-read INSTRUCTION.md. Did you produce the exact file at the exact path it asked for?
+- If the task is "fix the failing test", actually run the test and confirm it passes.
+- If you can't get to a passing state, leave the best partial solution and explain
+  what failed and where in a comment at the top of the deliverable.
 ```
+
+**4. Tight and focused.** Long prescriptive packs cause Qwen3.5 to satisfice on instruction-following and stop before producing real work. Empirically: tight ~3–5 KB packs with verified payloads outperform long playbooks. The 32 KB schema cap is a ceiling, not a target.
 
 ### What NOT to include
 
-- Hardcoded curl commands or API endpoints (the agent should discover them via `/health`)
-- Scenario-specific workflows (your SKILL.md should work across different scenarios)
-- References to specific criteria IDs (the judge criteria may change between scenarios)
-- Static task checklists — the value is in the learning loop, not a fixed playbook
+- **Scenario-specific playbooks** ("for `cancel-async-tasks`, do X; for `fix-git`, do Y"). Caught by the pre-eval filter.
+- **Hardcoded test names, file paths from the benchmark internals, or verifier output schemas.** The agent sees `INSTRUCTION.md`; the verifier and its tests are not exposed to it.
+- **Mirroring the rubric.** There is no judge LLM and no natural-language criteria list to mirror. Scoring is pure `passed/total` — tactics that "look thorough to a judge" do nothing.
+- **Cross-session memory hooks.** There is no persistent `/workspace/learned/`. SKILL.md is the only persistent context.
 
 ---
 
 ## Pre-Eval Compliance (Anti-Gaming)
 
-> If an author could NOT have written your SKILL.md without knowing the benchmark's exact scenarios and scoring rubric — it will be flagged as cheating.
+> Validators run a pre-eval filter that rejects packs that look like benchmark-specific cheats. If an author could not have written your SKILL.md without knowing the exact scenario set — it gets flagged.
 
-Write a **genuinely general-purpose skill** that guides an agent to reason dynamically, not a benchmark-specific recipe. The pre-eval gate checks for these red lines:
+Write a **genuinely general SKILL.md** that guides an agent to reason dynamically. The pre-eval gate checks for these patterns:
 
-### 1. Hardcoded Benchmark Answers
+### 1. Hardcoded benchmark answers
 
-Do not embed specific identifiers or data that should be retrieved at runtime:
-- Incident details (root causes, timelines, SLA numbers)
-- Company/team/person names from evaluation fixtures
-- PR numbers, task IDs, bug descriptions
-- Specific Slack channels or email subjects
-- Pre-written status updates or briefs
+Do not embed solutions to specific scenarios:
 
-**Instead:** Instruct the agent to retrieve information dynamically.
+- Pre-written shell scripts that solve a specific scenario verbatim
+- Specific file paths from inside scenario containers
+- Test names or assertions copied from a scenario's `test.sh`
 
-### 2. Static Response Mapping
+**Instead:** Provide general tactics for the category of task; let the agent investigate and solve at runtime.
 
-Do not map keywords or triggers to fixed outputs:
+### 2. Scenario-name dispatch
+
+Do not branch behavior by scenario name or task title:
+
 ```
-If task involves "incident" → post this exact update
-If message contains "standup" → output fixed text
+If task mentions "git" → run this exact recovery script
+If task mentions "nginx" → drop this exact config
 ```
 
-**Instead:** Provide behavioral guidance; let the agent generate responses from retrieved data.
+**Instead:** Provide domain knowledge applicable to the broad category.
 
-### 3. Tool Avoidance
+### 3. Tool avoidance
 
-Do not disable or discourage tools needed for data retrieval:
-- Blanket: "Do not use tools" / "Avoid external access"
-- Selective: "Do not read email" / "Skip Slack"
-- Cost-gaming: "Limit to 2 tool calls"
+Do not disable or discourage tools needed to investigate:
+
+- "Do not use `terminal`"
+- "Limit yourself to N tool calls"
+- "Avoid reading files larger than X bytes"
 
 **Instead:** Suggest efficient tool use without forbidding necessary ones.
 
-### 4. Scenario-Specific Playbooks
+### 4. Per-scenario playbook collections
 
-Do not write dedicated sections that map 1-to-1 to benchmark scenarios with per-scenario output templates.
+Do not include N scenario-specific sections matching the active scenario count:
 
-Red flags:
-- Exactly N detailed playbooks matching the N benchmark scenarios
-- Per-scenario output templates (exact section names, field lists, formatting rules)
-- Instructions that only make sense if the author knows the eval scenarios
+- Red flag: exactly 9 (current scenario-count) detailed playbooks
+- Red flag: per-scenario output templates with exact field lists
+- Red flag: instructions that only make sense if the author knew the eval scenarios
 
-**Instead:** Provide general guidance applicable to diverse tasks.
+**Instead:** One unified procedure that handles diverse tasks.
 
-### 5. Evaluation Rubric Reverse-Engineering
+### 5. Verifier reverse-engineering
 
-Do not embed rules that mirror the automated scoring system:
-- Checklists matching judge criteria names verbatim
-- Regex/pattern gaming ("word X must NOT appear within N characters of word Y")
-- Banned word lists with exact replacements
-- Exact tool-call budgets per scenario type
-- Output templates designed to hit scoring keywords
+Do not embed rules that mirror specific verifier checks:
 
-**Instead:** Give general quality guidance, not encoded evaluator logic.
+- Regex/pattern gaming targeting exact strings the verifier looks for
+- Output formatting that targets known `test_outputs.py` assertions
+- "Always emit this exact JSON structure" templates that match a particular scenario's expected schema
 
-### 6. Benchmark Coverage Overfitting
+**Instead:** General quality guidance, not encoded verifier logic.
 
-Do not tailor the skill to cover exactly and only the benchmark's scenarios:
-- Addressing only known scenarios with zero other task types
-- Per-scenario gate criteria that mirror judge rubrics
-- Suspiciously precise knowledge of what the evaluator grades on
+### 6. Benchmark-coverage overfitting
 
-**Instead:** Write a genuinely general skill that handles tasks beyond the benchmark scope.
+Do not tailor the skill to cover exactly and only the benchmark scenarios:
 
-### 7. Hardcoded Benchmark Infrastructure
+- Addressing only known scenarios with zero generalization beyond them
+- Suspiciously precise knowledge of what the verifier grades on
 
-Do not embed specific API endpoints, port numbers, URLs, or shell commands from the benchmark runtime:
-- Full API URLs (e.g. `http://localhost:8090/api/v2/messages`)
-- Pre-written `curl` commands
-- Hardcoded port numbers (e.g. `8090`)
-- Complete API reference manuals for the benchmark environment
+**Instead:** Write a genuinely general skill that handles tasks beyond the current scenario set.
 
-**Instead:** Let the agent discover available services dynamically at runtime (read ENVIRONMENT.md).
+### Self-check before submitting
 
-### Self-Check Before Submitting
-
-1. **Generality** — Does this skill still make sense in a completely new, unseen scenario?
-2. **Knowledge source** — Could every instruction be written without knowing the benchmark?
+1. **Generality** — Does this SKILL.md still make sense for a brand-new, never-seen scenario in the same domain?
+2. **Knowledge source** — Could every instruction be written without knowing the active scenario list?
 3. **Tool freedom** — Can the agent still use all necessary tools?
-4. **Output flexibility** — Must the agent decide output format at runtime?
-5. **Scope** — Does the skill cover task types beyond the benchmark?
+4. **Scope** — Does the skill cover task types beyond the current benchmark?
 
 ---
 
 ## Sandbox Environment
 
-### What the testee agent sees
-
-The testee agent SSHes into the sandbox as user `agent` and gets a shell. Inside:
+The agent runs inside the scenario container as the non-root user `hermes` (uid 10000). It has a full Linux shell with whatever the scenario's Dockerfile installed (Python, git, curl, jq, chromium, etc. — varies by scenario).
 
 ```
 /workspace/
-  SKILL.md         # Your pack (read-only, root:agent 440)
-  INSTRUCTION.md   # Episode task (read-only, set by validator each episode)
-  learned/         # Agent-writable, persists across episodes
+  SKILL.md          # Your pack (read-only, dropped by validator)
+  INSTRUCTION.md    # Scenario task statement (read-only, scenario-static)
+/app/
+  <scenario files>  # Scenario-specific working dir; agent writes deliverable here
 ```
 
-The agent has a full Linux shell with `curl`, `python3`, `jq`, standard tools. Future scenarios may expose additional paths (e.g. `/repo/` for codebase tasks, `/data/` for research tasks).
+The agent has **no internet** (`eval_net` is internal-only) except for the LLM API egress that Hermes itself uses to talk to the testee model. Standard Linux tools and any deps the scenario installed are available. The verifier (`tests/test.sh`) is bundled in the image but lives at a path the `hermes` user cannot read.
 
-### Mock services at localhost:8090
+### Per-scenario specifics
 
-Once inside the sandbox, the agent discovers services via `curl http://localhost:8090/health`.
+Each scenario has its own:
 
-| Service | Read | Write |
-|---------|------|-------|
-| **Email** | `GET /api/v2/messages` | `POST /api/v2/messages` |
-| **Slack** | `GET /slack/channels/{id}/messages` | `POST /slack/channels/{id}/messages` |
-| **Notion** | `POST /notion/databases/{id}/query` | `POST /notion/pages` |
-| **Calendar** | `GET /calendar/events` | `POST /calendar/events` |
-| **Gitea** | `GET /api/v1/repos/{owner}/{repo}/issues` | `POST .../issues/{n}/comments` |
+- **`INSTRUCTION.md`** — the task statement. The agent must read this every session.
+- **`agent_output_path`** — where the agent's deliverable goes (e.g. `/app/run.py`, `/app/setup.sh`). Defined in `task.toml`.
+- **`agent_timeout_s`** — wall-clock limit for the agent. Varies per scenario (default ~900s). Defined in `task.toml`.
+- **Pre-installed tooling** — Dockerfile installs whatever the task needs (selenium + chromium for HTML scenarios, postgres tools for db scenarios, etc.).
 
-### Constraints
-
-- **No internet** -- only mock services
-- **3 min** per episode (well-written SKILL.md typically finishes in 60-150s)
-- **4 episodes** of the same scenario with different data
-- Agent cannot read scoring logic
-
-### What changes between episodes
-
-Inbox emails, Slack history, tasks, calendar, Gitea data, specific details. The company, team roster, and your SKILL.md stay the same.
+For the live active list, definitions, and source code, see [trajrl-bench](https://github.com/trajectoryRL/trajrl-bench).
 
 ---
 
-## Scoring
-
-### Per-episode quality
-
-A judge agent scores each episode against scenario-specific criteria defined in `scenarios/<name>/JUDGE.md` (in the [trajrl-bench repo](https://github.com/trajectoryRL/trajrl-bench)). Typical criteria include completeness, correctness, prioritization, communication, safety, coordination, and judgment — but the exact list varies by scenario. The judge reads the rubric in natural language, SSHes into the sandbox to verify what actually happened (mock state, files touched), and writes `evaluation.json` with a quality score (0.0-1.0) and per-criterion breakdown.
-
-### Final score
+## Scoring Recap
 
 ```
-final_score = mean_quality * (1 + 0.5 * max(0, delta))
-
-mean_quality = mean(ep1, ep2, ep3, ep4)
-delta        = mean(ep3, ep4) - mean(ep1, ep2)
-
-Anti-sandbagging: if early_mean < 0.3 and delta > 0.4, delta is zeroed.
+quality_scenario = passed / total            (from ctrf.json)
+final_score      = Σ quality_scenario        ∈ [0, N]
+mean_quality     = final_score / N           ∈ [0, 1]
 ```
 
-Quality dominates. A consistently good agent (0.90) beats an improving-but-mediocre one (0.60 + delta).
+Cost (USD from Hermes's `turns.jsonl`) is reported alongside but never folded into the score. The fastest cheapest 0-scoring agent still gets weight 0; quality dominates.
+
+No learning bonus, no split-half delta, no early-mean floor.
+
+`qualified = True` whenever `final_score > 0` (at least one scenario passed any tests).
 
 ---
 
 ## Submission
 
-1. **Write your SKILL.md.** This is the source content; you do not host it directly.
+Use the `trajectoryrl-miner` CLI (full reference in [MINER_OPERATIONS.md](MINER_OPERATIONS.md)):
 
-2. **Build a `pack.json`** wrapping your SKILL.md and host the pack at a public URL (raw GitHub file, S3, any HTTP(S) endpoint).
+```bash
+git clone https://github.com/trajectoryRL/trajectoryRL.git
+cd trajectoryRL && pip install -e .
 
-3. **Submit on-chain** via the Python SDK:
-
-```python
-from pathlib import Path
-from trajectoryrl.base.miner import TrajectoryMiner
-
-skill_md = Path("path/to/SKILL.md").read_text()
-pack = TrajectoryMiner.build_s1_pack(skill_md)
-pack_hash = TrajectoryMiner.save_pack(pack, "pack.json")
-
-miner = TrajectoryMiner(wallet_name="miner", wallet_hotkey="default")
-miner.submit_commitment(pack_hash, "https://your-host.com/pack.json")
+trajectoryrl-miner build SKILL.md -o pack.json
+trajectoryrl-miner web-submit pack.json          # managed hosting, recommended
+# OR: trajectoryrl-miner upload pack.json        # self-host on S3 / R2 / GCS
+trajectoryrl-miner submit <pack_url>             # on-chain commitment
+trajectoryrl-miner status
 ```
 
-The on-chain commitment is `{pack_hash}|{pack_url}`. Validators fetch your `pack.json` from the URL, verify it against `pack_hash`, and extract `SKILL.md` from `pack["files"]`.
-
-For the equivalent CLI workflow (`build` / `validate` / `upload` / `submit`), see [MINER_OPERATIONS.md](MINER_OPERATIONS.md).
+The on-chain commitment is `{pack_hash}|{pack_url}`. Validators fetch your `pack.json`, verify the hash, extract `SKILL.md`, and run the full scenario session.
 
 ---
 
 ## Local Testing
 
 ```bash
-git clone https://github.com/trajectoryRL/trajrl-bench.git
-cd trajrl-bench
-pip install -e ".[dev]"
-make build       # builds sandbox + hermes Docker images
-cp .env.example .env  # add your LLM API key
-make test-hermes      # runs one episode with real agent + real judge
+git clone https://github.com/trajectoryRL/trajectoryRL.git
+cd trajectoryRL && pip install -e .
+
+cp .env.validator.example .env.validator
+# Edit: set LLM_API_KEY=sk-... and LLM_MODEL=qwen/qwen3.5-35b-a3b
+
+python scripts/eval_pack.py --skill-md path/to/SKILL.md
+# or: python scripts/eval_pack.py --pack pack.json --json results.json -o ./eval_output
 ```
 
-Results are saved to `results/`. See the [trajrl-bench README](https://github.com/trajectoryRL/trajrl-bench) for more.
+The script auto-pulls `sandbox-agent` and every per-scenario image in `SANDBOX_SCENARIOS` on first invocation. Output: per-scenario `passed/total`, per-scenario cost, final `Σ` score. Use `--json` for machine-readable results, `-o ./eval_output` to save full transcripts and verifier artifacts.
+
+Prereqs: Docker daemon, an LLM API key (e.g. OpenRouter), ~10 GB free disk for images on first run.
 
 ---
 
 ## Tips
 
-1. **Design a learning loop**, not a static playbook. The delta bonus rewards agents that genuinely improve across 4 episodes.
-2. **Structure your logs** -- categorized entries with timestamps beat freeform notes. The agent needs to retrieve, not just record.
-3. **Handle stale knowledge** -- rep 4 may contradict rep 1. Teach the agent to timestamp, supersede, and prefer recent observations.
-4. **Detect recurring patterns** -- rep 3 reuses rep 1's structure. An agent that extracted the pattern short-circuits discovery.
-5. **Protect sensitive info** -- multiple criteria check for confidentiality leaks. Safety matters.
-6. **Keep it general** -- your SKILL.md should work across different scenarios, not script a specific workflow.
-7. **Don't sandbag** -- anti-sandbagging guard zeros delta if early episodes are deliberately bad.
+1. **Spell out the deliverable.** Qwen3.5-A3B does not reliably figure out "write to /app/foo.sh" without being told. The most common 0-score failure is "agent produced text in chat but never wrote the file."
+2. **Verify before declaring done.** Run the deliverable. Check it satisfies the task. Many partial credits come from "the script exists but errors on first invocation."
+3. **Keep it tight.** Empirically, ~3–5 KB focused packs beat long playbooks. Qwen3.5 stops earlier when given more prescriptive text.
+4. **Diversify across domains.** The active scenario set covers async Python, git, sysadmin, database recovery, HTML/JS, log analysis, C/graphics, binary RE. A SKILL.md that helps in two domains beats one that's deep in one.
+5. **Don't game the scenario list.** Scenarios rotate. Each `SPEC_NUMBER` bump can add/remove scenarios. SKILL.md targeted at exactly today's set will drop when the set changes.
+6. **Don't reverse-engineer the verifier.** It's hidden, and scoring is pure `passed/total` from pytest. The way to score higher is to write better tactics for the agent, not to guess what `test_outputs.py` asserts.
 
 ---
 
 ## FAQ
 
 **Q: What agent framework runs my SKILL.md?**
-A: The default is Hermes Agent, but the sandbox just exposes SSH. Any agent that can SSH in and run shell commands works. The validator controls the testee container image.
+A: Hermes (NousResearch) 0.13.x is the default testee. It runs inside the scenario container with built-in `terminal`, `file`, and `execute_code` tools. The validator controls the testee image; miners do not configure it.
 
-**Q: Can I see the judge criteria?**
-A: Yes. Open `scenarios/<name>/JUDGE.md` in the [trajrl-bench repo](https://github.com/trajectoryRL/trajrl-bench) — that's the exact instructions the judge agent reads. Criteria vary by scenario. Transparency is intentional: gaming is hard because the judge reasons about coherence, not pattern-matches.
+**Q: What LLM does the testee use?**
+A: Configurable per validator. Default: `qwen/qwen3.5-35b-a3b` via OpenRouter. Validators may run other models; the harness/LLM identity is published per-eval on the dashboard.
 
-**Q: What's the difference between testee and judge agents?**
-A: Testee is your solver — SSHes in, reads your SKILL.md, does the task. Judge is the grader — SSHes in after the testee exits, inspects what actually happened (mock state, files), scores against JUDGE.md. Both use the same agent framework; they're just configured with different prompts.
+**Q: Is there a judge LLM?**
+A: No. Scoring is fully programmatic from `tests/test.sh` → `ctrf.json`. The earlier agent-judge architecture was removed 2026-05-11.
 
-**Q: Can I submit both SKILL.md and AGENTS.md?**
-A: No. Season 1 packs must contain `SKILL.md` only. `AGENTS.md` and `tool_policy` are v4.0 concepts — S1 doesn't use them.
+**Q: Can I see the scenario tests?**
+A: No. `tests/test.sh` is in the scenario image but at a path the `hermes` user cannot read. You can read `INSTRUCTION.md` and any other files the scenario's Dockerfile exposed to `/workspace` or `/app`. For development, you can clone [trajrl-bench](https://github.com/trajectoryRL/trajrl-bench) locally and inspect the tests — but if your SKILL.md hardcodes test names or expected assertions, the pre-eval filter will catch it.
+
+**Q: Does my SKILL.md get to learn between scenarios in a session?**
+A: No. SKILL.md is static — same file used for every scenario. There is no persistent `/workspace/learned/` between scenarios.
+
+**Q: Can I submit multiple files?**
+A: The schema permits multiple files in `files`, but Season 1 only reads `SKILL.md`. Other files are placed in `/workspace` but the testee prompt only points to SKILL.md + INSTRUCTION.md.
 
 **Q: What if I don't submit a SKILL.md?**
-A: Your pack is rejected. Season 1 requires SKILL.md.
+A: Pack rejected at schema validation.
 
-**Q: What model do the testee and judge use?**
-A: Configurable by validators. Default provider is OpenRouter. As of v0.5.14 the recommended setup splits the two: testee runs **Qwen3.5-35B-A3B** (`LLM_MODEL`), judge runs **GLM-5.1** (`JUDGE_MODEL`). Different model families on purpose — judge bias stays uncorrelated with testee bias.
+**Q: How often can I resubmit?**
+A: Self-hosted (`upload` + `submit`): chain-side rate limit (~100 blocks ≈ 20 min between commits). Managed (`web-submit`): one successful submission per hour per hotkey (server cooldown), plus the same chain rate limit on the subsequent `submit` step.
