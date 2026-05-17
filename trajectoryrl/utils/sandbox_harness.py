@@ -64,6 +64,7 @@ SANDBOX_SCENARIOS: tuple[str, ...] = (
     "log-summary-date-ranges",
     "nginx-request-logging",
     "path-tracing",
+    "swe-bench-astropy-2",
     "vulnerable-secret",
 )
 
