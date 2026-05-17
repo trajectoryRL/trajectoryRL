@@ -348,6 +348,11 @@ class _SessionResult:
     pack_hash: str = ""
     validator_salt: str = ""
     skill_md: str = ""
+    # True when the scenario loop broke early via the
+    # ``is_epoch_still_current`` gate. The downstream layer treats this
+    # as "discard the session" — submitting the partial sum would punish
+    # the miner for scenarios we never ran.
+    aborted_mid_session: bool = False
 
     def compute_scores(self) -> None:
         """Aggregate per-scenario correctness into the session score.
@@ -389,6 +394,10 @@ class SandboxEvaluationResult:
         self.response = ""
         self.rubric = {}
         self.error: Optional[str] = None
+        # Mirrors _SessionResult.aborted_mid_session — surfaces up to
+        # evaluate_miner_s1 so the validator can drop the partial
+        # session rather than POST a low-biased score.
+        self.aborted_mid_session: bool = session_result.aborted_mid_session
 
         self.cost_usd: Optional[float] = None
         self.token_usage: Optional[Dict[str, int]] = None
@@ -1059,6 +1068,7 @@ class TrajectorySandboxHarness:
                         session_id, pack_hash[:12], cell_index, total,
                         total - cell_index,
                     )
+                    session_result.aborted_mid_session = True
                     break
 
             episode = self._run_episode(

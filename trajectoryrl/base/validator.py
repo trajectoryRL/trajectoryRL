@@ -38,7 +38,11 @@ from ..utils.sandbox_harness import TrajectorySandboxHarness
 from ..utils.github import PackFetcher
 from ..utils import config as _config_mod
 from ..utils.commitments import MinerCommitment
-from ..utils.miner_eval import evaluate_miner_s1, SKIP_PACK_VERIFY
+from ..utils.miner_eval import (
+    evaluate_miner_s1,
+    SKIP_PACK_VERIFY,
+    SKIP_EPOCH_CHANGED,
+)
 from ..utils.trajrl_api import (
     heartbeat,
     fetch_current_epoch,
@@ -1070,6 +1074,19 @@ class TrajectoryValidator:
         )
 
         eval_result = await self._evaluate_challenger(commitment, challenge_epoch_id)
+
+        # Harness aborted mid-session because the epoch had moved on.
+        # Drop the eval entirely — POSTing the partial sum would punish
+        # the miner for scenarios we never ran (server-side 409s most of
+        # these anyway, but the intent here is "no submission", not "low
+        # submission that hopefully gets rejected").
+        if eval_result and eval_result.get("skip_reason") == SKIP_EPOCH_CHANGED:
+            logger.info(
+                "Discarding eval for epoch %d: harness aborted mid-session "
+                "(epoch moved on); no score submitted",
+                challenge_epoch_id,
+            )
+            return
 
         rejected = False
         rejection_detail: Optional[str] = None
