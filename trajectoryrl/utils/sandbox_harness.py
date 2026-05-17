@@ -34,6 +34,7 @@ import json
 import logging
 import math
 import queue
+import re
 import secrets
 import tarfile
 import threading
@@ -621,6 +622,41 @@ def _strip_provider_prefix(model: str) -> str:
         if model.startswith(prefix):
             return model[len(prefix):]
     return model
+
+
+# Hermes prints this exact shape to stdout when every retry of an LLM
+# request bounces with a 4xx/5xx — the body that reaches the validator
+# log as the "transcript" of a failed episode. Anchoring on the hermes-
+# side wording rather than a generic "HTTP 4xx" so we only trip when
+# the failure was on hermes's side of the wire (provider rejected the
+# call), not when a miner pack's own code happens to print 4xx strings.
+_PROVIDER_FAILURE_RE = re.compile(
+    r"API call failed after \d+ retries: HTTP [45]\d{2}"
+)
+
+
+def _looks_like_provider_failure(episodes: List["_EpisodeResult"]) -> bool:
+    """True when every episode in the session looks like the agent never
+    got a usable LLM response — i.e. the validator's own LLM provider
+    rejected every request (auth, credits, rate-limit, upstream 5xx).
+
+    Conservative by design: requires BOTH signals on every episode
+    (no billed cost AND a hermes-side retry-exhaustion line). This rules
+    out genuinely-bad packs (which would have billed cost from real LLM
+    calls) and do-nothing packs (which wouldn't carry the provider-
+    error string).
+
+    Returns False on empty input — callers handle "no episodes ran" as
+    a separate upstream skip condition.
+    """
+    if not episodes:
+        return False
+    for ep in episodes:
+        if ep.cost_usd is not None:
+            return False
+        if not _PROVIDER_FAILURE_RE.search(ep.transcript or ""):
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------

@@ -33,6 +33,7 @@ from .sandbox_harness import (
     SandboxEvaluationResult,
     TrajectorySandboxHarness,
     _EpisodeResult,
+    _looks_like_provider_failure,
 )
 
 
@@ -47,6 +48,13 @@ SKIP_S1_EVAL_ERROR = "s1_eval_error"
 # epoch had moved on. The validator discards the partial session rather
 # than POSTing a score whose missing scenarios would be counted as 0.
 SKIP_EPOCH_CHANGED = "epoch_changed_mid_eval"
+# Validator's own LLM provider failed every scenario (auth, credits,
+# rate-limit, upstream 5xx). The session "completed" — every verifier
+# ran — but the agent never produced real outputs, so the resulting
+# score is infra-poisoned rather than a reflection of the miner. Discard
+# rather than POST: silently shipping these scores would punish miners
+# for OUR billing failure and pollute consensus.
+SKIP_PROVIDER_FAILURE = "llm_provider_failure"
 
 
 @dataclass
@@ -207,6 +215,26 @@ async def evaluate_miner_s1(
             success=False,
             sandbox_result=result,
             skip_reason=SKIP_EPOCH_CHANGED,
+        )
+
+    # Infra-failure gate: when our LLM provider rejected every single
+    # request (e.g. OpenRouter HTTP 402 after credits ran out — the
+    # 2026-05-16 incident), the verifier still ran on empty agent
+    # outputs and assigned baseline-credit scores that look like a
+    # legitimately-low miner score. POSTing that to the network would
+    # poison consensus for every miner sampled while our key was dead.
+    # Discard the eval and surface the operator-actionable skip reason.
+    if _looks_like_provider_failure(result.session_result.episodes):
+        log.error(
+            "S1 evaluation: every scenario hit a hermes-side LLM "
+            "provider error (HTTP 4xx/5xx after retries); session "
+            "result is infra-poisoned, not a real miner score. "
+            "Discarding; fix the validator's testee LLM key/credits."
+        )
+        return MinerEvalOutcome(
+            success=False,
+            sandbox_result=result,
+            skip_reason=SKIP_PROVIDER_FAILURE,
         )
 
     # Step 3: Per-episode transcript tail logging (file-only via mlog)

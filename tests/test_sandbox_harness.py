@@ -15,6 +15,7 @@ from trajectoryrl.utils.sandbox_harness import (
     TrajectorySandboxHarness,
     _drain_exec_stream_with_deadline,
     _EpisodeResult,
+    _looks_like_provider_failure,
     _parse_ctrf_correctness,
     _parse_session_cost,
     _pick_episode_timeout,
@@ -117,6 +118,135 @@ class TestSessionResultScoring:
         sr = _make_session_result([("scenario_a", 5 / 6)])
         assert abs(sr.final_score - 5 / 6) < 1e-9
         assert abs(sr.mean_quality - 5 / 6) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# Tests: LLM-provider-failure detection
+# ---------------------------------------------------------------------------
+
+# Reproduces the exact transcript that the 2026-05-16 incident wrote into
+# every episode (OpenRouter HTTP 402 after hermes exhausted its 3 retries).
+# Keeping this verbatim so the regex is anchored to the real-world signal
+# the bug surfaces, not to a paraphrase.
+_HERMES_402 = (
+    "API call failed after 3 retries: HTTP 402: This request requires more "
+    "credits, or fewer max_tokens. You requested up to 65536 tokens, but can "
+    "only afford 22485. To increase, visit https://openrouter.ai/settings/"
+    "credits and add more credits\n"
+    "Exported 1 sessions to /workspace/turns.jsonl"
+)
+
+
+def _provider_failed_episode(scenario: str) -> _EpisodeResult:
+    """An episode mirroring the 402 case: no agent output, no cost, transcript
+    is just the hermes provider-error message."""
+    return _EpisodeResult(
+        episode_index=0,
+        scenario=scenario,
+        quality=0.0,
+        cost_usd=None,
+        transcript=_HERMES_402,
+    )
+
+
+def _real_episode(scenario: str, quality: float, cost_usd: float) -> _EpisodeResult:
+    """An episode that actually ran through hermes — has real cost recorded."""
+    return _EpisodeResult(
+        episode_index=0,
+        scenario=scenario,
+        quality=quality,
+        cost_usd=cost_usd,
+        transcript=(
+            "  ┊ review diff\na//app/setup.sh → b//app/setup.sh\n"
+            "@@ -0,0 +1,5 @@\n+#!/bin/bash\n+set -e\n+apt-get install nginx\n"
+        ),
+    )
+
+
+class TestLooksLikeProviderFailure:
+    def test_all_episodes_402_is_provider_failure(self):
+        eps = [_provider_failed_episode(s) for s in ("a", "b", "c")]
+        assert _looks_like_provider_failure(eps) is True
+
+    def test_mixed_session_is_not_provider_failure(self):
+        # Mirrors epoch 1445 — credits ran out mid-session, some
+        # scenarios completed normally before the 402 hit. We must not
+        # discard a session that has any real billed data, because the
+        # partial signal is still meaningful to the network.
+        eps = [
+            _real_episode("a", quality=1.0, cost_usd=0.07),
+            _real_episode("b", quality=0.83, cost_usd=0.01),
+            _provider_failed_episode("c"),
+        ]
+        assert _looks_like_provider_failure(eps) is False
+
+    def test_bad_pack_with_real_llm_calls_is_not_flagged(self):
+        # A genuinely terrible pack that DID call the LLM (so cost is
+        # recorded) but produced wrong outputs. Score is 0 but this is
+        # legitimate evaluation data — must not be discarded.
+        eps = [
+            _real_episode("a", quality=0.0, cost_usd=0.20),
+            _real_episode("b", quality=0.0, cost_usd=0.15),
+            _real_episode("c", quality=0.0, cost_usd=0.18),
+        ]
+        assert _looks_like_provider_failure(eps) is False
+
+    def test_empty_episodes_is_not_flagged(self):
+        # No episodes ran at all — that's a different upstream skip
+        # condition (epoch_changed etc.), not provider failure.
+        assert _looks_like_provider_failure([]) is False
+
+    def test_no_cost_but_no_provider_error_is_not_flagged(self):
+        # A pack whose agent never reached the LLM (e.g. crashed in
+        # setup, or wrote the output without calling the model). Cost
+        # is None but transcripts don't carry a provider-error pattern,
+        # so we don't second-guess the verifier's verdict.
+        eps = [
+            _EpisodeResult(
+                episode_index=0, scenario="a", quality=0.0, cost_usd=None,
+                transcript="agent: I refuse to call the LLM. Exiting.",
+            ),
+            _EpisodeResult(
+                episode_index=1, scenario="b", quality=0.0, cost_usd=None,
+                transcript="",
+            ),
+        ]
+        assert _looks_like_provider_failure(eps) is False
+
+    def test_detects_429_rate_limit(self):
+        # Different provider-error class but same logical failure
+        # (we received zero usable evaluation data because OUR infra
+        # got rejected). Verify the regex generalizes beyond 402.
+        ep = _EpisodeResult(
+            episode_index=0, scenario="a", quality=0.0, cost_usd=None,
+            transcript=(
+                "API call failed after 5 retries: HTTP 429: Rate limit "
+                "exceeded. Retry after 60s."
+            ),
+        )
+        assert _looks_like_provider_failure([ep]) is True
+
+    def test_detects_5xx_provider_outage(self):
+        # OpenRouter / OpenAI return 502/503 when upstream model
+        # providers are unreachable. Same poisoning effect.
+        ep = _EpisodeResult(
+            episode_index=0, scenario="a", quality=0.0, cost_usd=None,
+            transcript=(
+                "API call failed after 3 retries: HTTP 503: upstream "
+                "provider unavailable"
+            ),
+        )
+        assert _looks_like_provider_failure([ep]) is True
+
+    def test_episode_with_recorded_cost_breaks_the_pattern(self):
+        # Belt-and-suspenders: even if a transcript LOOKS like a
+        # provider error, a non-None cost_usd proves billing happened —
+        # i.e. the LLM did respond at least once. Don't flag.
+        ep = _EpisodeResult(
+            episode_index=0, scenario="a", quality=0.0, cost_usd=0.02,
+            transcript=_HERMES_402,
+        )
+        assert _looks_like_provider_failure([ep]) is False
 
 
 # ---------------------------------------------------------------------------

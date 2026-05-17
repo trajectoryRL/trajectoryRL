@@ -42,6 +42,7 @@ from ..utils.miner_eval import (
     evaluate_miner_s1,
     SKIP_PACK_VERIFY,
     SKIP_EPOCH_CHANGED,
+    SKIP_PROVIDER_FAILURE,
 )
 from ..utils.trajrl_api import (
     heartbeat,
@@ -1084,6 +1085,26 @@ class TrajectoryValidator:
             logger.info(
                 "Discarding eval for epoch %d: harness aborted mid-session "
                 "(epoch moved on); no score submitted",
+                challenge_epoch_id,
+            )
+            return
+
+        # Infra-failure discard: when the validator's own LLM provider
+        # rejected every scenario (credits/auth/rate-limit/5xx), the
+        # session "completed" but the per-scenario qualities are baseline
+        # credit on empty agent outputs — not a miner signal. POSTing
+        # that score would mark this miner as broken on our behalf and
+        # pollute consensus. Skip the submission entirely; the validator
+        # picks up the next challenger on the next eval tick, and once
+        # the operator fixes the key the evaluation resumes normally.
+        if (
+            eval_result
+            and eval_result.get("skip_reason") == SKIP_PROVIDER_FAILURE
+        ):
+            logger.error(
+                "Discarding eval for epoch %d: every scenario hit an "
+                "LLM-provider error. Validator infrastructure is broken — "
+                "fix the testee LLM key/credits. No score submitted.",
                 challenge_epoch_id,
             )
             return
