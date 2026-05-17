@@ -121,132 +121,180 @@ class TestSessionResultScoring:
 
 
 # ---------------------------------------------------------------------------
-# Tests: LLM-provider-failure detection
+# Tests: provider-failure detection
 # ---------------------------------------------------------------------------
-
-# Reproduces the exact transcript that the 2026-05-16 incident wrote into
-# every episode (OpenRouter HTTP 402 after hermes exhausted its 3 retries).
-# Keeping this verbatim so the regex is anchored to the real-world signal
-# the bug surfaces, not to a paraphrase.
-_HERMES_402 = (
-    "API call failed after 3 retries: HTTP 402: This request requires more "
-    "credits, or fewer max_tokens. You requested up to 65536 tokens, but can "
-    "only afford 22485. To increase, visit https://openrouter.ai/settings/"
-    "credits and add more credits\n"
-    "Exported 1 sessions to /workspace/turns.jsonl"
-)
+#
+# Keys off ``chat_exit`` (Docker exec exit code) + ``timed_out``. Hermes
+# returning non-zero across every episode is direct evidence its own LLM
+# round-trip never produced output, regardless of provider shape — works
+# on OpenRouter HTTP 4xx, local-server connection-refused, hermes OOM,
+# deadline-kill, etc. ``cost_usd > 0`` on any episode short-circuits:
+# billing somewhere proves the provider answered at least once, so it's
+# not a session-wide infra failure.
 
 
-def _provider_failed_episode(scenario: str) -> _EpisodeResult:
-    """An episode mirroring the 402 case: no agent output, no cost, transcript
-    is just the hermes provider-error message."""
+def _hermes_failed(scenario: str, *, chat_exit: int = 1,
+                   timed_out: bool = False) -> _EpisodeResult:
+    """Episode where hermes itself exited badly (LLM call never returned
+    usable output). chat_exit defaults to 1 (the 2026-05-16 incident
+    value); pass ``chat_exit=137`` for SIGKILL'd hermes etc."""
     return _EpisodeResult(
         episode_index=0,
         scenario=scenario,
         quality=0.0,
         cost_usd=None,
-        transcript=_HERMES_402,
+        chat_exit=chat_exit,
+        timed_out=timed_out,
+        agent_output_missing=True,
+        transcript="",  # v2 doesn't care about transcript shape
     )
 
 
-def _real_episode(scenario: str, quality: float, cost_usd: float) -> _EpisodeResult:
-    """An episode that actually ran through hermes — has real cost recorded."""
+def _hermes_ran_cleanly(scenario: str, *, quality: float = 0.0,
+                        cost_usd: float | None = None,
+                        agent_output_missing: bool = False) -> _EpisodeResult:
+    """Episode where hermes itself exited 0 (the LLM round-trip worked).
+    Whether the agent produced useful output or billed cost is downstream
+    pack behavior, not infra."""
     return _EpisodeResult(
         episode_index=0,
         scenario=scenario,
         quality=quality,
         cost_usd=cost_usd,
-        transcript=(
-            "  ┊ review diff\na//app/setup.sh → b//app/setup.sh\n"
-            "@@ -0,0 +1,5 @@\n+#!/bin/bash\n+set -e\n+apt-get install nginx\n"
-        ),
+        chat_exit=0,
+        timed_out=False,
+        agent_output_missing=agent_output_missing,
+        transcript="agent output: <some content>",
     )
 
 
 class TestLooksLikeProviderFailure:
-    def test_all_episodes_402_is_provider_failure(self):
-        eps = [_provider_failed_episode(s) for s in ("a", "b", "c")]
+    """Structural (chat_exit / timed_out), provider-agnostic predicate."""
+
+    def test_every_episode_hermes_exit_nonzero_is_flagged(self):
+        # The 2026-05-16 incident: hermes' exec exit is non-zero on every
+        # scenario because every LLM call exhausted retries.
+        eps = [_hermes_failed(s, chat_exit=1) for s in ("a", "b", "c")]
         assert _looks_like_provider_failure(eps) is True
-
-    def test_mixed_session_is_not_provider_failure(self):
-        # Mirrors epoch 1445 — credits ran out mid-session, some
-        # scenarios completed normally before the 402 hit. We must not
-        # discard a session that has any real billed data, because the
-        # partial signal is still meaningful to the network.
-        eps = [
-            _real_episode("a", quality=1.0, cost_usd=0.07),
-            _real_episode("b", quality=0.83, cost_usd=0.01),
-            _provider_failed_episode("c"),
-        ]
-        assert _looks_like_provider_failure(eps) is False
-
-    def test_bad_pack_with_real_llm_calls_is_not_flagged(self):
-        # A genuinely terrible pack that DID call the LLM (so cost is
-        # recorded) but produced wrong outputs. Score is 0 but this is
-        # legitimate evaluation data — must not be discarded.
-        eps = [
-            _real_episode("a", quality=0.0, cost_usd=0.20),
-            _real_episode("b", quality=0.0, cost_usd=0.15),
-            _real_episode("c", quality=0.0, cost_usd=0.18),
-        ]
-        assert _looks_like_provider_failure(eps) is False
 
     def test_empty_episodes_is_not_flagged(self):
         # No episodes ran at all — that's a different upstream skip
         # condition (epoch_changed etc.), not provider failure.
         assert _looks_like_provider_failure([]) is False
 
-    def test_no_cost_but_no_provider_error_is_not_flagged(self):
-        # A pack whose agent never reached the LLM (e.g. crashed in
-        # setup, or wrote the output without calling the model). Cost
-        # is None but transcripts don't carry a provider-error pattern,
-        # so we don't second-guess the verifier's verdict.
+    def test_every_episode_timed_out_is_flagged(self):
+        # Provider/server stuck — hermes hits the per-episode deadline
+        # and gets SIGKILL'd. chat_exit may be 137 or whatever the
+        # signal mapped to, but ``timed_out=True`` is the canonical
+        # signal here.
         eps = [
-            _EpisodeResult(
-                episode_index=0, scenario="a", quality=0.0, cost_usd=None,
-                transcript="agent: I refuse to call the LLM. Exiting.",
-            ),
-            _EpisodeResult(
-                episode_index=1, scenario="b", quality=0.0, cost_usd=None,
-                transcript="",
-            ),
+            _hermes_failed(s, chat_exit=137, timed_out=True)
+            for s in ("a", "b", "c")
+        ]
+        assert _looks_like_provider_failure(eps) is True
+
+    def test_local_model_success_is_not_flagged(self):
+        # Validator pointed at a local vLLM/Qwen instance. Hermes runs
+        # fine, agent produces output, BUT turns.jsonl has no $ pricing
+        # → cost_usd is None for every episode. v1 would have either
+        # false-positived (if regex happened to match) or done nothing;
+        # v2 must let this through cleanly.
+        eps = [
+            _hermes_ran_cleanly("a", quality=0.5),
+            _hermes_ran_cleanly("b", quality=0.8),
+            _hermes_ran_cleanly("c", quality=1.0),
         ]
         assert _looks_like_provider_failure(eps) is False
 
-    def test_detects_429_rate_limit(self):
-        # Different provider-error class but same logical failure
-        # (we received zero usable evaluation data because OUR infra
-        # got rejected). Verify the regex generalizes beyond 402.
-        ep = _EpisodeResult(
-            episode_index=0, scenario="a", quality=0.0, cost_usd=None,
-            transcript=(
-                "API call failed after 5 retries: HTTP 429: Rate limit "
-                "exceeded. Retry after 60s."
-            ),
-        )
-        assert _looks_like_provider_failure([ep]) is True
+    def test_local_model_failure_is_flagged(self):
+        # Local model server went down mid-session: every hermes call
+        # fails (connection refused — no HTTP status, so v1 regex would
+        # have silently passed). v2 catches it via chat_exit.
+        eps = [_hermes_failed(s, chat_exit=1) for s in ("a", "b", "c")]
+        assert _looks_like_provider_failure(eps) is True
 
-    def test_detects_5xx_provider_outage(self):
-        # OpenRouter / OpenAI return 502/503 when upstream model
-        # providers are unreachable. Same poisoning effect.
-        ep = _EpisodeResult(
-            episode_index=0, scenario="a", quality=0.0, cost_usd=None,
-            transcript=(
-                "API call failed after 3 retries: HTTP 503: upstream "
-                "provider unavailable"
-            ),
-        )
-        assert _looks_like_provider_failure([ep]) is True
+    def test_do_nothing_pack_clean_exit_is_not_flagged(self):
+        # Agent's SKILL.md instructs it to exit immediately without
+        # calling the LLM — hermes exits 0, no output, no cost. This is
+        # legitimately-bad pack signal, NOT infra. The score (0) is
+        # honest information about the pack; do not discard.
+        eps = [
+            _hermes_ran_cleanly(s, agent_output_missing=True)
+            for s in ("a", "b", "c")
+        ]
+        assert _looks_like_provider_failure(eps) is False
 
-    def test_episode_with_recorded_cost_breaks_the_pattern(self):
-        # Belt-and-suspenders: even if a transcript LOOKS like a
-        # provider error, a non-None cost_usd proves billing happened —
-        # i.e. the LLM did respond at least once. Don't flag.
-        ep = _EpisodeResult(
-            episode_index=0, scenario="a", quality=0.0, cost_usd=0.02,
-            transcript=_HERMES_402,
-        )
-        assert _looks_like_provider_failure([ep]) is False
+    def test_bad_pack_with_billing_is_not_flagged(self):
+        # Pack called the LLM, got wrong answers. Every episode has
+        # real billed cost. Anti-FP gate fires regardless of chat_exit.
+        eps = [
+            _hermes_ran_cleanly("a", quality=0.0, cost_usd=0.20),
+            _hermes_ran_cleanly("b", quality=0.0, cost_usd=0.15),
+            _hermes_ran_cleanly("c", quality=0.0, cost_usd=0.18),
+        ]
+        assert _looks_like_provider_failure(eps) is False
+
+    def test_mixed_one_billed_rest_failed_is_not_flagged(self):
+        # Credits ran out mid-session — first scenario got a real
+        # response (cost > 0), rest failed. The first episode's signal
+        # is meaningful; don't discard the whole session.
+        eps = [
+            _hermes_ran_cleanly("a", quality=1.0, cost_usd=0.07),
+            _hermes_failed("b", chat_exit=1),
+            _hermes_failed("c", chat_exit=1),
+        ]
+        assert _looks_like_provider_failure(eps) is False
+
+    def test_recorded_zero_cost_does_not_count_as_billing(self):
+        # ``cost_usd == 0.0`` (vs ``None``) can happen on free-tier /
+        # unpriced local models that still write turns.jsonl. It is
+        # NOT evidence the provider answered usefully — chat_exit
+        # determines outcome. Here every chat_exit != 0 → still flag.
+        eps = [
+            _EpisodeResult(
+                episode_index=i, scenario=s, quality=0.0,
+                cost_usd=0.0, chat_exit=1, timed_out=False,
+                agent_output_missing=True, transcript="",
+            )
+            for i, s in enumerate(("a", "b", "c"))
+        ]
+        assert _looks_like_provider_failure(eps) is True
+
+    def test_predicate_ignores_transcript_shape(self):
+        # v1 required a hermes-specific regex on stdout. v2 must NOT
+        # rely on transcript content — same chat_exit signal, different
+        # provider error strings should all be caught.
+        for transcript in (
+            "API call failed after 3 retries: HTTP 402: ...",  # OpenRouter
+            "openai.APIConnectionError: Connection refused",   # local
+            "RuntimeError: CUDA out of memory",                 # vLLM OOM
+            "",                                                 # silent
+            "garbage \x00 bytes that decode oddly",            # weird
+        ):
+            ep = _EpisodeResult(
+                episode_index=0, scenario="a", quality=0.0,
+                cost_usd=None, chat_exit=1, timed_out=False,
+                agent_output_missing=True, transcript=transcript,
+            )
+            assert _looks_like_provider_failure([ep]) is True, (
+                f"failed for transcript={transcript!r}"
+            )
+
+    def test_unknown_chat_exit_alone_is_not_flagged(self):
+        # If chat_exit is None (e.g. Docker inspect raced and we never
+        # got an exit code), treat as "unknown" rather than "failed".
+        # Don't false-positive on a session where we just lack the
+        # signal — POST the score honestly.
+        eps = [
+            _EpisodeResult(
+                episode_index=i, scenario=s, quality=0.0,
+                cost_usd=None, chat_exit=None, timed_out=False,
+                agent_output_missing=False,
+                transcript="agent output: ...",
+            )
+            for i, s in enumerate(("a", "b", "c"))
+        ]
+        assert _looks_like_provider_failure(eps) is False
 
 
 # ---------------------------------------------------------------------------

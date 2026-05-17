@@ -48,12 +48,14 @@ SKIP_S1_EVAL_ERROR = "s1_eval_error"
 # epoch had moved on. The validator discards the partial session rather
 # than POSTing a score whose missing scenarios would be counted as 0.
 SKIP_EPOCH_CHANGED = "epoch_changed_mid_eval"
-# Validator's own LLM provider failed every scenario (auth, credits,
-# rate-limit, upstream 5xx). The session "completed" — every verifier
-# ran — but the agent never produced real outputs, so the resulting
-# score is infra-poisoned rather than a reflection of the miner. Discard
-# rather than POST: silently shipping these scores would punish miners
-# for OUR billing failure and pollute consensus.
+# Hermes itself failed on every scenario this session (non-zero exit
+# code or deadline kill, with no billed LLM call anywhere). Catches
+# OpenRouter HTTP 4xx, OpenAI 5xx, local-server connection refused,
+# hermes OOM, etc. — any failure that surfaces as "hermes did not
+# produce real output for any scenario". The verifier still ran and
+# scored baseline-credit on empty agent outputs; that's not a miner
+# signal. Discard rather than POST — silently shipping these scores
+# would punish miners for OUR infra failure and pollute consensus.
 SKIP_PROVIDER_FAILURE = "llm_provider_failure"
 
 
@@ -217,19 +219,19 @@ async def evaluate_miner_s1(
             skip_reason=SKIP_EPOCH_CHANGED,
         )
 
-    # Infra-failure gate: when our LLM provider rejected every single
-    # request (e.g. OpenRouter HTTP 402 after credits ran out — the
-    # 2026-05-16 incident), the verifier still ran on empty agent
-    # outputs and assigned baseline-credit scores that look like a
-    # legitimately-low miner score. POSTing that to the network would
-    # poison consensus for every miner sampled while our key was dead.
-    # Discard the eval and surface the operator-actionable skip reason.
+    # Infra-failure gate: when hermes itself failed on every scenario
+    # (non-zero exit or deadline kill, with no billed LLM call anywhere
+    # in the session), the verifier still ran but on empty agent
+    # outputs — the resulting baseline-credit scores look like a
+    # legitimately-low miner score but are infra-poisoned. POSTing them
+    # would punish honest miners for our key/credits/network failure.
+    # The 2026-05-16 incident: OpenRouter HTTP 402 across every call.
     if _looks_like_provider_failure(result.session_result.episodes):
         log.error(
-            "S1 evaluation: every scenario hit a hermes-side LLM "
-            "provider error (HTTP 4xx/5xx after retries); session "
-            "result is infra-poisoned, not a real miner score. "
-            "Discarding; fix the validator's testee LLM key/credits."
+            "S1 evaluation: hermes failed on every scenario (no LLM "
+            "round-trip produced output and nothing was billed). "
+            "Session result is infra-poisoned, not a real miner score. "
+            "Discarding; check the validator's LLM key/credits/network."
         )
         return MinerEvalOutcome(
             success=False,

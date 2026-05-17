@@ -35,14 +35,6 @@ from trajectoryrl.utils.sandbox_harness import (
 )
 
 
-_HERMES_402 = (
-    "API call failed after 3 retries: HTTP 402: This request requires more "
-    "credits, or fewer max_tokens. You requested up to 65536 tokens, but can "
-    "only afford 22485.\n"
-    "Exported 1 sessions to /workspace/turns.jsonl"
-)
-
-
 def _commitment(pack_bytes: bytes) -> MagicMock:
     """Stand-in for ``MinerCommitment`` — only the fields the pipeline reads."""
     c = MagicMock()
@@ -95,13 +87,15 @@ def _make_eval_result(
 
 @pytest.mark.asyncio
 async def test_provider_failure_skips_with_dedicated_reason():
-    """Every scenario hit hermes' "HTTP 4xx after retries" error and no
-    cost was billed → outcome must be ``SKIP_PROVIDER_FAILURE``, not a
-    poisoned score submission."""
+    """Every scenario's hermes process exited non-zero (LLM round-trip
+    never produced output) and no cost was billed → outcome must be
+    ``SKIP_PROVIDER_FAILURE``, not a poisoned score submission."""
     eps = [
         _EpisodeResult(
             episode_index=i, scenario=name,
-            quality=0.0, cost_usd=None, transcript=_HERMES_402,
+            quality=0.0, cost_usd=None,
+            chat_exit=1, agent_output_missing=True,
+            transcript="",
         )
         for i, name in enumerate(("a", "b", "c"))
     ]
@@ -124,11 +118,13 @@ async def test_real_low_score_still_submits():
     eps = [
         _EpisodeResult(
             episode_index=0, scenario="a",
-            quality=0.0, cost_usd=0.21, transcript="agent output: <wrong answer>",
+            quality=0.0, cost_usd=0.21, chat_exit=0,
+            transcript="agent output: <wrong answer>",
         ),
         _EpisodeResult(
             episode_index=1, scenario="b",
-            quality=0.125, cost_usd=0.04, transcript="agent output: <partial>",
+            quality=0.125, cost_usd=0.04, chat_exit=0,
+            transcript="agent output: <partial>",
         ),
     ]
     pack = {"schema_version": 1, "files": {"SKILL.md": "# Real skill\n"}}

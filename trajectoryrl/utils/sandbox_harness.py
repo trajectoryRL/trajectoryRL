@@ -34,7 +34,6 @@ import json
 import logging
 import math
 import queue
-import re
 import secrets
 import tarfile
 import threading
@@ -335,6 +334,18 @@ class _EpisodeResult:
     turns_log: str = ""
     turns_export_err: str = ""
     timed_out: bool = False
+    # Hermes' Docker exec exit code. ``None`` when inspect failed / not
+    # yet probed; ``0`` on clean exit; non-zero when hermes itself
+    # errored (LLM round-trip exhausted retries, OOM, signal kill, etc).
+    # Distinguishes "hermes failed at the LLM layer" (non-zero) from
+    # "hermes ran fine but the agent did nothing useful" (zero with no
+    # output) — the latter is a pack signal, not infra failure.
+    chat_exit: int | None = None
+    # True when ``_extract_file`` couldn't find the agent's output file
+    # after hermes finished. Currently observability-only; reserved for
+    # future predicates that need to differentiate "agent crashed
+    # post-LLM" from "agent finished cleanly with empty output".
+    agent_output_missing: bool = False
     error: str | None = None
     duration_s: float = 0.0
     judge_result: dict = field(default_factory=dict)
@@ -624,37 +635,55 @@ def _strip_provider_prefix(model: str) -> str:
     return model
 
 
-# Hermes prints this exact shape to stdout when every retry of an LLM
-# request bounces with a 4xx/5xx — the body that reaches the validator
-# log as the "transcript" of a failed episode. Anchoring on the hermes-
-# side wording rather than a generic "HTTP 4xx" so we only trip when
-# the failure was on hermes's side of the wire (provider rejected the
-# call), not when a miner pack's own code happens to print 4xx strings.
-_PROVIDER_FAILURE_RE = re.compile(
-    r"API call failed after \d+ retries: HTTP [45]\d{2}"
-)
-
-
 def _looks_like_provider_failure(episodes: List["_EpisodeResult"]) -> bool:
-    """True when every episode in the session looks like the agent never
-    got a usable LLM response — i.e. the validator's own LLM provider
-    rejected every request (auth, credits, rate-limit, upstream 5xx).
+    """True when every episode in the session ended with hermes itself
+    failing — non-zero exit code or deadline kill — and no episode ever
+    billed an LLM call.
 
-    Conservative by design: requires BOTH signals on every episode
-    (no billed cost AND a hermes-side retry-exhaustion line). This rules
-    out genuinely-bad packs (which would have billed cost from real LLM
-    calls) and do-nothing packs (which wouldn't carry the provider-
-    error string).
+    Provider-format-agnostic. Catches OpenRouter HTTP 4xx, OpenAI 5xx,
+    local-server connection-refused, hermes-side OOM, deadline-driven
+    SIGKILLs alike. Earlier versions of this predicate parsed a hermes-
+    specific stdout regex (``"API call failed after N retries: HTTP
+    4xx/5xx"``) which silently failed on (a) local-model deployments
+    that emit different error shapes, and (b) anything not surfacing as
+    a clean HTTP status. ``chat_exit`` is the direct structural signal.
+
+    Decision:
+      1. Any episode billed real cost (``cost_usd > 0``)? → False.
+         Hermes spoke to the provider successfully at least once
+         during this session; not a session-wide infra failure even if
+         later scenarios broke.
+      2. Every episode has a hermes-side failure (``chat_exit`` non-
+         zero OR ``timed_out``)? → True. Provider rejected/never
+         answered every request, regardless of error format.
+      3. Otherwise → False. ``chat_exit == 0`` means hermes ran cleanly;
+         any downstream emptiness is a pack signal, not infra. Mixed
+         sessions where some episodes ran cleanly also return False —
+         the clean episodes' scores are honest data.
+
+    Treats ``chat_exit is None`` as "unknown" (not "failed"): rather
+    miss a session where we lack the signal than false-positive on it.
 
     Returns False on empty input — callers handle "no episodes ran" as
     a separate upstream skip condition.
     """
     if not episodes:
         return False
+    # Anti-false-positive: any positively billed episode proves the
+    # provider answered usefully at least once this session.
+    # ``cost_usd == 0.0`` (vs ``None``) can be written by hermes for
+    # free-tier / unpriced local models even on failed responses, so we
+    # require strictly > 0 — chat_exit then makes the final call.
     for ep in episodes:
-        if ep.cost_usd is not None:
+        if ep.cost_usd is not None and ep.cost_usd > 0:
             return False
-        if not _PROVIDER_FAILURE_RE.search(ep.transcript or ""):
+    # Trigger: every episode must show hermes-side failure.
+    for ep in episodes:
+        hermes_errored = (
+            (ep.chat_exit is not None and ep.chat_exit != 0)
+            or ep.timed_out
+        )
+        if not hermes_errored:
             return False
     return True
 
@@ -1309,6 +1338,7 @@ class TrajectorySandboxHarness:
 
             inspect = self.client.api.exec_inspect(exec_id)
             chat_exit = inspect.get("ExitCode")
+            episode.chat_exit = chat_exit
             logger.info(
                 "[%s] %s hermes chat finished (exit=%s, timed_out=%s, %d chars)",
                 session_id, scenario, chat_exit, episode.timed_out,
@@ -1334,6 +1364,7 @@ class TrajectorySandboxHarness:
             )
 
             agent_output_bytes = self._extract_file(sandbox, agent_output_path)
+            episode.agent_output_missing = agent_output_bytes is None
             if agent_output_bytes is None:
                 logger.warning(
                     "[%s] %s agent produced no output at %s",
