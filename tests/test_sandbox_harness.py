@@ -1419,10 +1419,10 @@ class TestParallelScenarioOrchestrator:
 
         return h
 
-    def test_default_config_is_three(self):
+    def test_default_config_is_two(self):
         # Bumping this default is a behavior change for every operator;
         # surface it in a test so a casual edit can't slip through.
-        assert ValidatorConfig.parallel_scenario_evals == 3
+        assert ValidatorConfig.parallel_scenario_evals == 2
 
     def test_env_var_clamps_to_at_least_one(self, monkeypatch, tmp_path):
         # PARALLEL_SCENARIO_EVALS=0 (or negative) must clamp up — a
