@@ -1141,8 +1141,16 @@ class TrajectorySandboxHarness:
                 return True
 
         def _kill_in_flight() -> None:
+            # Clear under the lock so a repeat invocation (the abort
+            # path is checked at both branches of the while-loop and
+            # would otherwise double-fire ``docker kill`` on the same
+            # container) is a no-op. The worker's
+            # ``on_container_finished`` callback uses ``pop(default=None)``
+            # so removing entries here doesn't race with worker
+            # cleanup.
             with in_flight_lock:
                 snapshot = list(in_flight.items())
+                in_flight.clear()
             for cell_index, sb in snapshot:
                 try:
                     sb.kill()
@@ -1298,6 +1306,22 @@ class TrajectorySandboxHarness:
         # code's output. Aborted-and-never-submitted scenarios are
         # simply absent from ``results``, mirroring the pre-PR
         # ``break``-out-of-loop behavior.
+        #
+        # Shape note for the parallel abort path: scenarios that were
+        # *in flight* when the epoch flipped land in ``results`` with
+        # ``chat_exit != 0`` (their containers were ``docker kill``-ed
+        # mid-exec). The pre-PR sequential code never had anything
+        # in-flight at the gate, so those entries didn't exist. This
+        # is fine in practice because ``miner_eval.evaluate_miner_s1``
+        # short-circuits on ``aborted_mid_session=True`` *before* it
+        # reads ``session_result.episodes`` for provider-failure
+        # detection or score submission (``miner_eval.py``: the
+        # ``aborted_mid_session`` branch returns ``SKIP_EPOCH_CHANGED``
+        # ahead of the ``_looks_like_provider_failure`` check). Any
+        # future consumer that reads ``episodes`` without first
+        # honoring ``aborted_mid_session`` must filter for
+        # ``chat_exit == 0`` (or ``error is None``) to recover the
+        # sequential shape.
         for cell_index in sorted(results):
             session_result.episodes.append(results[cell_index])
 

@@ -1632,13 +1632,15 @@ class TestParallelScenarioOrchestrator:
 
         # Aborted flag flipped.
         assert result.aborted_mid_session is True
-        # The two scenarios that were in flight alongside s0 (s1, s2)
-        # received a kill signal. s3+ were never submitted.
+        # Both scenarios in flight alongside s0 (s1, s2) must receive
+        # a kill signal — a single-kill regression in the fan-out
+        # loop would only stop one of them. ``== 2`` catches that;
+        # ``>= 1`` would silently allow it.
         with killed_lock:
             kill_count = len(killed_containers)
-        assert kill_count >= 1, (
-            "expected the orchestrator to kill at least one in-flight "
-            "container after the epoch changed; recorded kills: "
+        assert kill_count == 2, (
+            "expected exactly the two in-flight containers (s1, s2) "
+            "to be killed after the epoch changed; recorded kills: "
             f"{kill_count}"
         )
         # No scenario past the initial parallelism window should have
