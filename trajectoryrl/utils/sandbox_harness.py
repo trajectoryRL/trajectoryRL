@@ -38,6 +38,7 @@ import secrets
 import tarfile
 import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -1106,61 +1107,199 @@ class TrajectorySandboxHarness:
         )
 
         total = len(scenario_specs)
-        for cell_index, spec in enumerate(scenario_specs):
-            # Pre-scenario epoch-current check. Skip on the first
-            # scenario — the session-start gate in validator.py already
-            # verified the pack was current when this session was
-            # picked up. For scenarios 2..N, the epoch may have ended
-            # while we were grinding through earlier scenarios; in that
-            # case the final submission will 409, and we should bail
-            # immediately to free compute for the new challenger.
-            if cell_index > 0 and is_epoch_still_current is not None:
+        # PARALLEL_SCENARIO_EVALS knob: run up to N scenarios
+        # concurrently inside one session. =1 reproduces the old
+        # sequential behavior. Bounded by ``total`` so we don't
+        # allocate idle worker threads when the scenario set is small.
+        parallelism = max(1, int(self.config.parallel_scenario_evals))
+        if total > 0:
+            parallelism = min(parallelism, total)
+        logger.info(
+            "[%s] dispatching %d scenarios with parallelism=%d",
+            session_id, total, parallelism,
+        )
+
+        results: dict[int, _EpisodeResult] = {}
+        in_flight: dict[int, Container] = {}
+        in_flight_lock = threading.Lock()
+        abort_event = threading.Event()
+
+        def _check_still_current() -> bool:
+            """Epoch-current gate. True means keep going; False means
+            stop dispatching and kill in-flight."""
+            if is_epoch_still_current is None:
+                return True
+            try:
+                return bool(is_epoch_still_current(pack_hash))
+            except Exception as e:
+                # Transient API failure: assume current to avoid
+                # false-aborts on a momentary 5xx / timeout.
+                logger.debug(
+                    "is_epoch_still_current callback failed: %s "
+                    "(assuming still current)", e,
+                )
+                return True
+
+        def _kill_in_flight() -> None:
+            with in_flight_lock:
+                snapshot = list(in_flight.items())
+            for cell_index, sb in snapshot:
                 try:
-                    still_current = is_epoch_still_current(pack_hash)
-                except Exception as e:
-                    # Transient API failure: assume current to avoid
-                    # false-aborts on a momentary 5xx / timeout.
-                    logger.debug(
-                        "is_epoch_still_current callback failed: %s "
-                        "(assuming still current)", e,
-                    )
-                    still_current = True
-                if not still_current:
+                    sb.kill()
                     logger.info(
-                        "[%s] pack %s no longer the current challenger "
-                        "after %d/%d scenarios; aborting remaining %d "
-                        "scenarios to catch up to new epoch",
-                        session_id, pack_hash[:12], cell_index, total,
-                        total - cell_index,
+                        "[%s] killed scenario %s (cell %d) — epoch moved on",
+                        session_id,
+                        scenario_specs[cell_index]["name"],
+                        cell_index,
                     )
-                    session_result.aborted_mid_session = True
+                except Exception as e:
+                    logger.debug(
+                        "[%s] sandbox.kill() failed for cell %d: %s",
+                        session_id, cell_index, e,
+                    )
+
+        def _make_started_cb(
+            cell_index: int,
+        ) -> Callable[[Container], None]:
+            def _cb(sandbox: Container) -> None:
+                with in_flight_lock:
+                    in_flight[cell_index] = sandbox
+                # Race: abort_event flipped after submit but before
+                # the worker registered its container. Kill now so
+                # we don't waste a hermes roundtrip.
+                if abort_event.is_set():
+                    try:
+                        sandbox.kill()
+                    except Exception:
+                        pass
+            return _cb
+
+        def _make_finished_cb(cell_index: int) -> Callable[[], None]:
+            def _cb() -> None:
+                with in_flight_lock:
+                    in_flight.pop(cell_index, None)
+            return _cb
+
+        with ThreadPoolExecutor(
+            max_workers=parallelism,
+            thread_name_prefix=f"sandbox-eval-{session_id}",
+        ) as pool:
+            futures: dict[Future, int] = {}
+            submitted = 0
+            while submitted < total or futures:
+                # Top up the pool, respecting the epoch-current gate.
+                # The gate is consulted before every scenario submit
+                # *after* the first — the first scenario was already
+                # gated by validator.py's session-start check.
+                while (
+                    submitted < total
+                    and len(futures) < parallelism
+                    and not abort_event.is_set()
+                ):
+                    cell_index = submitted
+                    if cell_index > 0 and not _check_still_current():
+                        logger.info(
+                            "[%s] pack %s no longer the current "
+                            "challenger after %d/%d scenarios "
+                            "submitted; aborting remaining %d and "
+                            "killing in-flight to catch up to new "
+                            "epoch",
+                            session_id, pack_hash[:12],
+                            cell_index, total, total - cell_index,
+                        )
+                        session_result.aborted_mid_session = True
+                        abort_event.set()
+                        break
+
+                    spec = scenario_specs[cell_index]
+                    fut = pool.submit(
+                        self._run_episode,
+                        session_id=session_id,
+                        episode_index=cell_index,
+                        skill_md=skill_md,
+                        spec=spec,
+                        on_chat_start=(
+                            (lambda sc=spec["name"], idx=cell_index, tot=total:
+                                on_episode_start(sc, idx, tot))
+                            if on_episode_start is not None else None
+                        ),
+                        on_chat_end=(
+                            (lambda sc=spec["name"], idx=cell_index, tot=total:
+                                on_episode_verifying(sc, idx, tot))
+                            if on_episode_verifying is not None else None
+                        ),
+                        on_container_started=_make_started_cb(cell_index),
+                        on_container_finished=_make_finished_cb(cell_index),
+                    )
+                    futures[fut] = cell_index
+                    submitted += 1
+
+                if abort_event.is_set():
+                    _kill_in_flight()
+
+                if not futures:
                     break
 
-            episode = self._run_episode(
-                session_id=session_id,
-                episode_index=cell_index,
-                skill_md=skill_md,
-                spec=spec,
-                on_chat_start=(
-                    (lambda sc=spec["name"], idx=cell_index, tot=total:
-                        on_episode_start(sc, idx, tot))
-                    if on_episode_start is not None else None
-                ),
-                on_chat_end=(
-                    (lambda sc=spec["name"], idx=cell_index, tot=total:
-                        on_episode_verifying(sc, idx, tot))
-                    if on_episode_verifying is not None else None
-                ),
-            )
-            session_result.episodes.append(episode)
-            if on_episode_done is not None:
-                try:
-                    on_episode_done(episode, cell_index, total)
-                except Exception as e:
-                    logger.warning(
-                        "on_episode_done callback failed for %s: %s",
-                        episode.scenario, e,
+                done, _ = wait(
+                    list(futures.keys()), return_when=FIRST_COMPLETED,
+                )
+                for fut in done:
+                    cell_index = futures.pop(fut)
+                    try:
+                        episode = fut.result()
+                    except Exception as e:
+                        # ``_run_episode`` catches its own exceptions
+                        # and writes them to ``episode.error``. This
+                        # is a defensive backstop for unexpected
+                        # executor-side failures (e.g. the worker
+                        # thread itself crashed before returning).
+                        logger.error(
+                            "[%s] episode cell %d crashed in worker: %s",
+                            session_id, cell_index, e, exc_info=True,
+                        )
+                        episode = _EpisodeResult(
+                            episode_index=cell_index,
+                            scenario=scenario_specs[cell_index]["name"],
+                        )
+                        episode.error = f"executor exception: {e}"
+                    results[cell_index] = episode
+                    if on_episode_done is not None:
+                        try:
+                            on_episode_done(episode, cell_index, total)
+                        except Exception as e:
+                            logger.warning(
+                                "on_episode_done callback failed for %s: %s",
+                                episode.scenario, e,
+                            )
+
+                # After completing at least one episode, re-check the
+                # epoch gate so a stale-epoch pack doesn't keep
+                # launching scenarios. (The inner submit loop also
+                # re-checks per-submit; this catches the case where
+                # the gate flipped while we were waiting on a future
+                # to complete.)
+                if (
+                    submitted < total
+                    and not abort_event.is_set()
+                    and not _check_still_current()
+                ):
+                    logger.info(
+                        "[%s] pack %s no longer the current challenger "
+                        "after %d/%d scenarios completed; aborting "
+                        "remaining and killing in-flight to catch up "
+                        "to new epoch",
+                        session_id, pack_hash[:12], len(results), total,
                     )
+                    session_result.aborted_mid_session = True
+                    abort_event.set()
+                    _kill_in_flight()
+
+        # Stable-order append by cell_index — matches the sequential
+        # code's output. Aborted-and-never-submitted scenarios are
+        # simply absent from ``results``, mirroring the pre-PR
+        # ``break``-out-of-loop behavior.
+        for cell_index in sorted(results):
+            session_result.episodes.append(results[cell_index])
 
         session_result.compute_scores()
         return session_result
@@ -1173,6 +1312,8 @@ class TrajectorySandboxHarness:
         spec: dict,
         on_chat_start: Optional[Callable[[], None]] = None,
         on_chat_end: Optional[Callable[[], None]] = None,
+        on_container_started: Optional[Callable[[Container], None]] = None,
+        on_container_finished: Optional[Callable[[], None]] = None,
     ) -> _EpisodeResult:
         """Run one cell: spin up the scenario container, exec hermes,
         extract output, run verifier, tear down.
@@ -1249,6 +1390,19 @@ class TrajectorySandboxHarness:
                 time.sleep(0.5 + min(attempt * 0.2, 1.5))
             else:
                 raise RuntimeError("Sandbox container failed to start")
+
+            # Register the in-flight container handle with the
+            # orchestrator so it can kill it if the epoch moves on
+            # mid-session. Best-effort — exception in the callback
+            # must not block the episode.
+            if on_container_started is not None:
+                try:
+                    on_container_started(sandbox)
+                except Exception as e:
+                    logger.warning(
+                        "[%s] %s on_container_started callback failed: %s",
+                        session_id, scenario, e,
+                    )
 
             # Drop SKILL.md + INSTRUCTION.md into /workspace.
             _put_file(sandbox, "/workspace/SKILL.md", skill_md)
@@ -1429,6 +1583,14 @@ class TrajectorySandboxHarness:
                     sandbox.remove(force=True, v=True)
                 except Exception:
                     pass
+            if on_container_finished is not None:
+                try:
+                    on_container_finished()
+                except Exception as e:
+                    logger.warning(
+                        "[%s] %s on_container_finished callback failed: %s",
+                        session_id, scenario, e,
+                    )
 
         episode.duration_s = time.time() - t0
         return episode
