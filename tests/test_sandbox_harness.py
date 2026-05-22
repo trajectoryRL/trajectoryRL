@@ -1344,3 +1344,347 @@ class TestTimedOutRecoveryE2E:
             "content didn't make it through write_artifacts"
         )
         assert turns_file.read_text() == recovered
+
+
+# ---------------------------------------------------------------------------
+# Tests: parallel scenario orchestrator (PARALLEL_SCENARIO_EVALS)
+#
+# These pin down the contract for the parallel scenario dispatcher inside
+# ``TrajectorySandboxHarness._run_eval_sync``. The dispatcher must:
+#   - run up to ``parallel_scenario_evals`` scenarios concurrently
+#   - preserve the per-cell-index ordering of ``session_result.episodes``
+#     (downstream score aggregation is order-invariant, but
+#      ``scenario_qualities`` and the validator's live page assume the list
+#      is stable)
+#   - re-check the epoch-current gate before each submit + after each
+#     completion, and kill in-flight containers on abort
+# ---------------------------------------------------------------------------
+
+class TestParallelScenarioOrchestrator:
+    """Verifies fan-out, ordering, and mid-session kill semantics.
+
+    Mocks ``_run_episode`` with a timed stub so we can observe overlap
+    and ordering deterministically without touching Docker.
+    """
+
+    @staticmethod
+    def _setup_harness(
+        monkeypatch,
+        tmp_path,
+        parallelism: int,
+        scenarios: tuple[str, ...] = (
+            "scenario-a", "scenario-b", "scenario-c",
+            "scenario-d", "scenario-e",
+        ),
+    ) -> TrajectorySandboxHarness:
+        """Build a harness with the scenario set + image lookup mocked."""
+        from trajectoryrl.utils import sandbox_harness as sh
+
+        cfg = ValidatorConfig(
+            pack_cache_dir=tmp_path / "packs",
+            log_dir=tmp_path / "logs",
+            eval_state_path=tmp_path / "eval_state.json",
+            winner_state_path=tmp_path / "winner_state.json",
+            pack_first_seen_path=tmp_path / "pack_first_seen.json",
+            active_set_dir=tmp_path / "active_sets",
+            parallel_scenario_evals=parallelism,
+        )
+        h = TrajectorySandboxHarness(cfg)
+
+        # Pin the scenario set for this test — the production tuple has
+        # 10 real scenarios, but we only need 3–5 to exercise the
+        # orchestrator.
+        monkeypatch.setattr(sh, "SANDBOX_SCENARIOS", scenarios)
+
+        # Image refresh + scenario-info loading + image ref are not
+        # exercised by the parallel loop itself; short-circuit them.
+        monkeypatch.setattr(h, "_pull_sync", lambda: None)
+
+        def fake_load(name):
+            h._scenario_info = {
+                "name": name,
+                "image_repo": f"ghcr.io/test/{name}",
+                "instruction_md": f"# {name}\n",
+                "agent_output_path": "/app/out.txt",
+                "verifier_timeout_s": 60,
+                "agent_timeout_s": 60,
+                "tests_files_b64": {"test.sh": "echo ok"},
+            }
+            return h._scenario_info
+
+        monkeypatch.setattr(h, "_load_scenario_info", fake_load)
+        monkeypatch.setattr(
+            h, "_scenario_image_ref", lambda: "ghcr.io/test/img:latest",
+        )
+
+        return h
+
+    def test_default_config_is_two(self):
+        # Bumping this default is a behavior change for every operator;
+        # surface it in a test so a casual edit can't slip through.
+        assert ValidatorConfig.parallel_scenario_evals == 2
+
+    def test_env_var_clamps_to_at_least_one(self, monkeypatch, tmp_path):
+        # PARALLEL_SCENARIO_EVALS=0 (or negative) must clamp up — a
+        # bare ThreadPoolExecutor refuses max_workers<1.
+        monkeypatch.setenv("PARALLEL_SCENARIO_EVALS", "0")
+        # ``from_env`` reads .env files; pin to an empty file so the
+        # env var is the only source of truth in this test.
+        env_file = tmp_path / "empty.env"
+        env_file.write_text("")
+        cfg = ValidatorConfig.from_env(dotenv_path=env_file)
+        assert cfg.parallel_scenario_evals == 1
+
+    def test_sequential_when_parallelism_one(self, monkeypatch, tmp_path):
+        """With parallelism=1, no two episodes are in flight at the
+        same instant — the dispatcher reproduces the pre-PR sequential
+        behavior."""
+        scenarios = ("s0", "s1", "s2")
+        h = self._setup_harness(
+            monkeypatch, tmp_path, parallelism=1, scenarios=scenarios,
+        )
+
+        active = 0
+        active_lock = threading.Lock()
+        max_observed = 0
+
+        def fake_run_episode(*, session_id, episode_index, skill_md, spec,
+                             on_chat_start=None, on_chat_end=None,
+                             on_container_started=None,
+                             on_container_finished=None):
+            nonlocal active, max_observed
+            with active_lock:
+                active += 1
+                max_observed = max(max_observed, active)
+            time.sleep(0.02)
+            with active_lock:
+                active -= 1
+            return _EpisodeResult(
+                episode_index=episode_index, scenario=spec["name"],
+                quality=0.5,
+            )
+
+        monkeypatch.setattr(h, "_run_episode", fake_run_episode)
+        result = h._run_eval_sync(
+            skill_md="x", epoch_seed=0, salt="s", pack_hash="abc",
+        )
+
+        assert max_observed == 1
+        assert [e.scenario for e in result.episodes] == list(scenarios)
+
+    def test_peak_concurrency_bounded_by_parallelism(
+        self, monkeypatch, tmp_path,
+    ):
+        """With parallelism=N, at most N episodes are ever in flight
+        simultaneously."""
+        scenarios = ("s0", "s1", "s2", "s3", "s4")
+        h = self._setup_harness(
+            monkeypatch, tmp_path, parallelism=3, scenarios=scenarios,
+        )
+
+        active = 0
+        active_lock = threading.Lock()
+        max_observed = 0
+        start_barrier = threading.Barrier(3, timeout=5.0)
+
+        def fake_run_episode(*, session_id, episode_index, skill_md, spec,
+                             on_chat_start=None, on_chat_end=None,
+                             on_container_started=None,
+                             on_container_finished=None):
+            nonlocal active, max_observed
+            with active_lock:
+                active += 1
+                max_observed = max(max_observed, active)
+            # The first three to enter sync up via the barrier so we
+            # can prove 3 truly run concurrently (rather than "3 over
+            # the lifetime of the loop"). Later submits don't wait
+            # because the barrier has already broken.
+            try:
+                start_barrier.wait()
+            except threading.BrokenBarrierError:
+                pass
+            time.sleep(0.02)
+            with active_lock:
+                active -= 1
+            return _EpisodeResult(
+                episode_index=episode_index, scenario=spec["name"],
+                quality=0.4,
+            )
+
+        monkeypatch.setattr(h, "_run_episode", fake_run_episode)
+        result = h._run_eval_sync(
+            skill_md="x", epoch_seed=0, salt="s", pack_hash="abc",
+        )
+
+        # Concurrency cap is exactly 3, never exceeded.
+        assert max_observed == 3
+        # Ordering is still stable by cell_index, not completion order.
+        assert [e.scenario for e in result.episodes] == list(scenarios)
+
+    def test_preserves_cell_index_order_when_completions_race(
+        self, monkeypatch, tmp_path,
+    ):
+        """Stubs that complete in reverse order must still produce
+        ``session_result.episodes`` sorted by cell_index."""
+        scenarios = ("s0", "s1", "s2", "s3")
+        h = self._setup_harness(
+            monkeypatch, tmp_path, parallelism=4, scenarios=scenarios,
+        )
+
+        def fake_run_episode(*, session_id, episode_index, skill_md, spec,
+                             on_chat_start=None, on_chat_end=None,
+                             on_container_started=None,
+                             on_container_finished=None):
+            # Lower indices sleep longer → finish in reverse order.
+            time.sleep(0.05 * (len(scenarios) - episode_index))
+            return _EpisodeResult(
+                episode_index=episode_index, scenario=spec["name"],
+                quality=episode_index / 10.0,
+            )
+
+        monkeypatch.setattr(h, "_run_episode", fake_run_episode)
+        result = h._run_eval_sync(
+            skill_md="x", epoch_seed=0, salt="s", pack_hash="abc",
+        )
+
+        assert [e.scenario for e in result.episodes] == list(scenarios)
+        assert [e.episode_index for e in result.episodes] == [0, 1, 2, 3]
+
+    def test_aborts_and_kills_in_flight_when_epoch_changes(
+        self, monkeypatch, tmp_path,
+    ):
+        """When ``is_epoch_still_current`` flips to False mid-session,
+        the orchestrator stops dispatching new scenarios AND calls
+        ``container.kill()`` on each in-flight container so the workers
+        unwind quickly."""
+        from unittest.mock import MagicMock
+
+        scenarios = ("s0", "s1", "s2", "s3", "s4", "s5")
+        h = self._setup_harness(
+            monkeypatch, tmp_path, parallelism=3, scenarios=scenarios,
+        )
+
+        completed_count = 0
+        completed_lock = threading.Lock()
+        killed_containers: list[MagicMock] = []
+        killed_lock = threading.Lock()
+
+        def fake_is_current(pack_hash: str) -> bool:
+            # First scenario gate is skipped (cell_index==0). After
+            # at least one episode has completed, simulate the
+            # validator's challenge_epoch advancing.
+            with completed_lock:
+                return completed_count < 1
+
+        def fake_run_episode(*, session_id, episode_index, skill_md, spec,
+                             on_chat_start=None, on_chat_end=None,
+                             on_container_started=None,
+                             on_container_finished=None):
+            nonlocal completed_count
+
+            # Each scenario registers a unique mock "container" with
+            # the orchestrator so we can observe kill() calls.
+            fake_container = MagicMock(name=f"sandbox-{spec['name']}")
+
+            def _on_kill(*a, **kw):
+                with killed_lock:
+                    killed_containers.append(fake_container)
+
+            fake_container.kill.side_effect = _on_kill
+
+            if on_container_started is not None:
+                on_container_started(fake_container)
+
+            # Park here for a long time unless killed. ``kill()`` fires
+            # our side_effect synchronously, which we use as the wake
+            # signal via a dedicated event.
+            wake = threading.Event()
+
+            def _signal_wake(*a, **kw):
+                wake.set()
+
+            fake_container.kill.side_effect = lambda *a, **kw: (
+                _on_kill(), _signal_wake(),
+            )
+
+            # ``s0`` completes naturally to drive the epoch flip; the
+            # others wait to be killed or until a generous deadline.
+            if episode_index == 0:
+                time.sleep(0.02)
+            else:
+                wake.wait(timeout=3.0)
+
+            with completed_lock:
+                completed_count += 1
+            if on_container_finished is not None:
+                on_container_finished()
+            return _EpisodeResult(
+                episode_index=episode_index, scenario=spec["name"],
+                quality=0.0,
+                error="killed" if episode_index > 0 else None,
+            )
+
+        monkeypatch.setattr(h, "_run_episode", fake_run_episode)
+        result = h._run_eval_sync(
+            skill_md="x", epoch_seed=0, salt="s", pack_hash="abc",
+            is_epoch_still_current=fake_is_current,
+        )
+
+        # Aborted flag flipped.
+        assert result.aborted_mid_session is True
+        # Both scenarios in flight alongside s0 (s1, s2) must receive
+        # a kill signal — a single-kill regression in the fan-out
+        # loop would only stop one of them. ``== 2`` catches that;
+        # ``>= 1`` would silently allow it.
+        with killed_lock:
+            kill_count = len(killed_containers)
+        assert kill_count == 2, (
+            "expected exactly the two in-flight containers (s1, s2) "
+            "to be killed after the epoch changed; recorded kills: "
+            f"{kill_count}"
+        )
+        # No scenario past the initial parallelism window should have
+        # been submitted — i.e. s3, s4, s5 never produced an episode.
+        scenarios_run = {e.scenario for e in result.episodes}
+        assert "s3" not in scenarios_run
+        assert "s4" not in scenarios_run
+        assert "s5" not in scenarios_run
+
+    def test_final_score_matches_sequential_baseline(
+        self, monkeypatch, tmp_path,
+    ):
+        """compute_scores() output is order-invariant: parallelism=1
+        and parallelism=4 produce the same final_score when scenarios
+        return identical qualities."""
+        scenarios = ("s0", "s1", "s2", "s3")
+
+        def _run_with(parallelism: int) -> float:
+            h = self._setup_harness(
+                monkeypatch, tmp_path, parallelism=parallelism,
+                scenarios=scenarios,
+            )
+
+            def fake_run_episode(*, session_id, episode_index, skill_md, spec,
+                                 on_chat_start=None, on_chat_end=None,
+                                 on_container_started=None,
+                                 on_container_finished=None):
+                # Quality depends on scenario name, not on completion order.
+                quality = {
+                    "s0": 0.25, "s1": 0.5, "s2": 0.75, "s3": 1.0,
+                }[spec["name"]]
+                time.sleep(0.005)
+                return _EpisodeResult(
+                    episode_index=episode_index, scenario=spec["name"],
+                    quality=quality,
+                )
+
+            monkeypatch.setattr(h, "_run_episode", fake_run_episode)
+            result = h._run_eval_sync(
+                skill_md="x", epoch_seed=0, salt="s", pack_hash="abc",
+            )
+            return result.final_score
+
+        seq_score = _run_with(1)
+        par_score = _run_with(4)
+        assert abs(par_score - seq_score) < 1e-9
+        assert abs(seq_score - (0.25 + 0.5 + 0.75 + 1.0)) < 1e-9

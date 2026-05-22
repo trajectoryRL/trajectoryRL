@@ -171,6 +171,18 @@ class ValidatorConfig:
     image_channel: str = DEFAULT_IMAGE_CHANNEL
     sandbox_image: str = ""
     sandbox_timeout_per_episode: int = 600  # 10 min per scenario cell
+    # Number of scenarios to evaluate concurrently within a single
+    # pack's eval session. Each parallel slot spins up its own
+    # scenario container (mem_limit=4g, cpu_quota=2cpu) and its own
+    # hermes chat (one concurrent LLM stream). Default 2 ≈ 8 GB RAM
+    # + 4 CPU + 2 concurrent LLM requests at peak — conservative
+    # sizing that fits a typical validator host with room to spare.
+    # Set ``PARALLEL_SCENARIO_EVALS=1`` to reproduce the pre-PR
+    # sequential behavior, or raise it on bigger boxes. Clamped to
+    # >=1 at load time. The on-chain submit path is unaffected —
+    # scenarios still produce the same per-name quality dict, just
+    # in a different completion order.
+    parallel_scenario_evals: int = 2
     # Scenarios + episodes-per-scenario are not configurable on purpose:
     # every validator runs the same set so scores are comparable across
     # validators / windows / SPEC_NUMBER bumps. To change the set, add a
@@ -279,6 +291,9 @@ class ValidatorConfig:
             # can still pass sandbox_image directly to bypass it.
             image_channel=os.getenv("IMAGE_CHANNEL", DEFAULT_IMAGE_CHANNEL),
             sandbox_timeout_per_episode=int(os.getenv("SANDBOX_TIMEOUT_PER_EPISODE", "600")),
+            parallel_scenario_evals=max(
+                1, int(os.getenv("PARALLEL_SCENARIO_EVALS", "2"))
+            ),
             # --- Startup aggregation ---
             aggregate_when_start=os.getenv("AGGREGATE_WHEN_START", "1") == "1",
             full_cycle_on_startup=os.getenv("FULL_CYCLE_ON_STARTUP", "0") == "1",
