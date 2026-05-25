@@ -57,16 +57,17 @@ logger = logging.getLogger(__name__)
 # bumps. Adding or removing a scenario must come with a SPEC_NUMBER bump
 # so cached scores invalidate. Sorted alphabetically for stability.
 SANDBOX_SCENARIOS: tuple[str, ...] = (
-    "break-filter-js-from-html",
     "cancel-async-tasks",
     "configure-git-webserver",
     "db-wal-recovery",
     "fix-git",
+    "largest-eigenval",
     "log-summary-date-ranges",
     "nginx-request-logging",
     "path-tracing",
     "swe-bench-astropy-2",
     "vulnerable-secret",
+    "write-compressor",
 )
 
 
