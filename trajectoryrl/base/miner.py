@@ -1,17 +1,28 @@
-"""TrajectoryRL Miner — Pack building and on-chain submission.
+"""TrajectoryRL Miner — Pack building and submission.
 
-Season 1 workflow:
-    1. Write SKILL.md
-    2. Build pack: build_s1_pack(skill_content) -> {"schema_version": 1, "files": {"SKILL.md": "..."}}
-    3. Host pack.json — either:
-        a. Self-hosted (S3-compatible bucket, R2, etc.), or
-        b. Submit to the managed web service via ``submit_pack_via_api``
-           (POST /api/v2/miners/submit) — server stores the pack at a
-           random GCS key and returns the URL
-    4. Submit on-chain commitment via submit_commitment(pack_hash, pack_url)
+Season 1 workflow — two independent paths:
 
-The on-chain commitment is block-timestamped, establishing first-mover
-precedence. Validators read commitments and fetch packs via HTTP.
+    Path A — self-host + on-chain commit
+        1. Write SKILL.md
+        2. Build pack: build_s1_pack(skill_content)
+                       -> {"schema_version": 1, "files": {"SKILL.md": "..."}}
+        3. Host pack.json on a public URL (S3 / R2 / GCS / GitHub raw / etc.)
+        4. submit_commitment(pack_hash, pack_url) writes the on-chain
+           pointer; validators read commitments and fetch packs via HTTP.
+
+    Path B — managed web submit (no chain commit needed)
+        1. Write SKILL.md
+        2. Build pack
+        3. submit_pack_via_api(pack) POSTs to /api/v2/miners/submit.
+           The platform stores the pack at a random GCS key, runs
+           pre-eval, and admits the pack to the challenger queue
+           directly. The miner does NOT need to follow up with
+           submit_commitment — eligibility is driven by the
+           miner_submissions row created by the API call.
+
+Both paths produce an equally-evaluated entry in the challenger queue;
+they differ only in who hosts the bytes and whether the eligibility
+event lives on-chain or in the platform DB.
 """
 
 import hashlib
@@ -43,13 +54,21 @@ DEFAULT_MINER_SUBMIT_URL = f"{DEFAULT_API_BASE_URL}/api/v2/miners/submit"
 class TrajectoryMiner:
     """TrajectoryRL miner for building and submitting policy packs.
 
-    Example::
+    Example (Path A — self-host + chain commit)::
 
         miner = TrajectoryMiner(wallet_name="miner", wallet_hotkey="default")
         pack = TrajectoryMiner.build_s1_pack(open("SKILL.md").read())
         pack_hash = TrajectoryMiner.save_pack(pack, "pack.json")
         # Upload pack.json to a public URL, then:
         miner.submit_commitment(pack_hash, "https://example.com/pack.json")
+
+    Example (Path B — managed web submit, no chain commit needed)::
+
+        miner = TrajectoryMiner(wallet_name="miner", wallet_hotkey="default")
+        pack = TrajectoryMiner.build_s1_pack(open("SKILL.md").read())
+        miner.submit_pack_via_api(pack)
+        # The platform queues the pack for evaluation; no follow-up
+        # submit_commitment call is required.
     """
 
     def __init__(
@@ -291,11 +310,13 @@ class TrajectoryMiner:
     ) -> Optional[Dict[str, Any]]:
         """Submit a pack to the managed web service (POST /api/v2/miners/submit).
 
-        The web service stores the pack in GCS under a random key and
-        returns a public ``pack_url`` that the miner subsequently
-        commits on-chain via ``submit_commitment``. This is an
-        alternative to self-hosting (R2, S3, etc.) — the chain
-        commitment step is identical in both cases.
+        The web service stores the pack in GCS under a random key,
+        runs pre-eval, and admits the pack to the challenger queue
+        directly. Web-submitted packs do NOT require a follow-up
+        on-chain ``submit_commitment`` — eligibility is driven by the
+        ``miner_submissions`` row this call creates on the platform.
+        This is a fully self-contained alternative to the self-host +
+        chain-commit path; pick one, not both.
 
         Args:
             pack: The pack dict (will be canonicalized and hashed).

@@ -200,7 +200,9 @@ def cmd_web_submit(args):
     print(f"  next_upload_at:   {response.get('next_upload_allowed_at')}")
     print(f"  pre_eval_status:  {response.get('pre_eval_status')}")
     print()
-    print(f"Next step: python neurons/miner.py submit {pack_url}")
+    print("Done — the platform will pre-eval and admit your pack to the")
+    print("challenger queue automatically. No on-chain commit required for")
+    print("web-submitted packs.")
     return 0
 
 
@@ -321,7 +323,7 @@ Examples:
     p_web = sub.add_parser(
         "web-submit",
         help="Submit pack via /api/v2/miners/submit (managed GCS hosting); "
-             "follow up with `submit <pack_url>` for the on-chain commit",
+             "no on-chain commit needed — the platform queues the pack directly",
     )
     p_web.add_argument("pack_path", help="Path to pack.json")
     p_web.add_argument(
