@@ -228,13 +228,18 @@ git clone https://github.com/trajectoryRL/trajectoryRL.git
 cd trajectoryRL && pip install -e .
 
 trajectoryrl-miner build SKILL.md -o pack.json
-trajectoryrl-miner web-submit pack.json          # managed hosting, recommended
-# OR: trajectoryrl-miner upload pack.json        # self-host on S3 / R2 / GCS
-trajectoryrl-miner submit <pack_url>             # on-chain commitment
+
+# Path B — managed web submit (recommended, no chain commit needed)
+trajectoryrl-miner web-submit pack.json
+
+# Path A — self-host + chain commit (alternative)
+# trajectoryrl-miner upload pack.json             # self-host on S3 / R2 / GCS
+# trajectoryrl-miner submit <pack_url>            # set_commitment on-chain
+
 trajectoryrl-miner status
 ```
 
-The on-chain commitment is `{pack_hash}|{pack_url}`. Validators fetch your `pack.json`, verify the hash, extract `SKILL.md`, and run the full scenario session.
+Path A writes the on-chain commitment `{pack_hash}|{pack_url}`; the platform's syncer ingests it into the challenger queue. Path B writes the queue entry directly via the web API and does not touch the chain. In both cases validators fetch your `pack.json`, verify the hash, extract `SKILL.md`, and run the full scenario session — pick one path, not both.
 
 ---
 
@@ -292,4 +297,4 @@ A: The schema permits multiple files in `files`, but Season 1 only reads `SKILL.
 A: Pack rejected at schema validation.
 
 **Q: How often can I resubmit?**
-A: Self-hosted (`upload` + `submit`): chain-side rate limit (~100 blocks ≈ 20 min between commits). Managed (`web-submit`): one successful submission per hour per hotkey (server cooldown), plus the same chain rate limit on the subsequent `submit` step.
+A: Self-hosted (`upload` + `submit`): chain-side rate limit (~100 blocks ≈ 20 min between commits). Managed (`web-submit`): one successful submission per hour per hotkey (server cooldown). Web-submitted packs do not require a follow-up on-chain `submit`, so the chain rate limit does not apply on this path.

@@ -30,7 +30,7 @@ The miner CLI (`trajectoryrl-miner`) is a **toolbox**: independent commands you 
 
 ## Quick Start
 
-Submission is three steps: **build** the pack, **host** it (one of two routes), then **commit** the URL on-chain.
+Submission has two paths. **Option A** is three steps (build, host, on-chain commit). **Option B** is two steps (build, web-submit) — the platform handles queue admission for you, no chain commit needed.
 
 ```bash
 git clone https://github.com/trajectoryRL/trajectoryRL.git
@@ -43,9 +43,9 @@ vim SKILL.md
 trajectoryrl-miner build SKILL.md -o pack.json
 ```
 
-For step 3 (hosting), pick **one** route. Both produce a public `pack_url`.
+Then pick **one** route below.
 
-**Option A — Self-hosted (S3 / R2 / GCS / etc.)**
+**Option A — Self-hosted + on-chain commit**
 
 ```bash
 # 3a. Upload to your own S3-compatible bucket
@@ -56,15 +56,14 @@ trajectoryrl-miner upload pack.json
 trajectoryrl-miner submit https://your-bucket.s3.amazonaws.com/pack.json
 ```
 
-**Option B — Managed hosting via `/api/v2/miners/submit`**
+**Option B — Managed web submit (no chain commit)**
 
 ```bash
-# 3b. Submit pack content to trajrl.com (managed GCS), get back pack_url
+# 3b. Submit pack content to trajrl.com (managed GCS).
+#     The platform stores the pack, runs pre-eval, and admits it to
+#     the challenger queue directly. No on-chain commit needed.
 trajectoryrl-miner web-submit pack.json
 # → prints pack_url + cooldown info
-
-# 4b. Commit on-chain (same step as Option A)
-trajectoryrl-miner submit <pack_url>
 ```
 
 Then check status:
@@ -73,7 +72,7 @@ Then check status:
 trajectoryrl-miner status
 ```
 
-That's it. Repeat steps 1 → 4 whenever you improve your SKILL.md.
+That's it. Repeat whenever you improve your SKILL.md.
 
 > The CLI is also runnable as `python neurons/miner.py <command>` if you'd rather not install the entry point. Behaviour is identical.
 
@@ -81,12 +80,12 @@ That's it. Repeat steps 1 → 4 whenever you improve your SKILL.md.
 
 ## Two submission paths
 
-| Path | What you operate | Where the pack lives | Reveal | Use this when |
-|------|-----------------|----------------------|--------|---------------|
-| **A. Self-host + chain commit** | An HTTP host (S3 / GCS / GH / your own server) for `pack.json` | Your bucket | Public on chain immediately (commit URL is on-chain) | You already have hosting and want full control |
-| **B. Web submit (recommended for new miners)** | Just the miner CLI, no hosting | Subnet's GCS at an unguessable random key | URL hidden 48 h; commit on-chain still required for discovery | You want the easiest path; you don't want to run hosting |
+| Path | What you operate | Where the pack lives | Eligibility event | Reveal | Use this when |
+|------|-----------------|----------------------|-------------------|--------|---------------|
+| **A. Self-host + chain commit** | An HTTP host (S3 / GCS / GH / your own server) for `pack.json` | Your bucket | `set_commitment(pack_hash \| url)` on-chain | Public on chain immediately | You already have hosting and want full control |
+| **B. Web submit (recommended for new miners)** | Just the miner CLI, no hosting | Subnet's GCS at an unguessable random key | `miner_submissions` row created by the web-submit API | URL hidden 48 h | You want the easiest path; you don't want to run hosting |
 
-Both paths produce the same on-chain artifact: `set_commitment(pack_hash | url)`. The difference is who hosts the pack content.
+The two paths are **independent and equivalent** in how they feed the challenger queue — pick one, not both. Both produce a `pending_pre_eval` row in the platform's `miner_submissions` table (chain commits via the platform's metagraph syncer; web-submit directly). The picker reads from that table; chain-source and web-source rows compete on identical terms.
 
 ### Path A — chain commit (classic)
 
@@ -103,16 +102,14 @@ trajectoryrl-miner submit https://your-bucket/pack.json   # set_commitment on ch
 trajectoryrl-miner build SKILL.md -o pack.json
 
 # 2. POST pack to the subnet's hosted submit endpoint (signed with your hotkey).
-#    The endpoint stores the pack at an unguessable random GCS path and
-#    returns the pack_url to use on-chain.
+#    The endpoint stores the pack at an unguessable random GCS path,
+#    creates the miner_submissions row, and kicks off pre-eval.
+#    No on-chain commit step is required after this.
 trajectoryrl-miner web-submit pack.json
 # → Response: { pack_url: "https://storage.googleapis.com/.../pack.json", ... }
-
-# 3. Commit on-chain with the returned pack_url
-trajectoryrl-miner submit <pack_url_from_response>
 ```
 
-The `web-submit` endpoint immediately validates your signature, hash and pack format, kicks off pre-eval asynchronously, and returns the `pack_url`. Web-source URLs are not exposed in any other API for **48 hours** (the "reveal gate"), so a competitor can't simply scrape the dashboard to harvest your fresh SKILL.md.
+The `web-submit` endpoint immediately validates your signature, hash and pack format, kicks off pre-eval asynchronously, and returns the `pack_url`. The platform queues the pack for the next eligible challenger epoch on its own — no follow-up `set_commitment` is needed. Web-source URLs are not exposed in any other API for **48 hours** (the "reveal gate"), so a competitor can't simply scrape the dashboard to harvest your fresh SKILL.md.
 
 Full request/response spec for `/api/v2/miners/submit` is in [`trajectoryrl.web/API.md`](https://github.com/trajectoryRL/trajectoryrl.web/blob/main/API.md).
 
@@ -168,9 +165,9 @@ Reads S3 config from environment or CLI flags. Returns the public URL for use wi
 
 ### web-submit
 
-Submit pack content directly to the managed web service (`POST /api/v2/miners/submit`). The server stores your pack at an unguessable random GCS path and returns the public URL. No S3 / R2 / bucket config required — the request is signed with your hotkey, so the only credential you need is the wallet itself.
+Submit pack content directly to the managed web service (`POST /api/v2/miners/submit`). The server stores your pack at an unguessable random GCS path, creates the `miner_submissions` row, and kicks off pre-eval. No S3 / R2 / bucket config required — the request is signed with your hotkey, so the only credential you need is the wallet itself.
 
-This command does **only** the HTTP upload — it does not touch the chain. The on-chain commit is a separate step, run via `submit <pack_url>` (same step you'd run after `upload`).
+This command is **self-contained** — it does not touch the chain, and you do **not** need to follow up with `submit <pack_url>`. The platform queues the pack for evaluation on its own.
 
 ```bash
 trajectoryrl-miner web-submit pack.json
@@ -189,7 +186,9 @@ Submitted! pack_url = https://storage.googleapis.com/<bucket>/<prefix>/<uid>/<ra
   next_upload_at:   2026-05-04T15:00:00.000Z
   pre_eval_status:  pending
 
-Next step: trajectoryrl-miner submit https://storage.googleapis.com/<bucket>/<prefix>/<uid>/<random_key>.json
+Done — the platform will pre-eval and admit your pack to the
+challenger queue automatically. No on-chain commit required for
+web-submitted packs.
 ```
 
 **Cooldown**: The endpoint enforces a per-miner cooldown (default **1 hour**, set server-side via `MINER_SUBMIT_COOLDOWN_SECONDS`). Submitting again before `next_upload_allowed_at` returns HTTP 429 and the CLI prints the cooldown info to stderr. Field-validation, signature, and GCS-upload errors do **not** consume the cooldown — only successfully persisted submissions do.
@@ -296,16 +295,19 @@ For SKILL.md authoring patterns and what makes a pack score well, the canonical 
 │                                                         │
 │  1. Write / iterate on SKILL.md                         │
 │  2. build → pack.json                                   │
-│  3. host:                                               │
-│       • upload      → self-hosted public URL            │
-│       • web-submit  → managed GCS URL via /api/v2/...   │
-│  4. submit → on-chain commitment                        │
-│  5. Wait for validator evaluation (one epoch)           │
-│  6. Check results, iterate                              │
+│  3. Pick ONE submission path:                           │
+│       Path A (self-host + chain commit)                 │
+│         • upload  → self-hosted public URL              │
+│         • submit  → on-chain commitment                 │
+│       Path B (managed web submit)                       │
+│         • web-submit → platform queues the pack         │
+│                        directly; no chain commit        │
+│  4. Wait for validator evaluation (one epoch)           │
+│  5. Check results, iterate                              │
 └─────────────────────────────────────────────────────────┘
 ```
 
-Validators only re-evaluate when your `pack_hash` changes. No need to resubmit if your SKILL.md hasn't changed — your existing on-chain commitment carries you forward into every future epoch's eval set automatically (eligibility is driven by the chain commitment, not by an off-chain heartbeat).
+Validators only re-evaluate when your `pack_hash` changes. No need to resubmit if your SKILL.md hasn't changed — once your pack is in the queue (via chain commitment or via web-submit), it carries forward into every future epoch's eval set automatically. Eligibility is driven by the latest `miner_submissions` row for your hotkey, not by an off-chain heartbeat.
 
 ### Submission timing — the freeze gap
 
@@ -337,7 +339,7 @@ For the full window math (`cutoff_time`, `window_start`, `commit_block` semantic
 | Pre-eval feedback loop | none — wait for next epoch's snapshot | server runs pre-eval async; reflected in the next epoch_snapshot |
 | Best for | miners with existing infra / custom storage | new miners or anyone wanting one-command publishing |
 
-The on-chain commit step (and therefore the validator discovery path) is identical in both cases — `<pack_hash>|<pack_url>` written via `set_commitment`.
+Discovery differs by path: Path A relies on the on-chain `<pack_hash>|<pack_url>` written via `set_commitment`, which the platform's syncer ingests into `miner_submissions`. Path B writes the `miner_submissions` row directly via the API. Once the row exists, the challenger picker treats both sources identically.
 
 ---
 
