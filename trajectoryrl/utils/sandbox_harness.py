@@ -57,18 +57,32 @@ logger = logging.getLogger(__name__)
 # bumps. Adding or removing a scenario must come with a SPEC_NUMBER bump
 # so cached scores invalidate. Sorted alphabetically for stability.
 SANDBOX_SCENARIOS: tuple[str, ...] = (
-    "cancel-async-tasks",
     "configure-git-webserver",
     "db-wal-recovery",
-    "fix-git",
     "largest-eigenval",
-    "log-summary-date-ranges",
     "nginx-request-logging",
     "path-tracing",
     "swe-bench-astropy-2",
-    "vulnerable-secret",
     "write-compressor",
 )
+
+# Headline-score offset for scenarios that have been retired from the
+# rotation. When we drop saturated scenarios (mean score ≥ ~0.8 in the
+# 72h window, i.e. every top pack is at the ceiling) the per-pack
+# ``final_score`` would otherwise visibly regress (e.g. 8 → 7 for a
+# perfect run after one drop). Top miners haven't actually got worse —
+# the scoring surface shrank — so we add a constant equal to the
+# number of dropped scenarios. Perfect runs still land at the
+# pre-drop max (currently 11), and the score history stays continuous
+# across SPEC bumps. Per-scenario discrimination (mean_quality, the
+# [0,1] aggregate) is unaffected.
+#
+# Increment this whenever a scenario is removed; reset when a removed
+# scenario is replaced rather than just dropped. SPEC 14 dropped 4
+# scenarios — cancel-async-tasks, fix-git, log-summary-date-ranges,
+# vulnerable-secret — saturated at mean ≥ 0.82 over last 72h with
+# pass rates of 96-98% (validator analytics 2026-05-27).
+REMOVED_SCENARIO_BASE_SCORE: float = 4.0
 
 
 # ---------------------------------------------------------------------------
@@ -373,9 +387,13 @@ class _SessionResult:
 
         Each scenario contributes ``passed_i / total_i`` ∈ [0, 1] (the
         episode's ``quality``). Final score is the equal-weighted sum
-        across scenarios — range [0, N] for N scenarios — so a perfect
-        all-pass session lands at ``len(SANDBOX_SCENARIOS)``. Mean
-        quality is exposed as the [0, 1] convenience aggregate.
+        across scenarios plus ``REMOVED_SCENARIO_BASE_SCORE`` — range
+        [B, N+B] where N=len(SANDBOX_SCENARIOS) and B is the base
+        offset for retired scenarios. A perfect all-pass session lands
+        at ``len(SANDBOX_SCENARIOS) + REMOVED_SCENARIO_BASE_SCORE``,
+        which holds steady across SPEC bumps that drop saturated
+        scenarios (see the constant's docstring for rationale). Mean
+        quality (sum/N, no offset) is the [0, 1] convenience aggregate.
 
         Rationale (Ning, 2026-05-04): equal weight per scenario, no
         learning bonus, no split-half delta. With one episode per
@@ -388,7 +406,7 @@ class _SessionResult:
             self.final_score = 0.0
             return
         self.mean_quality = sum(scores) / len(scores)
-        self.final_score = sum(scores)
+        self.final_score = sum(scores) + REMOVED_SCENARIO_BASE_SCORE
 
 
 class SandboxEvaluationResult:
@@ -403,7 +421,11 @@ class SandboxEvaluationResult:
         # results below.
         self.scenario_name = scenario_name
         self.score = session_result.final_score
-        self.success = session_result.final_score > 0.0
+        # ``success`` keys off ``mean_quality`` (the unoffset [0,1]
+        # aggregate) instead of ``final_score`` because the latter
+        # now includes ``REMOVED_SCENARIO_BASE_SCORE`` and would
+        # treat a fully-zero session as "successful".
+        self.success = session_result.mean_quality > 0.0
         self.tool_calls = 0
         self.response = ""
         self.rubric = {}
@@ -711,7 +733,9 @@ class TrajectorySandboxHarness:
          - Run a one-shot verifier container against the output;
            parse ctrf.json → quality = passed / total ∈ [0, 1].
          - Tear down the container.
-      3. Final score = Σ qualities across scenarios (range [0, N]).
+      3. Final score = Σ qualities across scenarios + base offset for
+         retired scenarios (range ``[B, N+B]``; see
+         ``REMOVED_SCENARIO_BASE_SCORE``).
          No learning bonus, no split-half delta.
     """
 
