@@ -11,6 +11,7 @@ import pytest
 
 from trajectoryrl.utils.config import ValidatorConfig
 from trajectoryrl.utils.sandbox_harness import (
+    REMOVED_SCENARIO_BASE_SCORE,
     SandboxEvaluationResult,
     TrajectorySandboxHarness,
     _drain_exec_stream_with_deadline,
@@ -49,20 +50,26 @@ def _make_session_result(
 
 class TestSandboxEvaluationResult:
     def test_maps_final_score_sums_per_scenario(self):
-        # Three scenarios, equal weight per scenario → final = sum.
+        # Three scenarios, equal weight per scenario → final = sum + base.
         sr = _make_session_result([
             ("cancel-async-tasks",        0.833),
             ("log-summary-date-ranges",   1.0),
             ("break-filter-js-from-html", 0.5),
         ])
         result = SandboxEvaluationResult(sr)
-        assert abs(result.score - (0.833 + 1.0 + 0.5)) < 1e-6
+        expected = 0.833 + 1.0 + 0.5 + REMOVED_SCENARIO_BASE_SCORE
+        assert abs(result.score - expected) < 1e-6
         assert result.success is True
 
     def test_zero_score_not_qualified(self):
+        # Zero per-scenario quality → mean_quality=0 → success=False.
+        # The visible ``score`` floors at the retired-scenario base
+        # (a fully-zero session shows ``score = B``, not 0), so the
+        # qualification gate keys off mean_quality instead.
         sr = _make_session_result([0.0, 0.0, 0.0])
         result = SandboxEvaluationResult(sr)
-        assert result.score == 0.0
+        assert result.score == REMOVED_SCENARIO_BASE_SCORE
+        assert result.mean_quality == 0.0
         assert result.success is False
 
     def test_scenario_qualities_exposed(self):
@@ -79,9 +86,9 @@ class TestSandboxEvaluationResult:
         ])
         result = SandboxEvaluationResult(sr)
         assert abs(result.mean_quality - 0.6) < 1e-9
-        # final_score is a *sum* (range [0, N]); mean_quality is the
-        # convenience [0, 1] aggregate.
-        assert abs(result.score - 1.8) < 1e-9
+        # final_score is a *sum* + retired-scenario base (range
+        # [B, N+B]); mean_quality is the unaffected [0, 1] aggregate.
+        assert abs(result.score - (1.8 + REMOVED_SCENARIO_BASE_SCORE)) < 1e-9
 
     def test_error_field_default_none(self):
         sr = _make_session_result([0.5, 0.5, 0.5])
@@ -96,9 +103,9 @@ class TestSandboxEvaluationResult:
 class TestSessionResultScoring:
     def test_sum_across_scenarios(self):
         sr = _make_session_result([("a", 0.5), ("b", 0.833), ("c", 1.0)])
-        # final_score = sum of correctness ratios (no learning bonus,
-        # equal weight per scenario).
-        assert abs(sr.final_score - 2.333) < 1e-3
+        # final_score = sum of correctness ratios + retired-scenario
+        # base offset (no learning bonus, equal weight per scenario).
+        assert abs(sr.final_score - (2.333 + REMOVED_SCENARIO_BASE_SCORE)) < 1e-3
         assert abs(sr.mean_quality - 0.7777) < 1e-3
 
     def test_no_episodes(self):
@@ -109,14 +116,14 @@ class TestSessionResultScoring:
 
     def test_perfect_session(self):
         sr = _make_session_result([("a", 1.0), ("b", 1.0), ("c", 1.0)])
-        assert sr.final_score == 3.0
+        assert sr.final_score == 3.0 + REMOVED_SCENARIO_BASE_SCORE
         assert sr.mean_quality == 1.0
 
     def test_partial_credit_visible(self):
         # The whole point of moving off binary scoring: a pack that
         # passes 5 of 6 tests on one scenario gets credit instead of 0.
         sr = _make_session_result([("scenario_a", 5 / 6)])
-        assert abs(sr.final_score - 5 / 6) < 1e-9
+        assert abs(sr.final_score - (5 / 6 + REMOVED_SCENARIO_BASE_SCORE)) < 1e-9
         assert abs(sr.mean_quality - 5 / 6) < 1e-9
 
 
@@ -1687,4 +1694,5 @@ class TestParallelScenarioOrchestrator:
         seq_score = _run_with(1)
         par_score = _run_with(4)
         assert abs(par_score - seq_score) < 1e-9
-        assert abs(seq_score - (0.25 + 0.5 + 0.75 + 1.0)) < 1e-9
+        expected = 0.25 + 0.5 + 0.75 + 1.0 + REMOVED_SCENARIO_BASE_SCORE
+        assert abs(seq_score - expected) < 1e-9
