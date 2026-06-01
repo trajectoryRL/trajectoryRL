@@ -62,6 +62,8 @@ SANDBOX_SCENARIOS: tuple[str, ...] = (
     "largest-eigenval",
     "nginx-request-logging",
     "path-tracing",
+    "race-condition-fix",
+    "regex-chess",
     "swe-bench-astropy-2",
     "write-compressor",
 )
@@ -77,12 +79,21 @@ SANDBOX_SCENARIOS: tuple[str, ...] = (
 # across SPEC bumps. Per-scenario discrimination (mean_quality, the
 # [0,1] aggregate) is unaffected.
 #
-# Increment this whenever a scenario is removed; reset when a removed
-# scenario is replaced rather than just dropped. SPEC 14 dropped 4
-# scenarios — cancel-async-tasks, fix-git, log-summary-date-ranges,
-# vulnerable-secret — saturated at mean ≥ 0.82 over last 72h with
-# pass rates of 96-98% (validator analytics 2026-05-27).
-REMOVED_SCENARIO_BASE_SCORE: float = 4.0
+# Increment this whenever a scenario is removed; decrement when a
+# removed slot is refilled with a real scenario. SPEC 14 dropped 4
+# saturated scenarios — cancel-async-tasks, fix-git,
+# log-summary-date-ranges, vulnerable-secret (mean ≥ 0.82 over 72h,
+# pass rates 96-98%, validator analytics 2026-05-27) — and set the
+# offset to 4 so the headline max stayed at 11.
+#
+# SPEC 15 refills 2 of those 4 slots with hard, discriminating
+# scenarios (race-condition-fix, regex-chess), so N goes 7→9 and the
+# offset drops 4→2 — the headline max stays 11. Note this is NOT
+# score-preserving the way SPEC 14's *removal* was: those phantom
+# base-points are now backed by real hard scenarios, so observed
+# scores will fall until packs actually solve them. That drop is the
+# intended discrimination signal, not a regression.
+REMOVED_SCENARIO_BASE_SCORE: float = 2.0
 
 
 # ---------------------------------------------------------------------------
