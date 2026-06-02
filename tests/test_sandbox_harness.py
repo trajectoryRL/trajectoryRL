@@ -20,6 +20,7 @@ from trajectoryrl.utils.sandbox_harness import (
     _looks_like_provider_failure,
     _parse_ctrf_correctness,
     _parse_session_cost,
+    _parse_session_output_tokens,
     _parse_session_tool_calls,
     _pick_episode_timeout,
     _SessionResult,
@@ -162,19 +163,20 @@ def _hermes_failed(scenario: str, *, chat_exit: int = 1,
 def _hermes_ran_cleanly(scenario: str, *, quality: float = 0.0,
                         cost_usd: float | None = None,
                         agent_output_missing: bool = False,
-                        tool_call_count: int | None = None) -> _EpisodeResult:
+                        tool_call_count: int | None = None,
+                        output_tokens: int | None = None) -> _EpisodeResult:
     """Episode where hermes itself exited 0 (the LLM round-trip worked).
     Whether the agent produced useful output or billed cost is downstream
     pack behavior, not infra.
 
-    ``tool_call_count`` (when not None) is baked into a one-line
-    turns.jsonl blob so the predicate can read it; None leaves turns_log
-    empty (the "unknown tool calls" case)."""
+    ``tool_call_count`` / ``output_tokens`` (when not None) are baked into
+    a one-line turns.jsonl blob so the predicate can read them; leaving
+    both None gives an empty turns_log (the "unknown" case)."""
     turns_log = ""
-    if tool_call_count is not None:
+    if tool_call_count is not None or output_tokens is not None:
         turns_log = json.dumps({
             "id": scenario, "tool_call_count": tool_call_count,
-            "actual_cost_usd": cost_usd,
+            "output_tokens": output_tokens, "actual_cost_usd": cost_usd,
         }) + "\n"
     return _EpisodeResult(
         episode_index=0,
@@ -189,14 +191,27 @@ def _hermes_ran_cleanly(scenario: str, *, quality: float = 0.0,
     )
 
 
-def _degenerate_episode(scenario: str, *, cost_usd: float = 0.0007) -> _EpisodeResult:
+def _degenerate_episode(scenario: str, *, cost_usd: float = 0.0007,
+                        output_tokens: int = 94) -> _EpisodeResult:
     """Episode where the provider returned a degenerate completion: hermes
     exited 0, the call was billed, but the agent issued zero tool calls
-    (model emitted reasoning then stopped before acting). The 2026-06-02
-    Parasail signature."""
+    and produced almost no output (model emitted reasoning then stopped
+    before acting). The 2026-06-02 Parasail signature."""
     return _hermes_ran_cleanly(
         scenario, quality=0.0, cost_usd=cost_usd,
         agent_output_missing=True, tool_call_count=0,
+        output_tokens=output_tokens,
+    )
+
+
+def _export_bugged_healthy_episode(scenario: str) -> _EpisodeResult:
+    """Healthy session hit by the hermes sessions-export bug: the message
+    log (and derived tool_call_count) was dropped post-compaction, so
+    tool_call_count reads 0 — but output_tokens is huge (real work was
+    done) and the call was billed. MUST NOT be flagged as degenerate."""
+    return _hermes_ran_cleanly(
+        scenario, quality=0.8, cost_usd=0.15,
+        tool_call_count=0, output_tokens=48_000,
     )
 
 
@@ -395,6 +410,38 @@ class TestLooksLikeProviderFailure:
         ]
         assert _looks_like_provider_failure(eps) is False
 
+    def test_export_bugged_healthy_session_is_not_flagged(self):
+        # CRITICAL false-positive guard. The hermes sessions-export bug
+        # zeroes tool_call_count on HEALTHY sessions (drops the message
+        # log post-compaction), but output_tokens stays huge (7.9k–85k
+        # observed). Without the output-token floor these would be
+        # misread as degenerate and the whole high-scoring session
+        # discarded — punishing an honest miner. The floor keeps them in.
+        eps = [_export_bugged_healthy_episode(s) for s in ("a", "b", "c")]
+        assert _looks_like_provider_failure(eps) is False
+
+    def test_export_bugged_mixed_with_degenerate_is_not_flagged(self):
+        # One scenario genuinely degenerate (94 tokens), the rest are
+        # export-bugged-but-healthy (48k tokens). The healthy ones aren't
+        # degenerate (output floor) and aren't productive (tool_calls
+        # unreadable) → "unknown" → session kept rather than discarded.
+        eps = [
+            _degenerate_episode("a"),
+            _export_bugged_healthy_episode("b"),
+            _export_bugged_healthy_episode("c"),
+        ]
+        assert _looks_like_provider_failure(eps) is False
+
+    def test_degenerate_missing_output_tokens_is_not_flagged(self):
+        # tool_call_count==0 + billed but output_tokens absent → we can't
+        # tell degenerate from export-bug → "unknown", stay conservative.
+        eps = [
+            _hermes_ran_cleanly(s, cost_usd=0.0007, tool_call_count=0,
+                                output_tokens=None)
+            for s in ("a", "b", "c")
+        ]
+        assert _looks_like_provider_failure(eps) is False
+
 
 # ---------------------------------------------------------------------------
 # Tests: tool-call extraction from turns.jsonl
@@ -428,6 +475,35 @@ class TestParseSessionToolCalls:
     def test_non_int_count_is_none(self):
         line = json.dumps({"id": "abc", "tool_call_count": "seven"})
         assert _parse_session_tool_calls(line) is None
+
+
+class TestParseSessionOutputTokens:
+    def test_reads_output_tokens(self):
+        line = json.dumps({"id": "abc", "output_tokens": 48000})
+        assert _parse_session_output_tokens(line + "\n") == 48000
+
+    def test_zero_output_tokens(self):
+        line = json.dumps({"id": "abc", "output_tokens": 0})
+        assert _parse_session_output_tokens(line) == 0
+
+    def test_missing_field_is_none(self):
+        line = json.dumps({"id": "abc", "tool_call_count": 0})
+        assert _parse_session_output_tokens(line) is None
+
+    def test_null_value_is_none(self):
+        line = json.dumps({"id": "abc", "output_tokens": None})
+        assert _parse_session_output_tokens(line) is None
+
+    def test_takes_last_session_when_multiple(self):
+        first = json.dumps({"id": "old", "output_tokens": 50000})
+        last = json.dumps({"id": "new", "output_tokens": 94})
+        assert _parse_session_output_tokens(first + "\n" + last + "\n") == 94
+
+    def test_empty_blob(self):
+        assert _parse_session_output_tokens("") is None
+
+    def test_unparseable_line(self):
+        assert _parse_session_output_tokens("not json\n") is None
 
 
 # ---------------------------------------------------------------------------

@@ -700,6 +700,46 @@ def _parse_session_tool_calls(turns_log: str) -> int | None:
         return None
 
 
+def _parse_session_output_tokens(turns_log: str) -> int | None:
+    """Pull ``output_tokens`` out of the latest Hermes session in a
+    turns.jsonl blob. Returns None when the blob is empty / unparseable /
+    the field is absent.
+
+    Needed to disambiguate ``tool_call_count == 0``, which has two very
+    different causes (confirmed empirically 2026-06-02):
+
+      * **degenerate completion** — ``message_count`` ~3, ``output_tokens``
+        < 100 (often 0). The model emitted nothing usable. Infra failure.
+      * **hermes sessions-export bug** — ``message_count == 0`` but
+        ``output_tokens`` in the tens of thousands (7.9k–85k observed).
+        The session did real work (huge output) but the message log —
+        and the derived ``tool_call_count`` — was dropped on export,
+        likely post-compaction. A HEALTHY session, not infra.
+
+    ``output_tokens`` survives the export bug while ``tool_call_count``
+    does not, so it's the robust discriminator. The two populations sit
+    on opposite sides of a wide gap (<100 vs >7900).
+    """
+    last = _last_session_obj(turns_log)
+    if last is None:
+        return None
+    raw = last.get("output_tokens")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+# A clean-exit, billed, zero-tool-call episode is a degenerate provider
+# completion only when its output is also tiny. Observed degenerate runs
+# top out at ~94 output tokens; healthy sessions hit by the hermes export
+# bug (which also zeroes tool_call_count) carry 7.9k–85k output tokens.
+# 500 sits in the wide empty gap between the two populations.
+_DEGENERATE_MAX_OUTPUT_TOKENS = 500
+
+
 def _strip_provider_prefix(model: str) -> str:
     """Remove provider routing prefixes from model identifiers."""
     for prefix in ("openrouter/", "chutes/"):
@@ -724,8 +764,9 @@ def _looks_like_provider_failure(episodes: List["_EpisodeResult"]) -> bool:
         status).
 
       * **degenerate completion** — hermes exited 0 and the call *was
-        billed*, yet the agent issued zero tool calls all episode. Seen
-        when an upstream provider returns reasoning-only / truncated
+        billed*, yet the agent issued zero tool calls and produced almost
+        no output (``output_tokens < _DEGENERATE_MAX_OUTPUT_TOKENS``).
+        Seen when an upstream provider returns reasoning-only / truncated
         completions for the eval model: the model narrates "let me read
         the files" then stops before the first tool call (finish_reason
         ``stop``/``incomplete``, ~tens of tokens, billed ~freebie cost).
@@ -734,6 +775,13 @@ def _looks_like_provider_failure(episodes: List["_EpisodeResult"]) -> bool:
         The older guard missed these: it treated *any* billed call as
         proof the provider answered usefully. Billing is not proof of
         work — a degenerate completion bills too.
+
+        The ``output_tokens`` floor is load-bearing: ``tool_call_count``
+        alone is ambiguous because a hermes sessions-export bug also
+        zeroes it on *healthy* sessions (message log dropped post-
+        compaction) — but those carry tens of thousands of output tokens,
+        so the floor keeps them out of the degenerate bucket. Missing
+        ``output_tokens`` → "unknown", never "degenerate".
 
     Decision:
       1. Any episode *productive* (issued ≥1 tool call)? → False.
@@ -771,19 +819,25 @@ def _looks_like_provider_failure(episodes: List["_EpisodeResult"]) -> bool:
             or ep.timed_out
         )
         tool_calls = _parse_session_tool_calls(ep.turns_log)
+        output_tokens = _parse_session_output_tokens(ep.turns_log)
         billed = ep.cost_usd is not None and ep.cost_usd > 0
 
         # Anti-false-positive: a tool call proves the agent acted.
         if tool_calls is not None and tool_calls > 0:
             return False
 
-        # Billed call that issued zero tool calls on a clean exit: the
-        # provider returned an empty/truncated completion the agent
-        # couldn't act on. (Billing separates it from a do-nothing pack.)
+        # Billed clean-exit episode that issued zero tool calls AND
+        # produced almost no output: the provider returned an empty/
+        # truncated completion the agent couldn't act on. Billing
+        # separates it from a do-nothing pack; the output-token floor
+        # separates it from an export-bugged healthy session (which
+        # zeroes tool_call_count but carries tens of thousands of tokens).
         degenerate = (
             not hermes_errored
             and billed
             and tool_calls == 0
+            and output_tokens is not None
+            and output_tokens < _DEGENERATE_MAX_OUTPUT_TOKENS
         )
 
         if not (hermes_errored or degenerate):
