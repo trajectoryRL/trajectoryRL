@@ -365,8 +365,11 @@ class _EpisodeResult:
     # yet probed; ``0`` on clean exit; non-zero when hermes itself
     # errored (LLM round-trip exhausted retries, OOM, signal kill, etc).
     # Distinguishes "hermes failed at the LLM layer" (non-zero) from
-    # "hermes ran fine but the agent did nothing useful" (zero with no
-    # output) — the latter is a pack signal, not infra failure.
+    # "hermes ran fine" (zero). A clean exit with no useful output is
+    # usually a pack signal — but not always: a *billed* clean exit that
+    # issued zero tool calls is a degenerate provider completion (infra),
+    # not a pack signal. ``_looks_like_provider_failure`` makes that call
+    # by pairing chat_exit with tool-call count + billing.
     chat_exit: int | None = None
     # True when ``_extract_file`` couldn't find the agent's output file
     # after hermes finished. Currently observability-only; reserved for
@@ -628,14 +631,13 @@ def _parse_ctrf_correctness(ctrf: dict | None) -> tuple[int, int]:
     return passed, total
 
 
-def _parse_session_cost(turns_log: str) -> float | None:
-    """Pull ``actual_cost_usd`` out of the latest Hermes session in
-    a turns.jsonl blob. Returns None when the blob is empty / unparseable
-    / Hermes didn't bill (e.g. unbilled provider, network error).
+def _last_session_obj(turns_log: str) -> dict | None:
+    """Return the last non-empty JSON object in a turns.jsonl blob.
 
     The validator wipes Hermes' SQLite store between episodes so the
     JSONL should carry exactly one session per file — but we take the
-    last non-empty line defensively in case that ever drifts.
+    last non-empty line defensively in case that ever drifts. Returns
+    None when the blob is empty / every line is unparseable.
     """
     if not turns_log:
         return None
@@ -648,7 +650,16 @@ def _parse_session_cost(turns_log: str) -> float | None:
             last = json.loads(line)
         except json.JSONDecodeError:
             continue
-    if not isinstance(last, dict):
+    return last if isinstance(last, dict) else None
+
+
+def _parse_session_cost(turns_log: str) -> float | None:
+    """Pull ``actual_cost_usd`` out of the latest Hermes session in
+    a turns.jsonl blob. Returns None when the blob is empty / unparseable
+    / Hermes didn't bill (e.g. unbilled provider, network error).
+    """
+    last = _last_session_obj(turns_log)
+    if last is None:
         return None
     cost = last.get("actual_cost_usd")
     if cost is None:
@@ -662,6 +673,33 @@ def _parse_session_cost(turns_log: str) -> float | None:
     return cost_f
 
 
+def _parse_session_tool_calls(turns_log: str) -> int | None:
+    """Pull ``tool_call_count`` out of the latest Hermes session in a
+    turns.jsonl blob — how many tool calls the agent actually issued this
+    episode. Returns None when the blob is empty / unparseable / the
+    field is absent (older hermes exports that didn't emit it).
+
+    Zero tool calls is the structural fingerprint of a degenerate
+    completion: every sandbox scenario requires reading the instructions
+    and writing an output file *through tools*, so a session that issues
+    no tool call did no work. Observed when an upstream provider returns
+    reasoning-only / truncated completions for the eval model — the model
+    narrates "let me read the files" then stops before emitting the first
+    tool call (finish_reason ``stop``/``incomplete``, ~tens of tokens,
+    billed ~freebie cost). See ``_looks_like_provider_failure``.
+    """
+    last = _last_session_obj(turns_log)
+    if last is None:
+        return None
+    raw = last.get("tool_call_count")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def _strip_provider_prefix(model: str) -> str:
     """Remove provider routing prefixes from model identifiers."""
     for prefix in ("openrouter/", "chutes/"):
@@ -671,56 +709,87 @@ def _strip_provider_prefix(model: str) -> str:
 
 
 def _looks_like_provider_failure(episodes: List["_EpisodeResult"]) -> bool:
-    """True when every episode in the session ended with hermes itself
-    failing — non-zero exit code or deadline kill — and no episode ever
-    billed an LLM call.
+    """True when every episode in the session is infra-poisoned — by
+    either of two failure modes — so the result is not a real miner score.
 
-    Provider-format-agnostic. Catches OpenRouter HTTP 4xx, OpenAI 5xx,
-    local-server connection-refused, hermes-side OOM, deadline-driven
-    SIGKILLs alike. Earlier versions of this predicate parsed a hermes-
-    specific stdout regex (``"API call failed after N retries: HTTP
-    4xx/5xx"``) which silently failed on (a) local-model deployments
-    that emit different error shapes, and (b) anything not surfacing as
-    a clean HTTP status. ``chat_exit`` is the direct structural signal.
+    Two infra failure modes, one gate:
+
+      * **hermes-side failure** — ``chat_exit`` non-zero or ``timed_out``.
+        Hermes' own round-trip never returned usable output. Provider-
+        format-agnostic: catches OpenRouter HTTP 4xx, OpenAI 5xx, local-
+        server connection-refused, hermes OOM, deadline SIGKILLs alike.
+        ``chat_exit`` is the direct structural signal (an earlier version
+        parsed a hermes-specific stdout regex that silently missed local-
+        model error shapes and anything not surfacing as a clean HTTP
+        status).
+
+      * **degenerate completion** — hermes exited 0 and the call *was
+        billed*, yet the agent issued zero tool calls all episode. Seen
+        when an upstream provider returns reasoning-only / truncated
+        completions for the eval model: the model narrates "let me read
+        the files" then stops before the first tool call (finish_reason
+        ``stop``/``incomplete``, ~tens of tokens, billed ~freebie cost).
+        The agent never touches /app, so the verifier scores it ~0 — a
+        provider artifact dressed up as a legitimately-low miner score.
+        The older guard missed these: it treated *any* billed call as
+        proof the provider answered usefully. Billing is not proof of
+        work — a degenerate completion bills too.
 
     Decision:
-      1. Any episode billed real cost (``cost_usd > 0``)? → False.
-         Hermes spoke to the provider successfully at least once
-         during this session; not a session-wide infra failure even if
-         later scenarios broke.
-      2. Every episode has a hermes-side failure (``chat_exit`` non-
-         zero OR ``timed_out``)? → True. Provider rejected/never
-         answered every request, regardless of error format.
-      3. Otherwise → False. ``chat_exit == 0`` means hermes ran cleanly;
-         any downstream emptiness is a pack signal, not infra. Mixed
-         sessions where some episodes ran cleanly also return False —
-         the clean episodes' scores are honest data.
+      1. Any episode *productive* (issued ≥1 tool call)? → False.
+         A tool call is direct proof the agent acted on the scenario, so
+         the session carries honest data even if other scenarios broke.
+         This is the anti-false-positive gate (it replaces the old, too-
+         loose "was billed at all" proxy).
+      2. Every episode infra-poisoned (hermes-failed OR degenerate)?
+         → True. The whole session is infra, not a miner score.
+      3. Otherwise → False. Unknown/mixed signals we can't confidently
+         attribute to infra stay in — rather miss a poisoned session
+         than discard an honest one.
 
-    Treats ``chat_exit is None`` as "unknown" (not "failed"): rather
-    miss a session where we lack the signal than false-positive on it.
+    Conservative-bias notes:
+      * ``chat_exit is None`` (Docker inspect raced) → "unknown", not
+        "failed".
+      * ``tool_call_count`` absent/unparseable (older hermes export) →
+        "unknown", never "degenerate".
+      * Degeneracy requires ``cost_usd > 0``: a clean-exit episode that
+        issued no tool call but was *never billed* is a do-nothing pack
+        that never engaged the LLM — an honest pack signal, not infra.
+        ``cost_usd == 0.0`` (vs ``None``, written by free-tier/unpriced
+        local models) is not billing.
 
     Returns False on empty input — callers handle "no episodes ran" as
     a separate upstream skip condition.
     """
     if not episodes:
         return False
-    # Anti-false-positive: any positively billed episode proves the
-    # provider answered usefully at least once this session.
-    # ``cost_usd == 0.0`` (vs ``None``) can be written by hermes for
-    # free-tier / unpriced local models even on failed responses, so we
-    # require strictly > 0 — chat_exit then makes the final call.
-    for ep in episodes:
-        if ep.cost_usd is not None and ep.cost_usd > 0:
-            return False
-    # Trigger: every episode must show hermes-side failure.
+
+    all_infra_poisoned = True
     for ep in episodes:
         hermes_errored = (
             (ep.chat_exit is not None and ep.chat_exit != 0)
             or ep.timed_out
         )
-        if not hermes_errored:
+        tool_calls = _parse_session_tool_calls(ep.turns_log)
+        billed = ep.cost_usd is not None and ep.cost_usd > 0
+
+        # Anti-false-positive: a tool call proves the agent acted.
+        if tool_calls is not None and tool_calls > 0:
             return False
-    return True
+
+        # Billed call that issued zero tool calls on a clean exit: the
+        # provider returned an empty/truncated completion the agent
+        # couldn't act on. (Billing separates it from a do-nothing pack.)
+        degenerate = (
+            not hermes_errored
+            and billed
+            and tool_calls == 0
+        )
+
+        if not (hermes_errored or degenerate):
+            all_infra_poisoned = False
+
+    return all_infra_poisoned
 
 
 # ---------------------------------------------------------------------------

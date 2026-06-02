@@ -4,6 +4,7 @@ Tests the result mapping, config wiring, and SKILL.md extraction
 without requiring Docker or real LLM API calls.
 """
 
+import json
 import threading
 import time
 
@@ -19,6 +20,7 @@ from trajectoryrl.utils.sandbox_harness import (
     _looks_like_provider_failure,
     _parse_ctrf_correctness,
     _parse_session_cost,
+    _parse_session_tool_calls,
     _pick_episode_timeout,
     _SessionResult,
 )
@@ -159,10 +161,21 @@ def _hermes_failed(scenario: str, *, chat_exit: int = 1,
 
 def _hermes_ran_cleanly(scenario: str, *, quality: float = 0.0,
                         cost_usd: float | None = None,
-                        agent_output_missing: bool = False) -> _EpisodeResult:
+                        agent_output_missing: bool = False,
+                        tool_call_count: int | None = None) -> _EpisodeResult:
     """Episode where hermes itself exited 0 (the LLM round-trip worked).
     Whether the agent produced useful output or billed cost is downstream
-    pack behavior, not infra."""
+    pack behavior, not infra.
+
+    ``tool_call_count`` (when not None) is baked into a one-line
+    turns.jsonl blob so the predicate can read it; None leaves turns_log
+    empty (the "unknown tool calls" case)."""
+    turns_log = ""
+    if tool_call_count is not None:
+        turns_log = json.dumps({
+            "id": scenario, "tool_call_count": tool_call_count,
+            "actual_cost_usd": cost_usd,
+        }) + "\n"
     return _EpisodeResult(
         episode_index=0,
         scenario=scenario,
@@ -172,6 +185,18 @@ def _hermes_ran_cleanly(scenario: str, *, quality: float = 0.0,
         timed_out=False,
         agent_output_missing=agent_output_missing,
         transcript="agent output: <some content>",
+        turns_log=turns_log,
+    )
+
+
+def _degenerate_episode(scenario: str, *, cost_usd: float = 0.0007) -> _EpisodeResult:
+    """Episode where the provider returned a degenerate completion: hermes
+    exited 0, the call was billed, but the agent issued zero tool calls
+    (model emitted reasoning then stopped before acting). The 2026-06-02
+    Parasail signature."""
+    return _hermes_ran_cleanly(
+        scenario, quality=0.0, cost_usd=cost_usd,
+        agent_output_missing=True, tool_call_count=0,
     )
 
 
@@ -302,6 +327,107 @@ class TestLooksLikeProviderFailure:
             for i, s in enumerate(("a", "b", "c"))
         ]
         assert _looks_like_provider_failure(eps) is False
+
+    # --- Degenerate-completion mode (2026-06-02 Parasail signature) ---
+
+    def test_every_episode_degenerate_is_flagged(self):
+        # Whole-session collapse: every scenario billed a call (clean exit)
+        # but the agent issued zero tool calls — the provider returned
+        # reasoning-only/truncated completions. The verifier scores ~0,
+        # but it's an infra artifact, not a miner score. The OLD guard
+        # missed this (it short-circuited to False on any billing).
+        eps = [_degenerate_episode(s) for s in ("a", "b", "c")]
+        assert _looks_like_provider_failure(eps) is True
+
+    def test_degenerate_mixed_with_productive_is_not_flagged(self):
+        # Some scenarios landed on the bad backend (degenerate), one got a
+        # healthy backend and did real work (≥1 tool call). The productive
+        # episode is honest data → keep the session.
+        eps = [
+            _degenerate_episode("a"),
+            _hermes_ran_cleanly("b", quality=0.7, cost_usd=0.17,
+                                tool_call_count=12),
+            _degenerate_episode("c"),
+        ]
+        assert _looks_like_provider_failure(eps) is False
+
+    def test_degenerate_mixed_with_hermes_error_is_flagged(self):
+        # Both infra modes in one session: some scenarios degenerate, the
+        # rest hermes-errored. No episode did real work → all infra.
+        eps = [
+            _degenerate_episode("a"),
+            _hermes_failed("b", chat_exit=1),
+            _degenerate_episode("c"),
+        ]
+        assert _looks_like_provider_failure(eps) is True
+
+    def test_zero_tool_calls_without_billing_is_not_flagged(self):
+        # A do-nothing pack can also issue zero tool calls — but it never
+        # engaged the LLM, so nothing was billed. That's an honest pack
+        # signal (the 0 score is real), NOT a degenerate provider
+        # completion. Billing is what separates the two.
+        eps = [
+            _hermes_ran_cleanly(s, agent_output_missing=True,
+                                cost_usd=None, tool_call_count=0)
+            for s in ("a", "b", "c")
+        ]
+        assert _looks_like_provider_failure(eps) is False
+
+    def test_recorded_zero_cost_with_zero_tool_calls_is_not_flagged(self):
+        # ``cost_usd == 0.0`` (free-tier/unpriced model) is not billing.
+        # Zero tool calls + zero cost = do-nothing pack, not degenerate.
+        eps = [
+            _hermes_ran_cleanly(s, cost_usd=0.0, tool_call_count=0)
+            for s in ("a", "b", "c")
+        ]
+        assert _looks_like_provider_failure(eps) is False
+
+    def test_billed_with_tool_calls_is_not_flagged(self):
+        # Pack called the LLM, did real work (tool calls), got wrong
+        # answers. Billed + productive → honest low score, keep it.
+        eps = [
+            _hermes_ran_cleanly("a", quality=0.0, cost_usd=0.20,
+                                tool_call_count=8),
+            _hermes_ran_cleanly("b", quality=0.0, cost_usd=0.15,
+                                tool_call_count=15),
+            _hermes_ran_cleanly("c", quality=0.0, cost_usd=0.18,
+                                tool_call_count=6),
+        ]
+        assert _looks_like_provider_failure(eps) is False
+
+
+# ---------------------------------------------------------------------------
+# Tests: tool-call extraction from turns.jsonl
+# ---------------------------------------------------------------------------
+
+class TestParseSessionToolCalls:
+    def test_reads_tool_call_count(self):
+        line = json.dumps({"id": "abc", "tool_call_count": 7})
+        assert _parse_session_tool_calls(line + "\n") == 7
+
+    def test_zero_tool_calls(self):
+        line = json.dumps({"id": "abc", "tool_call_count": 0})
+        assert _parse_session_tool_calls(line) == 0
+
+    def test_missing_field_is_none(self):
+        line = json.dumps({"id": "abc", "actual_cost_usd": 0.01})
+        assert _parse_session_tool_calls(line) is None
+
+    def test_takes_last_session_when_multiple(self):
+        first = json.dumps({"id": "old", "tool_call_count": 5})
+        last = json.dumps({"id": "new", "tool_call_count": 0})
+        assert _parse_session_tool_calls(first + "\n" + last + "\n") == 0
+
+    def test_empty_blob(self):
+        assert _parse_session_tool_calls("") is None
+        assert _parse_session_tool_calls("\n\n") is None
+
+    def test_unparseable_line(self):
+        assert _parse_session_tool_calls("not json\n") is None
+
+    def test_non_int_count_is_none(self):
+        line = json.dumps({"id": "abc", "tool_call_count": "seven"})
+        assert _parse_session_tool_calls(line) is None
 
 
 # ---------------------------------------------------------------------------
