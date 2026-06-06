@@ -86,14 +86,20 @@ SANDBOX_SCENARIOS: tuple[str, ...] = (
 # pass rates 96-98%, validator analytics 2026-05-27) — and set the
 # offset to 4 so the headline max stayed at 11.
 #
-# SPEC 15 refills 2 of those 4 slots with hard, discriminating
-# scenarios (race-condition-fix, regex-chess), so N goes 7→9 and the
-# offset drops 4→2 — the headline max stays 11. Note this is NOT
-# score-preserving the way SPEC 14's *removal* was: those phantom
-# base-points are now backed by real hard scenarios, so observed
-# scores will fall until packs actually solve them. That drop is the
-# intended discrimination signal, not a regression.
-REMOVED_SCENARIO_BASE_SCORE: float = 2.0
+# SPEC 15 refilled 2 of those 4 slots with hard, discriminating
+# scenarios (race-condition-fix, regex-chess), so N went 7→9 and the
+# offset dropped 4→2 — the headline max stayed 11.
+#
+# SPEC 16 removes the remaining base offset entirely (2→0). The 2
+# phantom base-points were a free, everyone-gets-them constant left
+# over from the original 11-scenario rotation; they inflated every
+# score and added no discrimination. With the same 9 scenarios and no
+# offset the score range becomes [0, 9] (a perfect all-pass lands at
+# 9, not 11). This intentionally breaks the "headline max stays 11"
+# continuity — that is exactly what the SPEC_NUMBER bump signals: SPEC
+# 16 scores are not comparable with SPEC ≤15, the seat is re-competed
+# from a clean start, and the score surface tightens to performance only.
+REMOVED_SCENARIO_BASE_SCORE: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -400,11 +406,11 @@ class _SessionResult:
         episode's ``quality``). Final score is the equal-weighted sum
         across scenarios plus ``REMOVED_SCENARIO_BASE_SCORE`` — range
         [B, N+B] where N=len(SANDBOX_SCENARIOS) and B is the base
-        offset for retired scenarios. A perfect all-pass session lands
-        at ``len(SANDBOX_SCENARIOS) + REMOVED_SCENARIO_BASE_SCORE``,
-        which holds steady across SPEC bumps that drop saturated
-        scenarios (see the constant's docstring for rationale). Mean
-        quality (sum/N, no offset) is the [0, 1] convenience aggregate.
+        offset. A perfect all-pass session lands at ``N + B``. From
+        SPEC 16 B=0, so the range is [0, N] (perfect = N = 9); the
+        prior "headline max stays 11" continuity was deliberately
+        dropped at the SPEC 16 bump (see the constant's docstring).
+        Mean quality (sum/N, no offset) is the [0, 1] convenience aggregate.
 
         Rationale (Ning, 2026-05-04): equal weight per scenario, no
         learning bonus, no split-half delta. With one episode per
