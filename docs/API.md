@@ -1452,6 +1452,7 @@ None — public read.
   // describe two different epoch tenses; the field name says which.
   "finalized_epoch": {
     "challenge_epoch_id":   201,
+    "spec_number":          16,                        // spec the epoch finalized under; the daemon selects the matching consensus aggregation (Winsorized from spec 16, plain mean before). null only for cold-start data predating migration 067.
     "challenger_hotkey":    "5...",
     "challenger_pack_hash": "abc...",
     "challenger_pack_url":  "https://.../pack.json",   // null if miner_submissions row has none
