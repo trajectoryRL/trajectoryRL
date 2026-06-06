@@ -17,8 +17,8 @@ The core loop:
 1. **Submission**: Miners deliver packs via either the on-chain commitment slot or the platform's web submit API (both first-class).
 2. **Pre-Eval Gate**: The platform server runs the integrity LLM-as-judge check once per `pack_hash` and admits passing submissions to the **challenger queue**.
 3. **Challenge Epoch**: Each epoch the queue head is dispatched to validators as the active challenger. Validators evaluate it independently and post stake-signed scores back to the platform.
-4. **Stake-Weighted Aggregation**: The platform finalizes the epoch by computing the consensus score (stake-weighted average) and consensus qualified flag (stake-weighted majority), gated by a stake quorum.
-5. **Winner Protection**: A challenger replaces the seated winner only if it qualifies and beats the seated winner's score by ≥ δ.
+4. **Score Aggregation**: The platform finalizes the epoch by computing the consensus score (from spec 16, the **Winsorized** mean over qualified validator votes — the single highest and lowest are clipped before averaging; plain average before) and consensus qualified flag (majority of reporting validators by head count), gated by a stake quorum.
+5. **Winner Protection**: A challenger replaces the seated winner only if it qualifies and clears the takeover bar — from spec 16, an **absolute** margin of `D = 0.4` points (plus a slack multiplicative floor); before, the legacy multiplicative `δ = 3%`.
 6. **Weight Setting**: Validators read the canonical winner from the platform and call `set_weights` every tempo. The seated winner takes 100% of miner alpha; when no seat exists (cold start, deregistered or banned winner) weight is set to the subnet owner UID and the chain burns the emission.
 
 For the current season's scoring method, pack schema, and evaluation specifics, see [SCORING_AND_EVALUATION.md](SCORING_AND_EVALUATION.md).
@@ -106,46 +106,47 @@ Validators **always call `set_weights` every tempo**, never skip — failure to 
 
 If `winner_state` is empty (no one has ever won), or the winner hotkey has been deregistered/banned, validators set **all weight to the subnet owner UID**, which the chain burns. This guarantees `set_weights` always runs and emissions are paused (not lost) until a qualifying winner exists.
 
-### Winner Protection (Score-Based, δ = 3%)
+### Winner Protection (noise-calibrated from spec 16; multiplicative δ before)
 
-To resist copy-paste attacks, trivial undercutting, and evaluation variance, the platform enforces **multiplicative Winner Protection** on every challenge-epoch finalize:
+To resist copy-paste attacks, trivial undercutting, and evaluation variance, the platform enforces Winner Protection on every challenge-epoch finalize. The seated winner defends with their **winning score** (the consensus score recorded when they took the seat — not their latest evaluation).
 
-**Rule**: The seated winner defends with their **winning score** (the consensus score recorded when they took the seat). A challenger dethrones only if:
+The rule has a **cutover at `NOISE_AWARE_SEATING_MIN_SPEC` (spec 16)**:
+
+**From spec 16 — absolute, noise-calibrated bar.** Grading is deterministic, so cross-validator score spread is pure agent-rollout noise; the absolute gap between two packs is what a takeover must clear, and that noise is roughly constant in score points (independent of the score scale / any base offset). A challenger dethrones only if it clears **both**:
 
 ```
-better(challenger_score, winner_score, δ)
+absolute:       challenger_score >= winner_score + D     (D = 0.4 points, primary)
+multiplicative: challenger_score >  winner_score × (1 + δ)   (δ = 0.03, slack floor)
 ```
 
-Where:
+- **D = 0.4** points ≈ 1.2× the standard error of the between-pack score difference at the typical validator count — i.e. a challenger must *clearly* beat the incumbent, not edge it out within noise. Absolute (not %) so it stays calibrated when the score scale changes (e.g. removing a base-score offset). Cuts noise-driven seat changes from ~23% to ~11%.
 
-- **δ = 0.03** (3% improvement threshold — tightened from 10% in v6.0 because each challenge epoch already aggregates stake-weighted across all participating validators, suppressing evaluation variance more directly than the older two-phase off-chain protocol)
-- **winner_score** = the consensus score frozen at seat acquisition (not the winner's latest evaluation)
-- **better()** is season-defined:
-  - higher-is-better seasons: `challenger > winner × (1 + δ)`
+**Before spec 16 — legacy multiplicative δ only.** A challenger dethrones iff `better(challenger_score, winner_score, δ)`:
+  - higher-is-better seasons: `challenger > winner × (1 + δ)`  (δ = 0.03)
   - lower-is-better seasons: `challenger < winner × (1 - δ)`
 
 **Winner self-update**: If a `challenge_epoch` evaluates a new pack from the seated winner and that new pack's consensus score passes `better()` against the winner_score, `winner_state` advances to the new pack and a higher defense bar. A *worse* new pack from the seated winner is harmless — the seat references the previous winning pack, not the latest one.
 
 **Winner disqualification on the seat**: If a separate periodic reconciliation (deregistration check, owner ban) marks the seated hotkey ineligible, `winner_state` is cleared. The next finalized epoch with a qualifying challenger seats the new winner without δ being applied.
 
-**Canonical state — published, not dictated**: The server stores a single `winner_state` row, but in v6 that row is **a published aggregate, not a directive**. What binds the network's `set_weights` is convergent **local derivation** on each validator: the server publishes the per-vote inputs (with each vote's `validator_stake` frozen at score-submission time) via `GET /api/v2/winner/current`, every honest daemon runs its own copy of the consensus algorithm against those inputs plus its deterministic on-chain metagraph view, and the locally-derived winner is what drives `set_weights`. The server's `winner_state` row is shown alongside as an advisory cross-check; a divergence between local derivation and the server's claim is a server-bug or attack signal, not a network-consensus problem — honest validators stay convergent regardless. Daemons may cache the *raw response* up to `WINNER_FALLBACK_TTL` (default 24 h) on server unreachability and re-derive each tick from the cached inputs; beyond TTL the daemon refuses to set weights and emits an alert.
+**Canonical state — server-resolved, publicly auditable**: The server stores a single `winner_state` row, resolved deterministically at finalize time, and publishes it together with the per-vote inputs (each vote's `validator_stake` frozen at score-submission time) via `GET /api/v2/winner/current`. Each validator **adopts that published winner** (identity + score) to drive `set_weights`; the daemon does not re-derive the winner authoritatively. Instead it re-runs the same aggregation locally over the published `submissions[]` as a **cross-check** and raises a divergence alarm if its recomputed consensus disagrees with the server's claim. Because the inputs and the aggregation are public and deterministic, a misbehaving server is *detectable* — any validator (or external auditor) can replay the computation and compare `submissions[]` against its own signed votes — though detection alarms rather than auto-overrides. Daemons cache the *raw response* up to `WINNER_FALLBACK_TTL` (default 24 h) on server unreachability and keep setting weights from the cached winner; beyond TTL the daemon refuses to set weights and emits an alert.
 
 ### Decentralized Winner Derivation in v6
 
 The split between server-side and validator-side responsibilities is deliberate. The server cannot reproduce the votes (only the validator-signed score POST creates them) and the validator cannot reproduce the off-chain pack-fetch / pre-eval pipeline (only the server runs that). So:
 
-- **The server uniquely owns**: receiving signed score POSTs, freezing each vote's `validator_stake` at receipt, exposing the immutable input set via `GET /api/v2/winner/current`, running its own copy of `finalize.ts` to publish `winner_state` for observability.
-- **Each validator uniquely owns**: running the off-chain eval, signing score POSTs, fetching its own deterministic on-chain metagraph view at the relevant block, and **running its own copy of the same aggregation algorithm** the server runs in `finalize.ts` to derive the seated winner. `set_weights` is driven by the validator's local result — never the server's claim.
+- **The server uniquely owns**: receiving signed score POSTs, freezing each vote's `validator_stake` at receipt, running `finalize.ts` to resolve `winner_state`, and exposing both the immutable input set and the resolved winner via `GET /api/v2/winner/current`.
+- **Each validator uniquely owns**: running the off-chain eval, signing score POSTs, fetching its own deterministic on-chain metagraph view at the relevant block, **adopting the server's published winner to drive `set_weights`**, and **independently recomputing the aggregation** over the published `submissions[]` as a cross-check that alarms on divergence.
 
-The decentralization guarantee follows from these two non-overlapping responsibilities: tampering with the server's published `winner_state` row does not change `set_weights` (validators ignore that field for authority); tampering with submission contents requires forging a validator signature (infeasible). The only attack surface left is the published input set itself — which is verifiable: validators can compare the `submissions[]` they fetch with their own record of what they submitted, and any structural divergence (vote dropped, vote modified, stake snapshot altered) is observable.
+The integrity guarantee follows from these responsibilities plus public, replayable inputs: tampering with submission contents requires forging a validator signature (infeasible); tampering with the resolved winner or the published input set is **detectable**, because every validator can replay the deterministic aggregation over `submissions[]` and compare both the result and its own votes against what the server published. Detection alarms rather than auto-overrides — the daemon follows the server's winner and raises an alarm on mismatch — so widespread divergence across independent validators is the operational signal that the server-side `finalize.ts` or its input feed has drifted and must be investigated.
 
-**Inputs the daemon needs locally** for the aggregation:
+**Inputs the daemon uses** for the cross-check aggregation:
 
-1. The `submissions[]` array from `/api/v2/winner/current` — votes with frozen `validator_stake`. Authoritative for per-vote weight; the daemon must not substitute the live metagraph value for that validator.
-2. The deterministic on-chain metagraph snapshot at the finalized epoch's `start_block` — for the global denominators (total active stake, deregistration, eligibility). Every honest validator reads the same chain and reaches the same snapshot.
-3. The consensus config (`MIN_VALIDATOR_STAKE`, `QUORUM_FRACTION`, `WINNER_PROTECTION_DELTA`, …) — pinned in the validator's release; not fetched from the server.
+1. The `submissions[]` array from `/api/v2/winner/current` — votes with frozen `validator_stake`; the daemon must not substitute the live metagraph value for that validator. (Stake no longer weights the score or the qualified majority — votes are equal-weighted; stake gates only voter eligibility and the quorum denominator.)
+2. The deterministic on-chain metagraph snapshot at the finalized epoch's `start_block` — for the global denominators (total active stake for quorum, deregistration, eligibility). Every honest validator reads the same chain and reaches the same snapshot.
+3. The consensus config (`MIN_VALIDATOR_STAKE`, `QUORUM_FRACTION`, `WINNER_PROTECTION_DELTA`, `WINNER_PROTECTION_ABS_MARGIN`, `NOISE_AWARE_SEATING_MIN_SPEC`, …) — pinned in the validator's release; not fetched from the server.
 
-When the daemon's locally-derived winner matches the server's published `winner_state` (the steady state), they agree silently. When they diverge, the daemon proceeds with its local result and emits an alarm; widespread divergence across independent validators is an operational signal that the server-side `finalize.ts` or the server's input feed has drifted — but `set_weights` continues to track the convergent local result.
+When the daemon's recomputed consensus matches the server's published `winner_state` (the steady state), they agree silently. When they diverge, the daemon **keeps following the server's published winner** for `set_weights` and emits an alarm; persistent divergence across independent validators indicates the server-side `finalize.ts` or its input feed has drifted and is the cue to halt and investigate.
 
 ### Reward Distribution
 
@@ -247,16 +248,16 @@ When `SPEC_NUMBER` (formerly `scoring_version`) bumps, the active scoring contra
 - URL tampering (Channel A: hash mismatch invalidates commitment)
 - Forged submissions (Channel B: invalid signature is rejected at the API)
 
-### 2. Winner Protection (Multiplicative δ)
+### 2. Winner Protection (absolute margin from spec 16; multiplicative δ before)
 
-**Enforcement**: Challenger must improve score by > δ (3%) to dethrone. See [Winner Protection](#winner-protection-score-based-δ--3) above.
+**Enforcement**: From spec 16 a challenger must beat the incumbent by an absolute `D = 0.4` points (plus the slack multiplicative floor) to dethrone; before, by the multiplicative `δ = 3%`. See [Winner Protection](#winner-protection-noise-calibrated-from-spec-16-multiplicative-δ-before) above.
 
 **Prevents**:
 
 - Exact copy-paste (same score fails)
-- Trivial undercutting (< 3% improvement fails)
+- Trivial undercutting (gain within noise fails)
 - Free-riding on others' research
-- Winner oscillation from evaluation variance
+- Winner oscillation from evaluation variance (the absolute bar + Winsorized consensus make this the primary win, since one outlier validator can no longer swing the seat)
 
 ### 3. Pack Ownership Lock (`pack_first_seen`)
 
@@ -302,22 +303,25 @@ The platform tracks per-ownerkey ban state (`miner_bans` table). Each ownerkey a
 - Environment manipulation
 - Replay attacks
 
-### 7. Server-Coordinated Stake-Weighted Aggregation
+### 7. Server-Coordinated Score Aggregation
 
 **Enforcement**: For each finalized challenge epoch, the platform aggregates per-validator submissions:
 
 ```
-consensus_qualified = (Σ stake of validators reporting qualified=true)
-                       > 0.50 × (Σ stake of all reporting validators)
+consensus_qualified = (count of validators reporting qualified=true)
+                       > 0.50 × (count of all reporting validators)
 
-consensus_score     = Σ(stake_i × score_i) / Σ(stake_i),
-                      summed over qualified-reporting validators only
-                      (mirrors v5.x: only non-disqualifying votes contribute
-                       to the score, preventing fail-fast partials from
-                       skewing the score)
+consensus_score     = aggregate(score_i) over qualified-reporting validators only
+                      (every validator's vote counts equally — stake does not
+                       weight the score or the qualified majority; only
+                       non-disqualifying votes contribute to the score,
+                       preventing fail-fast partials from skewing it)
+                      aggregate = Winsorized mean from spec 16 (clip the single
+                       lowest+highest before averaging when n>=4, so one outlier
+                       validator can't swing the seat); plain mean before
 ```
 
-Aggregation runs server-side, but every input (per-validator `score_submit_log` row, hotkey signature, stake snapshot at start_block) is publicly readable and the computation is pure-function deterministic — any auditor can replay it.
+Aggregation runs server-side, but every input (per-validator `score_submit_log` row, hotkey signature, stake snapshot at start_block) is publicly readable and the computation is pure-function deterministic — any auditor can replay it. (The stake snapshot still gates the quorum below; it no longer weights the score or qualified flag.)
 
 **Prevents**:
 
@@ -354,8 +358,8 @@ v6.0 replaces the v5.x off-chain CAS + on-chain pointer protocol with a server-c
 Layer 1 (per epoch, off-chain):
   Server publishes one challenger
   → Validators evaluate independently and POST signed scores
-  → Server aggregates stake-weighted, applies Winner Protection,
-    publishes canonical winner_state.
+  → Server aggregates (Winsorized mean from spec 16, plain average before),
+    applies Winner Protection, publishes canonical winner_state.
 
 Layer 2 (on-chain, every tempo):
   Validators read winner_state via API and call set_weights
@@ -420,12 +424,15 @@ The on-chain layer (YC3 + commit-reveal + bond dynamics) is unchanged from v5.x.
             row stays pending_eval, will be repicked next epoch
 
    else: aggregate + Winner Protection
-     consensus_qualified := stake-weighted majority (>50% reporting stake true)
-     consensus_score     := stake-weighted average over qualified votes
+     consensus_qualified := majority by head count (>50% of reporting validators true)
+     noise_aware         := spec_number >= NOISE_AWARE_SEATING_MIN_SPEC (16)
+     consensus_score     := (noise_aware ? Winsorized mean : plain mean) over qualified votes
+     beats := noise_aware
+                ? consensus_score >= winner_score + D(0.4) AND consensus_score > winner_score×(1+δ)
+                : better(consensus_score, winner_score, δ=0.03)
      if seated winner empty AND consensus_qualified:
         seat (challenger_hotkey, challenger_pack_hash, consensus_score)
-     elif consensus_qualified AND
-          better(consensus_score, winner_score, δ=0.03):
+     elif consensus_qualified AND beats:
         seat (challenger_hotkey, challenger_pack_hash, consensus_score)
         record winner_history row with changed_from_prev = true
      else:
@@ -462,7 +469,7 @@ Each rejection is logged to a per-epoch diagnostic record so operators can inves
 
 After every terminal epoch (both `finalized` and `aborted_quorum`), the server records one `validator_activity` row per active validator: `participated = true` if a non-rejected submission from that validator exists for the epoch, else `false`.
 
-A validator is **marked inactive** if `participated = false` for the most recent `INACTIVE_THRESHOLD_EPOCHS` (default 3) consecutive epochs. Inactive validators have stake **excluded** from quorum and aggregation until they participate again (one participated row clears the flag). This is non-punitive: it prevents disconnected validators from dragging quorum below threshold.
+A validator is **marked inactive** if `participated = false` for the most recent `INACTIVE_THRESHOLD_EPOCHS` (default 3) consecutive epochs. Inactive validators are **excluded** from quorum (their stake) and from aggregation (their vote) until they participate again (one participated row clears the flag). This is non-punitive: it prevents disconnected validators from dragging quorum below threshold.
 
 ### Winner Protection (Post-Aggregation)
 
@@ -488,7 +495,7 @@ See [Winner Protection](#winner-protection-score-based-δ--3) above for the full
 | CAS / GCS read failure on validator | Validator skips the epoch. Counted as non-participation. |
 | Quorum miss | Epoch `aborted_quorum`; challenger submission moves to `eval_status='exhausted'` immediately — no retry. Miner can submit a different `pack_hash`. |
 | DB outage on server | Write APIs return 5xx; validators retry. Read APIs serve last cached state if available. |
-| Single validator submitting malicious score | Diluted by stake-weighted average. Cannot dethrone unless > 50% stake collusion (already a network-level trust assumption). |
+| Single validator submitting malicious score | Diluted by the plain average across validators. Cannot dethrone unless > 50% of reporting validators (by head count, each above `MIN_VALIDATOR_STAKE`) collude. Note: with unweighted votes the collusion bar is a count of qualifying validators rather than a stake majority — sizing `MIN_VALIDATOR_STAKE` is what bounds cheap-identity (sybil) flooding. |
 
 ### Cross-Validator: YC3 On-Chain Consensus
 
@@ -513,7 +520,7 @@ Validators earn rewards for:
 **Attack resistance**:
 
 - Colluding validators cannot fake packs (content-addressed + verifiable bytes)
-- Dishonest validators submitting inflated/deflated scores are diluted by stake-weighted aggregation from honest validators
+- Dishonest validators submitting inflated/deflated scores are diluted by the plain average across honest validators
 - Free-riding validators (no submissions, just reading `winner_state`) are filtered by participation tracking and YC3's zero-signal exclusion
 - Weight-copying detectable by YC3; copier lags behind on bond dynamics
 
@@ -524,7 +531,7 @@ Validators earn rewards for:
 The v6.0 validator daemon is intentionally thin. It carries no per-miner evaluation cache, no client-side integrity gate, and no ownership state. Its responsibilities reduce to **three** concurrent loops — eval, winner-derivation, and weights — split because the underlying server-published reads have different semantics:
 
 - `GET /api/v2/epoch/current` answers "what's the active challenge **right now**?" — used by the eval loop to find the pack to score.
-- `GET /api/v2/winner/current` answers "what evidence has been finalized into the **current seat**?" — used by the winner-derivation loop, which **re-runs the consensus aggregation locally** from the returned `submissions[]` and uses the local result (not the server's `winner_state` claim) to drive `set_weights`.
+- `GET /api/v2/winner/current` answers "what evidence has been finalized into the **current seat**?" — used by the winner-derivation loop, which **adopts the server's published winner** to drive `set_weights` and re-runs the consensus aggregation locally over the returned `submissions[]` purely as a divergence cross-check.
 
 ```
 # Eval loop — drives the per-epoch challenger evaluation
@@ -536,19 +543,19 @@ loop every ~10 s:
         POST /api/v2/epoch/{challenge_epoch_id}/score   # signed
         mark already_scored(resp.epoch.challenge_epoch_id)
 
-# Winner-derivation loop — produces the locally-derived seated winner used by set_weights
+# Winner-derivation loop — adopts the server's published winner used by set_weights
 loop every ~10 s (can share a tick with the eval loop):
     w = GET /api/v2/winner/current
     if w.finalized_epoch is null:
         cache.winner = null                            # cold start, no finalized epoch yet
     else:
-        derived = local_aggregate(
+        cache.winner = w.winner                        # adopt the server-resolved winner
+        derived = local_aggregate(                     # cross-check only — does not drive set_weights
                     w.submissions,                     # votes + frozen validator_stake
                     on_chain_metagraph_at(w.finalized_epoch.start_block),
                     CONSENSUS_CONFIG)                  # pinned in this release
         if derived.uid != w.winner?.uid:
-            log_alarm("server winner ≠ locally-derived"); proceed with derived
-        cache.winner = derived
+            log_alarm("server winner ≠ locally-recomputed")   # alarm, keep following server
 
 # Weight loop — drives on-chain weight-setting
 loop every ~5 min:
@@ -561,9 +568,9 @@ loop every ~5 min:
             set_weights(uid = cache.winner.uid)        # winner-take-all
 ```
 
-The eval loop produces at most one signed score per `challenge_epoch_id`. The winner-derivation loop re-derives on every successful poll — it does **not** cache the derived winner across polls (otherwise a later finalize-time fix on the server would not propagate); what it caches for fault-tolerance is the *raw* `/api/v2/winner/current` response. The weight loop is independent and tempo-gated. A separate heartbeat task (~10 min) reports liveness, version, and bench/harness image digests via `POST /api/v2/validators/heartbeat`.
+The eval loop produces at most one signed score per `challenge_epoch_id`. The winner-derivation loop refreshes on every successful poll — it does **not** cache the adopted winner across polls (otherwise a later finalize-time fix on the server would not propagate); what it caches for fault-tolerance is the *raw* `/api/v2/winner/current` response. The weight loop is independent and tempo-gated. A separate heartbeat task (~10 min) reports liveness, version, and bench/harness image digests via `POST /api/v2/validators/heartbeat`.
 
-The server's `winner_state` row, surfaced as `w.winner` on `/api/v2/winner/current` (and as the non-authoritative `winner` block on `/api/v2/epoch/current`), is **advisory** — used only for cross-checking. `set_weights` follows the locally-derived result. See [Decentralized Winner Derivation in v6](#decentralized-winner-derivation-in-v6) for the security argument.
+The server's `winner_state` row, surfaced as `w.winner` on `/api/v2/winner/current`, is what `set_weights` follows. The local recomputation over `submissions[]` is the **cross-check** — it alarms on divergence but does not override the server's winner. (The same `winner` block also appears on `/api/v2/epoch/current` for observability; daemons read it from `/api/v2/winner/current`, which carries the inputs needed for the cross-check.) See [Decentralized Winner Derivation in v6](#decentralized-winner-derivation-in-v6) for the integrity argument.
 
 ## What Validators No Longer Do (v6.0)
 
@@ -579,7 +586,7 @@ Compared with v5.x, the following responsibilities have been removed from the va
 
 What validators newly **gain** in v6.0:
 
-- **Local Winner Protection (δ) computation** — explicitly **not** removed. v6.0 validators run their own copy of the consensus aggregation against `/api/v2/winner/current.submissions[]` and use the locally-derived winner to drive `set_weights`. The server's `winner_state` row is advisory only. See [Decentralized Winner Derivation in v6](#decentralized-winner-derivation-in-v6).
+- **Local consensus cross-check** — v6.0 validators recompute the consensus aggregation against `/api/v2/winner/current.submissions[]` and compare it (plus their own signed votes) against the server's published winner, alarming on divergence. `set_weights` follows the server-resolved winner; Winner Protection (δ) is applied server-side at finalize, not recomputed on the daemon. The cross-check is what keeps server coordination publicly auditable. See [Decentralized Winner Derivation in v6](#decentralized-winner-derivation-in-v6).
 
 ---
 
@@ -590,7 +597,7 @@ All read endpoints are public; write endpoints require hotkey signature. Validat
 | Method | Path | Purpose |
 |--------|------|---------|
 | `GET` | `/api/v2/epoch/current` | **(critical)** In-progress challenge: `{ epoch: { challenge_epoch_id, challenger_hotkey, challenger_pack_hash, start_block, end_block, status } }`. Also returns a non-authoritative `winner` block (mirror of `winner_state`) for observability — daemons must **not** drive `set_weights` from this field; use `/api/v2/winner/current` instead. 404 when no epoch is in progress. Polling cadence ~10 s. |
-| `GET` | `/api/v2/winner/current` | **(critical)** Latest finalized epoch's per-validator votes (`challenger_score`, `challenger_qualified`, `winner_*` for dual-eval) with each vote's `validator_stake` snapshotted at score POST. Also returns the server's `winner_state` claim as `winner` (advisory only). v6 daemons consume `submissions[]`, run a local copy of the consensus aggregation, and use the locally-derived winner to drive `set_weights`. This is the endpoint that makes v6 winner derivation decentralized — see [Decentralized Winner Derivation in v6](#decentralized-winner-derivation-in-v6). |
+| `GET` | `/api/v2/winner/current` | **(critical)** Server-resolved `winner` block plus the latest finalized epoch's per-validator votes (`challenger_score`, `challenger_qualified`, `winner_*` for dual-eval) with each vote's `validator_stake` snapshotted at score POST. v6 daemons **adopt the `winner` block to drive `set_weights`** and recompute the aggregation over `submissions[]` as a divergence cross-check. The published inputs are what make the server-resolved winner publicly auditable — see [Decentralized Winner Derivation in v6](#decentralized-winner-derivation-in-v6). |
 | `POST` | `/api/v2/epoch/{challenge_epoch_id}/score` | **(critical)** Validator v6 score submission. Path carries the epoch id; body carries a `challenger` block (required) and a `winner` block (optional, dual-eval). Signed prefix: `trajectoryrl-challenge-score:{validator_hotkey}:{timestamp}:{challenge_epoch_id}` — replay-safe across epochs. Server stamps `challenger_hotkey`/`challenger_pack_hash` from `challenge_epochs(id)` and `validator_stake` from `nodes` at receipt; writes to `challenge_scores`. Distinct path / prefix from the legacy v5.2 `/api/v2/scores/submit`. |
 | `POST` | `/api/v2/validators/heartbeat` | **(critical)** Validator liveness + running version + bench/harness image digests. |
 | `GET` | `/api/queue` | FIFO challenger queue snapshot (validators do not call this). |
@@ -630,16 +637,16 @@ miner_submissions row inserted with eval_status = 'pending_pre_eval'
    │
    ├─ quorum < QUORUM_FRACTION  → aborted_quorum, eval_status='exhausted' (no retry)
    │
-   └─ quorum ≥ QUORUM_FRACTION  → aggregate (stake-weighted)
+   └─ quorum ≥ QUORUM_FRACTION  → aggregate (plain average)
                                   → apply Winner Protection (δ = 0.03)
                                   → seat winner / hold
                                   → eval_status = 'completed'
 
 every ~10 s (winner-derivation loop, can share a tick with the eval loop):
-   validator GET /api/v2/winner/current  (returns latest finalized_epoch + per-validator submissions)
-   → local_aggregate(submissions, on_chain_metagraph_at(finalized_epoch.start_block), CONSENSUS_CONFIG)
-   → cache.winner = derived          (server's response.winner is advisory only)
-   → if derived.uid != response.winner?.uid: emit divergence alarm
+   validator GET /api/v2/winner/current  (returns server-resolved winner + finalized_epoch + per-validator submissions)
+   → cache.winner = response.winner   (adopt the server-resolved winner)
+   → local_aggregate(submissions, on_chain_metagraph_at(finalized_epoch.start_block), CONSENSUS_CONFIG)  # cross-check only
+   → if derived.uid != response.winner?.uid: emit divergence alarm (keep following server)
 
 every Bittensor tempo (set_weights cadence):
    validator uses cache.winner from the loop above
@@ -660,7 +667,7 @@ No seated winner → all weight to subnet owner UID (burned).
 Where seated_winner satisfies:
 
 - Server-canonical winner_state is non-empty and not deregistered
-- consensus_qualified = stake-weighted majority of qualified votes
+- consensus_qualified = majority of qualified votes by head count
 - consensus_score passes `better(score, winner_score, δ = 0.03)` against the prior seat
 - pack passes schema validation and content-address check
 - hotkey is the recorded owner in the server's `pack_first_seen[pack_hash]` (copies are filtered before queue admission and never reach validators)
@@ -706,7 +713,7 @@ v6.0 ships in three phases gated by an `INCENTIVE_MECHANISM` major-version bump.
 
 **Phase 2 — Cutover (v6.0):**
 
-- Validator daemons flip to driving `set_weights` from the locally-derived winner (`GET /api/v2/winner/current` → `local_aggregate(submissions, on_chain_metagraph_at(finalized_epoch.start_block), CONSENSUS_CONFIG)`) and to writing scores via `POST /api/v2/epoch/{challenge_epoch_id}/score`.
+- Validator daemons flip to driving `set_weights` from the server-resolved winner (`GET /api/v2/winner/current` → `response.winner`, with `local_aggregate(submissions, on_chain_metagraph_at(finalized_epoch.start_block), CONSENSUS_CONFIG)` run as a divergence cross-check) and to writing scores via `POST /api/v2/epoch/{challenge_epoch_id}/score`.
 - v5.2 off-chain CAS + chain commitment-pointer path is disabled (code retained, gated by an env flag).
 - `consensus_payload_log` writes stop, and `POST /api/v2/scores/submit` traffic from v6 daemons is expected to drop to zero. Existing rows retained as historical record.
 

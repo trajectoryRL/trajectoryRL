@@ -1,20 +1,26 @@
-"""Local winner derivation + cache.
+"""Server winner adoption + local cross-check + cache.
 
-In v6.0 the seated winner is **derived locally** by every validator
-from the per-vote inputs published at ``GET /api/v2/winner/current``:
-the server returns the latest finalized epoch's submissions with
-``validator_stake`` snapshotted at score-POST time, and each daemon
-runs the same stake-weighted aggregation against those rows.
+In v6.0 the seated winner is resolved **server-side** at finalize time
+and published at ``GET /api/v2/winner/current``. Each validator adopts
+that published winner (identity + score) to drive ``set_weights``; it
+does not re-derive the winner authoritatively. Alongside the winner the
+server publishes the per-vote inputs (``submissions[]`` with
+``validator_stake`` snapshotted at score-POST time) so the daemon can
+re-run the aggregation locally as an **advisory cross-check** and alarm
+on divergence — the recomputed value does not override the server's
+winner.
 
 This module provides:
 
 * ``WinnerState`` — the cache shape (hotkey, uid, score, freshness).
 * ``aggregate_challenger_score`` — pure function over ``submissions[]``
-  that mirrors the server's finalize aggregation (stake-weighted
-  consensus score + stake-weighted majority qualified).
+  that mirrors the server's finalize aggregation (plain-average
+  consensus score + head-count majority qualified). Used only for the
+  divergence cross-check; its result does not drive ``set_weights``.
 * ``derive_winner_state`` — wraps the parsed ``/api/v2/winner/current``
-  response into a ``WinnerState`` and emits a divergence warning when
-  the locally-computed consensus disagrees with the server's claim.
+  response into a ``WinnerState`` (taken from the server's ``winner``
+  block) and emits a divergence warning when the locally-recomputed
+  consensus disagrees with the server's claim.
 
 The cache is persisted to disk so cold starts and short server outages
 survive; ``WINNER_FALLBACK_TTL_SECONDS`` (24 h) is the staleness alarm
@@ -84,21 +90,50 @@ class WinnerState:
 
 _DIVERGENCE_TOLERANCE = 0.01
 
+# Noise-aware seating (Winsorized consensus + absolute takeover margin) takes
+# effect from this spec onward; earlier epochs use the legacy plain mean. Pinned
+# in the daemon release to mirror the server's NOISE_AWARE_SEATING_MIN_SPEC.
+_NOISE_AWARE_SEATING_MIN_SPEC = 16
+
+
+def _winsorized_mean(values: List[float]) -> float:
+    """Robust consensus center — mirrors the server's aggregator.winsorizedMean.
+
+    Cross-validator score spread is pure agent-rollout noise (grading is
+    deterministic), and a single validator's rollout is occasionally a wild
+    outlier. Plain averaging gives that outlier full 1/n leverage; Winsorizing
+    clips the single lowest and highest score to their nearest neighbour before
+    averaging. n-adaptive: only clip when n >= 4 (at n <= 3 clipping collapses
+    toward a single validator, so fall back to the plain mean).
+    """
+    n = len(values)
+    xs = sorted(values)
+    if n >= 4:
+        xs[0] = xs[1]
+        xs[-1] = xs[-2]
+    return sum(xs) / n
+
 
 def aggregate_challenger_score(
     submissions: Optional[List[Dict[str, Any]]],
+    *,
+    winsorize: bool = False,
 ) -> Optional[Tuple[float, bool]]:
-    """Stake-weighted aggregate of ``(score, qualified)`` over submissions.
+    """Unweighted aggregate of ``(score, qualified)`` over submissions.
 
     Mirrors the server-side finalize aggregation:
 
     * Rows with ``challenger_rejected = true`` are dropped.
-    * Rows with null/zero ``validator_stake`` are dropped (pre-migration-070
-      rows would need a metagraph fallback; out of scope here).
-    * ``consensus_qualified`` = stake-weighted majority of ``challenger_qualified
-      = true`` (> 0.5 of valid stake).
-    * ``consensus_score`` = stake-weighted average of ``challenger_score`` over
-      ``challenger_qualified = true`` rows only.
+    * Rows with null/zero ``validator_stake`` are dropped — stake is used only
+      to identify eligible voters (a proxy for the server's MIN_VALIDATOR_STAKE
+      / active-set filter); it does **not** weight the score or the qualified
+      majority. Pre-migration-070 rows would need a metagraph fallback; out of
+      scope here.
+    * ``consensus_qualified`` = majority by head count of ``challenger_qualified
+      = true`` (> 0.5 of eligible voters).
+    * ``consensus_score`` = (``winsorize=True``) the Winsorized mean of
+      ``challenger_score`` over qualified rows, else the plain mean. The caller
+      sets ``winsorize`` from the epoch's spec vs ``_NOISE_AWARE_SEATING_MIN_SPEC``.
 
     Returns ``None`` when no rows survive filtering, otherwise
     ``(consensus_score, consensus_qualified)``.
@@ -119,26 +154,18 @@ def aggregate_challenger_score(
             continue
         if stake_f <= 0:
             continue
-        s_copy = dict(s)
-        s_copy["validator_stake"] = stake_f
-        valid.append(s_copy)
+        valid.append(s)
 
     if not valid:
         return None
 
-    total_stake = sum(s["validator_stake"] for s in valid)
-    if total_stake <= 0:
-        return None
-
     qualified_subs = [s for s in valid if s.get("challenger_qualified")]
-    qualified_stake = sum(s["validator_stake"] for s in qualified_subs)
-    consensus_qualified = (qualified_stake / total_stake) > 0.5
+    consensus_qualified = (len(qualified_subs) / len(valid)) > 0.5
 
-    if not qualified_subs or qualified_stake <= 0:
+    if not qualified_subs:
         return 0.0, consensus_qualified
 
-    weighted_sum = 0.0
-    used_stake = 0.0
+    scores: List[float] = []
     for s in qualified_subs:
         score_raw = s.get("challenger_score")
         try:
@@ -147,13 +174,13 @@ def aggregate_challenger_score(
             score_f = None
         if score_f is None:
             continue
-        weighted_sum += s["validator_stake"] * score_f
-        used_stake += s["validator_stake"]
+        scores.append(score_f)
 
-    if used_stake <= 0:
+    if not scores:
         return 0.0, consensus_qualified
 
-    return weighted_sum / used_stake, consensus_qualified
+    consensus = _winsorized_mean(scores) if winsorize else sum(scores) / len(scores)
+    return consensus, consensus_qualified
 
 
 def derive_winner_state(
@@ -189,7 +216,16 @@ def derive_winner_state(
     server_winner = response.get("winner")
 
     if finalized and server_winner:
-        derived = aggregate_challenger_score(response.get("submissions"))
+        # Match the server's aggregation for this epoch's spec: Winsorized from
+        # the noise-aware cutover, plain mean before it.
+        spec_number = finalized.get("spec_number")
+        winsorize = (
+            spec_number is not None
+            and spec_number >= _NOISE_AWARE_SEATING_MIN_SPEC
+        )
+        derived = aggregate_challenger_score(
+            response.get("submissions"), winsorize=winsorize
+        )
         if derived is not None and finalized.get("winner_replaced"):
             local_score, _local_qualified = derived
             server_score_raw = server_winner.get("score")

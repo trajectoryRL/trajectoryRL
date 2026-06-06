@@ -145,7 +145,7 @@ class TestAggregateChallengerScore:
         assert score == pytest.approx(0.9)
         assert qualified is True
 
-    def test_stake_weighted_average(self):
+    def test_plain_average(self):
         subs = [
             {"validator_stake": 75.0, "challenger_score": 1.0,
              "challenger_qualified": True, "challenger_rejected": False},
@@ -153,8 +153,9 @@ class TestAggregateChallengerScore:
              "challenger_qualified": True, "challenger_rejected": False},
         ]
         score, qualified = aggregate_challenger_score(subs)
-        # 75/100 → 1.0, 25/100 → 0.0  ⇒  weighted avg = 0.75
-        assert score == pytest.approx(0.75)
+        # plain mean (1.0 + 0.0) / 2 = 0.5; stake does NOT weight the score
+        # (the old stake-weighted result would have been 0.75).
+        assert score == pytest.approx(0.5)
         assert qualified is True
 
     def test_rejected_rows_dropped(self):
@@ -179,7 +180,23 @@ class TestAggregateChallengerScore:
         assert score == pytest.approx(0.6)
         assert qualified is True
 
-    def test_stake_weighted_majority_qualified(self):
+    def test_majority_qualified_by_count(self):
+        subs = [
+            {"validator_stake": 10.0, "challenger_score": 0.9,
+             "challenger_qualified": True, "challenger_rejected": False},
+            {"validator_stake": 10.0, "challenger_score": 0.7,
+             "challenger_qualified": True, "challenger_rejected": False},
+            {"validator_stake": 80.0, "challenger_score": 0.0,
+             "challenger_qualified": False, "challenger_rejected": False},
+        ]
+        score, qualified = aggregate_challenger_score(subs)
+        # 2 of 3 validators qualified → majority by head count, even though the
+        # dissenting validator holds 80% of the stake.
+        assert qualified is True
+        # score = plain mean of the two qualified votes = (0.9 + 0.7) / 2 = 0.8
+        assert score == pytest.approx(0.8)
+
+    def test_exactly_half_qualified_not_majority(self):
         subs = [
             {"validator_stake": 60.0, "challenger_score": 0.0,
              "challenger_qualified": False, "challenger_rejected": False},
@@ -187,7 +204,7 @@ class TestAggregateChallengerScore:
              "challenger_qualified": True, "challenger_rejected": False},
         ]
         score, qualified = aggregate_challenger_score(subs)
-        # qualified stake is 40/100 = 40% — not a majority
+        # 1 of 2 qualified = 50% by head count — not a majority (must be > 50%)
         assert qualified is False
         # score is computed only over qualified rows
         assert score == pytest.approx(0.9)
@@ -200,6 +217,27 @@ class TestAggregateChallengerScore:
         score, qualified = aggregate_challenger_score(subs)
         assert score == 0.0
         assert qualified is False
+
+    def test_winsorize_clips_outlier(self):
+        # sorted [3,8,8,8,8,9] → clip min→8, max→8 → all 8 → mean 8.
+        subs = [
+            {"validator_stake": 10.0, "challenger_score": s,
+             "challenger_qualified": True, "challenger_rejected": False}
+            for s in (3.0, 8.0, 8.0, 8.0, 8.0, 9.0)
+        ]
+        win, _ = aggregate_challenger_score(subs, winsorize=True)
+        plain, _ = aggregate_challenger_score(subs)  # default: plain
+        assert win == pytest.approx(8.0)
+        assert plain == pytest.approx(44.0 / 6)  # outlier kept
+
+    def test_winsorize_noop_below_four_votes(self):
+        subs = [
+            {"validator_stake": 10.0, "challenger_score": s,
+             "challenger_qualified": True, "challenger_rejected": False}
+            for s in (1.0, 8.0, 9.0)
+        ]
+        win, _ = aggregate_challenger_score(subs, winsorize=True)
+        assert win == pytest.approx(6.0)  # n<=3 → plain mean, no clip
 
 
 class TestDeriveWinnerState:
@@ -273,6 +311,37 @@ class TestDeriveWinnerState:
         with caplog.at_level("WARNING", logger="trajectoryrl.utils.winner_state"):
             derive_winner_state(resp, now=100.0)
         assert any("divergence" in r.message for r in caplog.records)
+
+    def _replaced_resp(self, spec_number, server_score):
+        # 6 votes with one low outlier: winsorized mean = 8.0, plain = 44/6 ≈ 7.33.
+        return {
+            "winner": {"hotkey": "5G", "uid": 7, "score": str(server_score)},
+            "finalized_epoch": {
+                "challenge_epoch_id": 300,
+                "spec_number": spec_number,
+                "winner_replaced": True,
+                "outcome": "winner_replaced",
+            },
+            "submissions": [
+                {"validator_stake": 10.0, "challenger_score": s,
+                 "challenger_qualified": True, "challenger_rejected": False}
+                for s in (3.0, 8.0, 8.0, 8.0, 8.0, 9.0)
+            ],
+        }
+
+    def test_spec_at_cutover_uses_winsorized_no_divergence(self, caplog):
+        # spec 16: server publishes the Winsorized 8.0; local must match.
+        resp = self._replaced_resp(16, 8.0)
+        with caplog.at_level("WARNING", logger="trajectoryrl.utils.winner_state"):
+            derive_winner_state(resp, now=100.0)
+        assert not any("divergence" in r.message for r in caplog.records)
+
+    def test_spec_before_cutover_uses_plain_mean(self, caplog):
+        # spec 15: server publishes the plain 7.33; local plain mean must match.
+        resp = self._replaced_resp(15, 44.0 / 6)
+        with caplog.at_level("WARNING", logger="trajectoryrl.utils.winner_state"):
+            derive_winner_state(resp, now=100.0)
+        assert not any("divergence" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
