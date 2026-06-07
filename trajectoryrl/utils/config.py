@@ -182,6 +182,20 @@ class ValidatorConfig:
     # scenarios still produce the same per-name quality dict, just
     # in a different completion order.
     parallel_scenario_evals: int = 3
+    # Scenario-level retry for infra-incomplete episodes. When the testee
+    # LLM endpoint returns ``finish_reason=incomplete`` with no tool call
+    # (a rate-limit / load-shedding truncation — the agent never acts and
+    # would otherwise be scored a poisoned 0), re-run the whole scenario
+    # after an incremental backoff so a transient multi-minute window can
+    # pass before the real score is recorded. hermes' in-container retry
+    # (~6 LLM calls in ~1.3s) is far too fast to outlast such a window.
+    # Defaults: sleeps of 20s / 60s / 180s (max ~260s cumulative backoff),
+    # sized to cover the epoch-2030 ~5-min OpenRouter degradation. Backoff
+    # is gated on the epoch-current check, so short dynamic epochs bail
+    # early instead of stalling. Set max_retries=0 to disable.
+    scenario_incomplete_max_retries: int = 3
+    scenario_incomplete_backoff_base_s: float = 20.0
+    scenario_incomplete_backoff_factor: float = 3.0
     # Scenarios + episodes-per-scenario are not configurable on purpose:
     # every validator runs the same set so scores are comparable across
     # validators / windows / SPEC_NUMBER bumps. To change the set, add a
