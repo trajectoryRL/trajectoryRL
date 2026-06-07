@@ -729,6 +729,116 @@ def _looks_like_provider_failure(episodes: List["_EpisodeResult"]) -> bool:
     return True
 
 
+def _last_session_obj(turns_log: str) -> dict | None:
+    """Return the last non-empty JSON object in a turns.jsonl blob.
+
+    The validator wipes Hermes' store between episodes, so the blob
+    normally carries exactly one session; we take the last line
+    defensively. Returns None when empty / unparseable.
+    """
+    if not turns_log:
+        return None
+    last: dict | None = None
+    for line in turns_log.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            last = parsed
+    return last
+
+
+def _episode_incomplete_no_progress(ep: "_EpisodeResult") -> bool:
+    """True when hermes exited cleanly but the agent never acted because
+    the testee model truncated (``finish_reason=incomplete``) instead of
+    answering — the epoch-2030 rate-limit signature.
+
+    Distinguishes infra failure (retry-worthy) from a real miner 0:
+
+    * ``chat_exit`` non-zero / deadline kill → not this path (that is the
+      session-wide ``_looks_like_provider_failure`` case or a real
+      timeout); only clean exits (``0`` / unknown ``None``) qualify.
+    * ``timed_out`` → the agent did real work then hit the deadline; a
+      genuine signal, not a truncation. Keep it.
+    * ``tool_call_count > 0`` → the agent engaged with the task. Whatever
+      score it got is a real pack signal, even if zero.
+    * ``tool_call_count == 0`` AND any assistant turn
+      ``finish_reason == "incomplete"`` → the model emitted reasoning but
+      no content / tool call and got cut off. Infra. A clean
+      ``finish_reason == "stop"`` with no tool call is the agent giving
+      up — a pack signal — and is NOT flagged.
+    """
+    if ep.chat_exit not in (0, None):
+        return False
+    if ep.timed_out:
+        return False
+    session = _last_session_obj(ep.turns_log)
+    if not session:
+        return False
+    try:
+        tool_calls = int(session.get("tool_call_count") or 0)
+    except (TypeError, ValueError):
+        tool_calls = 0
+    if tool_calls > 0:
+        return False
+    for msg in session.get("messages") or []:
+        if (
+            isinstance(msg, dict)
+            and msg.get("role") == "assistant"
+            and msg.get("finish_reason") == "incomplete"
+        ):
+            return True
+    return False
+
+
+def _retry_episode_on_incomplete(
+    run_fn: Callable[[], "_EpisodeResult"],
+    *,
+    max_retries: int,
+    backoff_base_s: float,
+    backoff_factor: float,
+    still_current: Optional[Callable[[], bool]] = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    log: Optional[logging.Logger] = None,
+    label: str = "",
+) -> "_EpisodeResult":
+    """Run an episode, retrying with incremental backoff while it comes
+    back infra-incomplete (see ``_episode_incomplete_no_progress``).
+
+    hermes' in-container retry fires ~6 LLM calls in ~1.3s — far too fast
+    to outlast a multi-minute provider rate-limit window. This re-runs the
+    whole scenario after a growing sleep (``base * factor**attempt``), so a
+    transient window can pass before the agent's real score is recorded
+    instead of a poisoned 0.
+
+    The backoff is gated on ``still_current``: if the epoch advances during
+    a sleep, retrying is pointless (the submission would 409) so we stop
+    and return what we have.
+    """
+    ep = run_fn()
+    attempt = 0
+    while attempt < max_retries and _episode_incomplete_no_progress(ep):
+        if still_current is not None and not still_current():
+            break
+        sleep_s = backoff_base_s * (backoff_factor ** attempt)
+        if log is not None:
+            log.warning(
+                "%s infra-incomplete (clean exit, no tool call, "
+                "finish_reason=incomplete); retry %d/%d after %.0fs backoff",
+                label, attempt + 1, max_retries, sleep_s,
+            )
+        sleep_fn(sleep_s)
+        if still_current is not None and not still_current():
+            break
+        attempt += 1
+        ep = run_fn()
+    return ep
+
+
 # ---------------------------------------------------------------------------
 # Harness
 # ---------------------------------------------------------------------------
@@ -1263,7 +1373,8 @@ class TrajectorySandboxHarness:
 
                     spec = scenario_specs[cell_index]
                     fut = pool.submit(
-                        self._run_episode,
+                        self._run_episode_with_retry,
+                        still_current=_check_still_current,
                         session_id=session_id,
                         episode_index=cell_index,
                         skill_md=skill_md,
@@ -1369,6 +1480,30 @@ class TrajectorySandboxHarness:
 
         session_result.compute_scores()
         return session_result
+
+    def _run_episode_with_retry(
+        self,
+        *,
+        still_current: Optional[Callable[[], bool]] = None,
+        **episode_kwargs,
+    ) -> _EpisodeResult:
+        """Worker entrypoint: run a scenario, retrying with incremental
+        backoff while it returns infra-incomplete (clean exit, no tool
+        call, ``finish_reason=incomplete`` — a testee-LLM truncation, not
+        a miner signal). See ``_retry_episode_on_incomplete`` and the
+        ``scenario_incomplete_*`` config knobs.
+        """
+        spec = episode_kwargs.get("spec") or {}
+        label = f"[{episode_kwargs.get('session_id')}] {spec.get('name', '?')}"
+        return _retry_episode_on_incomplete(
+            lambda: self._run_episode(**episode_kwargs),
+            max_retries=self.config.scenario_incomplete_max_retries,
+            backoff_base_s=self.config.scenario_incomplete_backoff_base_s,
+            backoff_factor=self.config.scenario_incomplete_backoff_factor,
+            still_current=still_current,
+            log=logger,
+            label=label,
+        )
 
     def _run_episode(
         self,

@@ -15,11 +15,13 @@ from trajectoryrl.utils.sandbox_harness import (
     SandboxEvaluationResult,
     TrajectorySandboxHarness,
     _drain_exec_stream_with_deadline,
+    _episode_incomplete_no_progress,
     _EpisodeResult,
     _looks_like_provider_failure,
     _parse_ctrf_correctness,
     _parse_session_cost,
     _pick_episode_timeout,
+    _retry_episode_on_incomplete,
     _SessionResult,
 )
 
@@ -1426,6 +1428,43 @@ class TestParallelScenarioOrchestrator:
 
         return h
 
+    def test_run_eval_sync_retries_infra_incomplete_scenario(
+        self, monkeypatch, tmp_path,
+    ):
+        # Epoch-2030: a scenario comes back infra-incomplete (clean exit,
+        # 0 tool calls, finish_reason=incomplete). The dispatcher must
+        # re-run it and record the recovered score, not POST a poisoned 0.
+        scenarios = ("s0",)
+        h = self._setup_harness(
+            monkeypatch, tmp_path, parallelism=1, scenarios=scenarios,
+        )
+        h.config.scenario_incomplete_max_retries = 2
+        h.config.scenario_incomplete_backoff_base_s = 0.0  # no real sleep
+
+        calls = {"n": 0}
+
+        def fake_run_episode(*, session_id, episode_index, skill_md, spec,
+                             on_chat_start=None, on_chat_end=None,
+                             on_container_started=None,
+                             on_container_finished=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _ep(scenario=spec["name"])  # infra-incomplete
+            return _EpisodeResult(
+                episode_index=episode_index, scenario=spec["name"],
+                quality=0.7, chat_exit=0,
+                turns_log=_turns_log_blob(
+                    tool_call_count=3, finish_reason="stop",
+                ),
+            )
+
+        monkeypatch.setattr(h, "_run_episode", fake_run_episode)
+        result = h._run_eval_sync(
+            skill_md="x", epoch_seed=0, salt="s", pack_hash="abc",
+        )
+        assert calls["n"] == 2  # retried the infra-incomplete scenario once
+        assert [e.quality for e in result.episodes] == [0.7]
+
     def test_default_config_is_three(self):
         # Bumping this default is a behavior change for every operator;
         # surface it in a test so a casual edit can't slip through.
@@ -1696,3 +1735,174 @@ class TestParallelScenarioOrchestrator:
         assert abs(par_score - seq_score) < 1e-9
         expected = 0.25 + 0.5 + 0.75 + 1.0 + REMOVED_SCENARIO_BASE_SCORE
         assert abs(seq_score - expected) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# Infra-incomplete detection + scenario-level retry with backoff
+# ---------------------------------------------------------------------------
+# Anchor (epoch 2030 incident): the testee LLM endpoint returned
+# `finish_reason=incomplete` with no tool call / ~0 billing on fresh
+# sessions during a multi-minute rate-limit window. Those scenarios were
+# scored 0 and POSTed to consensus. hermes' in-container retry (6 calls in
+# ~1.3s) was too fast to outlast the window. We detect that signature per
+# episode and retry the whole scenario with incremental backoff.
+
+import json as _json_retry
+
+
+def _turns_log_blob(*, tool_call_count: int, finish_reason: str) -> str:
+    """Build a one-session turns.jsonl blob like hermes exports."""
+    session = {
+        "tool_call_count": tool_call_count,
+        "messages": [
+            {"role": "user", "content": "Solve the task"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": None,
+                "finish_reason": finish_reason,
+            },
+        ],
+    }
+    return _json_retry.dumps(session)
+
+
+def _ep(
+    *,
+    chat_exit=0,
+    timed_out=False,
+    tool_call_count=0,
+    finish_reason="incomplete",
+    turns_log=None,
+    quality=0.0,
+    scenario="regex-chess",
+) -> _EpisodeResult:
+    if turns_log is None:
+        turns_log = _turns_log_blob(
+            tool_call_count=tool_call_count, finish_reason=finish_reason
+        )
+    return _EpisodeResult(
+        episode_index=0,
+        scenario=scenario,
+        quality=quality,
+        chat_exit=chat_exit,
+        timed_out=timed_out,
+        turns_log=turns_log,
+    )
+
+
+class TestEpisodeIncompleteNoProgress:
+    def test_clean_exit_no_tool_calls_incomplete_is_infra(self):
+        # The epoch-2030 signature: hermes exited 0, agent never issued a
+        # tool call, model truncated (finish_reason=incomplete).
+        assert _episode_incomplete_no_progress(_ep()) is True
+
+    def test_genuine_pack_zero_with_tool_calls_is_not_infra(self):
+        # db-wal-recovery style: agent worked (tool calls) but failed the
+        # task. A real miner 0 — must NOT be treated as infra / retried.
+        ep = _ep(tool_call_count=5, finish_reason="stop", quality=0.0)
+        assert _episode_incomplete_no_progress(ep) is False
+
+    def test_timed_out_is_not_infra(self):
+        # Heavy scenario that ran real work then hit the per-episode
+        # deadline (GyrMS write-compressor). Real signal, keep it.
+        ep = _ep(timed_out=True, tool_call_count=0)
+        assert _episode_incomplete_no_progress(ep) is False
+
+    def test_hermes_hard_fail_nonzero_exit_is_not_this_path(self):
+        # chat_exit != 0 is the session-wide provider-failure path
+        # (_looks_like_provider_failure), not the clean-exit incomplete one.
+        ep = _ep(chat_exit=1, tool_call_count=0)
+        assert _episode_incomplete_no_progress(ep) is False
+
+    def test_clean_stop_no_tools_is_not_infra(self):
+        # Model cleanly stopped (finish_reason=stop) without a tool call:
+        # a pack signal (agent gave up), not a truncation. Keep the 0.
+        ep = _ep(tool_call_count=0, finish_reason="stop")
+        assert _episode_incomplete_no_progress(ep) is False
+
+    def test_empty_turns_log_is_not_infra(self):
+        # No session captured → no positive evidence of incomplete; be
+        # conservative and don't false-trigger a retry.
+        ep = _ep(turns_log="")
+        assert _episode_incomplete_no_progress(ep) is False
+
+
+class TestRetryEpisodeOnIncomplete:
+    def test_retries_until_success_then_stops(self):
+        results = [_ep(), _ep(), _ep(tool_call_count=4, finish_reason="stop", quality=0.8)]
+        calls = {"n": 0}
+        slept: list[float] = []
+
+        def run_fn():
+            ep = results[calls["n"]]
+            calls["n"] += 1
+            return ep
+
+        out = _retry_episode_on_incomplete(
+            run_fn,
+            max_retries=3,
+            backoff_base_s=20.0,
+            backoff_factor=3.0,
+            sleep_fn=slept.append,
+        )
+        assert out.quality == 0.8           # returned the recovered episode
+        assert calls["n"] == 3              # 1 initial + 2 retries
+        assert slept == [20.0, 60.0]        # incremental backoff steps
+
+    def test_exhausts_retries_when_always_incomplete(self):
+        calls = {"n": 0}
+        slept: list[float] = []
+
+        def run_fn():
+            calls["n"] += 1
+            return _ep()
+
+        out = _retry_episode_on_incomplete(
+            run_fn,
+            max_retries=3,
+            backoff_base_s=20.0,
+            backoff_factor=3.0,
+            sleep_fn=slept.append,
+        )
+        assert _episode_incomplete_no_progress(out) is True
+        assert calls["n"] == 4              # 1 initial + 3 retries
+        assert slept == [20.0, 60.0, 180.0]  # max cumulative backoff = 260s
+
+    def test_no_retry_when_first_attempt_succeeds(self):
+        calls = {"n": 0}
+        slept: list[float] = []
+
+        def run_fn():
+            calls["n"] += 1
+            return _ep(tool_call_count=3, finish_reason="stop", quality=1.0)
+
+        out = _retry_episode_on_incomplete(
+            run_fn,
+            max_retries=3,
+            backoff_base_s=20.0,
+            backoff_factor=3.0,
+            sleep_fn=slept.append,
+        )
+        assert out.quality == 1.0
+        assert calls["n"] == 1
+        assert slept == []
+
+    def test_stops_retrying_when_epoch_moved_on(self):
+        calls = {"n": 0}
+        slept: list[float] = []
+
+        def run_fn():
+            calls["n"] += 1
+            return _ep()
+
+        out = _retry_episode_on_incomplete(
+            run_fn,
+            max_retries=3,
+            backoff_base_s=20.0,
+            backoff_factor=3.0,
+            sleep_fn=slept.append,
+            still_current=lambda: False,   # epoch already advanced
+        )
+        assert calls["n"] == 1             # no retry attempted
+        assert slept == []
