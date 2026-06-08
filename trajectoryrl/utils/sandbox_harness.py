@@ -59,6 +59,8 @@ logger = logging.getLogger(__name__)
 SANDBOX_SCENARIOS: tuple[str, ...] = (
     "configure-git-webserver",
     "db-wal-recovery",
+    "git-leak-recovery",
+    "kv-store-grpc",
     "largest-eigenval",
     "nginx-request-logging",
     "path-tracing",
@@ -99,6 +101,12 @@ SANDBOX_SCENARIOS: tuple[str, ...] = (
 # continuity — that is exactly what the SPEC_NUMBER bump signals: SPEC
 # 16 scores are not comparable with SPEC ≤15, the seat is re-competed
 # from a clean start, and the score surface tightens to performance only.
+#
+# SPEC 17 adds two real scenarios — git-leak-recovery + kv-store-grpc
+# (adapted from terminal-bench-2) — so N goes 9→11 and the score range
+# becomes [0, 11]. The offset stays 0.0 (these are real scenarios, not
+# phantom refills). Requires trajrl-bench >= 4.0.13, which ships the new
+# scenario images; older bench images will report "unknown scenario".
 REMOVED_SCENARIO_BASE_SCORE: float = 0.0
 
 
