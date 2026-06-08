@@ -24,6 +24,7 @@ on:
       - "trajectoryrl/**"
       - "docker/**"
       - "pyproject.toml"
+      - "VERSION"
       - ".github/workflows/**"
     tags:
       - "v*"
