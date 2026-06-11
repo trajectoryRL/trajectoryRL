@@ -90,9 +90,13 @@ class WinnerState:
 
 _DIVERGENCE_TOLERANCE = 0.01
 
-# Noise-aware seating (Winsorized consensus + absolute takeover margin) takes
-# effect from this spec onward; earlier epochs use the legacy plain mean. Pinned
-# in the daemon release to mirror the server's NOISE_AWARE_SEATING_MIN_SPEC.
+# Noise-aware seating takes effect from this spec onward: the server switches the
+# consensus center to a Winsorized mean and the takeover margin to a
+# score-dependent δ (3% decaying to 0 near the score ceiling). Earlier epochs use
+# the legacy plain mean + flat 3%. The daemon only re-derives the *consensus*
+# (Winsorized) here to cross-check the server's winner score; the takeover-margin
+# decision itself is server-canonical and not recomputed locally. Pinned in the
+# daemon release to mirror the server's NOISE_AWARE_SEATING_MIN_SPEC.
 _NOISE_AWARE_SEATING_MIN_SPEC = 16
 
 

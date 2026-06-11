@@ -18,7 +18,7 @@ The core loop:
 2. **Pre-Eval Gate**: The platform server runs the integrity LLM-as-judge check once per `pack_hash` and admits passing submissions to the **challenger queue**.
 3. **Challenge Epoch**: Each epoch the queue head is dispatched to validators as the active challenger. Validators evaluate it independently and post stake-signed scores back to the platform.
 4. **Score Aggregation**: The platform finalizes the epoch by computing the consensus score (from spec 16, the **Winsorized** mean over qualified validator votes — the single highest and lowest are clipped before averaging; plain average before) and consensus qualified flag (majority of reporting validators by head count), gated by a stake quorum.
-5. **Winner Protection**: A challenger replaces the seated winner only if it qualifies and clears the takeover bar — from spec 16, an **absolute** margin of `D = 0.4` points (plus a slack multiplicative floor); before, the legacy multiplicative `δ = 3%`.
+5. **Winner Protection**: A challenger replaces the seated winner only if it qualifies and clears the takeover bar — from spec 16, a **score-dependent multiplicative margin δ(s)**: 3% across the normal range, decaying linearly to zero as the defended score approaches the score ceiling; before, a flat multiplicative `δ = 3%`.
 6. **Weight Setting**: Validators read the canonical winner from the platform and call `set_weights` every tempo. The seated winner takes 100% of miner alpha; when no seat exists (cold start, deregistered or banned winner) weight is set to the subnet owner UID and the chain burns the emission.
 
 For the current season's scoring method, pack schema, and evaluation specifics, see [SCORING_AND_EVALUATION.md](SCORING_AND_EVALUATION.md).
@@ -106,22 +106,28 @@ Validators **always call `set_weights` every tempo**, never skip — failure to 
 
 If `winner_state` is empty (no one has ever won), or the winner hotkey has been deregistered/banned, validators set **all weight to the subnet owner UID**, which the chain burns. This guarantees `set_weights` always runs and emissions are paused (not lost) until a qualifying winner exists.
 
-### Winner Protection (noise-calibrated from spec 16; multiplicative δ before)
+### Winner Protection (noise-aware from spec 16; flat multiplicative δ before)
 
 To resist copy-paste attacks, trivial undercutting, and evaluation variance, the platform enforces Winner Protection on every challenge-epoch finalize. The seated winner defends with their **winning score** (the consensus score recorded when they took the seat — not their latest evaluation).
 
 The rule has a **cutover at `NOISE_AWARE_SEATING_MIN_SPEC` (spec 16)**:
 
-**From spec 16 — absolute, noise-calibrated bar.** Grading is deterministic, so cross-validator score spread is pure agent-rollout noise; the absolute gap between two packs is what a takeover must clear, and that noise is roughly constant in score points (independent of the score scale / any base offset). A challenger dethrones only if it clears **both**:
+**From spec 16 — score-dependent multiplicative margin δ(s).** Grading is deterministic, so cross-validator score spread is pure agent-rollout noise; the takeover bar exists so a challenger must *clearly* beat the incumbent, not edge it out within noise. A challenger dethrones only if (strict):
 
 ```
-absolute:       challenger_score >= winner_score + D     (D = 0.4 points, primary)
-multiplicative: challenger_score >  winner_score × (1 + δ)   (δ = 0.03, slack floor)
+challenger_score > winner_score × (1 + δ(s)),   s = winner_score / max_score
+
+  s ≤ 0.70       → δ = 3%   (flat — full protection in the normal range)
+  0.70 < s < 1.0 → δ = 3% · (1−s)/0.30   (linear decay)
+  s ≥ 1.0        → δ = 0    (at the ceiling, any strictly better score seats)
 ```
 
-- **D = 0.4** points ≈ 1.2× the standard error of the between-pack score difference at the typical validator count — i.e. a challenger must *clearly* beat the incumbent, not edge it out within noise. Absolute (not %) so it stays calibrated when the score scale changes (e.g. removing a base-score offset). Cuts noise-driven seat changes from ~23% to ~11%.
+- **Why the decay**: as the leading packs converge near a perfect score, a fixed gap (absolute or full-3%) demands a jump the remaining headroom can't supply and the seat would freeze regardless of merit; rollout noise also shrinks near the ceiling. Decaying δ to zero keeps the seat takeable by a genuinely better pack all the way up to the maximum, while preserving full 3% protection in the normal range.
+- **No freeze band**: the threshold `w × (1 + δ(w/max))` is monotonically increasing in `w` and converges to `max_score` at `w = max_score`, so it is always reachable below a perfect score. An exact tie at the perfect score is held by the strict `>` (incumbent-favored).
+- **Why a ratio anchor**: δ is keyed off `winner_score / max_score` (the spec's score ceiling, e.g. 9 for SPEC 16, 11 for SPEC 17), not the absolute score — so the shape is invariant to score-scale changes (base offsets, scenario count).
+- **History**: the initial spec-16 cutover used an absolute bar `D = 0.4` points (calibrated to ~1.2σ of the between-pack noise). It was replaced 2026-06-12 by δ(s): Winsorization had already removed the outlier noise D was sized against (compounding conservatism), and a fixed absolute bar becomes unsatisfiable near the score ceiling. A 2% floor variant was considered and dropped — it left a thin unreachable band within 2% of the hard max. See the design record in the web repo (`docs/noise-aware-seating.md`).
 
-**Before spec 16 — legacy multiplicative δ only.** A challenger dethrones iff `better(challenger_score, winner_score, δ)`:
+**Before spec 16 — legacy flat multiplicative δ only.** A challenger dethrones iff `better(challenger_score, winner_score, δ)`:
   - higher-is-better seasons: `challenger > winner × (1 + δ)`  (δ = 0.03)
   - lower-is-better seasons: `challenger < winner × (1 - δ)`
 
@@ -144,7 +150,7 @@ The integrity guarantee follows from these responsibilities plus public, replaya
 
 1. The `submissions[]` array from `/api/v2/winner/current` — votes with frozen `validator_stake`; the daemon must not substitute the live metagraph value for that validator. (Stake no longer weights the score or the qualified majority — votes are equal-weighted; stake gates only voter eligibility and the quorum denominator.)
 2. The deterministic on-chain metagraph snapshot at the finalized epoch's `start_block` — for the global denominators (total active stake for quorum, deregistration, eligibility). Every honest validator reads the same chain and reaches the same snapshot.
-3. The consensus config (`MIN_VALIDATOR_STAKE`, `QUORUM_FRACTION`, `WINNER_PROTECTION_DELTA`, `WINNER_PROTECTION_ABS_MARGIN`, `NOISE_AWARE_SEATING_MIN_SPEC`, …) — pinned in the validator's release; not fetched from the server.
+3. The consensus config (`MIN_VALIDATOR_STAKE`, `QUORUM_FRACTION`, `WINNER_PROTECTION_DELTA`, `NOISE_AWARE_SEATING_MIN_SPEC`, …) — pinned in the validator's release; not fetched from the server. (The takeover-margin decision itself is server-side; the daemon cross-check re-derives only the consensus aggregation.)
 
 When the daemon's recomputed consensus matches the server's published `winner_state` (the steady state), they agree silently. When they diverge, the daemon **keeps following the server's published winner** for `set_weights` and emits an alarm; persistent divergence across independent validators indicates the server-side `finalize.ts` or its input feed has drifted and is the cue to halt and investigate.
 
@@ -248,16 +254,16 @@ When `SPEC_NUMBER` (formerly `scoring_version`) bumps, the active scoring contra
 - URL tampering (Channel A: hash mismatch invalidates commitment)
 - Forged submissions (Channel B: invalid signature is rejected at the API)
 
-### 2. Winner Protection (absolute margin from spec 16; multiplicative δ before)
+### 2. Winner Protection (score-dependent δ from spec 16; flat multiplicative δ before)
 
-**Enforcement**: From spec 16 a challenger must beat the incumbent by an absolute `D = 0.4` points (plus the slack multiplicative floor) to dethrone; before, by the multiplicative `δ = 3%`. See [Winner Protection](#winner-protection-noise-calibrated-from-spec-16-multiplicative-δ-before) above.
+**Enforcement**: From spec 16 a challenger must beat the incumbent by the score-dependent margin `δ(s)` — 3% in the normal range, decaying to zero near the score ceiling — to dethrone; before, by a flat multiplicative `δ = 3%`. See [Winner Protection](#winner-protection-noise-aware-from-spec-16-flat-multiplicative-δ-before) above.
 
 **Prevents**:
 
 - Exact copy-paste (same score fails)
 - Trivial undercutting (gain within noise fails)
 - Free-riding on others' research
-- Winner oscillation from evaluation variance (the absolute bar + Winsorized consensus make this the primary win, since one outlier validator can no longer swing the seat)
+- Winner oscillation from evaluation variance (the margin + Winsorized consensus make this the primary win, since one outlier validator can no longer swing the seat)
 
 ### 3. Pack Ownership Lock (`pack_first_seen`)
 
@@ -428,7 +434,8 @@ The on-chain layer (YC3 + commit-reveal + bond dynamics) is unchanged from v5.x.
      noise_aware         := spec_number >= NOISE_AWARE_SEATING_MIN_SPEC (16)
      consensus_score     := (noise_aware ? Winsorized mean : plain mean) over qualified votes
      beats := noise_aware
-                ? consensus_score >= winner_score + D(0.4) AND consensus_score > winner_score×(1+δ)
+                ? consensus_score > winner_score×(1+δ(s)),  s = winner_score/max_score
+                  (δ(s): 3% for s ≤ 0.70, linear decay to 0 at s = 1.0)
                 : better(consensus_score, winner_score, δ=0.03)
      if seated winner empty AND consensus_qualified:
         seat (challenger_hotkey, challenger_pack_hash, consensus_score)
@@ -473,7 +480,7 @@ A validator is **marked inactive** if `participated = false` for the most recent
 
 ### Winner Protection (Post-Aggregation)
 
-See [Winner Protection](#winner-protection-score-based-δ--3) above for the full rule. Three concrete states result from each finalized epoch:
+See [Winner Protection](#winner-protection-noise-aware-from-spec-16-flat-multiplicative-δ-before) above for the full rule. Three concrete states result from each finalized epoch:
 
 | Outcome | Meaning |
 |---------|---------|
@@ -637,8 +644,8 @@ miner_submissions row inserted with eval_status = 'pending_pre_eval'
    │
    ├─ quorum < QUORUM_FRACTION  → aborted_quorum, eval_status='exhausted' (no retry)
    │
-   └─ quorum ≥ QUORUM_FRACTION  → aggregate (plain average)
-                                  → apply Winner Protection (δ = 0.03)
+   └─ quorum ≥ QUORUM_FRACTION  → aggregate (Winsorized mean from spec 16)
+                                  → apply Winner Protection (δ(s) = 3%→0 from spec 16)
                                   → seat winner / hold
                                   → eval_status = 'completed'
 
@@ -686,7 +693,7 @@ No seated winner:  burned to subnet owner UID
 |-----------|---------|----------|
 | `EPOCH_LENGTH_BLOCKS` | 150 (≈ 30 min) | Yes (bench-driven; 30 min – several days) |
 | `QUORUM_FRACTION` | 0.50 | Yes |
-| `WINNER_PROTECTION_MARGIN` (δ) | 0.03 (3%) | Yes |
+| `WINNER_PROTECTION_MARGIN` (δ) | 0.03 (3%) base, decaying to 0 near max score (spec ≥ 16); flat 3% before | Yes |
 | `INACTIVE_THRESHOLD_EPOCHS` | 3 | Yes |
 | `MIN_VALIDATOR_STAKE` | 10000.0 | Yes |
 | `EMPTY_QUEUE_RECHECK_BLOCKS` | 60 | Yes |
@@ -732,6 +739,7 @@ The full design rationale lives in [`docs/superpowers/specs/2026-05-07-per-epoch
 
 | Version | Date | Summary |
 |---------|------|---------|
+| **v6.1** | **2026-06-12** | **Noise-aware seating (from spec 16).** Consensus center switched to a Winsorized mean (clip single highest + lowest at n ≥ 4). Takeover bar: initially an absolute `D = 0.4` points (2026-06-07), replaced 2026-06-12 by a **score-dependent multiplicative margin δ(s)** — 3% in the normal range, decaying linearly to zero as `winner_score/max_score` goes 0.70 → 1.0 — because Winsorization had already removed the noise D was calibrated against and a fixed absolute bar freezes the seat near the score ceiling; with δ → 0 the takeover bar stays reachable all the way to a perfect score (no freeze band). Pre-spec-16 epochs keep plain mean + flat 3%. |
 | **v6.0** | **2026-05-07** | **Winner-challenger model.** Replaced decentralized off-chain CAS + chain-commitment-pointer consensus with server-coordinated challenge epochs (one challenger per epoch, evaluated against the seated winner). Centralized Phase-1 pre-eval as queue gate. Added `web submit` as a first-class submission channel alongside on-chain commitments. `winner_state` is now server-canonical (replaces per-validator local `WinnerState` JSON). Tightened Winner Protection δ from 10% to 3%. New tables: `challenge_epochs`, `winner_state`, `winner_history`, `validator_activity`.  New `eval_status = 'exhausted'` for `pack_hash` whose first scheduled epoch ended in `aborted_quorum` (no-retry policy — superseded the earlier retry-up-to-3 design). |
 | v5.2 | 2026-04-26 | Deterministic window-start active-set snapshots; submit-when-fully-done with stake-quorum-gated aggregation; dual-window `physical_window` vs `target_window`; burn-while-waiting on quorum miss. |
 | v5.1 | 2026-04-24 | Replaced on-chain `block_number` first-mover + NCD pre-eval with `pack_first_seen` ownership lock (no succession; 7-window grace). |
