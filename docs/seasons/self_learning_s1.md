@@ -206,7 +206,7 @@ See [MINER_OPERATIONS.md § Viewing Evaluation Results](../MINER_OPERATIONS.md#v
 
 ## Score → Weights
 
-Quality flows into the consensus protocol as a higher-is-better score. The consensus pipeline (stake-weighted aggregation, winner protection with δ=10%, WTA weight setting) is defined in [INCENTIVE_MECHANISM.md](../INCENTIVE_MECHANISM.md#winner-take-all-with-winner-protection).
+Quality flows into the consensus protocol as a higher-is-better score. The consensus pipeline (consensus aggregation, winner protection margin, WTA weight setting) is defined in [INCENTIVE_MECHANISM.md](../INCENTIVE_MECHANISM.md#winner-take-all-with-winner-protection).
 
 ---
 
