@@ -60,6 +60,7 @@ SANDBOX_SCENARIOS: tuple[str, ...] = (
     "configure-git-webserver",
     "db-wal-recovery",
     "git-leak-recovery",
+    "git-multibranch",
     "kv-store-grpc",
     "largest-eigenval",
     "nginx-request-logging",
@@ -418,6 +419,7 @@ class _SessionResult:
         SPEC 16 B=0, so the range is [0, N] (perfect = N = 9); the
         prior "headline max stays 11" continuity was deliberately
         dropped at the SPEC 16 bump (see the constant's docstring).
+        (N grows as scenarios are added — currently 12.)
         Mean quality (sum/N, no offset) is the [0, 1] convenience aggregate.
 
         Rationale (Ning, 2026-05-04): equal weight per scenario, no
