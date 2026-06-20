@@ -34,7 +34,11 @@ from typing import Any, Dict, List, Optional, Tuple
 import bittensor as bt
 
 from ..utils.config import ValidatorConfig
-from ..utils.sandbox_harness import TrajectorySandboxHarness
+from ..utils.sandbox_harness import (
+    TrajectorySandboxHarness,
+    scenarios_for_spec,
+    LATEST_SPEC,
+)
 from ..utils.github import PackFetcher
 from ..utils import config as _config_mod
 from ..utils.commitments import MinerCommitment
@@ -801,6 +805,8 @@ class TrajectoryValidator:
         self,
         commitment: MinerCommitment,
         challenge_epoch_id: int,
+        spec: int,
+        scenarios: tuple,
     ) -> Optional[Dict[str, Any]]:
         """Run a single trajrl-bench evaluation on the active challenger."""
         mlog = self._get_miner_logger(commitment.hotkey)
@@ -840,7 +846,7 @@ class TrajectoryValidator:
                 cost_usd=cost_usd,
                 duration_s=duration_s,
                 timed_out=timed_out,
-                spec_number=_spec_number(),
+                spec_number=spec,
                 harness_name=self._sandbox_harness.harness_name,
                 harness_version=self._sandbox_harness.harness_version,
                 llm_model=self.config.llm_model,
@@ -892,6 +898,7 @@ class TrajectoryValidator:
             commitment=commitment,
             epoch_seed=self._challenge_seed(challenge_epoch_id, self.config.netuid),
             validator_salt=self._default_validator_salt(),
+            scenarios=scenarios,
             mlog=mlog,
             on_episode_start=on_episode_start,
             on_episode_verifying=on_episode_verifying,
@@ -1036,7 +1043,31 @@ class TrajectoryValidator:
             )
             return
 
-        await self._score_challenger(challenge_epoch_id, commitment)
+        # Resolve the active scoring spec for this epoch. The server dictates
+        # it (epoch.spec_number, resolved from the web spec_schedule), so the
+        # validator auto-switches scenario sets at the scheduled cutover epoch
+        # with no redeploy. Fall back to this build's max-known spec when the
+        # field is absent (older web). If the server's spec is newer than this
+        # build knows, abstain — operators must upgrade before the schedule's
+        # effective_epoch; a stale-spec submission is dropped by the web spec
+        # floor anyway.
+        try:
+            spec = int(epoch.get("spec_number", LATEST_SPEC))
+        except (TypeError, ValueError):
+            spec = LATEST_SPEC
+        scenarios = scenarios_for_spec(spec)
+        if scenarios is None:
+            logger.error(
+                "epoch %d requires spec %d but this validator build only "
+                "knows up to spec %d — upgrade the validator. Abstaining "
+                "(no submission) until then.",
+                challenge_epoch_id, spec, LATEST_SPEC,
+            )
+            return
+
+        await self._score_challenger(
+            challenge_epoch_id, commitment, spec, scenarios,
+        )
 
     async def _refresh_winner_cache(self):
         """Pull /api/v2/winner/current, run local derivation, persist cache."""
@@ -1053,6 +1084,7 @@ class TrajectoryValidator:
 
     async def _score_challenger(
         self, challenge_epoch_id: int, commitment: MinerCommitment,
+        spec: int, scenarios: tuple,
     ):
         eval_id = (
             datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
@@ -1074,7 +1106,9 @@ class TrajectoryValidator:
             eval_id, commitment.hotkey,
         )
 
-        eval_result = await self._evaluate_challenger(commitment, challenge_epoch_id)
+        eval_result = await self._evaluate_challenger(
+            commitment, challenge_epoch_id, spec, scenarios,
+        )
 
         # Harness aborted mid-session because the epoch had moved on.
         # Drop the eval entirely — POSTing the partial sum would punish
@@ -1138,7 +1172,7 @@ class TrajectoryValidator:
             rejected=rejected if rejected else None,
             rejection_detail=rejection_detail if rejected else None,
             scenario_results=scenario_results or None,
-            spec_number=_spec_number(),
+            spec_number=spec,
             llm_base_url=self.config.llm_base_url,
             llm_model=self.config.llm_model,
             judge_model=self.config.judge_model or None,
