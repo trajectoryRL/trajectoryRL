@@ -67,6 +67,7 @@ SANDBOX_SCENARIOS: tuple[str, ...] = (
     "path-tracing",
     "race-condition-fix",
     "regex-chess",
+    "schemelike-metacircular-eval",
     "swe-bench-astropy-2",
     "write-compressor",
 )
@@ -419,7 +420,7 @@ class _SessionResult:
         SPEC 16 B=0, so the range is [0, N] (perfect = N = 9); the
         prior "headline max stays 11" continuity was deliberately
         dropped at the SPEC 16 bump (see the constant's docstring).
-        (N grows as scenarios are added — currently 12.)
+        (N grows as scenarios are added — currently 13.)
         Mean quality (sum/N, no offset) is the [0, 1] convenience aggregate.
 
         Rationale (Ning, 2026-05-04): equal weight per scenario, no
