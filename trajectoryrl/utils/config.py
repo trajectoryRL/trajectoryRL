@@ -41,6 +41,14 @@ SANDBOX_IMAGE_REPO = "ghcr.io/trajectoryrl/sandbox-agent"
 # consulted only as the fallback target when no on-chain spec_number group
 # reaches >50% stake, and as the value written into outgoing commitments /
 # payloads.
+#
+# With the dynamic-spec field on GET /epoch/current, the *active* spec for
+# an epoch comes from the server (epoch.spec_number, resolved from the web
+# spec_schedule). SPEC_NUMBER is now this build's MAX-KNOWN spec: it must
+# equal ``max(sandbox_harness.SPEC_SCENARIOS)`` (enforced by a test), and it
+# is the fallback the validator uses only when the server omits the field
+# (older web). It cannot import the registry (sandbox_harness imports this
+# module), so it is kept in sync manually + by test.
 SPEC_NUMBER = 18
 
 # Backwards-compatible alias for legacy callers / persisted state. Will be

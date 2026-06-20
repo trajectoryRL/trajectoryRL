@@ -77,6 +77,7 @@ async def evaluate_miner_s1(
     commitment: MinerCommitment,
     epoch_seed: int,
     validator_salt: str = "",
+    scenarios: Optional[tuple[str, ...]] = None,
     mlog: Optional[logging.Logger] = None,
     on_episode_start: Optional[Callable[[str, int, int], None]] = None,
     on_episode_verifying: Optional[Callable[[str, int, int], None]] = None,
@@ -173,9 +174,13 @@ async def evaluate_miner_s1(
             skip_reason=SKIP_EMPTY_SKILL_MD,
         )
 
+    # Scenario set for the epoch's active spec (resolved upstream from
+    # epoch.spec_number). Falls back to the harness default when omitted.
+    eval_scenarios = tuple(scenarios) if scenarios else tuple(harness.sandbox_scenarios)
+
     log.info(
         "S1 evaluation: %d scenarios, skill_md=%d chars",
-        len(harness.sandbox_scenarios), len(skill_md),
+        len(eval_scenarios), len(skill_md),
     )
 
     # Step 2: Run trajrl-bench sandbox evaluation
@@ -185,6 +190,7 @@ async def evaluate_miner_s1(
             epoch_seed=epoch_seed,
             pack_hash=commitment.pack_hash,
             validator_salt=validator_salt,
+            scenarios=eval_scenarios,
             on_episode_start=on_episode_start,
             on_episode_verifying=on_episode_verifying,
             on_episode_done=on_episode_done,
@@ -211,7 +217,7 @@ async def evaluate_miner_s1(
         log.info(
             "S1 evaluation aborted mid-session: epoch moved on after "
             "%d/%d scenarios; discarding partial result",
-            len(result.scenarios), len(harness.sandbox_scenarios),
+            len(result.scenarios), len(eval_scenarios),
         )
         return MinerEvalOutcome(
             success=False,
