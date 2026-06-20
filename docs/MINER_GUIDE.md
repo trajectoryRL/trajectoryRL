@@ -142,7 +142,7 @@ Do not disable or discourage tools needed to investigate:
 
 Do not include N scenario-specific sections matching the active scenario count:
 
-- Red flag: exactly 9 (current scenario-count) detailed playbooks
+- Red flag: exactly 12 (current scenario-count) detailed playbooks
 - Red flag: per-scenario output templates with exact field lists
 - Red flag: instructions that only make sense if the author knew the eval scenarios
 

@@ -60,12 +60,13 @@ SANDBOX_SCENARIOS: tuple[str, ...] = (
     "configure-git-webserver",
     "db-wal-recovery",
     "git-leak-recovery",
-    "kv-store-grpc",
+    "git-multibranch",
     "largest-eigenval",
     "nginx-request-logging",
     "path-tracing",
     "race-condition-fix",
     "regex-chess",
+    "schemelike-metacircular-eval",
     "swe-bench-astropy-2",
     "write-compressor",
 )
@@ -77,7 +78,7 @@ SANDBOX_SCENARIOS: tuple[str, ...] = (
 # perfect run after one drop). Top miners haven't actually got worse —
 # the scoring surface shrank — so we add a constant equal to the
 # number of dropped scenarios. Perfect runs still land at the
-# pre-drop max (currently 11), and the score history stays continuous
+# pre-drop max (currently 12), and the score history stays continuous
 # across SPEC bumps. Per-scenario discrimination (mean_quality, the
 # [0,1] aggregate) is unaffected.
 #
@@ -107,6 +108,12 @@ SANDBOX_SCENARIOS: tuple[str, ...] = (
 # becomes [0, 11]. The offset stays 0.0 (these are real scenarios, not
 # phantom refills). Requires trajrl-bench >= 4.0.13, which ships the new
 # scenario images; older bench images will report "unknown scenario".
+#
+# SPEC 18 rotates the set: it retires kv-store-grpc (saturated — vanilla
+# solved it 7/7, no discrimination left) and adds two harder scenarios,
+# git-multibranch + schemelike-metacircular-eval, so N goes 11→12 and the
+# score range becomes [0, 12]. The offset stays 0.0. Requires trajrl-bench
+# >= 4.0.14, which ships the new scenario images.
 REMOVED_SCENARIO_BASE_SCORE: float = 0.0
 
 
@@ -418,6 +425,7 @@ class _SessionResult:
         SPEC 16 B=0, so the range is [0, N] (perfect = N = 9); the
         prior "headline max stays 11" continuity was deliberately
         dropped at the SPEC 16 bump (see the constant's docstring).
+        (N changes as scenarios rotate in/out — currently 12.)
         Mean quality (sum/N, no offset) is the [0, 1] convenience aggregate.
 
         Rationale (Ning, 2026-05-04): equal weight per scenario, no
