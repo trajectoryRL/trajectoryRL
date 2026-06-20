@@ -108,17 +108,22 @@ No split-half delta, no learning bonus, no early-mean floor. With one episode pe
 
 `SANDBOX_SCENARIOS` (in `trajectoryrl/utils/sandbox_harness.py`), alphabetical order:
 
+SPEC 18 — 12 scenarios:
+
 | Scenario | Category | Difficulty | Verifier output |
 |---|---|---|---|
-| `break-filter-js-from-html` | security | medium | `/app/out.html` |
-| `cancel-async-tasks` | async/concurrency | hard | `/app/run.py` |
-| `configure-git-webserver` | sysadmin / git | hard | `/app/setup.sh` |
-| `db-wal-recovery` | file ops / database | medium | `/app/recovered.json` |
-| `fix-git` | git / version control | easy | `/app/recovery.sh` |
-| `log-summary-date-ranges` | data processing | medium | (runs in `/app`) |
-| `nginx-request-logging` | sysadmin / web server | medium | `/app/setup.sh` |
+| `configure-git-webserver` | system-administration | hard | `/app/setup.sh` |
+| `db-wal-recovery` | file-operations | medium | `/app/recovered.json` |
+| `git-leak-recovery` | security / version control | medium | `/app/recovery.sh` |
+| `git-multibranch` | devops / sysadmin | hard | `/app/setup_server.sh` |
+| `largest-eigenval` | numerical / algorithmic | medium | `/app/eigen.py` |
+| `nginx-request-logging` | system-administration | medium | `/app/setup.sh` |
 | `path-tracing` | graphics / C | hard | `/app/image.c` |
-| `vulnerable-secret` | security / binary RE | medium | `/app/results.txt` |
+| `race-condition-fix` | concurrency / threading | hard | `/app/bank.py` |
+| `regex-chess` | algorithmic / regex | hard | `/app/re.json` |
+| `schemelike-metacircular-eval` | interpreters | hard | `/app/eval.scm` |
+| `swe-bench-astropy-2` | debugging / SWE-bench | hard | `/app/solution.patch` |
+| `write-compressor` | algorithmic / compression | hard | `/app/data.comp` |
 
 Per-scenario sources live at `scenarios/<name>/` in [trajrl-bench](https://github.com/trajectoryRL/trajrl-bench):
 
@@ -138,7 +143,7 @@ scenarios/<name>/
 
 Scenarios from Terminal-Bench retain upstream attribution in `NOTICE` and `THIRD_PARTY_LICENSES`. Adoption rules: TrajOS `feedback_third_party_license_playbook.md`.
 
-`swe-bench-astropy-2` lives in the bench repo but is **not** in the validator's active list yet.
+Scenario rotation is gated by `SPEC_NUMBER`: SPEC 18 retired `kv-store-grpc` (saturated) and added `git-multibranch` + `schemelike-metacircular-eval`. Retired scenarios (`cancel-async-tasks`, `fix-git`, `log-summary-date-ranges`, `vulnerable-secret`, `break-filter-js-from-html`, `kv-store-grpc`) stay in the bench repo for historical pack pages but are not in the active set.
 
 ---
 
@@ -165,7 +170,7 @@ Scenarios from Terminal-Bench retain upstream attribution in `NOTICE` and `THIRD
    transcripts) to dashboard; consensus aggregates stake-weighted final_score.
 ```
 
-A full 9-scenario session typically takes ~30-45 min wall-clock (LLM latency-bound). Validator capacity at this cadence is the rate-limiter on eval cycles per epoch.
+A full 12-scenario session typically takes ~30-45 min wall-clock (LLM latency-bound). Validator capacity at this cadence is the rate-limiter on eval cycles per epoch.
 
 ---
 
@@ -249,7 +254,7 @@ Harness + LLM identity per eval is reported to the dashboard (bench v4.0.6+) —
 
 Score comparability across validators is governed by `SPEC_NUMBER` — a manually maintained constant in `trajectoryrl/utils/config.py`, decoupled from the `trajrl-bench` image version. Aggregation derives the active `spec_number` from on-chain stake distribution: the stake-weighted dominant value wins if it holds >50% stake; otherwise validators fall back to their local `SPEC_NUMBER`. See [INCENTIVE_MECHANISM.md](../INCENTIVE_MECHANISM.md#spec_number-and-target-spec-selection).
 
-**Current**: `SPEC_NUMBER = 11` (bumped in v0.6.15 when `configure-git-webserver` was added; the previous bump 9→10 was for the Hermes 0.13 cutover).
+**Current**: `SPEC_NUMBER = 18` (SPEC 18 retired `kv-store-grpc` and added `git-multibranch` + `schemelike-metacircular-eval`; see the rotation history in the `REMOVED_SCENARIO_BASE_SCORE` comment in `sandbox_harness.py`).
 
 | Change | Bench image bump | `SPEC_NUMBER` bump? |
 |--------|-------------------|---------------------|
@@ -275,7 +280,7 @@ Same SKILL.md → different per-scenario qualities across validators because the
 
 ### 3. Evaluation cost and time
 
-Per miner per session: ~30-45 min wall-clock, dominated by LLM latency (Qwen3.5-A3B at ~10-30s per turn × ~30 turns × 9 scenarios). Validators bear all inference cost (testee only — no judge). At 200 miners × stable epoch length, full eval cycles take several hours; some validators stagger or skip epochs when behind.
+Per miner per session: ~30-45 min wall-clock, dominated by LLM latency (Qwen3.5-A3B at ~10-30s per turn × ~30 turns × 12 scenarios). Validators bear all inference cost (testee only — no judge). At 200 miners × stable epoch length, full eval cycles take several hours; some validators stagger or skip epochs when behind.
 
 ### 4. The "already good" problem
 
@@ -306,4 +311,4 @@ Four components, all live today:
 3. **Validator harness** (`trajectoryrl/utils/sandbox_harness.py`): orchestrates `docker run` + `docker exec hermes` + verifier container per scenario.
 4. **CLI probes** (`trajrl_bench.cli`): `scenarios` (lists names) and `scenario-info --scenario X` (returns image repo, instruction.md, agent_output_path, verifier_timeout, base64 `tests/`).
 
-Current versions: `trajrl-bench` v4.0.6+, `trajectoryRL` v0.6.15, `SPEC_NUMBER` 11. The competition is on SKILL.md instruction quality and the scenario set's diversity.
+Current versions: `trajrl-bench` v4.0.15+, `trajectoryRL` v0.6.23, `SPEC_NUMBER` 18. The competition is on SKILL.md instruction quality and the scenario set's diversity.
