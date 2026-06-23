@@ -2,7 +2,7 @@
 
 **Subnet**: SN11 (TrajectoryRL)
 
-**Version**: v6.0
+**Version**: v6.2
 
 **Date**: 2026-05-07
 
@@ -14,7 +14,7 @@ TrajectoryRL rewards miners who submit **packs** (PolicyBundles) that are evalua
 
 The core loop:
 
-1. **Submission**: Miners deliver packs via either the on-chain commitment slot or the platform's web submit API (both first-class).
+1. **Submission**: Miners deliver packs via the platform's web submit API (the sole submission channel; on-chain commitments are no longer ingested as submissions).
 2. **Pre-Eval Gate**: The platform server runs the integrity LLM-as-judge check once per `pack_hash` and admits passing submissions to the **challenger queue**.
 3. **Challenge Epoch**: Each epoch the queue head is dispatched to validators as the active challenger. Validators evaluate it independently and post stake-signed scores back to the platform.
 4. **Score Aggregation**: The platform finalizes the epoch by computing the consensus score (from spec 16, the **Winsorized** mean over qualified validator votes — the single highest and lowest are clipped before averaging; plain average before) and consensus qualified flag (majority of reporting validators by head count), gated by a stake quorum.
@@ -29,25 +29,9 @@ For the current season's scoring method, pack schema, and evaluation specifics, 
 
 ## Submission Protocol
 
-Miners deliver packs via one of two **first-class** channels. Both feed the same `miner_submissions` row, the same pre-eval pipeline, and the same challenger queue.
+Miners deliver packs via the platform's **web submit API** — the sole submission entry point. On-chain `set_commitment` is no longer ingested as a submission channel (the metagraph sync continues to read stake, ownerkey, and name from chain, but commitment payloads are ignored for submission purposes).
 
-### Channel A — On-Chain Commitment
-
-Miners upload `pack.json` to any publicly accessible HTTP(S) URL (S3, GCS, IPFS gateway, personal server, …) and submit metadata on-chain via Bittensor's `set_commitment` extrinsic.
-
-```
-1. Upload  pack.json  →  any HTTP(S) endpoint that returns 200 on GET
-2. Commit  subtensor.set_commitment(netuid=11, data="<pack_hash>|<pack_url>")
-3. Server sync worker observes the new commitment, fetches the pack,
-   verifies sha256(canonical_json) == pack_hash, and inserts a row
-   with eval_status = 'pending_pre_eval'.
-```
-
-- Commit content: `pack_hash` and `pack_url`, pipe-delimited, ≤ 256 bytes
-- Rate limit: one commitment per ~100 blocks (~20 min) per hotkey (chain-enforced)
-- The chain timestamp is unforgeable (block-level)
-
-### Channel B — Web Submit API (Platform-Hosted)
+### Web Submit API
 
 Miners POST a signed payload to the platform; the server uploads the pack to GCS and inserts the row directly.
 
@@ -55,29 +39,61 @@ Miners POST a signed payload to the platform; the server uploads the pack to GCS
 POST /api/v2/miners/submit
 {
   miner_hotkey, timestamp, signature,
-  pack_hash, pack_content   // canonical pack JSON, ≤ 32 KB
+  pack_hash, pack_content,          // canonical pack JSON, ≤ 32 KB
+  recycle_block, recycle_extrinsic_index  // recycle_alpha receipt (when fee enabled)
 }
 ```
 
-- Hotkey signature verified server-side
+- Hotkey signature verified server-side (identity + freshness only — it does **not** bind the recycle receipt; see [Submission Fee (recycle_alpha)](#submission-fee-recycle_alpha) below)
 - Pack canonicalized + hashed server-side; mismatch → `400`
-- Per-miner cooldown: 60 min (configurable via `MINER_SUBMIT_COOLDOWN_SECONDS`)
-- Owner ban check (see [Anti-Gaming](#anti-gaming-measures))
+- Per-miner cooldown: 20 min (configurable via `MINER_SUBMIT_COOLDOWN_SECONDS`)
 - On success, server uploads the canonical bytes to GCS and inserts a row with `eval_status = 'pending_pre_eval'`
 
-### Why Two Channels?
+The submission passes through the same **pre-eval pipeline** (see [Anti-Gaming → Pre-Eval Gate](#4-pre-eval-gate-server-side)). When pre-eval passes, the row advances to `eval_status = 'pending_eval'` and is eligible for the challenger queue.
 
-| Property | Channel A (on-chain) | Channel B (web submit) |
-|----------|----------------------|------------------------|
-| Hosting requirement | Self-hosted HTTP | None (platform-hosted GCS) |
-| Discovery | All validators read chain | Server publishes via queue API |
-| Timestamp authority | Chain block | Server clock + signature timestamp |
-| Latency to queue entry | ~5 min sync interval | Immediate (next pre-eval tick) |
-| Use case | Fully self-sovereign miners | Convenience + lower ops burden |
+### Submission Fee (`recycle_alpha`)
 
-Both channels converge through the same **pre-eval pipeline** (see [Anti-Gaming → Pre-Eval Gate](#4-pre-eval-gate-server-side)). When pre-eval passes, the row advances to `eval_status = 'pending_eval'` and is eligible for the challenger queue.
+To deter low-quality and spam submissions, each submission must be backed by a `recycle_alpha` extrinsic that the miner issues on-chain before submitting:
 
-### Pack Verification (both channels)
+```
+recycle_alpha(hotkey, amount, netuid = 11)
+```
+
+- Signed by the miner's **coldkey** (the owner of `hotkey`).
+- `hotkey` is the miner's own hotkey — the same one used in the web submission.
+- `amount` must be `≥ SUBMISSION_FEE_ALPHA` (operator-configured). Recycling is irreversible — the alpha is burned back to the subnet, making each submission attempt a direct economic cost.
+
+The miner identifies the receipt by its on-chain location `(block, recycle_extrinsic_index)` and includes those values in the web submit payload. The server **verifies** the receipt but never issues the recycle itself.
+
+**The signature is not coupled to the receipt.** The signed message is identity + freshness only and is unchanged by the fee:
+
+```
+trajectoryrl-miner-submit:${hotkey}:${timestamp}
+```
+
+The receipt needs no signature binding: it is already tied to the miner on-chain (its `hotkey` argument and signer coldkey, checked in `fee_check`) and replay-locked by the unique `(block, index)` consume. Keeping the message stable means an un-upgraded miner's signature still verifies — when the fee is on but the receipt fields are absent, the request is rejected with a clear `400` (recycle reference required) instead of a confusing signature error.
+
+**Server verification (two layers).**
+
+*Synchronous (inside the submit route, no chain call):*
+- `recycle_block` and `recycle_extrinsic_index` are present and well-formed.
+- The `(block, index)` pair is not already consumed by a prior submission that reached `pending_eval`. A receipt backing only submissions that failed technical checks (download / format / hash / uniqueness / NCD / integrity) is still free to reuse.
+- Missing / malformed / already-consumed → `400`; row is not recorded.
+
+*Asynchronous (`fee_check` step, first in the pre-eval pipeline):*
+1. Fetch the extrinsic at `(recycle_block, recycle_extrinsic_index)` from chain.
+2. Confirm it is a successful `recycle_alpha`, that its `hotkey` argument equals the submitting `miner_hotkey`, and that the signer coldkey equals that hotkey's `nodes.ownerkey`.
+3. Confirm `netuid == 11` and `amount ≥ SUBMISSION_FEE_ALPHA` (compared in RAO).
+4. Confirm the recycle block timestamp is within 24 h of the submission.
+5. Confirm the receipt is not already consumed by another `pending_eval` submission.
+
+Pass → pipeline continues. Fail → `eval_status='failed'`, `fee_check='failed'` with reason; pipeline stops. The `fee_check` step runs first so an unpaid or invalid submission never incurs download, format, hash, uniqueness, NCD, or LLM-integrity cost.
+
+**Receipt consumption.** A receipt is consumed only at the moment a submission transitions to `pending_eval` (when all pipeline checks pass). An insert into `recycle_receipts` keyed by `(recycle_block, recycle_extrinsic_index)` with a `UNIQUE` constraint is the atomic lock — at most one `pending_eval` submission per receipt. A submission that fails any check between `fee_check` and `pending_eval` writes no row, leaving the receipt reusable within its 24 h window for a later submission of a **different** pack (a new `(miner_hotkey, pack_hash)` row). Resubmitting the same `pack_hash` that failed terminally does not re-evaluate it — pack hashes are content-addressed and the existing row's state is preserved; the receipt ref on that row is not refreshed.
+
+**Feature flag.** The fee is controlled by `SUBMISSION_FEE_ENABLED` (default off). When disabled, `recycle_block` / `recycle_extrinsic_index` are ignored. This allows the web channel to operate before the fee is activated.
+
+### Pack Verification
 
 Validators and the server enforce:
 
@@ -133,7 +149,7 @@ challenger_score > winner_score × (1 + δ(s)),   s = winner_score / max_score
 
 **Winner self-update**: If a `challenge_epoch` evaluates a new pack from the seated winner and that new pack's consensus score passes `better()` against the winner_score, `winner_state` advances to the new pack and a higher defense bar. A *worse* new pack from the seated winner is harmless — the seat references the previous winning pack, not the latest one.
 
-**Winner disqualification on the seat**: If a separate periodic reconciliation (deregistration check, owner ban) marks the seated hotkey ineligible, `winner_state` is cleared. The next finalized epoch with a qualifying challenger seats the new winner without δ being applied.
+**Winner disqualification on the seat**: If a separate periodic reconciliation (deregistration check) marks the seated hotkey ineligible, `winner_state` is cleared. The next finalized epoch with a qualifying challenger seats the new winner without δ being applied.
 
 **Canonical state — server-resolved, publicly auditable**: The server stores a single `winner_state` row, resolved deterministically at finalize time, and publishes it together with the per-vote inputs (each vote's `validator_stake` frozen at score-submission time) via `GET /api/v2/winner/current`. Each validator **adopts that published winner** (identity + score) to drive `set_weights`; the daemon does not re-derive the winner authoritatively. Instead it re-runs the same aggregation locally over the published `submissions[]` as a **cross-check** and raises a divergence alarm if its recomputed consensus disagrees with the server's claim. Because the inputs and the aggregation are public and deterministic, a misbehaving server is *detectable* — any validator (or external auditor) can replay the computation and compare `submissions[]` against its own signed votes — though detection alarms rather than auto-overrides. Daemons cache the *raw response* up to `WINNER_FALLBACK_TTL` (default 24 h) on server unreachability and keep setting weights from the cached winner; beyond TTL the daemon refuses to set weights and emits an alert.
 
@@ -246,13 +262,12 @@ When `SPEC_NUMBER` (formerly `scoring_version`) bumps, the active scoring contra
 
 ### 1. Content-Addressed Packs + Submission Verification
 
-**Enforcement**: All packs are content-addressed (SHA256). Channel A's chain commitment provides a tamper-proof timestamp; Channel B's signed POST provides hotkey-signed authenticity. Validators verify `sha256(canonical_json) == pack_hash` independently.
+**Enforcement**: All packs are content-addressed (SHA256). The web submit signed POST provides hotkey-signed authenticity. Validators verify `sha256(canonical_json) == pack_hash` independently.
 
 **Prevents**:
 
 - Retroactive pack changes (different bytes → different hash → invalid)
-- URL tampering (Channel A: hash mismatch invalidates commitment)
-- Forged submissions (Channel B: invalid signature is rejected at the API)
+- Forged submissions (invalid signature is rejected at the API)
 
 ### 2. Winner Protection (score-dependent δ from spec 16; flat multiplicative δ before)
 
@@ -283,21 +298,19 @@ Centralizing Phase-1 server-side eliminates N redundant LLM calls per pack (one 
 
 **Caching**: Results are keyed by `pack_hash`. A pack is analyzed at most once.
 
-**Owner ban**: If a hotkey's owner has been banned (see [Owner Ban](#owner-ban-server-side)), every submission from that hotkey is rejected at the gate.
-
 **Prevents**:
 
 - Known-bad packs from consuming validator evaluation budget
-- Banned miners from re-entering after being flagged
 - Wasted N×LLM cost on the same pack across all validators
 
-### 5. Owner Ban (Server-Side)
+### 5. Submission Fee (`recycle_alpha`)
 
-The platform tracks per-ownerkey ban state (`miner_bans` table). Each ownerkey accumulates a `failed_pack_count`. When `failed_pack_count > 3`, the ownerkey is banned for 30 days. A second over-threshold event after the 30-day ban (`served_one_timed_ban = true`) extends the ban to ~99 years. Bans propagate to all hotkeys controlled by the same ownerkey.
+**Enforcement**: Each submission must reference a `recycle_alpha` extrinsic that the miner's coldkey issued on Bittensor for the miner's own hotkey on netuid 11, with an amount ≥ the operator-configured fee. The server verifies the receipt on-chain (signer = ownerkey, hotkey arg = miner_hotkey, netuid, amount, freshness ≤ 24 h) as the first step of the pre-eval pipeline. A receipt is consumed (recorded in `recycle_receipts`) only when the submission reaches `pending_eval`; submissions that fail earlier technical checks do not consume the receipt, which may be reused within its 24 h window. See [Submission Protocol → Submission Fee](#submission-fee-recycle_alpha) for details.
 
 **Prevents**:
 
-- Sybil "burn-the-hotkey" attacks where one operator throws away hotkeys to flood the queue with bad packs
+- Spam / low-quality submissions (each attempt burns real alpha)
+- Sybil flooding across hotkeys controlled by the same coldkey (fee applies per submission regardless of hotkey count)
 
 ### 6. Validator-Side Evaluation
 
@@ -337,7 +350,7 @@ Aggregation runs server-side, but every input (per-validator `score_submit_log` 
 
 ### 8. Quorum Gate
 
-**Enforcement**: An epoch finalizes only if reporting stake ≥ `QUORUM_FRACTION` (default 0.5) of the start_block-snapshot active stake. Below quorum, the epoch is `aborted_quorum` and the challenger submission is moved to `eval_status = 'exhausted'` immediately — there is no retry. The miner can submit a different `pack_hash` to re-enter the queue (see [Challenge Epoch Lifecycle](#challenge-epoch-lifecycle)).
+**Enforcement**: An epoch finalizes only if reporting stake ≥ `QUORUM_FRACTION` (default 0.4) of the start_block-snapshot active stake. Below quorum, the epoch is `aborted_quorum` and the challenger submission is moved to `eval_status = 'exhausted'` immediately — there is no retry. The miner can submit a different `pack_hash` to re-enter the queue (see [Challenge Epoch Lifecycle](#challenge-epoch-lifecycle)). The default was lowered from 0.5 to 0.4 so that a small validator set with one dominant validator (~half the stake) still reaches quorum when that single validator misses an epoch, instead of aborting.
 
 **Prevents**:
 
@@ -498,7 +511,7 @@ See [Winner Protection](#winner-protection-noise-aware-from-spec-16-flat-multipl
 | Server outage > TTL | Daemons refuse to set weights; alert operators. No corrupt state written. |
 | Validator timeout | Submission absent → counted as non-participation. After `INACTIVE_THRESHOLD_EPOCHS` consecutive misses, marked inactive. |
 | Pre-Eval LLM unavailable | New rows stay `pending_pre_eval`; server retries on next tick. Queue does not move on these rows; previously-eligible rows continue normally. |
-| Chain RPC unavailable | Channel A sync stops; Channel B unaffected. Previously-queued rows continue. |
+| Chain RPC unavailable | Metagraph sync (stake/ownerkey/name) stops; web submit is unaffected. Previously-queued rows continue. Fee verification for new submissions fails at `fee_check` until chain is reachable. |
 | CAS / GCS read failure on validator | Validator skips the epoch. Counted as non-participation. |
 | Quorum miss | Epoch `aborted_quorum`; challenger submission moves to `eval_status='exhausted'` immediately — no retry. Miner can submit a different `pack_hash`. |
 | DB outage on server | Write APIs return 5xx; validators retry. Read APIs serve last cached state if available. |
@@ -611,7 +624,7 @@ All read endpoints are public; write endpoints require hotkey signature. Validat
 | `GET` | `/api/epoch/{id}` | Epoch metadata + per-validator submissions + outcome (validators do not call this). |
 | `GET` | `/api/winner/history?limit=N` | Recent `winner_replaced`/reaffirmed transitions (validators do not call this). |
 | `GET` | `/api/validator/{hotkey}/activity?limit=N` | Recent per-epoch participation records (validators do not call this). |
-| `POST` | `/api/v2/miners/submit` | Channel B miner pack submission (signed). |
+| `POST` | `/api/v2/miners/submit` | Miner pack submission (signed; web-only channel). |
 | `POST` | `/api/validators/logs/upload` | Per-miner eval log archive (fire-and-forget, debugging only). |
 | `POST` | `/api/validators/logs/cycle` | Cycle-level eval log archive (fire-and-forget, debugging only). |
 
@@ -624,13 +637,13 @@ All read endpoints are public; write endpoints require hotkey signature. Validat
 ### Submission → Winner
 
 ```
-miner submits (Channel A: chain commitment, or Channel B: web POST)
+miner submits (web POST /api/v2/miners/submit)
    │
    ▼
 miner_submissions row inserted with eval_status = 'pending_pre_eval'
    │
    ▼ pre-eval pipeline (server, 5 min cadence)
-   │  Phase-1 LLM judge + 7 *_check steps
+   │  fee_check (step 1, when fee enabled) + Phase-1 LLM judge + other *_check steps
    │
    ├─ failed                    → eval_status = 'failed'    (terminal)
    └─ all checks pass           → eval_status = 'pending_eval'  (queue)
@@ -692,13 +705,17 @@ No seated winner:  burned to subnet owner UID
 | Parameter | Default | Tunable? |
 |-----------|---------|----------|
 | `EPOCH_LENGTH_BLOCKS` | 150 (≈ 30 min) | Yes (bench-driven; 30 min – several days) |
-| `QUORUM_FRACTION` | 0.50 | Yes |
+| `QUORUM_FRACTION` | 0.40 | Yes |
 | `WINNER_PROTECTION_MARGIN` (δ) | 0.03 (3%) base, decaying to 0 near max score (spec ≥ 16); flat 3% before | Yes |
 | `INACTIVE_THRESHOLD_EPOCHS` | 3 | Yes |
 | `MIN_VALIDATOR_STAKE` | 10000.0 | Yes |
 | `EMPTY_QUEUE_RECHECK_BLOCKS` | 60 | Yes |
 | `WINNER_FALLBACK_TTL` | 24 h | Yes (validator daemon side) |
-| `MINER_SUBMIT_COOLDOWN_SECONDS` (Channel B) | 3600 (60 min) | Yes |
+| `MINER_SUBMIT_COOLDOWN_SECONDS` | 1200 (20 min) | Yes |
+| `CHAIN_SUBMIT_INGEST_ENABLED` | true | Yes (set to `false` at cutover to stop ingesting on-chain commitments as submissions; web-only) |
+| `SUBMISSION_FEE_ENABLED` | false | Yes |
+| `SUBMISSION_FEE_ALPHA` | operator-configured | Yes |
+| `SUBMISSION_FEE_RECEIPT_MAX_AGE_HOURS` | 24 | Yes |
 | `inactivity_blocks` | 14400 (~48 h) | Yes |
 | `EVICTION_GRACE_WINDOWS` (`pack_first_seen`) | 7 windows (~7 d) | No (server constant) |
 | `yuma_version` | 3 | Subnet owner (chain) |
@@ -739,6 +756,7 @@ The full design rationale lives in [`docs/superpowers/specs/2026-05-07-per-epoch
 
 | Version | Date | Summary |
 |---------|------|---------|
+| **v6.2** | **2026-06-24** | **Submission fee (recycle_alpha) replaces Coldban.** Web submit is now the sole submission channel; on-chain commitment ingestion is disabled (`CHAIN_SUBMIT_INGEST_ENABLED=false`). Each submission must reference a `recycle_alpha(hotkey, amount ≥ fee, netuid=11)` extrinsic issued by the miner's coldkey. The server verifies the receipt on-chain as the first pre-eval step (`fee_check`). Receipts are consumed only when the submission reaches `pending_eval`; technical failures (download/format/hash/uniqueness/NCD/integrity) do not consume the receipt, allowing the same receipt to back a later submission of a different pack within its 24 h freshness window. The feature is flag-gated (`SUBMISSION_FEE_ENABLED`, default off). Coldban enforcement (`miner_bans` write path) is removed; the table is retained as historical audit. |
 | **v6.1** | **2026-06-12** | **Noise-aware seating (from spec 16).** Consensus center switched to a Winsorized mean (clip single highest + lowest at n ≥ 4). Takeover bar: initially an absolute `D = 0.4` points (2026-06-07), replaced 2026-06-12 by a **score-dependent multiplicative margin δ(s)** — 3% in the normal range, decaying linearly to zero as `winner_score/max_score` goes 0.70 → 1.0 — because Winsorization had already removed the noise D was calibrated against and a fixed absolute bar freezes the seat near the score ceiling; with δ → 0 the takeover bar stays reachable all the way to a perfect score (no freeze band). Pre-spec-16 epochs keep plain mean + flat 3%. |
 | **v6.0** | **2026-05-07** | **Winner-challenger model.** Replaced decentralized off-chain CAS + chain-commitment-pointer consensus with server-coordinated challenge epochs (one challenger per epoch, evaluated against the seated winner). Centralized Phase-1 pre-eval as queue gate. Added `web submit` as a first-class submission channel alongside on-chain commitments. `winner_state` is now server-canonical (replaces per-validator local `WinnerState` JSON). Tightened Winner Protection δ from 10% to 3%. New tables: `challenge_epochs`, `winner_state`, `winner_history`, `validator_activity`.  New `eval_status = 'exhausted'` for `pack_hash` whose first scheduled epoch ended in `aborted_quorum` (no-retry policy — superseded the earlier retry-up-to-3 design). |
 | v5.2 | 2026-04-26 | Deterministic window-start active-set snapshots; submit-when-fully-done with stake-quorum-gated aggregation; dual-window `physical_window` vs `target_window`; burn-while-waiting on quorum miss. |
@@ -766,4 +784,4 @@ Earlier versions of this document are preserved in `legacy/` (e.g. `legacy/INCEN
 
 ---
 
-**Version**: v6.0
+**Version**: v6.2

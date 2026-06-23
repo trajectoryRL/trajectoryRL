@@ -553,6 +553,87 @@ class TestSubmitPackViaApi:
             f"trajectoryrl-miner-submit:{self.HOTKEY_ADDR}:"
         )
 
+    def test_recycle_receipt_in_payload_not_in_signature(self):
+        """A recycle receipt is included in the payload but is NOT bound into
+        the signed message — the web side verifies the receipt on-chain, so the
+        signature stays identity+freshness only (prefix:hotkey:timestamp)."""
+        miner = self._make_miner()
+        client = self._patched_client(self._fake_response(
+            200, json_body={"pack_url": "https://x", "submission_id": 1},
+        ))
+        with patch("trajectoryrl.base.miner.httpx.Client", return_value=client):
+            miner.submit_pack_via_api(
+                self.PACK, recycle_block=4827193, recycle_extrinsic_index=2,
+            )
+
+        signed_message = miner._wallet.hotkey.sign.call_args[0][0].decode()
+        # Message unchanged by the receipt: exactly prefix:hotkey:timestamp.
+        assert len(signed_message.split(":")) == 3
+        assert signed_message.startswith(
+            f"trajectoryrl-miner-submit:{self.HOTKEY_ADDR}:"
+        )
+        # Receipt travels in the payload for the server's fee_check.
+        payload = client.post.call_args[1]["json"]
+        assert payload["recycle_block"] == 4827193
+        assert payload["recycle_extrinsic_index"] == 2
+
+    def test_no_recycle_fields_when_absent(self):
+        """Without a receipt the message + payload are unchanged (pre-fee
+        behavior): no recycle fields, no message suffix."""
+        miner = self._make_miner()
+        client = self._patched_client(self._fake_response(
+            200, json_body={"pack_url": "https://x", "submission_id": 1},
+        ))
+        with patch("trajectoryrl.base.miner.httpx.Client", return_value=client):
+            miner.submit_pack_via_api(self.PACK)
+
+        signed_message = miner._wallet.hotkey.sign.call_args[0][0].decode()
+        # exactly prefix:hotkey:timestamp — three colon-separated parts
+        assert len(signed_message.split(":")) == 3
+        payload = client.post.call_args[1]["json"]
+        assert "recycle_block" not in payload
+        assert "recycle_extrinsic_index" not in payload
+
+    def test_recycle_alpha_fee_returns_block_index(self):
+        """recycle_alpha_fee composes a coldkey-signed recycle_alpha call
+        with the amount in RAO and returns the receipt's (block, index)."""
+        miner = self._make_miner()
+        miner._subtensor = MagicMock()
+        receipt = MagicMock()
+        receipt.block_number = 12345
+        receipt.extrinsic_idx = 3
+        response = MagicMock()
+        response.success = True
+        response.extrinsic_receipt = receipt
+        miner._subtensor.sign_and_send_extrinsic.return_value = response
+
+        out = miner.recycle_alpha_fee(50)
+        assert out == (12345, 3)
+
+        # coldkey-signed, amount in RAO (50 * 1e9), correct hotkey + netuid
+        send_kwargs = miner._subtensor.sign_and_send_extrinsic.call_args[1]
+        assert send_kwargs["sign_with"] == "coldkey"
+        call_params = miner._subtensor.substrate.compose_call.call_args[1]["call_params"]
+        assert call_params["amount"] == 50_000_000_000
+        assert call_params["netuid"] == 11
+        assert call_params["hotkey"] == self.HOTKEY_ADDR
+
+    def test_recycle_alpha_fee_returns_none_on_failure(self):
+        """A failed extrinsic (success False / no receipt) yields None."""
+        miner = self._make_miner()
+        miner._subtensor = MagicMock()
+        response = MagicMock()
+        response.success = False
+        response.extrinsic_receipt = None
+        miner._subtensor.sign_and_send_extrinsic.return_value = response
+        assert miner.recycle_alpha_fee(50) is None
+
+        # non-positive amount is rejected before any chain call
+        miner2 = self._make_miner()
+        miner2._subtensor = MagicMock()
+        assert miner2.recycle_alpha_fee(0) is None
+        miner2._subtensor.sign_and_send_extrinsic.assert_not_called()
+
     def test_429_cooldown_returns_none(self):
         """429 (cooldown) is logged with next_upload_allowed_at and
         returned as None — caller should not retry."""

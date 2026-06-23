@@ -31,7 +31,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import bittensor as bt
 import httpx
@@ -298,6 +298,103 @@ class TrajectoryMiner:
             return False
 
     # ------------------------------------------------------------------
+    # Submission fee — on-chain recycle_alpha
+    # ------------------------------------------------------------------
+
+    def recycle_alpha_fee(self, amount_alpha: float) -> Optional[Tuple[int, int]]:
+        """Pay the per-submission fee by recycling ``amount_alpha`` ALPHA
+        on-chain via the ``recycle_alpha`` extrinsic (coldkey-signed), and
+        return the ``(block_number, extrinsic_index)`` of the included
+        extrinsic so the caller can reference it in the web submit.
+
+        Recycling is irreversible — this alpha is gone. The web service
+        verifies the referenced extrinsic (signer == this hotkey's owner
+        coldkey, hotkey arg == this hotkey, netuid, amount >= the network
+        fee, within 24h) before admitting the pack. Recycle *more* than the
+        fee and the surplus is simply burned; recycle less and the web
+        ``fee_check`` rejects the submission.
+
+        Returns ``None`` on any failure (caller must not submit without a
+        valid receipt).
+
+        NOTE: the installed bittensor SDK exposes no high-level
+        ``recycle_alpha`` wrapper, so the call is composed dynamically.
+        Confirm the runtime's actual call_function / param names
+        (``recycle_alpha``; ``hotkey`` / ``amount`` / ``netuid``) against
+        the deployed Subtensor metadata and adjust below if they differ —
+        this mirrors the web side's same flagged assumption.
+        """
+        amount_rao = int(round(amount_alpha * 1e9))
+        if amount_rao <= 0:
+            logger.error(
+                "recycle fee amount must be > 0 (got %s alpha)", amount_alpha
+            )
+            return None
+
+        try:
+            hotkey_addr = self.wallet.hotkey.ss58_address
+            call = self.subtensor.substrate.compose_call(
+                call_module="SubtensorModule",
+                call_function="recycle_alpha",
+                call_params={
+                    "hotkey": hotkey_addr,
+                    "amount": amount_rao,
+                    "netuid": self.netuid,
+                },
+            )
+            response = self.subtensor.sign_and_send_extrinsic(
+                call=call,
+                wallet=self.wallet,
+                sign_with="coldkey",  # alpha/stake ops are coldkey-authorized
+                wait_for_inclusion=True,
+                wait_for_finalization=False,
+            )
+        except bt.NotRegisteredError:
+            logger.error(
+                "Miner hotkey is not registered on subnet %d — cannot recycle.",
+                self.netuid,
+            )
+            return None
+        except Exception as e:
+            logger.error(
+                "recycle_alpha extrinsic failed (%s): %s", type(e).__name__, e
+            )
+            return None
+
+        if getattr(response, "success", None) is False:
+            logger.error(
+                "recycle_alpha returned failure: %s",
+                getattr(response, "message", response),
+            )
+            return None
+
+        receipt = getattr(response, "extrinsic_receipt", None)
+        if receipt is None:
+            logger.error(
+                "recycle_alpha: response has no extrinsic_receipt — cannot "
+                "build a fee receipt. Ensure wait_for_inclusion succeeded."
+            )
+            return None
+        try:
+            block = receipt.block_number
+            index = receipt.extrinsic_idx
+        except Exception as e:
+            logger.error("recycle_alpha: cannot read receipt block/index: %s", e)
+            return None
+        if block is None or index is None:
+            logger.error(
+                "recycle_alpha: receipt missing block/index (block=%s index=%s)",
+                block, index,
+            )
+            return None
+
+        logger.info(
+            "Recycled %.6f alpha for submission fee at %d-%d",
+            amount_alpha, int(block), int(index),
+        )
+        return (int(block), int(index))
+
+    # ------------------------------------------------------------------
     # Managed web submission (POST /api/v2/miners/submit)
     # ------------------------------------------------------------------
 
@@ -307,6 +404,8 @@ class TrajectoryMiner:
         *,
         submit_url: str = DEFAULT_MINER_SUBMIT_URL,
         timeout: float = 30.0,
+        recycle_block: Optional[int] = None,
+        recycle_extrinsic_index: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
         """Submit a pack to the managed web service (POST /api/v2/miners/submit).
 
@@ -359,6 +458,12 @@ class TrajectoryMiner:
         timestamp = int(time.time())
 
         # Endpoint-specific signing prefix per API.md § /api/v2/miners/submit.
+        # The signed message is identity+freshness only — it does NOT bind the
+        # recycle receipt. The web side verifies the receipt on-chain (its
+        # hotkey arg + signer coldkey already tie it to this miner), so binding
+        # it here would add nothing; keeping the message stable means this
+        # signature stays valid whether or not a fee is in effect.
+        has_receipt = recycle_block is not None and recycle_extrinsic_index is not None
         message = f"trajectoryrl-miner-submit:{hotkey_addr}:{timestamp}"
         sig = hotkey_kp.sign(message.encode())
         signature = "0x" + (sig if isinstance(sig, bytes) else bytes(sig)).hex()
@@ -370,6 +475,9 @@ class TrajectoryMiner:
             "pack_hash": pack_hash,
             "pack_content": canonical,
         }
+        if has_receipt:
+            payload["recycle_block"] = recycle_block
+            payload["recycle_extrinsic_index"] = recycle_extrinsic_index
 
         logger.info(
             "Submitting pack to %s (hash=%s..., %d bytes)",
