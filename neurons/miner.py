@@ -185,9 +185,35 @@ def cmd_web_submit(args):
     miner = _make_miner(config)
     print(f"Pack hash: {pack_hash}")
     print(f"Endpoint: {submit_url}")
-    print("Submitting pack content to web service...")
 
-    response = miner.submit_pack_via_api(pack, submit_url=submit_url)
+    # Submission fee: when SUBMISSION_FEE_ALPHA > 0, recycle that much alpha
+    # on-chain first and reference the resulting (block, index) in the submit.
+    # 0 (default) keeps the pre-fee behavior.
+    recycle_block = None
+    recycle_index = None
+    if config.submission_fee_alpha > 0:
+        print(
+            f"Submission fee: recycling {config.submission_fee_alpha} alpha "
+            "on-chain (recycle_alpha, coldkey-signed)..."
+        )
+        receipt = miner.recycle_alpha_fee(config.submission_fee_alpha)
+        if receipt is None:
+            miner.close()
+            print(
+                "Submission fee failed: could not recycle alpha. Not submitting "
+                "(check wallet balance, registration, and chain connectivity)."
+            )
+            return 1
+        recycle_block, recycle_index = receipt
+        print(f"  recycle receipt: {recycle_block}-{recycle_index}")
+
+    print("Submitting pack content to web service...")
+    response = miner.submit_pack_via_api(
+        pack,
+        submit_url=submit_url,
+        recycle_block=recycle_block,
+        recycle_extrinsic_index=recycle_index,
+    )
     miner.close()
     if response is None:
         print("Submission failed. Check logs for details.")

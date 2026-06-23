@@ -68,16 +68,6 @@ See [docs/pre-eval.md](docs/pre-eval.md) for full architecture and integration g
 { "allowed": true, "verified": false, "pack_hash": "abc123def456" }
 ```
 
-**Blocked — miner's owner is banned:**
-```json
-{
-  "allowed": false,
-  "reason": "banned",
-  "ownerkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
-  "banned_until": "2025-04-01T00:00:00.000Z"
-}
-```
-
 **Blocked — hardcoding detected:**
 ```json
 {
@@ -107,11 +97,10 @@ See [docs/pre-eval.md](docs/pre-eval.md) for full architecture and integration g
    a. Verify `validator_hotkey` is a registered on-chain validator
    b. Verify validator Sr25519 signature (5-minute drift tolerance)
 3. Verify `miner_hotkey` is a registered, non-deregistered miner
-4. Check if the miner's ownerkey is banned → return `allowed: false, reason: "banned"`
-5. Look up cached eval result:
+4. Look up cached eval result:
    - If `pack_hash` provided → query by `(miner_hotkey, pack_hash)`
    - If `epoch_number` provided → query by `(miner_hotkey, epoch_number)`, returning the latest submission in that epoch
-6. Return result:
+5. Return result:
    - `passed` → return `allowed: true, verified: true, pack_hash`
    - `failed` → return `allowed: false, reason, verified: true, pack_hash`
    - Not found / `pending` → return `allowed: true, verified: false`
@@ -121,9 +110,7 @@ See [docs/pre-eval.md](docs/pre-eval.md) for full architecture and integration g
 
 ## POST /api/v2/miners/submit
 
-Miner-facing endpoint for submitting a `pack.json` directly to the web service. The web stores the pack in GCS under an unguessable random filename (so competitors can't enumerate packs by hotkey/uid/hash), immediately runs pre-eval asynchronously, and persists a `miner_submissions` row tagged `source='web'`.
-
-This **complements** — does not replace — the existing self-hosted flow. Validators still discover miners via on-chain commitments; this endpoint gives miners a managed hosting option and a faster pre-eval feedback loop.
+Miner-facing endpoint for submitting a `pack.json` directly to the web service — the **sole submission channel**. The web stores the pack in GCS under an unguessable random filename (so competitors can't enumerate packs by hotkey/uid/hash), immediately runs pre-eval asynchronously, and persists a `miner_submissions` row tagged `source='web'`.
 
 ### Method
 `POST`
@@ -137,9 +124,11 @@ This **complements** — does not replace — the existing self-hosted flow. Val
 |-------|------|----------|-------------|
 | `miner_hotkey` | string | Yes | Submitting miner's ss58 hotkey. |
 | `timestamp` | number | Yes | Unix timestamp in **seconds**. Drift > 5 min is rejected. |
-| `signature` | string | Yes | Sr25519 signature (hex, optional `0x` prefix) over `"trajectoryrl-miner-submit:{miner_hotkey}:{timestamp}"`. |
+| `signature` | string | Yes | Sr25519 signature (hex, optional `0x` prefix) over `"trajectoryrl-miner-submit:{miner_hotkey}:{timestamp}"`. The submission fee does **not** change the signed message — the recycle receipt is verified on-chain (not bound into the signature), so this signature stays valid whether or not the fee is enabled. |
 | `pack_hash` | string | Yes | 64-char lowercase hex SHA-256 of the canonical pack JSON. Server recomputes and rejects on mismatch. |
 | `pack_content` | string | Yes | The pack JSON serialized in **canonical** form (Python `json.dumps(pack, sort_keys=True)` with non-ASCII characters escaped as `\uXXXX`). Must hash to `pack_hash`. Maximum **32 KB**. |
+| `recycle_block` | integer | When fee enabled | Block number of the `recycle_alpha` extrinsic on Bittensor. Required when `SUBMISSION_FEE_ENABLED=true`; ignored otherwise. |
+| `recycle_extrinsic_index` | integer | When fee enabled | Index of the `recycle_alpha` extrinsic within its block. Required when `SUBMISSION_FEE_ENABLED=true`; ignored otherwise. |
 
 > **Identity validation** can be disabled in development by setting `VALIDATE_MINER_IDENTITY=false`. Production must leave it enabled.
 
@@ -172,10 +161,10 @@ This **complements** — does not replace — the existing self-hosted flow. Val
 | Field | Meaning |
 |-------|---------|
 | `pack_hash` | Echoed back (lowercased, normalized). |
-| `pack_url` | GCS URL of the stored pack, hosted under `<S3_PREFIX>/<uid>/<random_key>.json`. **Returned only to the submitting miner** — this URL is intentionally not exposed by any other public endpoint, so leak risk is bounded to the miner's own response. The miner uses this URL to verify upload contents and commits `<pack_hash>\|<pack_url>` on-chain so validators can pick it up via the existing chain-sync flow. |
+| `pack_url` | GCS URL of the stored pack, hosted under `<S3_PREFIX>/<uid>/<random_key>.json`. **Returned only to the submitting miner** — this URL is intentionally not exposed by any other public endpoint, so leak risk is bounded to the miner's own response. The miner may use this URL to verify upload contents. |
 | `submission_id` | Row id in `miner_submissions`. |
 | `next_upload_allowed_at` | When the per-miner cooldown lifts. |
-| `cooldown_seconds` | Configured cooldown window (default 1200 = 20 min, matching the on-chain commitment rate limit). |
+| `cooldown_seconds` | Configured cooldown window (default 1200 = 20 min; configurable). |
 | `pre_eval_status` | `"pending"` / `"passed"` / `"failed"`. On a first-time `(hotkey, pack_hash)` insert this is always `"pending"` — pre-eval runs asynchronously after the response. On a refresh of an existing pair, the row's current lifecycle state is collapsed via `toLegacyPreEvalStatus()`: internal `pending_pre_eval` → `"pending"`, `pending_eval` and `completed` → `"passed"`, `failed` → `"failed"`. The wire value set is the same as before — see `docs/eval-status-lifecycle.md`. Poll `/api/v2/miners/pre-eval` to check the outcome of an async run. |
 
 ### Error Responses
@@ -185,16 +174,16 @@ This **complements** — does not replace — the existing self-hosted flow. Val
 | 400 | Field-specific message | Missing/invalid required field, body not JSON, or `pack_hash` does not equal server-recomputed hash of `pack_content`. |
 | 400 | `pack_content must be ≤32768 bytes` | `pack_content` size cap. Total request body is also capped at 64 KB. |
 | 400 | `pack_content must be valid pack.json containing files.SKILL.md` | Pack shape check. |
+| 400 | `recycle receipt missing, malformed, or already consumed` | When `SUBMISSION_FEE_ENABLED=true`: `recycle_block`/`recycle_extrinsic_index` absent, not integers, or already consumed by a prior `pending_eval` submission. Note: async `fee_check` failure (amount < fee, >24h old, signer mismatch) yields a failed submission row rather than a `400`. |
 | 403 | Signature error | Timestamp drift > 5 min or invalid signature. |
 | 403 | `miner_hotkey is not a registered miner on-chain` | Hotkey absent from metagraph or deregistered. |
-| 403 | `ownerkey is currently banned` | Owner ban active. Response also includes `ownerkey` and `banned_until`. |
 | 429 | `cooldown` | Per-miner cooldown not yet elapsed. Response includes `last_upload_at`, `next_upload_allowed_at`, `cooldown_seconds`. |
 | 500 | `Failed to upload pack content to storage` | GCS write failed. Cooldown is **not** consumed (the row is written only after a successful GCS upload). Safe to retry. |
 | 500 | `Failed to persist submission record` | DB write failure. |
 
 ### Cooldown Semantics
 
-- **Per-miner**, **strict counting**: 1 successful submission per `cooldown_seconds` (default **1200 = 20 min**, matching the Bittensor on-chain commitment rate limit so neither submit channel offers a faster path; overridable via `MINER_SUBMIT_COOLDOWN_SECONDS`), regardless of whether pre-eval ultimately passes or fails.
+- **Per-miner**, **strict counting**: 1 successful submission per `cooldown_seconds` (default **1200 = 20 min**; overridable via `MINER_SUBMIT_COOLDOWN_SECONDS`), regardless of whether pre-eval ultimately passes or fails.
 - The cooldown clock starts when the `miner_submissions` row is persisted (which is **after** GCS upload succeeds). Field-validation errors, signature errors, and GCS upload failures do not consume the cooldown.
 - Resubmitting the same `pack_hash` within the cooldown window returns `429`. The previously-issued `pack_url` remains valid.
 
@@ -202,24 +191,20 @@ This **complements** — does not replace — the existing self-hosted flow. Val
 
 If the same `(miner_hotkey, pack_hash)` is submitted again **after** the cooldown elapses, the existing `pack_url` on the upload row is reused — the hash check guarantees the new body is byte-identical to the stored object, so no re-upload is performed and the URL returned to the miner is unchanged.
 
-### On-chain Commit (recommended workflow)
-
-After a successful submission, miners should still commit `<pack_hash>|<pack_url>` to Subtensor `commitments` so validators pick the pack up through the existing chain-sync pipeline (preserves first-mover precedence and keeps the discovery layer decentralized).
-
 ### Processing Flow
 
 1. Read body (≤ 64 KB), parse as JSON object
-2. Validate `miner_hotkey`, `timestamp`, `signature`, `pack_hash`, `pack_content` shape
+2. Validate `miner_hotkey`, `timestamp`, `signature`, `pack_hash`, `pack_content` shape; when `SUBMISSION_FEE_ENABLED=true`, also validate `recycle_block` and `recycle_extrinsic_index` (present, integer)
 3. Verify `pack_content` size (≤ 32 KB) and that `sha256(canonical_json(pack_content))` equals `pack_hash`
 4. Verify pack shape: `files["SKILL.md"]` is present
-5. Verify Sr25519 signature over `"trajectoryrl-miner-submit:{miner_hotkey}:{timestamp}"` (5-min drift)
+5. Verify Sr25519 signature over `"trajectoryrl-miner-submit:{miner_hotkey}:{timestamp}"` (5-min drift) — unchanged by the fee
 6. Verify miner is registered on-chain and not deregistered (also reads `uid` for the GCS path)
-7. Verify ownerkey is not banned
+7. When `SUBMISSION_FEE_ENABLED=true`, verify `(recycle_block, recycle_extrinsic_index)` is not already consumed (present in `recycle_receipts`). Missing / malformed / already-consumed → `400`, row not recorded.
 8. Enforce per-miner cooldown (latest `created_at` for `source='web'` rows of this hotkey)
 9. Look up an existing upload-source `pack_url` for `(miner_hotkey, pack_hash)`; if present, skip the GCS write (the hash check guarantees the stored object is byte-identical), otherwise generate a fresh 16-char base64url filename
 10. If a fresh upload is needed, write the body to GCS at `<S3_PREFIX>/<uid>/<random_key>.json` (`Content-Type: application/json`). The `<S3_PREFIX>` segment matches the existing `sync-packs` convention (`traj-prod` in production, `traj-dev` in development, overridable via `S3_PREFIX`); the random filename is what makes the URL unguessable. The random key is a transient value — only the full URL is persisted (in `pack_url`)
-11. Upsert the `miner_submissions` row with `source='web'` and the GCS URL stored in `pack_url`. **`gcs_pack_url` is intentionally left empty at this point** — the `sync-packs` job promotes `pack_url` into `gcs_pack_url` only after the row is older than 24 hours, deferring the publicly-visible mirror URL by that window
-12. Fire-and-forget pre-eval (`evaluateSubmissionNow`) — validators / the miner can poll `/api/v2/miners/pre-eval` for the result a few seconds later
+11. Upsert the `miner_submissions` row with `source='web'` and the GCS URL stored in `pack_url`; store `recycle_block`/`recycle_extrinsic_index` in `fee_recycle_block`/`fee_recycle_index` (when fee is enabled). **`gcs_pack_url` is intentionally left empty at this point** — the `sync-packs` job promotes `pack_url` into `gcs_pack_url` only after the row is older than 24 hours, deferring the publicly-visible mirror URL by that window
+12. Records a `pending_pre_eval` row; the background sync's pre-eval pipeline (called every sync tick) advances it through the checks — validators / the miner can poll `/api/v2/miners/pre-eval` for the result after the next sync tick
 13. Return the success payload
 
 ---
@@ -926,7 +911,7 @@ GET /api/v2/validators/epoch_snapshot?epoch_number=1234&validator_hotkey=5FFA...
 | `pack_url` | string | URL the validator should fetch. For chain-source rows this is the miner's self-hosted URL committed on chain; for web-source rows it's the random-key GCS URL we hosted at submission time. |
 | `refresh_time` | string | **Deprecated, retained for wire compatibility.** Server now populates this field from `miner_submissions.submitted_at` (the immutable first-commit timestamp back-derived from the on-chain commit block). Eligibility is no longer driven by a heartbeat; the server filters entries by joining to the live `nodes.commit_block` (see "Cutoff Semantics" and migration 062). Subnet code that only treats this as a monotone time stamp is unaffected. |
 | `pre_eval_status` | `"passed"` \| `"failed"` | Pre-eval verdict for this `(miner_hotkey, pack_hash)`. The wire-level value set is intentionally narrow — `"passed"` for any row that cleared the 7-step pre-eval pipeline, `"failed"` for any rejection. Internally `miner_submissions.eval_status` holds a broader 4-state lifecycle (`pending_pre_eval` / `pending_eval` / `completed` / `failed`); the snapshot builder collapses it via `toLegacyPreEvalStatus()` so subnet code only ever sees the legacy 2-value set and requires no changes when the column expands. Rows still in `pending_pre_eval` are filtered out at the SQL layer and absent from `entries`. See `docs/eval-status-lifecycle.md` for the full mapping. |
-| `pre_eval_reason` | string \| null | Human-readable failure reason. Populated only when `pre_eval_status = "failed"`; mirrors the row's `eval_reason` column (e.g. `"hardcoded"`, `"hash_mismatch"`, `"banned until 2026-06-01..."`, `"similarity=0.834 match=5HBE…"`). |
+| `pre_eval_reason` | string \| null | Human-readable failure reason. Populated only when `pre_eval_status = "failed"`; mirrors the row's `eval_reason` column (e.g. `"hardcoded"`, `"hash_mismatch"`, `"recycle amount below fee"`, `"similarity=0.834 match=5HBE…"`). |
 
 ### Cutoff Semantics
 
