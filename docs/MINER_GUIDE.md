@@ -46,7 +46,7 @@ Season 1 requires `SKILL.md` only.
 
 - `SKILL.md` must not be empty.
 - Total pack JSON ≤ 32 KB.
-- Content-addressed: `sha256(json.dumps(pack, sort_keys=True))` matches the on-chain `pack_hash`.
+- Content-addressed: `sha256(json.dumps(pack, sort_keys=True))` matches the `pack_hash` carried in your submission.
 
 ---
 
@@ -229,17 +229,28 @@ cd trajectoryRL && pip install -e .
 
 trajectoryrl-miner build SKILL.md -o pack.json
 
-# Path B — managed web submit (recommended, no chain commit needed)
+# Pay the submission fee + submit. web-submit is the only channel: the
+# CLI recycles SUBMISSION_FEE_ALPHA (default 50) on chain via
+# recycle_alpha, then submits the pack referencing that receipt.
 trajectoryrl-miner web-submit pack.json
-
-# Path A — self-host + chain commit (alternative)
-# trajectoryrl-miner upload pack.json             # self-host on S3 / R2 / GCS
-# trajectoryrl-miner submit <pack_url>            # set_commitment on-chain
 
 trajectoryrl-miner status
 ```
 
-Path A writes the on-chain commitment `{pack_hash}|{pack_url}`; the platform's syncer ingests it into the challenger queue. Path B writes the queue entry directly via the web API and does not touch the chain. In both cases validators fetch your `pack.json`, verify the hash, extract `SKILL.md`, and run the full scenario session — pick one path, not both.
+`web-submit` is the sole submission channel: the platform stores your `pack.json`, verifies the recycle receipt, runs pre-eval, and writes the challenger-queue entry. Validators then fetch your pack, verify the hash, extract `SKILL.md`, and run the full scenario session. (On-chain `set_commitment` is no longer ingested as a submission.)
+
+---
+
+## Submission Fee
+
+Every submission is backed by an on-chain `recycle_alpha` burn, paid before the pack is accepted. Recycling is irreversible — it is the economic cost that deters spam and low-quality packs (it replaces the old owner-ban system).
+
+- **Amount** — `SUBMISSION_FEE_ALPHA` (default `50` α), signed by your **coldkey** via `recycle_alpha(hotkey, amount, netuid=11)`. Recycle at least the network fee; surplus is burned too, too little is rejected.
+- **Receipt** — the CLI passes the recycle's `(block, extrinsic_index)` with the submission; the server verifies it on chain (your hotkey, `amount ≥ fee`, within 24 h) before queuing the pack.
+- **Reuse** — the fee is consumed only once your pack enters the eval queue. A submission that fails a technical check (bad format, duplicate, similarity, …) does not consume the receipt, so the same recycle can back another submission within its 24 h window. Re-submitting the same `pack_hash` that already failed terminally does not re-evaluate it.
+- **Cooldown** — one submission per hotkey every ~20 min (server-enforced, `MINER_SUBMIT_COOLDOWN_SECONDS`), on top of the fee.
+
+Set the amount in `.env.miner` (`SUBMISSION_FEE_ALPHA=50`) or inline; full reference in [MINER_OPERATIONS.md](MINER_OPERATIONS.md).
 
 ---
 
@@ -297,4 +308,4 @@ A: The schema permits multiple files in `files`, but Season 1 only reads `SKILL.
 A: Pack rejected at schema validation.
 
 **Q: How often can I resubmit?**
-A: Self-hosted (`upload` + `submit`): chain-side rate limit (~100 blocks ≈ 20 min between commits). Managed (`web-submit`): one successful submission per hour per hotkey (server cooldown). Web-submitted packs do not require a follow-up on-chain `submit`, so the chain rate limit does not apply on this path.
+A: One submission per hotkey every ~20 min (server cooldown, `MINER_SUBMIT_COOLDOWN_SECONDS`). Each submission also costs the `recycle_alpha` fee — see [Submission Fee](#submission-fee).
