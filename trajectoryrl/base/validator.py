@@ -74,7 +74,6 @@ def _spec_number() -> int:
 logger = logging.getLogger(__name__)
 
 OWNER_UID = 74
-BURN_FRACTION = 0.75  # 75% of miner emissions burned via owner UID
 
 _METAGRAPH_SYNC_RETRIES = 3
 _METAGRAPH_SYNC_DELAY = 10  # seconds between retries
@@ -1290,12 +1289,12 @@ class TrajectoryValidator:
             await self._set_fallback_weights(reason="No winner in cache")
             return
 
-        if winner_uid == OWNER_UID:
-            uids = [OWNER_UID]
-            weights = [1.0]
-        else:
-            uids = [winner_uid, OWNER_UID]
-            weights = [1.0 - BURN_FRACTION, BURN_FRACTION]
+        # Seated winner takes 100% of miner alpha. There is no standing burn —
+        # the submission fee (recycle_alpha) is now the economic mechanism.
+        # (The no-winner path still burns to the owner UID via
+        # _set_fallback_weights / _set_burn_weights.)
+        uids = [winner_uid]
+        weights = [1.0]
 
         await self._do_set_weights(
             uids, weights,
