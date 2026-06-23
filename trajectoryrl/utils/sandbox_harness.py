@@ -1639,14 +1639,40 @@ class TrajectorySandboxHarness:
                 "sh", "-c",
                 "mkdir -p /opt/data && chown -R hermes:hermes /opt/data",
             ])
+            # SKILL.md becomes the Hermes SOUL.md so its contents are
+            # injected as the system-prompt identity layer instead of
+            # being a file the agent has to read at runtime. A one-line
+            # identity prefix is prepended so the model has a "You are X"
+            # anchor before the procedural guidance.
+            sandbox.exec_run([
+                "sh", "-c",
+                "{ echo 'You are an expert software engineer solving autonomous terminal-based tasks.'; echo; cat /workspace/SKILL.md; }"
+                " > /opt/data/SOUL.md"
+                " && chown hermes:hermes /opt/data/SOUL.md",
+            ])
+            # Patch prompt_builder.py to strip boilerplate that doesn't apply
+            # to autonomous task-solving: hermes-agent help link, memory
+            # guidance, and CLI-chatbot source framing.
+            _put_file(sandbox, "/tmp/_hpatch.py",
+                "import re, pathlib\n"
+                "p = pathlib.Path('/opt/hermes/agent/prompt_builder.py')\n"
+                "t = p.read_text()\n"
+                "t = re.sub(r'HERMES_AGENT_HELP_GUIDANCE\\s*=\\s*\\(.*?\\n\\)',\n"
+                "           'HERMES_AGENT_HELP_GUIDANCE = \"\"', t, flags=re.DOTALL)\n"
+                "t = re.sub(r'MEMORY_GUIDANCE\\s*=\\s*\\(.*?\\n\\)',\n"
+                "           'MEMORY_GUIDANCE = \"\"', t, flags=re.DOTALL)\n"
+                "t = re.sub(r'\"cli\":\\s*\\(.*?\\n\\s*\\),',\n"
+                "           '\"cli\": \"\",', t, flags=re.DOTALL)\n"
+                "p.write_text(t)\n"
+            )
+            sandbox.exec_run(["python3", "/tmp/_hpatch.py"])
 
             harness_prompt = (
-                "Read /workspace/SKILL.md for your approach. "
                 "Read /workspace/INSTRUCTION.md for the task. "
                 "The task's working directory is /app/. "
                 "/app and /workspace/learned are writable scratch; "
                 "everything else is read-only. "
-                "Solve the task. Do not modify SKILL.md."
+                "Solve the task."
             )
 
             # Wrap chat + sessions export in one bash invocation so the
