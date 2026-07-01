@@ -59,6 +59,7 @@ logger = logging.getLogger(__name__)
 SANDBOX_SCENARIOS: tuple[str, ...] = (
     "configure-git-webserver",
     "db-wal-recovery",
+    "deterministic-tarball",
     "git-leak-recovery",
     "git-multibranch",
     "largest-eigenval",
@@ -68,6 +69,7 @@ SANDBOX_SCENARIOS: tuple[str, ...] = (
     "regex-chess",
     "schemelike-metacircular-eval",
     "swe-bench-astropy-2",
+    "tree-directory-parser",
     "write-compressor",
 )
 
@@ -114,6 +116,14 @@ SANDBOX_SCENARIOS: tuple[str, ...] = (
 # git-multibranch + schemelike-metacircular-eval, so N goes 11→12 and the
 # score range becomes [0, 12]. The offset stays 0.0. Requires trajrl-bench
 # >= 4.0.14, which ships the new scenario images.
+#
+# SPEC 19 adds two real scenarios adapted from terminal-bench —
+# deterministic-tarball (reproducible-build archiving) + tree-directory-parser
+# (reconstruct a directory tree from a `tree -F` snapshot) — so N goes 12→14
+# and the score range becomes [0, 14]. The offset stays 0.0 (real scenarios,
+# not phantom refills). Requires the trajrl-bench release that ships the new
+# scenario images (>= 4.0.16); older bench images will report
+# "unknown scenario".
 REMOVED_SCENARIO_BASE_SCORE: float = 0.0
 
 
