@@ -1914,7 +1914,14 @@ class TrajectorySandboxHarness:
                 with tarfile.open(fileobj=buf3, mode="w") as tar:
                     info = tarfile.TarInfo(name=out_path.name)
                     info.size = len(agent_output_bytes)
-                    info.mode = 0o644
+                    # 0o755, not 0o644: the deliverable is often an executable
+                    # script the verifier runs directly (e.g. deterministic-tarball
+                    # runs /app/build.sh and asserts os.X_OK; several scenarios also
+                    # assert the deliverable is executable). Extraction only carries
+                    # the bytes, not the agent's mode, so a hardcoded 0o644 strips
+                    # the exec bit and those scenarios score ~0 (EACCES). +x is
+                    # harmless for non-script deliverables (data.comp, *.patch, …).
+                    info.mode = 0o755
                     info.mtime = int(time.time())
                     tar.addfile(info, io.BytesIO(agent_output_bytes))
                 buf3.seek(0)
