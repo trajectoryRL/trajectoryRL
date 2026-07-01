@@ -140,7 +140,7 @@ See [MINER_OPERATIONS.md](docs/MINER_OPERATIONS.md) for full CLI reference (`bui
 
 #### 3. Test locally (optional)
 
-Prereqs: Docker, an LLM API key (e.g. OpenRouter), ~10 GB free disk for the per-scenario images on first run.
+Prereqs: Docker, an LLM API key (e.g. OpenRouter or [engy](https://engy.ai)), ~10 GB free disk for the per-scenario images on first run.
 
 The validator and miner share the same harness — `scripts/eval_pack.py` runs your SKILL.md through every scenario in `SANDBOX_SCENARIOS` end-to-end, no chain interaction needed. It auto-pulls the sandbox-agent + scenario images on first invocation.
 
