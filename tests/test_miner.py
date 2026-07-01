@@ -596,12 +596,20 @@ class TestSubmitPackViaApi:
 
     def test_recycle_alpha_fee_returns_block_index(self):
         """recycle_alpha_fee composes a coldkey-signed recycle_alpha call
-        with the amount in RAO and returns the receipt's (block, index)."""
+        with the amount in RAO and returns the receipt's (block, index).
+
+        Regression: on async-substrate-interface (bittensor >=9.x),
+        submit_extrinsic leaves ``receipt.block_number`` as ``None`` right
+        after submit (only block_hash is set; block_number resolves lazily).
+        The old code read ``.block_number`` directly and aborted on None,
+        so miners paid the alpha but couldn't submit. We now resolve via
+        ``get_extrinsic_identifier()`` — reproduce the None-block_number
+        receipt here so this can't regress."""
         miner = self._make_miner()
         miner._subtensor = MagicMock()
         receipt = MagicMock()
-        receipt.block_number = 12345
-        receipt.extrinsic_idx = 3
+        receipt.block_number = None  # the async-SDK reality post-submit
+        receipt.get_extrinsic_identifier.return_value = "12345-3"
         response = MagicMock()
         response.success = True
         response.extrinsic_receipt = receipt

@@ -375,24 +375,32 @@ class TrajectoryMiner:
                 "build a fee receipt. Ensure wait_for_inclusion succeeded."
             )
             return None
+        # Resolve (block, index) via the SDK's own identifier helper — do
+        # NOT read receipt.block_number directly. Since bittensor moved to
+        # async-substrate-interface (>=9.x), submit_extrinsic builds the
+        # receipt with block_hash only and leaves block_number None (it is
+        # resolved lazily). Reading .block_number returned None here, so the
+        # fee aborted *after* the recycle extrinsic had already succeeded —
+        # miners paid the alpha but couldn't submit. get_extrinsic_identifier()
+        # resolves block_number from block_hash and returns "<block>-<index>",
+        # working on both the old sync and new async substrate interfaces.
         try:
-            block = receipt.block_number
-            index = receipt.extrinsic_idx
+            identifier = receipt.get_extrinsic_identifier()  # "<block>-<index>"
+            block_str, index_str = identifier.split("-", 1)
+            block, index = int(block_str), int(index_str)
         except Exception as e:
-            logger.error("recycle_alpha: cannot read receipt block/index: %s", e)
-            return None
-        if block is None or index is None:
             logger.error(
-                "recycle_alpha: receipt missing block/index (block=%s index=%s)",
-                block, index,
+                "recycle_alpha: cannot resolve receipt identifier "
+                "(block_hash=%s): %s",
+                getattr(receipt, "block_hash", None), e,
             )
             return None
 
         logger.info(
             "Recycled %.6f alpha for submission fee at %d-%d",
-            amount_alpha, int(block), int(index),
+            amount_alpha, block, index,
         )
-        return (int(block), int(index))
+        return (block, index)
 
     # ------------------------------------------------------------------
     # Managed web submission (POST /api/v2/miners/submit)
