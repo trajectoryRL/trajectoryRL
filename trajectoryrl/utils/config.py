@@ -8,12 +8,12 @@ from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Default eval LLM: Qwen3.5-35B-A3B via OpenRouter — the same vendor
-# serves the testee and the judge (GLM-5.1) without juggling keys. See
-# .env.validator.example. Override per-validator with LLM_BASE_URL /
-# LLM_MODEL.
-DEFAULT_LLM_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_LLM_MODEL = "qwen/qwen3.5-35b-a3b"
+# Default eval LLM: Qwen3.6-35B-A3B via engy (https://engy.ai) — the
+# subnet's own OpenAI-compatible inference API, served on its GPU fleet
+# with tool-calling enabled. See .env.validator.example. Override
+# per-validator with LLM_BASE_URL / LLM_MODEL.
+DEFAULT_LLM_BASE_URL = "https://api.engy.ai/v1"
+DEFAULT_LLM_MODEL = "qwen3.6-35b-a3b"
 
 # Image channel drives the tag of the sandbox-agent image pulled by the
 # validator at runtime. Compose files set this per-channel (latest,

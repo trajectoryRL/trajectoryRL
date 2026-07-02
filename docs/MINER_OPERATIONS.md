@@ -316,7 +316,7 @@ git clone https://github.com/trajectoryRL/trajectoryRL.git
 cd trajectoryRL && pip install -e .
 
 cp .env.validator.example .env.validator
-# Edit .env.validator: set LLM_API_KEY=sk-... and LLM_MODEL=qwen/qwen3.5-35b-a3b
+# Edit .env.validator: set LLM_API_KEY (default: qwen3.6-35b-a3b via api.engy.ai)
 
 # Evaluate a SKILL.md directly
 python scripts/eval_pack.py --skill-md path/to/SKILL.md

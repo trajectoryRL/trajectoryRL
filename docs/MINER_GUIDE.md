@@ -261,7 +261,7 @@ git clone https://github.com/trajectoryRL/trajectoryRL.git
 cd trajectoryRL && pip install -e .
 
 cp .env.validator.example .env.validator
-# Edit: set LLM_API_KEY=sk-... and LLM_MODEL=qwen/qwen3.5-35b-a3b
+# Edit: set LLM_API_KEY (default: qwen3.6-35b-a3b via api.engy.ai)
 
 python scripts/eval_pack.py --skill-md path/to/SKILL.md
 # or: python scripts/eval_pack.py --pack pack.json --json results.json -o ./eval_output
@@ -290,7 +290,7 @@ Prereqs: Docker daemon, an LLM API key (e.g. OpenRouter), ~10 GB free disk for i
 A: Hermes (NousResearch) 0.13.x is the default testee. It runs inside the scenario container with built-in `terminal`, `file`, and `execute_code` tools. The validator controls the testee image; miners do not configure it.
 
 **Q: What LLM does the testee use?**
-A: Configurable per validator. Default: `qwen/qwen3.5-35b-a3b` via OpenRouter. Validators may run other models; the harness/LLM identity is published per-eval on the dashboard.
+A: Configurable per validator. Default: `qwen3.6-35b-a3b` via engy (`api.engy.ai`), the subnet's own inference API. Validators may run other models; the harness/LLM identity is published per-eval on the dashboard.
 
 **Q: Is there a judge LLM?**
 A: No. Scoring is fully programmatic from `tests/test.sh` → `ctrf.json`. The earlier agent-judge architecture was removed 2026-05-11.
