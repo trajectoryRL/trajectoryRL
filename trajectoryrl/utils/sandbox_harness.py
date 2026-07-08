@@ -57,7 +57,9 @@ logger = logging.getLogger(__name__)
 # bumps. Adding or removing a scenario must come with a SPEC_NUMBER bump
 # so cached scores invalidate. Sorted alphabetically for stability.
 SANDBOX_SCENARIOS: tuple[str, ...] = (
+    "3d-model-format-legacy",
     "configure-git-webserver",
+    "custom-memory-heap-crash",
     "db-wal-recovery",
     "deterministic-tarball",
     "git-leak-recovery",
@@ -65,6 +67,7 @@ SANDBOX_SCENARIOS: tuple[str, ...] = (
     "largest-eigenval",
     "nginx-request-logging",
     "path-tracing",
+    "pcap-to-netflow",
     "race-condition-fix",
     "regex-chess",
     "schemelike-metacircular-eval",
@@ -123,6 +126,18 @@ SANDBOX_SCENARIOS: tuple[str, ...] = (
 # and the score range becomes [0, 14]. The offset stays 0.0 (real scenarios,
 # not phantom refills). Requires the trajrl-bench release that ships the new
 # scenario images (>= 4.0.16); older bench images will report
+# "unknown scenario".
+#
+# SPEC 20 adds three real scenarios adapted from terminal-bench —
+# pcap-to-netflow (pcap capture → binary NetFlow v5 export, verified by
+# re-running the export script), 3d-model-format-legacy (reverse-engineer a
+# legacy binary 3D model format + modernize a win32-era C++ library, verified
+# by JSON field checks + a cmake rebuild), custom-memory-heap-crash (fix a
+# release-only custom-allocator lifetime bug behind a patched libstdc++,
+# verified by debug+release recompiles + Valgrind) — so N goes 14→17 and the
+# score range becomes [0, 17]. The offset stays 0.0 (real scenarios, not
+# phantom refills). Requires the trajrl-bench release that ships the new
+# scenario images (>= 4.0.18); older bench images will report
 # "unknown scenario".
 REMOVED_SCENARIO_BASE_SCORE: float = 0.0
 
