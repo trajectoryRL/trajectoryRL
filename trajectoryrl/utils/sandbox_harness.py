@@ -58,6 +58,7 @@ logger = logging.getLogger(__name__)
 # so cached scores invalidate. Sorted alphabetically for stability.
 SANDBOX_SCENARIOS: tuple[str, ...] = (
     "3d-model-format-legacy",
+    "audio-synth-stft-peaks",
     "configure-git-webserver",
     "custom-memory-heap-crash",
     "db-wal-recovery",
@@ -68,6 +69,8 @@ SANDBOX_SCENARIOS: tuple[str, ...] = (
     "nginx-request-logging",
     "path-tracing",
     "pcap-to-netflow",
+    "puzzle-solver",
+    "query-optimize",
     "race-condition-fix",
     "regex-chess",
     "schemelike-metacircular-eval",
@@ -139,6 +142,18 @@ SANDBOX_SCENARIOS: tuple[str, ...] = (
 # phantom refills). Requires the trajrl-bench release that ships the new
 # scenario images (>= 4.0.18); older bench images will report
 # "unknown scenario".
+#
+# SPEC 21 adds three real scenarios adapted from terminal-bench —
+# audio-synth-stft-peaks (synthesize a WAV, scipy STFT to CSV, awk top-3
+# spectral peaks per frame, verified by re-running the agent's own pipeline
+# under instrumented shims), puzzle-solver (optimal 8-puzzle BFS with exact
+# per-depth frontier files + SHA256 sidecars, verified by an independent BFS
+# recompute), query-optimize (rewrite an unoptimized SQLite query over the
+# Open English Wordnet DB to match a hidden golden query's rows and median
+# runtime) — so N goes 17→20 and the score range becomes [0, 20]. The offset
+# stays 0.0 (real scenarios, not phantom refills). Requires the trajrl-bench
+# release that ships the new scenario images (>= 4.0.19); older bench images
+# will report "unknown scenario".
 REMOVED_SCENARIO_BASE_SCORE: float = 0.0
 
 
