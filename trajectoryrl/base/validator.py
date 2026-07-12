@@ -34,7 +34,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import bittensor as bt
 
 from ..utils.config import ValidatorConfig
-from ..utils.sandbox_harness import TrajectorySandboxHarness
+from ..utils.sandbox_harness import TrajectorySandboxHarness, resolve_eval_spec
 from ..utils.github import PackFetcher
 from ..utils import config as _config_mod
 from ..utils.commitments import MinerCommitment
@@ -490,8 +490,11 @@ class TrajectoryValidator:
         miner_log_offset: int,
         block_height: int,
         challenge_epoch_id: int,
+        eval_spec: Optional[int] = None,
     ) -> None:
         """Collect and upload eval logs. Fire-and-forget."""
+        if eval_spec is None:
+            eval_spec = _spec_number()
         s1_result = eval_result.get("_s1_sandbox_result") if eval_result else None
         if s1_result is not None:
             try:
@@ -511,7 +514,7 @@ class TrajectoryValidator:
                 "miner_uid": uid,
                 "block_height": block_height,
                 "pack_hash": commitment.pack_hash,
-                "spec_number": _spec_number(),
+                "spec_number": eval_spec,
                 "type": "eval",
             }
             try:
@@ -531,7 +534,7 @@ class TrajectoryValidator:
                 pack_hash=commitment.pack_hash,
                 log_archive=log_archive,
                 epoch_number=challenge_epoch_id,
-                spec_number=_spec_number(),
+                spec_number=eval_spec,
             )
             if ok:
                 try:
@@ -545,8 +548,11 @@ class TrajectoryValidator:
         cycle_log_offset: int,
         block_height: int,
         challenge_epoch_id: int,
+        eval_spec: Optional[int] = None,
     ) -> None:
         """Upload the validator log segment for one challenger cycle."""
+        if eval_spec is None:
+            eval_spec = _spec_number()
         import io
         import tarfile
 
@@ -581,7 +587,7 @@ class TrajectoryValidator:
                 "eval_id": eval_id,
                 "challenge_epoch_id": challenge_epoch_id,
                 "block_height": block_height,
-                "spec_number": _spec_number(),
+                "spec_number": eval_spec,
                 "type": "cycle",
             }
             try:
@@ -598,7 +604,7 @@ class TrajectoryValidator:
                 block_height=block_height,
                 log_archive=archive,
                 epoch_number=challenge_epoch_id,
-                spec_number=_spec_number(),
+                spec_number=eval_spec,
             )
             if ok:
                 try:
@@ -800,6 +806,8 @@ class TrajectoryValidator:
         self,
         commitment: MinerCommitment,
         challenge_epoch_id: int,
+        eval_spec: int,
+        eval_scenarios: Tuple[str, ...],
     ) -> Optional[Dict[str, Any]]:
         """Run a single trajrl-bench evaluation on the active challenger."""
         mlog = self._get_miner_logger(commitment.hotkey)
@@ -839,7 +847,7 @@ class TrajectoryValidator:
                 cost_usd=cost_usd,
                 duration_s=duration_s,
                 timed_out=timed_out,
-                spec_number=_spec_number(),
+                spec_number=eval_spec,
                 harness_name=self._sandbox_harness.harness_name,
                 harness_version=self._sandbox_harness.harness_version,
                 llm_model=self.config.llm_model,
@@ -896,6 +904,7 @@ class TrajectoryValidator:
             on_episode_verifying=on_episode_verifying,
             on_episode_done=on_episode_done,
             is_epoch_still_current=is_epoch_still_current,
+            scenarios=eval_scenarios,
         )
 
         if not outcome.success:
@@ -1035,7 +1044,23 @@ class TrajectoryValidator:
             )
             return
 
-        await self._score_challenger(challenge_epoch_id, commitment)
+        # The scoring spec for this epoch comes from the server's
+        # spec_schedule (docs/API.md /epoch/current `spec_number`), not
+        # from the local SPEC_NUMBER constant — a deployed-but-not-yet-
+        # effective spec stays dormant until its scheduled cutover
+        # epoch. resolve_eval_spec falls back to the local constant on
+        # a missing/unknown value.
+        eval_spec, eval_scenarios = resolve_eval_spec(epoch.get("spec_number"))
+        if eval_spec != _spec_number():
+            logger.info(
+                "Epoch %s evaluates under SPEC %d per server schedule "
+                "(local binary default: SPEC %d)",
+                challenge_epoch_id, eval_spec, _spec_number(),
+            )
+
+        await self._score_challenger(
+            challenge_epoch_id, commitment, eval_spec, eval_scenarios,
+        )
 
     async def _refresh_winner_cache(self):
         """Pull /api/v2/winner/current, run local derivation, persist cache."""
@@ -1051,8 +1076,16 @@ class TrajectoryValidator:
             logger.warning("Failed to persist winner cache: %s", e)
 
     async def _score_challenger(
-        self, challenge_epoch_id: int, commitment: MinerCommitment,
+        self,
+        challenge_epoch_id: int,
+        commitment: MinerCommitment,
+        eval_spec: Optional[int] = None,
+        eval_scenarios: Optional[Tuple[str, ...]] = None,
     ):
+        # Callers normally pass the schedule-resolved spec; None (e.g.
+        # legacy call sites) falls back to the local binary default.
+        if eval_spec is None or eval_scenarios is None:
+            eval_spec, eval_scenarios = resolve_eval_spec(eval_spec)
         eval_id = (
             datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
             + f"_e{challenge_epoch_id}"
@@ -1073,7 +1106,9 @@ class TrajectoryValidator:
             eval_id, commitment.hotkey,
         )
 
-        eval_result = await self._evaluate_challenger(commitment, challenge_epoch_id)
+        eval_result = await self._evaluate_challenger(
+            commitment, challenge_epoch_id, eval_spec, eval_scenarios,
+        )
 
         # Harness aborted mid-session because the epoch had moved on.
         # Drop the eval entirely — POSTing the partial sum would punish
@@ -1137,7 +1172,7 @@ class TrajectoryValidator:
             rejected=rejected if rejected else None,
             rejection_detail=rejection_detail if rejected else None,
             scenario_results=scenario_results or None,
-            spec_number=_spec_number(),
+            spec_number=eval_spec,
             llm_base_url=self.config.llm_base_url,
             llm_model=self.config.llm_model,
             judge_model=self.config.judge_model or None,
@@ -1150,12 +1185,12 @@ class TrajectoryValidator:
             self._save_eval_state()
 
         # Fire-and-forget log uploads
-        eval_scenarios = list(scenario_results.keys()) if scenario_results else []
+        ran_scenarios = list(scenario_results.keys()) if scenario_results else []
         try:
             await self._fire_upload_eval_logs(
-                eval_id, commitment.uid, commitment, eval_scenarios,
+                eval_id, commitment.uid, commitment, ran_scenarios,
                 eval_result, eval_dir, vlog_offset, mlog_offset,
-                block_height, challenge_epoch_id,
+                block_height, challenge_epoch_id, eval_spec,
             )
         except Exception as e:
             logger.warning("Eval log upload failed: %s", e)
@@ -1163,7 +1198,7 @@ class TrajectoryValidator:
         try:
             await self._fire_upload_cycle_logs(
                 eval_id, self._cycle_log_offset, self._cycle_log_block,
-                challenge_epoch_id,
+                challenge_epoch_id, eval_spec,
             )
         except Exception as e:
             logger.warning("Cycle log upload failed: %s", e)

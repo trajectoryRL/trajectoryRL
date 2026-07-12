@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Sequence
 
 from .commitments import MinerCommitment
 from .github import PackFetcher
@@ -82,6 +82,7 @@ async def evaluate_miner_s1(
     on_episode_verifying: Optional[Callable[[str, int, int], None]] = None,
     on_episode_done: Optional[Callable[[_EpisodeResult, int, int], None]] = None,
     is_epoch_still_current: Optional[Callable[[str], bool]] = None,
+    scenarios: Optional[Sequence[str]] = None,
 ) -> MinerEvalOutcome:
     """Evaluate a single miner's pack via trajrl-bench (Season 1).
 
@@ -102,6 +103,9 @@ async def evaluate_miner_s1(
             string lets the harness fall back to its built-in default.
         mlog: Optional per-miner logger for transcript tails. Falls back
             to module logger when omitted.
+        scenarios: Scenario set for this eval (a ``SCENARIOS_BY_SPEC``
+            entry picked from the server's spec schedule). Defaults to
+            the harness's ``SANDBOX_SCENARIOS`` (local binary's spec).
 
     Returns:
         ``MinerEvalOutcome`` describing success or skip reason. On
@@ -189,6 +193,7 @@ async def evaluate_miner_s1(
             on_episode_verifying=on_episode_verifying,
             on_episode_done=on_episode_done,
             is_epoch_still_current=is_epoch_still_current,
+            scenarios=scenarios,
         )
     except Exception as e:
         log.error("S1 evaluation failed: %s", e, exc_info=True)

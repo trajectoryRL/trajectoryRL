@@ -41,43 +41,105 @@ import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import docker
 from docker.models.containers import Container
 from docker.types import LogConfig
 
-from ..utils.config import ValidatorConfig
+from ..utils.config import SPEC_NUMBER, ValidatorConfig
 
 logger = logging.getLogger(__name__)
 
 
-# Scenarios run per session, in order. Every validator runs the full set
-# so scores are comparable across validators / windows / SPEC_NUMBER
-# bumps. Adding or removing a scenario must come with a SPEC_NUMBER bump
-# so cached scores invalidate. Sorted alphabetically for stability.
-SANDBOX_SCENARIOS: tuple[str, ...] = (
-    "3d-model-format-legacy",
-    "audio-synth-stft-peaks",
-    "configure-git-webserver",
-    "custom-memory-heap-crash",
-    "db-wal-recovery",
-    "deterministic-tarball",
-    "git-leak-recovery",
-    "git-multibranch",
-    "largest-eigenval",
-    "nginx-request-logging",
-    "path-tracing",
-    "pcap-to-netflow",
-    "puzzle-solver",
-    "query-optimize",
-    "race-condition-fix",
-    "regex-chess",
-    "schemelike-metacircular-eval",
-    "swe-bench-astropy-2",
-    "tree-directory-parser",
-    "write-compressor",
-)
+# Scenario sets keyed by scoring spec (SPEC_NUMBER). The set to run for
+# a given epoch is chosen from the server-reported ``epoch.spec_number``
+# (web's ``spec_schedule``) via ``resolve_eval_spec`` — validators can
+# deploy a new release ahead of a scheduled cutover and auto-switch
+# scenario sets at the cutover epoch, with no coordinated redeploy.
+# Every validator runs the full set for a spec so scores are comparable
+# across validators / windows. Keep the previous spec's set during the
+# transition window; retire entries once their cutover is long past.
+# Adding or removing a scenario must come with a SPEC_NUMBER bump so
+# cached scores invalidate. Each set sorted alphabetically for
+# stability.
+SCENARIOS_BY_SPEC: Dict[int, tuple[str, ...]] = {
+    # SPEC 20 (activated 2026-07-08, challenge_epochs.id 2815).
+    20: (
+        "3d-model-format-legacy",
+        "configure-git-webserver",
+        "custom-memory-heap-crash",
+        "db-wal-recovery",
+        "deterministic-tarball",
+        "git-leak-recovery",
+        "git-multibranch",
+        "largest-eigenval",
+        "nginx-request-logging",
+        "path-tracing",
+        "pcap-to-netflow",
+        "race-condition-fix",
+        "regex-chess",
+        "schemelike-metacircular-eval",
+        "swe-bench-astropy-2",
+        "tree-directory-parser",
+        "write-compressor",
+    ),
+    # SPEC 21: +audio-synth-stft-peaks +puzzle-solver +query-optimize.
+    21: (
+        "3d-model-format-legacy",
+        "audio-synth-stft-peaks",
+        "configure-git-webserver",
+        "custom-memory-heap-crash",
+        "db-wal-recovery",
+        "deterministic-tarball",
+        "git-leak-recovery",
+        "git-multibranch",
+        "largest-eigenval",
+        "nginx-request-logging",
+        "path-tracing",
+        "pcap-to-netflow",
+        "puzzle-solver",
+        "query-optimize",
+        "race-condition-fix",
+        "regex-chess",
+        "schemelike-metacircular-eval",
+        "swe-bench-astropy-2",
+        "tree-directory-parser",
+        "write-compressor",
+    ),
+}
+
+# Default scenario set: the local binary's spec. A SPEC_NUMBER bump
+# without a matching registry entry fails loudly at import time.
+SANDBOX_SCENARIOS: tuple[str, ...] = SCENARIOS_BY_SPEC[SPEC_NUMBER]
+
+
+def resolve_eval_spec(api_spec: Any) -> tuple[int, tuple[str, ...]]:
+    """Resolve (spec, scenario set) for an eval from the server-reported
+    ``epoch.spec_number``.
+
+    Exact registry match wins; anything else (missing field, garbage,
+    or a spec this binary doesn't ship — older-than-registry or
+    newer-than-binary) falls back to the local ``SPEC_NUMBER`` so the
+    validator keeps evaluating instead of going silent. A fallback
+    under a too-new required spec means this binary is outdated: its
+    scores will be dropped by the web consensus floor until upgraded,
+    which is the correct pressure.
+    """
+    try:
+        spec = int(api_spec)
+    except (TypeError, ValueError):
+        spec = None
+    if spec is not None and spec in SCENARIOS_BY_SPEC:
+        return spec, SCENARIOS_BY_SPEC[spec]
+    if spec is not None:
+        logger.warning(
+            "Server requires SPEC %d but this binary only ships %s; "
+            "falling back to local SPEC %d (upgrade the validator if "
+            "the required spec is newer)",
+            spec, sorted(SCENARIOS_BY_SPEC), SPEC_NUMBER,
+        )
+    return SPEC_NUMBER, SCENARIOS_BY_SPEC[SPEC_NUMBER]
 
 # Headline-score offset for scenarios that have been retired from the
 # rotation. When we drop saturated scenarios (mean score ≥ ~0.8 in the
@@ -1068,10 +1130,15 @@ class TrajectorySandboxHarness:
             logger.warning("Failed to query sandbox version: %s", e)
 
         # Pull the per-scenario environment images for every scenario
-        # this validator runs. ``scenario_image_hashes`` keys each one
-        # for audit / submit-payload metadata.
+        # this validator may run — the union across SCENARIOS_BY_SPEC,
+        # so a schedule-driven fallback to the previous spec finds its
+        # images warm. ``scenario_image_hashes`` keys each one for
+        # audit / submit-payload metadata.
+        all_spec_scenarios = sorted(
+            {name for names in SCENARIOS_BY_SPEC.values() for name in names}
+        )
         self.scenario_image_hashes = {}
-        for scenario_name in SANDBOX_SCENARIOS:
+        for scenario_name in all_spec_scenarios:
             try:
                 self._scenario_info = None  # force re-fetch per scenario
                 self._load_scenario_info(scenario_name)
@@ -1172,8 +1239,14 @@ class TrajectorySandboxHarness:
         on_episode_verifying: Optional[Callable[[str, int, int], None]] = None,
         on_episode_done: Optional[Callable[[_EpisodeResult, int, int], None]] = None,
         is_epoch_still_current: Optional[Callable[[str], bool]] = None,
+        scenarios: Optional[Sequence[str]] = None,
     ) -> SandboxEvaluationResult:
         """Run the multi-scenario session.
+
+        ``scenarios`` selects the scenario set for this eval (a
+        ``SCENARIOS_BY_SPEC`` entry picked per epoch from the server's
+        spec schedule). Defaults to ``SANDBOX_SCENARIOS`` — the local
+        binary's spec.
 
         Callbacks (all optional, all invoked from the executor thread,
         all best-effort — exceptions are caught and logged):
@@ -1203,10 +1276,11 @@ class TrajectorySandboxHarness:
             f"{self.config.wallet_hotkey}:{self.config.netuid}".encode()
         ).hexdigest()[:16]
 
+        eval_scenarios = tuple(scenarios) if scenarios else tuple(SANDBOX_SCENARIOS)
         logger.info(
             "eval starting: pack_hash=%s, seed=%d, scenarios=%s",
             pack_hash[:12] if pack_hash else "?",
-            epoch_seed, list(SANDBOX_SCENARIOS),
+            epoch_seed, list(eval_scenarios),
         )
 
         loop = asyncio.get_event_loop()
@@ -1218,6 +1292,7 @@ class TrajectorySandboxHarness:
                     on_episode_verifying=on_episode_verifying,
                     on_episode_done=on_episode_done,
                     is_epoch_still_current=is_epoch_still_current,
+                    scenarios=eval_scenarios,
                 ),
             )
         except Exception as e:
@@ -1240,6 +1315,7 @@ class TrajectorySandboxHarness:
         on_episode_verifying: Optional[Callable[[str, int, int], None]] = None,
         on_episode_done: Optional[Callable[[_EpisodeResult, int, int], None]] = None,
         is_epoch_still_current: Optional[Callable[[str], bool]] = None,
+        scenarios: Optional[Sequence[str]] = None,
     ) -> _SessionResult:
         """One container per scenario, one episode each.
 
@@ -1277,8 +1353,9 @@ class TrajectorySandboxHarness:
         # Pre-load metadata for every scenario so we fail early on a
         # missing one. Each ``_load_scenario_info`` call also primes the
         # per-scenario image ref + tests payload.
+        eval_scenarios = tuple(scenarios) if scenarios else tuple(SANDBOX_SCENARIOS)
         scenario_specs: list[dict] = []
-        for name in SANDBOX_SCENARIOS:
+        for name in eval_scenarios:
             self._scenario_info = None  # bust cache; loop reads each
             info = self._load_scenario_info(name)
             scenario_image = self._scenario_image_ref()
