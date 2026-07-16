@@ -33,6 +33,7 @@ from trajectoryrl.utils.commitments import MinerCommitment
 
 
 SPEC21_ADDITIONS = {"audio-synth-stft-peaks", "puzzle-solver", "query-optimize"}
+SPEC22_ADDITIONS = {"crack-7z-hash", "parallel-particle-simulator", "regex-engine-from-scratch"}
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +59,15 @@ class TestScenarioRegistry:
     def test_scenario_sets_sorted_and_unique(self):
         for spec, scenarios in sh.SCENARIOS_BY_SPEC.items():
             assert list(scenarios) == sorted(set(scenarios)), spec
+
+
+class TestSpec22Set:
+    def test_spec22_is_spec21_plus_additions(self):
+        spec21 = set(sh.SCENARIOS_BY_SPEC[21])
+        spec22 = set(sh.SCENARIOS_BY_SPEC[22])
+        assert spec22 - spec21 == SPEC22_ADDITIONS
+        assert spec21 < spec22
+        assert len(spec21) == 20 and len(spec22) == 23
 
 
 # ---------------------------------------------------------------------------
