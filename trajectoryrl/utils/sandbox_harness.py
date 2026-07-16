@@ -107,6 +107,34 @@ SCENARIOS_BY_SPEC: Dict[int, tuple[str, ...]] = {
         "tree-directory-parser",
         "write-compressor",
     ),
+    # SPEC 22: +crack-7z-hash +parallel-particle-simulator
+    # +regex-engine-from-scratch. Requires trajrl-bench >= 4.0.20
+    # (v4.0.19 predates the particle-sim + regex-engine images).
+    22: (
+        "3d-model-format-legacy",
+        "audio-synth-stft-peaks",
+        "configure-git-webserver",
+        "crack-7z-hash",
+        "custom-memory-heap-crash",
+        "db-wal-recovery",
+        "deterministic-tarball",
+        "git-leak-recovery",
+        "git-multibranch",
+        "largest-eigenval",
+        "nginx-request-logging",
+        "parallel-particle-simulator",
+        "path-tracing",
+        "pcap-to-netflow",
+        "puzzle-solver",
+        "query-optimize",
+        "race-condition-fix",
+        "regex-chess",
+        "regex-engine-from-scratch",
+        "schemelike-metacircular-eval",
+        "swe-bench-astropy-2",
+        "tree-directory-parser",
+        "write-compressor",
+    ),
 }
 
 # Default scenario set: the local binary's spec. A SPEC_NUMBER bump
