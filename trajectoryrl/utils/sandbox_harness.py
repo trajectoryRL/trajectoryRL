@@ -135,6 +135,37 @@ SCENARIOS_BY_SPEC: Dict[int, tuple[str, ...]] = {
         "tree-directory-parser",
         "write-compressor",
     ),
+    # SPEC 23: +attention-mil +llm-inference-batching-scheduler
+    # +torch-tensor-parallelism. Requires trajrl-bench >= 4.0.21 (ships the
+    # three new scenario images and the shared sandbox-agent-torch base).
+    23: (
+        "3d-model-format-legacy",
+        "attention-mil",
+        "audio-synth-stft-peaks",
+        "configure-git-webserver",
+        "crack-7z-hash",
+        "custom-memory-heap-crash",
+        "db-wal-recovery",
+        "deterministic-tarball",
+        "git-leak-recovery",
+        "git-multibranch",
+        "largest-eigenval",
+        "llm-inference-batching-scheduler",
+        "nginx-request-logging",
+        "parallel-particle-simulator",
+        "path-tracing",
+        "pcap-to-netflow",
+        "puzzle-solver",
+        "query-optimize",
+        "race-condition-fix",
+        "regex-chess",
+        "regex-engine-from-scratch",
+        "schemelike-metacircular-eval",
+        "swe-bench-astropy-2",
+        "torch-tensor-parallelism",
+        "tree-directory-parser",
+        "write-compressor",
+    ),
 }
 
 # Default scenario set: the local binary's spec. A SPEC_NUMBER bump
