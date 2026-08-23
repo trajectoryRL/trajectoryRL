@@ -242,7 +242,7 @@ Season 1 implements [INCENTIVE_MECHANISM.md](../INCENTIVE_MECHANISM.md) with the
 | **Pack format** | SKILL.md only (one pack per contest) |
 | **NCD target** | SKILL.md content (threshold 0.80) |
 | **Default testee harness** | [Hermes Agent](https://github.com/NousResearch/hermes-agent) 0.13.x — built-in `terminal` / `file` / `execute_code` tools |
-| **Default testee LLM** | OpenRouter `qwen/qwen3.5-35b-a3b` (per-validator configurable via `LLM_*` env) |
+| **Default testee LLM** | OpenRouter `qwen/qwen3.8-27b` (per-validator configurable via `LLM_*` env) |
 | **Winner protection δ** | 10% |
 | **Inactivity** | 14400 blocks |
 
@@ -280,7 +280,7 @@ Same SKILL.md → different per-scenario qualities across validators because the
 
 ### 3. Evaluation cost and time
 
-Per miner per session: ~30-45 min wall-clock, dominated by LLM latency (Qwen3.5-A3B at ~10-30s per turn × ~30 turns × 12 scenarios). Validators bear all inference cost (testee only — no judge). At 200 miners × stable epoch length, full eval cycles take several hours; some validators stagger or skip epochs when behind.
+Per miner per session: ~30-45 min wall-clock, dominated by LLM latency (Qwen3.8-27B at ~10-30s per turn × ~30 turns × 12 scenarios). Validators bear all inference cost (testee only — no judge). At 200 miners × stable epoch length, full eval cycles take several hours; some validators stagger or skip epochs when behind.
 
 ### 4. The "already good" problem
 
@@ -288,7 +288,7 @@ A SKILL.md that produces high quality from the first attempt has no within-sessi
 
 ### 5. Miner meta-game evolution
 
-Differentiation comes from SKILL.md instruction quality, not model choice. Top miners discover this within weeks. Patterns observed: lean generalist (UID 25, 224 in 2026-04-17 first eval) beat scripted playbooks; tight-directive SKILL.md lifts Qwen3.5-A3B from a satisficing-0 floor to near-ceiling on scenarios it has the capability for. See TrajOS `project_qwen35_skill_design_findings.md` and `feedback_qwen35_satisficing_floor.md`.
+Differentiation comes from SKILL.md instruction quality, not model choice. Top miners discover this within weeks. Patterns observed: lean generalist (UID 25, 224 in 2026-04-17 first eval) beat scripted playbooks; tight-directive SKILL.md lifts Qwen3.8-27B from a satisficing-0 floor to near-ceiling on scenarios it has the capability for. See TrajOS `project_qwen35_skill_design_findings.md` and `feedback_qwen35_satisficing_floor.md`.
 
 ---
 

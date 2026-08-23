@@ -147,7 +147,7 @@ The validator and miner share the same harness — `scripts/eval_pack.py` runs y
 ```bash
 git clone https://github.com/trajectoryRL/trajectoryRL && cd trajectoryRL
 cp .env.validator.example .env.validator
-# Edit .env.validator: set LLM_API_KEY (default: qwen3.6-35b-a3b via api.engy.ai)
+# Edit .env.validator: set LLM_API_KEY (default: qwen3.8-27b via api.engy.ai)
 
 python scripts/eval_pack.py --skill-md path/to/SKILL.md
 # or, if you've already built a pack.json:

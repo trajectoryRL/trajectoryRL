@@ -8,12 +8,12 @@ from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Default eval LLM: Qwen3.6-35B-A3B via engy (https://engy.ai) — the
+# Default eval LLM: Qwen3.8-27B via engy (https://engy.ai) — the
 # subnet's own OpenAI-compatible inference API, served on its GPU fleet
 # with tool-calling enabled. See .env.validator.example. Override
 # per-validator with LLM_BASE_URL / LLM_MODEL.
 DEFAULT_LLM_BASE_URL = "https://api.engy.ai/v1"
-DEFAULT_LLM_MODEL = "qwen3.6-35b-a3b"
+DEFAULT_LLM_MODEL = "qwen3.8-27b"
 
 # Image channel drives the tag of the sandbox-agent image pulled by the
 # validator at runtime. Compose files set this per-channel (latest,

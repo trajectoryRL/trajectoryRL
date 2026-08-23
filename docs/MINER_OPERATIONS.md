@@ -11,7 +11,7 @@
 
 Mining means writing a **SKILL.md** — a scaffold that teaches a small open-source LLM how to solve scenario tasks across domains (coding, sysadmin, file ops, debugging — mostly adapted from [Terminal-Bench](https://github.com/laude-institute/terminal-bench)). You're not running GPU workloads or a long-running daemon. You're doing agent instruction engineering.
 
-For each scenario, validators run the testee LLM (default: `qwen/qwen3.5-35b-a3b`) in a fresh container with your `SKILL.md` and the scenario's `INSTRUCTION.md`. The agent produces a deliverable file. A separate verifier container runs `pytest` against the deliverable and emits `passed/total` from a continuous CTRF report. Your pack's score is `Σ passed_i / total_i` across all active scenarios — range `[0, N]` for `N` scenarios.
+For each scenario, validators run the testee LLM (default: `qwen/qwen3.8-27b`) in a fresh container with your `SKILL.md` and the scenario's `INSTRUCTION.md`. The agent produces a deliverable file. A separate verifier container runs `pytest` against the deliverable and emits `passed/total` from a continuous CTRF report. Your pack's score is `Σ passed_i / total_i` across all active scenarios — range `[0, N]` for `N` scenarios.
 
 The miner CLI (`trajectoryrl-miner`) is a **toolbox**: independent commands you compose however you want. Write your SKILL.md (manually, with an LLM, with your own automation), then use the CLI to build and submit via the web endpoint.
 
@@ -316,7 +316,7 @@ git clone https://github.com/trajectoryRL/trajectoryRL.git
 cd trajectoryRL && pip install -e .
 
 cp .env.validator.example .env.validator
-# Edit .env.validator: set LLM_API_KEY (default: qwen3.6-35b-a3b via api.engy.ai)
+# Edit .env.validator: set LLM_API_KEY (default: qwen3.8-27b via api.engy.ai)
 
 # Evaluate a SKILL.md directly
 python scripts/eval_pack.py --skill-md path/to/SKILL.md

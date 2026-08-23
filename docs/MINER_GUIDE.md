@@ -54,11 +54,11 @@ Season 1 requires `SKILL.md` only.
 
 Your `SKILL.md` is a static instruction document the agent reads before working on every scenario. The validator drops it at `/workspace/SKILL.md` (read-only). The agent has no other persistent memory — there is no `/workspace/learned/`, no cross-scenario state, no carryover between sessions.
 
-The competition rewards SKILL.md content that lifts the **Qwen3.5-35B-A3B testee** (default LLM) above its vanilla satisficing floor across a diverse scenario set. Vanilla Qwen3.5 tends to read the task, run one or two inspection commands, then stop without producing a deliverable. A well-written SKILL.md fixes that.
+The competition rewards SKILL.md content that lifts the **Qwen3.8-27B testee** (default LLM) above its vanilla satisficing floor across a diverse scenario set. Vanilla Qwen3.8 tends to read the task, run one or two inspection commands, then stop without producing a deliverable. A well-written SKILL.md fixes that.
 
 ### What a winning SKILL.md looks like
 
-**1. Directive operating procedure.** Tell the agent what to produce, in what order, and where to write it. Qwen3.5-A3B does not improvise the "write the answer to the deliverable file" step reliably — the SKILL.md must spell it out.
+**1. Directive operating procedure.** Tell the agent what to produce, in what order, and where to write it. Qwen3.8-27B does not improvise the "write the answer to the deliverable file" step reliably — the SKILL.md must spell it out.
 
 ```markdown
 ## Procedure
@@ -90,7 +90,7 @@ The competition rewards SKILL.md content that lifts the **Qwen3.5-35B-A3B testee
   what failed and where in a comment at the top of the deliverable.
 ```
 
-**4. Tight and focused.** Long prescriptive packs cause Qwen3.5 to satisfice on instruction-following and stop before producing real work. Empirically: tight ~3–5 KB packs with verified payloads outperform long playbooks. The 32 KB schema cap is a ceiling, not a target.
+**4. Tight and focused.** Long prescriptive packs cause Qwen3.8 to satisfice on instruction-following and stop before producing real work. Empirically: tight ~3–5 KB packs with verified payloads outperform long playbooks. The 32 KB schema cap is a ceiling, not a target.
 
 ### What NOT to include
 
@@ -261,7 +261,7 @@ git clone https://github.com/trajectoryRL/trajectoryRL.git
 cd trajectoryRL && pip install -e .
 
 cp .env.validator.example .env.validator
-# Edit: set LLM_API_KEY (default: qwen3.6-35b-a3b via api.engy.ai)
+# Edit: set LLM_API_KEY (default: qwen3.8-27b via api.engy.ai)
 
 python scripts/eval_pack.py --skill-md path/to/SKILL.md
 # or: python scripts/eval_pack.py --pack pack.json --json results.json -o ./eval_output
@@ -275,9 +275,9 @@ Prereqs: Docker daemon, an LLM API key (e.g. OpenRouter), ~10 GB free disk for i
 
 ## Tips
 
-1. **Spell out the deliverable.** Qwen3.5-A3B does not reliably figure out "write to /app/foo.sh" without being told. The most common 0-score failure is "agent produced text in chat but never wrote the file."
+1. **Spell out the deliverable.** Qwen3.8-27B does not reliably figure out "write to /app/foo.sh" without being told. The most common 0-score failure is "agent produced text in chat but never wrote the file."
 2. **Verify before declaring done.** Run the deliverable. Check it satisfies the task. Many partial credits come from "the script exists but errors on first invocation."
-3. **Keep it tight.** Empirically, ~3–5 KB focused packs beat long playbooks. Qwen3.5 stops earlier when given more prescriptive text.
+3. **Keep it tight.** Empirically, ~3–5 KB focused packs beat long playbooks. Qwen3.8 stops earlier when given more prescriptive text.
 4. **Diversify across domains.** The active scenario set covers async Python, git, sysadmin, database recovery, HTML/JS, log analysis, C/graphics, binary RE. A SKILL.md that helps in two domains beats one that's deep in one.
 5. **Don't game the scenario list.** Scenarios rotate. Each `SPEC_NUMBER` bump can add/remove scenarios. SKILL.md targeted at exactly today's set will drop when the set changes.
 6. **Don't reverse-engineer the verifier.** It's hidden, and scoring is pure `passed/total` from pytest. The way to score higher is to write better tactics for the agent, not to guess what `test_outputs.py` asserts.
@@ -290,7 +290,7 @@ Prereqs: Docker daemon, an LLM API key (e.g. OpenRouter), ~10 GB free disk for i
 A: Hermes (NousResearch) 0.13.x is the default testee. It runs inside the scenario container with built-in `terminal`, `file`, and `execute_code` tools. The validator controls the testee image; miners do not configure it.
 
 **Q: What LLM does the testee use?**
-A: Configurable per validator. Default: `qwen3.6-35b-a3b` via engy (`api.engy.ai`), the subnet's own inference API. Validators may run other models; the harness/LLM identity is published per-eval on the dashboard.
+A: Configurable per validator. Default: `qwen3.8-27b` via engy (`api.engy.ai`), the subnet's own inference API. Validators may run other models; the harness/LLM identity is published per-eval on the dashboard.
 
 **Q: Is there a judge LLM?**
 A: No. Scoring is fully programmatic from `tests/test.sh` → `ctrf.json`. The earlier agent-judge architecture was removed 2026-05-11.
