@@ -30,9 +30,7 @@ WALLET_NAME=validator
 WALLET_HOTKEY=default
 NETUID=11
 NETWORK=finney
-LLM_API_KEY=...
-LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
-LLM_MODEL=zhipu/glm-5.1
+LLM_API_KEY=...                   # your engy key; models/endpoints code-locked
 
 # Optional
 LOG_LEVEL=INFO                    # DEBUG for development

@@ -97,8 +97,8 @@ btcli stake add --wallet-name my-validator --hotkey default --netuid 11 --amount
 
 # 2. Configure
 cp .env.validator.example .env.validator
-# Edit: set WALLET_NAME, LLM_API_KEY, LLM_BASE_URL, LLM_MODEL (the model
-# the testee agent uses to solve scenarios).
+# Edit: set WALLET_NAME and LLM_API_KEY (your engy key). The testee/judge
+# models and endpoints are fixed in the validator code — not set here.
 
 # 3. Start
 docker compose -f docker/docker-compose.validator.yml --env-file .env.validator up -d

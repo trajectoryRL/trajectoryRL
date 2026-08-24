@@ -8,12 +8,41 @@ from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Default eval LLM: Qwen3.8-27B via engy (https://engy.ai) — the
-# subnet's own OpenAI-compatible inference API, served on its GPU fleet
-# with tool-calling enabled. See .env.validator.example. Override
-# per-validator with LLM_BASE_URL / LLM_MODEL.
+# Eval LLM: Qwen3.8-27B via engy (https://engy.ai) — the subnet's own
+# OpenAI-compatible inference API, served on its GPU fleet with tool-calling
+# enabled. The testee model and endpoint are CODE-LOCKED: every validator must
+# score miners against the identical model/endpoint or scores are not
+# comparable, so these are not operator-overridable (see from_env). Changing
+# the fleet's testee model = editing these constants and cutting a release; the
+# new image rolls out fleet-wide via watchtower. Operators supply only their
+# secret LLM_API_KEY / JUDGE_API_KEY.
 DEFAULT_LLM_BASE_URL = "https://api.engy.ai/v1"
 DEFAULT_LLM_MODEL = "qwen3.8-27b"
+
+# Judge LLM — also code-locked, and deliberately a DIFFERENT model family from
+# the testee (GLM vs Qwen) so judge bias stays uncorrelated with testee bias;
+# that decorrelation is what lets scoring separate real packs from no-skill
+# baselines. Served by the same engy endpoint, so one operator key covers both
+# (JUDGE_API_KEY may stay empty to reuse LLM_API_KEY). Not operator-overridable.
+DEFAULT_JUDGE_MODEL = "glm-5.2"
+DEFAULT_JUDGE_BASE_URL = "https://api.engy.ai/v1"
+
+# LLM env vars that are intentionally ignored (the model/endpoint are locked
+# above). Set-but-ignored values are surfaced as a warning so operators aren't
+# confused about why their override had no effect.
+_LOCKED_LLM_ENV_VARS = ("LLM_MODEL", "LLM_BASE_URL", "JUDGE_MODEL", "JUDGE_BASE_URL")
+
+
+def _warn_ignored_llm_env() -> None:
+    """Warn when an operator sets a locked LLM env var; it has no effect."""
+    overridden = [v for v in _LOCKED_LLM_ENV_VARS if os.getenv(v)]
+    if overridden:
+        logger.warning(
+            "Ignored operator env %s: the testee model and inference endpoint "
+            "are fixed by the validator for scoring consistency across the "
+            "fleet (only LLM_API_KEY / JUDGE_API_KEY are operator-supplied).",
+            ", ".join(overridden),
+        )
 
 # Image channel drives the tag of the sandbox-agent image pulled by the
 # validator at runtime. Compose files set this per-channel (latest,
@@ -266,6 +295,8 @@ class ValidatorConfig:
             dotenv_path = Path(__file__).parent.parent.parent / ".env.validator"
         load_dotenv(dotenv_path)
 
+        _warn_ignored_llm_env()
+
         return cls(
             # --- Bittensor ---
             wallet_name=os.getenv("WALLET_NAME", "validator"),
@@ -280,13 +311,21 @@ class ValidatorConfig:
             pack_cache_dir=Path(os.getenv("PACK_CACHE_DIR", "/var/lib/trajectoryrl/packs")),
             log_dir=Path(os.getenv("LOG_DIR", "./logs")),
             # --- LLM ---
-            llm_model=os.getenv("LLM_MODEL", DEFAULT_LLM_MODEL),
+            # Model + endpoint are code-locked (NOT operator-overridable) so the
+            # whole validator fleet scores miners against an identical testee —
+            # LLM_MODEL / LLM_BASE_URL in the operator env are ignored (see
+            # _warn_ignored_llm_env). Only the API key stays env-driven: it is a
+            # secret and must never be committed to this public repo.
+            llm_model=DEFAULT_LLM_MODEL,
             llm_api_key=os.getenv("LLM_API_KEY", ""),
-            llm_base_url=os.getenv("LLM_BASE_URL", DEFAULT_LLM_BASE_URL),
-            # --- LLM Judge (optional, falls back to primary LLM if empty) ---
-            judge_model=os.getenv("JUDGE_MODEL", ""),
+            llm_base_url=DEFAULT_LLM_BASE_URL,
+            # --- LLM Judge: model + base URL are code-locked to a fixed model
+            # distinct from the testee (see DEFAULT_JUDGE_MODEL); JUDGE_MODEL /
+            # JUDGE_BASE_URL are ignored. Only JUDGE_API_KEY stays env-driven
+            # (empty ⇒ reuse LLM_API_KEY, since the judge shares engy).
+            judge_model=DEFAULT_JUDGE_MODEL,
             judge_api_key=os.getenv("JUDGE_API_KEY", ""),
-            judge_base_url=os.getenv("JUDGE_BASE_URL", ""),
+            judge_base_url=DEFAULT_JUDGE_BASE_URL,
             # --- Operational ---
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             # --- Consensus CAS ---
