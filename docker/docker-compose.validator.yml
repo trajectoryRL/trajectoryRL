@@ -13,9 +13,7 @@
 #   WALLET_HOTKEY=default
 #   NETUID=11
 #   NETWORK=finney
-#   LLM_API_KEY=...
-#   LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
-#   LLM_MODEL=glm-5.1
+#   LLM_API_KEY=...        # your engy key (models/endpoints are code-locked)
 
 services:
   validator:
