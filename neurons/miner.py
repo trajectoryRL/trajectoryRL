@@ -29,14 +29,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 logger = logging.getLogger(__name__)
 
-# Miner submissions are currently closed, so the on-chain submission fee
-# (recycle_alpha, which irreversibly burns alpha) is hard-disabled here —
-# regardless of SUBMISSION_FEE_ALPHA. This prevents a leftover env var from
-# burning alpha for a submit that won't be admitted anyway. To re-enable the
-# fee when submissions reopen, set this back to False (the env-gated behavior
-# in cmd_web_submit takes over again).
-SUBMISSION_FEE_DISABLED = True
-
 
 def _fetch_pack(url: str) -> dict:
     import urllib.request
@@ -196,19 +188,10 @@ def cmd_web_submit(args):
 
     # Submission fee: when SUBMISSION_FEE_ALPHA > 0, recycle that much alpha
     # on-chain first and reference the resulting (block, index) in the submit.
-    # The fee is hard-disabled while miner submissions are closed (see
-    # SUBMISSION_FEE_DISABLED above) — the env var is ignored so no alpha is
-    # burned.
+    # 0 (default) keeps the pre-fee behavior.
     recycle_block = None
     recycle_index = None
-    if SUBMISSION_FEE_DISABLED:
-        if config.submission_fee_alpha > 0:
-            print(
-                "Submission fee is disabled in code (miner submissions closed) — "
-                f"NOT recycling {config.submission_fee_alpha} alpha "
-                "(SUBMISSION_FEE_ALPHA ignored)."
-            )
-    elif config.submission_fee_alpha > 0:
+    if config.submission_fee_alpha > 0:
         print(
             f"Submission fee: recycling {config.submission_fee_alpha} alpha "
             "on-chain (recycle_alpha, coldkey-signed)..."
