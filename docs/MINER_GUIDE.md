@@ -94,7 +94,7 @@ competition; a lookup table keyed on the identity of the known scenarios is not.
 - **Isolation**: the sidecar has no filesystem access to the task and no internet; the agent container has no
   internet either (from v0.7.1). Off-allowlist models are impossible by construction.
 - **Cap**: the $1 per-scenario cap ends an episode's model calls; whatever the agent had written is verified.
-- **Copying**: uniqueness and copycat checks; a copied policy with a fresh `SKILL.md` is still a copy.
+- **Copying**: duplicate packs fail the uniqueness check and the copycat audit of `SKILL.md`; extending that audit to policy files is next.
 - **Rotation**: the scenario set changes at spec bumps, as it did through Season 1.
 
 ## Sandbox Environment
