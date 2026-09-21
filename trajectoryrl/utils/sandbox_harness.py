@@ -925,6 +925,13 @@ def _strip_provider_prefix(model: str) -> str:
     return model
 
 
+# Prefix on ``_EpisodeResult.error`` for failures that are the VALIDATOR's, not
+# the miner's — the episode never got as far as running hermes, so ``chat_exit``
+# is None and the hermes-side test in ``_looks_like_provider_failure`` cannot
+# see it. Marked so the session is discarded instead of POSTed as a miner score.
+INFRA_ERROR_PREFIX = "validator-infra: "
+
+
 def _looks_like_provider_failure(episodes: List["_EpisodeResult"]) -> bool:
     """True when every episode in the session ended with hermes itself
     failing — non-zero exit code or deadline kill — and no episode ever
@@ -959,6 +966,12 @@ def _looks_like_provider_failure(episodes: List["_EpisodeResult"]) -> bool:
     """
     if not episodes:
         return False
+    # Ours, not the miner's: every episode failed before hermes could run
+    # (e.g. the policy sidecar had no route to the meter). ``chat_exit`` is
+    # None for those, so the hermes-side test below would read them as
+    # "unknown" and let an infra-poisoned zero be POSTed.
+    if all((ep.error or "").startswith(INFRA_ERROR_PREFIX) for ep in episodes):
+        return True
     # Anti-false-positive: any positively billed episode proves the
     # provider answered usefully at least once this session.
     # ``cost_usd == 0.0`` (vs ``None``) can be written by hermes for
@@ -2328,6 +2341,7 @@ class TrajectorySandboxHarness:
             # broken validator, not a low-scoring miner, so fail loudly instead
             # of producing a plausible-looking config (SN11 uid 74, 2026-09-21).
             raise RuntimeError(
+                INFRA_ERROR_PREFIX +
                 "cannot resolve this validator's own container, so the policy "
                 "sidecar has no route to the meter. Recreate the validator "
                 "container so its hostname matches its id "

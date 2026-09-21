@@ -91,3 +91,31 @@ def test_in_docker_without_own_container_is_fatal(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="no route to the meter"):
         h._start_policy_sidecar("sess", "scen", object(), "tok", {}, net)
+
+
+def test_all_infra_errors_count_as_provider_failure():
+    """A session where every episode failed for OUR reason must be discarded.
+
+    Those episodes never ran hermes, so chat_exit is None and the hermes-side
+    test reads "unknown". Without this branch the session would be POSTed as a
+    zero score and blame the miner for a broken validator.
+    """
+    from trajectoryrl.utils.sandbox_harness import (
+        _looks_like_provider_failure, INFRA_ERROR_PREFIX,
+    )
+
+    def ep(error=None, chat_exit=None, cost=None, timed_out=False):
+        return types.SimpleNamespace(
+            error=error, chat_exit=chat_exit, cost_usd=cost, timed_out=timed_out,
+        )
+
+    infra = [ep(error=INFRA_ERROR_PREFIX + "no route to the meter") for _ in range(26)]
+    assert _looks_like_provider_failure(infra) is True
+
+    # A miner-side sidecar crash is NOT ours: it must still score the episode.
+    miner = [ep(error="policy did not answer /v1/models") for _ in range(26)]
+    assert _looks_like_provider_failure(miner) is False
+
+    # One billed episode proves the provider answered: never an infra discard.
+    mixed = infra[:-1] + [ep(cost=0.42, chat_exit=0)]
+    assert _looks_like_provider_failure(mixed) is False
