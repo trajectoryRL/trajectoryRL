@@ -302,6 +302,37 @@ When `SPEC_NUMBER` (formerly `scoring_version`) bumps, the active scoring contra
 
 **Persistence**: `pack_first_seen` is part of the platform database alongside `miner_submissions`; it survives `spec_number` bumps. There is no per-validator JSON file or `PACK_FIRST_SEEN_PATH` environment variable in v6.0 — ownership is single-source-of-truth on the server.
 
+### 3b. Queue-Admission Dedup (NCD, content-keyed)
+
+**Problem**: `pack_first_seen` is keyed on `pack_hash`, so it only catches
+*byte-identical* copies. A submitter who changes a comment, a heading or a few
+words produces a new hash and a new queue slot for the same document. Counting
+identities does not help either — a coldkey costs a registration, so the same
+document can arrive from as many coldkeys as the submitter cares to register.
+
+**Enforcement**: at queue admission, compare the incoming pack against the packs
+already in `pending_eval` using the NCD measure in
+[`trajectoryrl/utils/ncd.py`](../trajectoryrl/utils/ncd.py)
+(`queue_duplicates`, threshold `SIMILARITY_THRESHOLD = 0.80`). The earliest
+`submitted_at` of a near-duplicate group keeps its slot; later members are
+refused **before** they reach `pending_eval`, which leaves the recycle receipt
+reusable for a genuinely different pack within its 24 h window.
+
+The rule is identity-agnostic by construction: only submission time and pack
+content decide, so one coldkey with thirty UIDs and thirty coldkeys with one UID
+each are treated the same way.
+
+**Prevents**:
+
+- One document occupying N queue slots via N lightly-edited resubmissions
+- Sybil flooding that per-hotkey or per-coldkey limits cannot see
+- Validator time and inference budget spent re-scoring the same document
+
+**Operational note**: apply from a stated epoch rather than retroactively, so
+submissions already paid for are not voided. `tools/pack_duplication_report.py`
+reports how many distinct documents the current public queue contains and how
+many slots the rule would free.
+
 ### 4. Pre-Eval Gate (Server-Side)
 
 **Enforcement**: Before any pack enters the challenger queue, the platform server runs a **single** Phase-1 LLM-as-judge integrity analysis (the same gate v4.x ran inside each validator). The judge looks for `hardcoded_response`, `instruction_override`, `tool_avoidance`, `keyword_stuffing`, `scenario_gaming`, `prompt_injection`. Any critical flag → `eval_status = 'failed'`, never enters the queue.

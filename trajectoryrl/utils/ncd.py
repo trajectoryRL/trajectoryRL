@@ -6,13 +6,19 @@ packs using zlib compression as a proxy for information-theoretic similarity.
 Deduplication is pairwise: all active miners are compared against each
 other, with on-chain block_number determining priority (lower = original).
 
+``queue_duplicates`` applies the same measure at queue admission, keyed on
+submission order rather than identity: it answers "is this pack a near-copy of
+something already waiting in the queue?". Because it compares content, it is
+unaffected by how many hotkeys or coldkeys a submitter controls — registering
+more identities does not buy more queue slots for the same document.
+
 Reference: INCENTIVE_MECHANISM.md § Pack Similarity Detection (NCD)
 """
 
 import logging
 import re
 import zlib
-from typing import Dict, Set, Tuple
+from typing import Dict, Hashable, List, Sequence, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -171,3 +177,99 @@ def deduplicate_packs(
                     excluded[member_hk] = original_hotkey
 
     return excluded
+
+
+def _fingerprint(pack: dict) -> Tuple[bytes, int]:
+    """Normalized policy bytes and their compressed length, computed once."""
+    text = normalize_policy(_extract_policy(pack)).encode("utf-8")
+    return text, len(zlib.compress(text, 9))
+
+
+def _similarity(a: Tuple[bytes, int], b: Tuple[bytes, int]) -> float:
+    """NCD similarity between two precomputed fingerprints."""
+    (text_a, ca), (text_b, cb) = a, b
+    max_c = max(ca, cb)
+    if max_c == 0:
+        return 1.0
+    cab = len(zlib.compress(text_a + text_b, 9))
+    return 1.0 - (cab - min(ca, cb)) / max_c
+
+
+def queue_duplicates(
+    entries: Sequence[Tuple[Hashable, dict, float]],
+    threshold: float = SIMILARITY_THRESHOLD,
+) -> Dict[Hashable, Hashable]:
+    """Find packs that duplicate an earlier entry in the same queue.
+
+    Identity-agnostic: only submission time and content decide. The earliest
+    entry of a near-duplicate group keeps its slot; later ones are returned as
+    duplicates so the caller can refuse them *before* they reach
+    ``pending_eval`` (which leaves the recycle receipt reusable).
+
+    Args:
+        entries: ``(key, pack, submitted_at)`` triples. ``key`` identifies the
+            submission (e.g. its id); ``submitted_at`` is any sortable
+            timestamp. Ties break on ``repr(key)`` so the result is
+            deterministic.
+        threshold: NCD similarity at or above which a pack counts as a copy.
+
+    Returns:
+        ``{duplicate_key: kept_key}`` for every entry that duplicates an
+        earlier one. Entries that keep their slot are absent.
+    """
+    ordered = sorted(entries, key=lambda e: (e[2], repr(e[0])))
+    kept: List[Tuple[Hashable, Tuple[bytes, int]]] = []
+    duplicates: Dict[Hashable, Hashable] = {}
+
+    for key, pack, _ in ordered:
+        try:
+            fp = _fingerprint(pack)
+        except (AttributeError, KeyError, TypeError):
+            continue
+        for kept_key, kept_fp in kept:
+            similarity = _similarity(fp, kept_fp)
+            if similarity >= threshold:
+                duplicates[key] = kept_key
+                logger.info(
+                    "queue dedup: %s duplicates %s (similarity=%.3f)",
+                    key, kept_key, similarity,
+                )
+                break
+        else:
+            kept.append((key, fp))
+
+    return duplicates
+
+
+def cluster_packs(
+    packs: Dict[Hashable, dict],
+    threshold: float = SIMILARITY_THRESHOLD,
+) -> List[List[Hashable]]:
+    """Group packs into near-duplicate clusters.
+
+    Reporting helper: shows how many *distinct* documents a set of packs
+    contains. Keys are visited in sorted order so clustering is deterministic.
+
+    Returns:
+        A list of clusters, each a list of keys, largest cluster first. The
+        first key of a cluster is its representative.
+    """
+    fps: Dict[Hashable, Tuple[bytes, int]] = {}
+    for key in sorted(packs, key=repr):
+        try:
+            fps[key] = _fingerprint(packs[key])
+        except (AttributeError, KeyError, TypeError):
+            continue
+
+    clusters: List[List[Hashable]] = []
+    reps: List[Tuple[Hashable, Tuple[bytes, int]]] = []
+    for key, fp in fps.items():
+        for index, (_, rep_fp) in enumerate(reps):
+            if _similarity(fp, rep_fp) >= threshold:
+                clusters[index].append(key)
+                break
+        else:
+            reps.append((key, fp))
+            clusters.append([key])
+
+    return sorted(clusters, key=len, reverse=True)

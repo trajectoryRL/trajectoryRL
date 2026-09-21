@@ -90,3 +90,22 @@ python3 tools/compare_pack_ncd.py <pack_url_a> <pack_url_b> --fail-on-similar  #
 ### Dependencies
 
 Requires the `trajectoryrl` package (project root) for `trajectoryrl.utils.ncd`.
+
+## pack_duplication_report.py — how many distinct documents are in the queue
+
+Downloads every publicly mirrored pack from the platform API and groups them into
+near-duplicate clusters using the repo's own NCD measure
+(`trajectoryrl/utils/ncd.py`). Reports how many slots a one-slot-per-document
+admission rule would free, and which clusters span more than one coldkey — the
+cases identity counting cannot see.
+
+### Usage
+
+```bash
+python3 tools/pack_duplication_report.py                        # defaults
+python3 tools/pack_duplication_report.py --threshold 0.85       # stricter grouping
+python3 tools/pack_duplication_report.py --json report.json     # full machine-readable report
+```
+
+A pack's mirror URL is published 24 h after submission, so the newest
+submissions are necessarily absent from the report.
