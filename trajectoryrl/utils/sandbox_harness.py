@@ -29,6 +29,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import re
+import pathlib
 import socket
 import hashlib
 import io
@@ -2200,20 +2202,89 @@ class TrajectorySandboxHarness:
                 self._meter = meter
             return self._meter
 
+    @staticmethod
+    def _own_container_id_from_proc() -> Optional[str]:
+        """Our container id as the kernel sees it, independent of the hostname.
+
+        Docker writes the container id into the overlay upper/work dirs in
+        ``/proc/self/mountinfo`` (cgroup v2, where ``/proc/self/cgroup`` no
+        longer carries it) and into the cgroup path on v1. Returns the first
+        64-hex token found, else None.
+        """
+        for path in ("/proc/self/mountinfo", "/proc/self/cgroup"):
+            try:
+                blob = pathlib.Path(path).read_text()
+            except Exception:  # noqa: BLE001
+                continue
+            m = re.search(r"\b([0-9a-f]{64})\b", blob)
+            if m:
+                return m.group(1)
+        return None
+
     def _own_container(self) -> Optional[Container]:
         """The validator's own container when running inside docker (the
         compose deployment), else None (host process, e.g. eval_pack.py).
-        Under compose the hostname is the container id."""
+
+        Resolution order, because ``socket.gethostname()`` is NOT reliably the
+        container id: Watchtower recreates a container by copying the previous
+        container's config forward, so ``Config.Hostname`` keeps the *old*
+        container's id and ``containers.get(hostname)`` 404s. When that
+        happens the caller falls back to the episode network's gateway address
+        and the policy sidecar can never reach the meter, so every model call
+        fails and the whole session scores zero (SN11 uid 74, 2026-09-21).
+
+        1. ``containers.get(gethostname())`` — correct for a freshly created
+           container, where docker sets the hostname to the new id.
+        2. the id read from ``/proc/self/mountinfo`` / ``/proc/self/cgroup``.
+        3. a scan for the container whose ``Config.Hostname`` matches ours,
+           which finds a Watchtower-recreated container by its stale hostname.
+        """
         if self._self_container_checked:
             return self._self_container
         self._self_container_checked = True
         if not os.path.exists("/.dockerenv"):
             return None
+
+        hostname = socket.gethostname()
+        attempts: list[tuple[str, Optional[str]]] = [
+            ("hostname", hostname),
+            ("proc", self._own_container_id_from_proc()),
+        ]
+        for how, ident in attempts:
+            if not ident:
+                continue
+            try:
+                self._self_container = self.client.containers.get(ident)
+                if how != "hostname":
+                    logger.warning(
+                        "own container resolved by %s (%s), not by hostname %s — "
+                        "this container was probably recreated by Watchtower",
+                        how, ident[:12], hostname,
+                    )
+                return self._self_container
+            except Exception:  # noqa: BLE001
+                continue
+
         try:
-            self._self_container = self.client.containers.get(socket.gethostname())
+            for c in self.client.containers.list():
+                if (c.attrs.get("Config") or {}).get("Hostname") == hostname:
+                    logger.warning(
+                        "own container resolved by stale hostname scan: %s (%s) — "
+                        "this container was probably recreated by Watchtower",
+                        c.name, c.id[:12],
+                    )
+                    self._self_container = c
+                    return self._self_container
         except Exception as e:  # noqa: BLE001
-            logger.warning("running in docker but cannot resolve own container: %s", e)
-            self._self_container = None
+            logger.warning("own-container scan failed: %s", e)
+
+        logger.error(
+            "running in docker but cannot resolve own container (hostname=%s). "
+            "The policy sidecar will be pointed at the episode network gateway "
+            "instead of the meter and every model call will fail.",
+            hostname,
+        )
+        self._self_container = None
         return self._self_container
 
     def _create_episode_network(self, session_id: str, scenario: str):
