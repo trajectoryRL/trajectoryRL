@@ -68,3 +68,26 @@ def test_result_is_cached(monkeypatch, tmp_path):
     assert h._own_container() is c
     h._docker_client = _Client([])   # a second call must not re-resolve
     assert h._own_container() is c
+
+
+def test_in_docker_without_own_container_is_fatal(monkeypatch):
+    """The gateway fallback is host-process-only; inside docker it must raise.
+
+    Regression guard for SN11 uid 74: the sidecar came up pointed at the
+    episode network's gateway, every model call failed, and the session scored
+    baseline credit at $0 while looking healthy.
+    """
+    import trajectoryrl.utils.sandbox_harness as sh
+
+    h = TrajectorySandboxHarness.__new__(TrajectorySandboxHarness)
+    h._self_container_checked = True
+    h._self_container = None                      # resolution already failed
+    h._meter = types.SimpleNamespace(port=8790)
+    h._meter_lock = __import__("threading").Lock()
+    monkeypatch.setattr(sh.os.path, "exists", lambda p: p == "/.dockerenv")
+
+    net = types.SimpleNamespace(
+        name="pnet_x", attrs={"IPAM": {"Config": [{"Gateway": "172.21.0.1"}]}},
+    )
+    with pytest.raises(RuntimeError, match="no route to the meter"):
+        h._start_policy_sidecar("sess", "scen", object(), "tok", {}, net)

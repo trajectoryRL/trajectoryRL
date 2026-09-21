@@ -2317,6 +2317,24 @@ class TrajectorySandboxHarness:
         if own is not None:
             net.connect(own, aliases=[METER_ALIAS])
             upstream = f"http://{METER_ALIAS}:{meter_port}/v1"
+        elif os.path.exists("/.dockerenv"):
+            # The gateway fallback below is only correct for a HOST process
+            # (eval_pack.py), where the meter binds the host's interfaces and
+            # the episode network's gateway reaches it. Inside docker the meter
+            # lives in this container and the episode network is `internal`, so
+            # the gateway address can never answer: the sidecar would come up,
+            # every model call would fail, the agent would write nothing, and
+            # the whole session would score baseline credit at $0. That is a
+            # broken validator, not a low-scoring miner, so fail loudly instead
+            # of producing a plausible-looking config (SN11 uid 74, 2026-09-21).
+            raise RuntimeError(
+                "cannot resolve this validator's own container, so the policy "
+                "sidecar has no route to the meter. Recreate the validator "
+                "container so its hostname matches its id "
+                "(docker compose ... up -d --force-recreate validator); a "
+                "Watchtower update leaves the previous container's id as the "
+                "hostname. Refusing to run an episode that would score zero."
+            )
         else:
             gw = net.attrs["IPAM"]["Config"][0]["Gateway"]
             upstream = f"http://{gw}:{meter_port}/v1"
