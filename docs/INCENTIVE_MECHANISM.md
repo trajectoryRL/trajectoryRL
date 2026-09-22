@@ -77,7 +77,7 @@ The receipt needs no signature binding: it is already tied to the miner on-chain
 
 *Synchronous (inside the submit route, no chain call):*
 - `recycle_block` and `recycle_extrinsic_index` are present and well-formed.
-- The `(block, index)` pair is not already consumed by a prior submission that reached `pending_eval`. A receipt backing only submissions that failed technical checks (download / format / hash / uniqueness / NCD / integrity) is still free to reuse.
+- The `(block, index)` pair is not already consumed by a prior submission that reached `pending_eval`. A receipt backing only submissions that failed technical checks (download / format / hash / uniqueness / integrity) is still free to reuse. NCD pre-eval was replaced by `pack_first_seen` in v5.1 (see the changelog); near-duplicate handling is described in [Queue-Admission Dedup](#3b-queue-admission-dedup-content-keyed).
 - Missing / malformed / already-consumed → `400`; row is not recorded.
 
 *Asynchronous (`fee_check` step, first in the pre-eval pipeline):*
@@ -87,7 +87,7 @@ The receipt needs no signature binding: it is already tied to the miner on-chain
 4. Confirm the recycle block timestamp is within 24 h of the submission.
 5. Confirm the receipt is not already consumed by another `pending_eval` submission.
 
-Pass → pipeline continues. Fail → `eval_status='failed'`, `fee_check='failed'` with reason; pipeline stops. The `fee_check` step runs first so an unpaid or invalid submission never incurs download, format, hash, uniqueness, NCD, or LLM-integrity cost.
+Pass → pipeline continues. Fail → `eval_status='failed'`, `fee_check='failed'` with reason; pipeline stops. The `fee_check` step runs first so an unpaid or invalid submission never incurs download, format, hash, uniqueness, or LLM-integrity cost.
 
 **Receipt consumption.** A receipt is consumed only at the moment a submission transitions to `pending_eval` (when all pipeline checks pass). An insert into `recycle_receipts` keyed by `(recycle_block, recycle_extrinsic_index)` with a `UNIQUE` constraint is the atomic lock — at most one `pending_eval` submission per receipt. A submission that fails any check between `fee_check` and `pending_eval` writes no row, leaving the receipt reusable within its 24 h window for a later submission of a **different** pack (a new `(miner_hotkey, pack_hash)` row). Resubmitting the same `pack_hash` that failed terminally does not re-evaluate it — pack hashes are content-addressed and the existing row's state is preserved; the receipt ref on that row is not refreshed.
 
@@ -302,21 +302,40 @@ When `SPEC_NUMBER` (formerly `scoring_version`) bumps, the active scoring contra
 
 **Persistence**: `pack_first_seen` is part of the platform database alongside `miner_submissions`; it survives `spec_number` bumps. There is no per-validator JSON file or `PACK_FIRST_SEEN_PATH` environment variable in v6.0 — ownership is single-source-of-truth on the server.
 
-### 3b. Queue-Admission Dedup (NCD, content-keyed)
+### 3b. Queue-Admission Dedup (content-keyed)
 
 **Problem**: `pack_first_seen` is keyed on `pack_hash`, so it only catches
-*byte-identical* copies. A submitter who changes a comment, a heading or a few
-words produces a new hash and a new queue slot for the same document. Counting
-identities does not help either — a coldkey costs a registration, so the same
-document can arrive from as many coldkeys as the submitter cares to register.
+*byte-identical* copies. Changing a comment, a heading or a few words gives a new
+hash and a new queue slot for the same document. Counting identities does not
+help either: a coldkey costs one registration, so the same document can arrive
+from as many coldkeys as the submitter cares to register.
 
-**Enforcement**: at queue admission, compare the incoming pack against the packs
-already in `pending_eval` using the NCD measure in
-[`trajectoryrl/utils/ncd.py`](../trajectoryrl/utils/ncd.py)
-(`queue_duplicates`, threshold `SIMILARITY_THRESHOLD = 0.80`). The earliest
-`submitted_at` of a near-duplicate group keeps its slot; later members are
-refused **before** they reach `pending_eval`, which leaves the recycle receipt
-reusable for a genuinely different pack within its 24 h window.
+**Enforcement**: at queue admission, compare the incoming pack with the packs
+already in `pending_eval` using `classify_queue` in
+[`trajectoryrl/utils/ncd.py`](../trajectoryrl/utils/ncd.py). The earliest
+`submitted_at` of a near-duplicate group keeps its slot.
+
+| similarity to an earlier queued pack | outcome |
+|---|---|
+| `>= QUEUE_REFUSE_THRESHOLD` (0.90) | refused **before** `pending_eval`, so the recycle receipt stays reusable |
+| `>= QUEUE_REVIEW_THRESHOLD` (0.75) and below 0.90 | admitted, flagged for operator review |
+| below 0.75 | admitted |
+
+How the measure is built, and why:
+
+- **lzma, not zlib.** zlib never reaches 1.0 on identical input (a real 21 KB
+  SKILL.md scores ~0.968 against itself); lzma scores it ~0.994 and widens the
+  gap between copies and independent work. bz2 is unsuitable — it scores
+  byte-identical files below 0.72.
+- **Every file, not only SKILL.md.** The policy files decide Season 2 scoring
+  behaviour, so a copied `policy.py` under reworded prose must count as a copy.
+  Each file present in both packs is compared and the maximum is taken. Files
+  under `MIN_FILE_BYTES` (256) are skipped, because short built-in
+  configurations such as `{"kind": "pin", ...}` legitimately coincide.
+- **Thresholds from labelled real packs.** Identical packs 0.994; known copies
+  (per-wallet edits) 0.931–0.970; independent rewrites of the same ideas
+  0.582–0.609; unrelated packs 0.265–0.369. The refusal line sits below every
+  observed copy and the review band covers derivative work in between.
 
 The rule is identity-agnostic by construction: only submission time and pack
 content decide, so one coldkey with thirty UIDs and thirty coldkeys with one UID
@@ -324,14 +343,15 @@ each are treated the same way.
 
 **Prevents**:
 
-- One document occupying N queue slots via N lightly-edited resubmissions
+- One document occupying N queue slots through N lightly edited resubmissions
+- Reusing a winning policy under new prose
 - Sybil flooding that per-hotkey or per-coldkey limits cannot see
 - Validator time and inference budget spent re-scoring the same document
 
 **Operational note**: apply from a stated epoch rather than retroactively, so
 submissions already paid for are not voided. `tools/pack_duplication_report.py`
-reports how many distinct documents the current public queue contains and how
-many slots the rule would free.
+reports how many distinct documents the current public queue contains, how
+many entries would be refused, and how many flagged.
 
 ### 4. Pre-Eval Gate (Server-Side)
 

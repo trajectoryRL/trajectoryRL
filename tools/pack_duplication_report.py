@@ -2,8 +2,9 @@
 """Report how many *distinct* documents the challenger queue actually contains.
 
 Downloads every publicly mirrored pack from the platform API, groups them into
-near-duplicate clusters with the repo's own NCD measure, and prints what the
-queue would look like if one slot were allowed per cluster.
+near-duplicate clusters with the repo's own similarity measure
+(``trajectoryrl.utils.ncd``), and prints which entries queue admission would
+refuse and which it would flag for review.
 
 The grouping ignores identity entirely: it does not matter whether one
 submitter used a single coldkey with many UIDs, or many coldkeys with one UID
@@ -11,7 +12,7 @@ each. Only submission time and pack content decide.
 
 Usage:
     python3 tools/pack_duplication_report.py
-    python3 tools/pack_duplication_report.py --threshold 0.85
+    python3 tools/pack_duplication_report.py --refuse 0.92 --review 0.80
     python3 tools/pack_duplication_report.py --api https://trajrl.com --json report.json
 
 Note: the platform publishes a pack's mirror URL 24 h after submission, so the
@@ -32,9 +33,12 @@ from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from trajectoryrl.utils.ncd import (  # noqa: E402
-    SIMILARITY_THRESHOLD,
+    QUEUE_REFUSE_THRESHOLD,
+    QUEUE_REVIEW_THRESHOLD,
+    REFUSE,
+    REVIEW,
+    classify_queue,
     cluster_packs,
-    queue_duplicates,
 )
 
 DEFAULT_API = "https://trajrl.com"
@@ -86,7 +90,8 @@ def collect(api: str, workers: int) -> list[dict]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--api", default=DEFAULT_API)
-    parser.add_argument("--threshold", type=float, default=SIMILARITY_THRESHOLD)
+    parser.add_argument("--refuse", type=float, default=QUEUE_REFUSE_THRESHOLD)
+    parser.add_argument("--review", type=float, default=QUEUE_REVIEW_THRESHOLD)
     parser.add_argument("--workers", type=int, default=6)
     parser.add_argument("--json", dest="json_out", help="write the full report here")
     args = parser.parse_args()
@@ -98,9 +103,9 @@ def main() -> int:
 
     packs = {row["id"]: row["pack"] for row in rows}
     by_id = {row["id"]: row for row in rows}
-    clusters = cluster_packs(packs, threshold=args.threshold)
+    clusters = cluster_packs(packs, threshold=args.refuse)
 
-    print(f"\n{len(rows)} packs -> {len(clusters)} distinct documents at threshold {args.threshold}\n")
+    print(f"\n{len(rows)} packs -> {len(clusters)} distinct documents at refusal threshold {args.refuse}\n")
     print(f"  {'packs':>5s}  {'coldkeys':>8s}  {'UIDs':>4s}  policy files")
     for cluster in clusters:
         coldkeys = {by_id[k]["coldkey"] for k in cluster}
@@ -112,12 +117,14 @@ def main() -> int:
         print(f"  {len(cluster):5d}  {len(coldkeys):8d}  {len(cluster):4d}  {summary}")
 
     entries = [(row["id"], row["pack"], row["submitted_at"]) for row in rows]
-    duplicates = queue_duplicates(entries, threshold=args.threshold)
-    kept = len(rows) - len(duplicates)
+    verdicts = classify_queue(entries, refuse=args.refuse, review=args.review)
+    refused = {k: v[1] for k, v in verdicts.items() if v[0] == REFUSE}
+    flagged = {k: v for k, v in verdicts.items() if v[0] == REVIEW}
+    admitted = len(rows) - len(refused)
     print(
-        f"\nqueue admission with one slot per document: {kept} kept, "
-        f"{len(duplicates)} refused as near-copies of an earlier submission "
-        f"({len(duplicates) / len(rows):.0%} of the queue)"
+        f"\nqueue admission: {admitted} admitted ({len(flagged)} of them flagged for review, "
+        f"similarity {args.review}-{args.refuse}), {len(refused)} refused as near-copies of an "
+        f"earlier submission ({len(refused) / len(rows):.0%} of the queue)"
     )
 
     spread = [c for c in clusters if len({by_id[k]["coldkey"] for k in c}) > 1]
@@ -129,7 +136,8 @@ def main() -> int:
 
     if args.json_out:
         report = {
-            "threshold": args.threshold,
+            "refuse_threshold": args.refuse,
+            "review_threshold": args.review,
             "packs": len(rows),
             "documents": len(clusters),
             "clusters": [
@@ -141,7 +149,8 @@ def main() -> int:
                 }
                 for c in clusters
             ],
-            "would_refuse": duplicates,
+            "would_refuse": refused,
+            "would_flag": {k: {"close_to": v[1], "similarity": round(v[2], 4)} for k, v in flagged.items()},
         }
         with open(args.json_out, "w") as handle:
             json.dump(report, handle, indent=1, default=str)

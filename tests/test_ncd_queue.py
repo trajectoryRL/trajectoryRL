@@ -1,9 +1,9 @@
 """Tests for queue-admission dedup helpers (trajectoryrl.utils.ncd).
 
-``queue_duplicates`` decides, for a set of packs waiting in the challenger
-queue, which ones are near-copies of an earlier entry. It keys on submission
-time and content only, so the outcome does not change with the number of
-hotkeys or coldkeys behind the submissions.
+``classify_queue`` / ``queue_duplicates`` decide, for packs waiting in the
+challenger queue, which are near-copies of an earlier entry. They key on
+submission time and content only, compare every sizeable file (not only
+SKILL.md) with lzma, and flag a review band below the refusal threshold.
 """
 
 import sys
@@ -20,10 +20,14 @@ if "bittensor" not in sys.modules:
     sys.modules["bittensor"] = _mock_bt
 
 from trajectoryrl.utils.ncd import (  # noqa: E402
-    SIMILARITY_THRESHOLD,
+    MIN_FILE_BYTES,
+    QUEUE_REFUSE_THRESHOLD,
+    REFUSE,
+    REVIEW,
+    classify_queue,
     cluster_packs,
-    pack_similarity,
     queue_duplicates,
+    queue_similarity,
 )
 
 
@@ -63,7 +67,7 @@ DOC_A_EDITED = DOC_A.replace("Ship the file", "Ship the file first").replace(
 
 def test_near_copy_of_earlier_entry_is_flagged():
     """A lightly edited resubmission loses to the entry that arrived first."""
-    assert pack_similarity(_pack(DOC_A), _pack(DOC_A_EDITED)) >= SIMILARITY_THRESHOLD
+    assert queue_similarity(_pack(DOC_A), _pack(DOC_A_EDITED)) >= QUEUE_REFUSE_THRESHOLD
 
     dupes = queue_duplicates(
         [
@@ -160,3 +164,92 @@ def test_cluster_packs_is_deterministic():
     packs["distinct"] = _pack(DOC_B)
 
     assert cluster_packs(packs) == cluster_packs(dict(reversed(list(packs.items()))))
+
+
+# A realistic policy file, long enough to be fingerprinted.
+POLICY = """
+from trajrl_policy import Policy, serve
+
+CHAIN = ["kimi-k3", "glm-5.3", "glm-5.3-flash"]
+
+
+class Fusion(Policy):
+    async def handle(self, req, ctx):
+        remaining = ctx.remaining_usd if ctx.remaining_usd is not None else 1.0
+        for model in CHAIN:
+            if self.reservation(req, model) + 0.05 <= remaining:
+                req["model"] = model
+                break
+        return await ctx.upstream(req)
+
+    def reservation(self, req, model):
+        return len(str(req.get("messages"))) / 3.0 * 2e-6 + 8192 * 1e-5
+
+
+serve(Fusion())
+"""
+
+
+def _pack_with(skill: str, policy: str | None = None, policy_name: str = "policy.py") -> dict:
+    files = {"SKILL.md": skill}
+    if policy is not None:
+        files[policy_name] = policy
+    return {"files": files}
+
+
+def test_copied_policy_under_reworded_prose_is_refused():
+    """The evasion a SKILL.md-only fingerprint misses: keep the policy, reword the prose."""
+    original = _pack_with(DOC_A, POLICY)
+    reworded = _pack_with(DOC_B, POLICY)
+
+    verdicts = classify_queue([("orig", original, 1.0), ("copy", reworded, 2.0)])
+
+    assert verdicts["copy"][0] == REFUSE
+    assert verdicts["copy"][1] == "orig"
+
+
+def test_short_builtin_configs_do_not_count_as_copies():
+    """Two packs sharing a tiny built-in policy.json are not copies of each other."""
+    pin = '{"kind": "pin", "model": "kimi-k3"}'
+    assert len(pin) < MIN_FILE_BYTES
+
+    verdicts = classify_queue(
+        [
+            ("a", _pack_with(DOC_A, pin, "policy.json"), 1.0),
+            ("b", _pack_with(DOC_B, pin, "policy.json"), 2.0),
+        ]
+    )
+
+    assert verdicts == {}
+
+
+def test_review_band_flags_without_refusing():
+    """A score between the two thresholds keeps its slot but is flagged."""
+    entries = [("a", _pack(DOC_A), 1.0), ("b", _pack(DOC_A_EDITED), 2.0)]
+    similarity = queue_similarity(_pack(DOC_A), _pack(DOC_A_EDITED))
+
+    verdicts = classify_queue(entries, refuse=similarity + 0.01, review=similarity - 0.01)
+
+    assert verdicts["b"][0] == REVIEW
+    assert "b" not in queue_duplicates(entries, threshold=similarity + 0.01)
+
+
+def test_flagged_entry_still_keeps_its_slot_for_later_comparisons():
+    """A reviewed entry is admitted, so a later copy of it is matched against it."""
+    a, b = _pack(DOC_A), _pack(DOC_B)
+    b_copy = _pack(DOC_B.replace("handover", "hand-over") + "\n<!-- 01 -->\n")
+
+    verdicts = classify_queue(
+        [("a", a, 1.0), ("b", b, 2.0), ("b_copy", b_copy, 3.0)],
+        refuse=QUEUE_REFUSE_THRESHOLD,
+        review=0.0,
+    )
+
+    assert verdicts["b"][0] == REVIEW
+    assert verdicts["b_copy"] == (REFUSE, "b", verdicts["b_copy"][2])
+
+
+def test_identical_packs_score_near_one():
+    """lzma keeps identical input near 1.0 (zlib tops out around 0.97)."""
+    pack = _pack_with(DOC_A + DOC_B, POLICY)
+    assert queue_similarity(pack, pack) > 0.98
