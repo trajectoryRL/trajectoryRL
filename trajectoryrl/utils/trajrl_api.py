@@ -89,6 +89,7 @@ async def heartbeat(
     bench_version: Optional[str] = None,
     llm_model: Optional[str] = None,
     llm_base_url: Optional[str] = None,
+    health_issue: Optional[str] = None,
 ) -> bool:
     """Send a validator heartbeat to the dashboard API (v2).
 
@@ -126,6 +127,10 @@ async def heartbeat(
         payload["llm_model"] = llm_model
     if llm_base_url is not None:
         payload["llm_base_url"] = llm_base_url
+    # None = healthy. A short operator-facing reason otherwise, so the
+    # platform can show a broken validator instead of a green one.
+    if health_issue is not None:
+        payload["health_issue"] = health_issue[:256]
 
     try:
         async with httpx.AsyncClient() as client:

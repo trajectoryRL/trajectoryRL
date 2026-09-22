@@ -18,15 +18,15 @@ auto mode (`engy/auto`), for any customer and any harness.
 ```
  miner                          validator (per scenario)                              Engy
  ┌────────────┐   web-submit    ┌─────────────────────────────────────────────┐
- │ SKILL.md   │ ─────────────►  │  scenario container: Hermes + the task       │
- │ policy.py  │                 │        │  OpenAI-compatible calls             │
- │ (or .json) │                 │        ▼                                     │
- └────────────┘                 │  policy sidecar: the miner's fusion policy   │   metered calls
-                                │        │  only route: the meter               │ ─────────────►  8 open-weight
-                                │        ▼                                     │   receipts       models
-                                │  meter: allowlist, $1 cap, cost, provenance  │ ◄─────────────
-                                │        │                                     │
-                                │  verifier container: hidden tests → score    │
+ │ SKILL.md   │ ─────────────►  │  scenario container: Hermes + the task      │
+ │ policy.py  │                 │        │  OpenAI-compatible calls           │
+ │ (or .json) │                 │        ▼                                    │
+ └────────────┘                 │  policy sidecar: the miner's fusion policy  │  metered calls
+                                │        │  only route: the meter             │ ─────────────►  8 open-weight models
+                                │        ▼                                    │   receipts
+                                │  meter: allowlist, $1 cap, cost, provenance │ ◄─────────────
+                                │        │                                    │
+                                │  verifier container: hidden tests → score   │
                                 └─────────────────────────────────────────────┘
 ```
 

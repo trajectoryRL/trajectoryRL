@@ -39,6 +39,12 @@ SPEC23_ADDITIONS = {"attention-mil", "llm-inference-batching-scheduler", "torch-
 # so it is asserted as a swap, not a subset like the additive specs above.
 SPEC24_ADDITIONS = {"fix-code-vulnerability", "large-scale-text-editing", "postgres-csv-clean"}
 SPEC24_REMOVALS = {"schemelike-metacircular-eval", "3d-model-format-legacy", "pcap-to-netflow"}
+# SPEC 26 is the first *shrinking* bump: it only removes (26 -> 20), so maxScore
+# drops 26 -> 20 on the web side (an intentional discontinuity, like SPEC 16).
+SPEC26_REMOVALS = {
+    "regex-chess", "race-condition-fix", "custom-memory-heap-crash",
+    "attention-mil", "git-leak-recovery", "tree-directory-parser",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +104,23 @@ class TestSpec24Set:
         # resolve_eval_spec must still serve SPEC 23 while validators roll forward.
         assert sh.SCENARIOS_BY_SPEC[23]
         assert sh.resolve_eval_spec(23) == (23, sh.SCENARIOS_BY_SPEC[23])
+
+
+class TestSpec26Set:
+    def test_spec26_drops_six_low_signal_scenarios(self):
+        spec25 = set(sh.SCENARIOS_BY_SPEC[25])
+        spec26 = set(sh.SCENARIOS_BY_SPEC[26])
+        # Pure removal: no additions, six dropped, net 26 -> 20.
+        assert spec25 - spec26 == SPEC26_REMOVALS
+        assert spec26 - spec25 == set()
+        assert spec26 < spec25
+        assert len(spec25) == 26 and len(spec26) == 20
+
+    def test_spec25_still_resolves_during_transition(self):
+        # resolve_eval_spec must still serve SPEC 25 while validators roll forward
+        # and the server has not yet flipped the active spec to 26.
+        assert sh.SCENARIOS_BY_SPEC[25]
+        assert sh.resolve_eval_spec(25) == (25, sh.SCENARIOS_BY_SPEC[25])
 
 
 # ---------------------------------------------------------------------------

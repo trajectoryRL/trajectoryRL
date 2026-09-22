@@ -29,6 +29,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import re
+import pathlib
 import socket
 import hashlib
 import io
@@ -214,6 +216,49 @@ SCENARIOS_BY_SPEC: Dict[int, tuple[str, ...]] = {
 # The bump marks the testee change: the miner's routing policy over the Engy
 # allowlist replaces the pinned qwen3.8-27b, so scores are not comparable.
 SCENARIOS_BY_SPEC[25] = SCENARIOS_BY_SPEC[24]
+
+# SPEC 26 — drop 6 low-signal / high-cost scenarios, 26 -> 20. Unlike SPEC 24
+# (which swapped to keep N=26), this SHRINKS the set, so maxScore drops 26 -> 20
+# on the web side (removedScenarioBase stays 0). That is an intentional
+# max-score discontinuity, like SPEC 16 — the point of the bump.
+#
+# Chosen from a cross-pack discrimination pass over 614 distinct spec-24/25
+# challenger packs (per-scenario stddev across packs, with infra-failed
+# sessions stripped out: a session only counts if >=2 of its scenarios scored
+# > 0, so the recent all-discarded outage cannot masquerade as "everyone 0").
+# Each dropped scenario adds ~a constant to every pack's score, so removing it
+# does not change the miner ranking:
+#   regex-chess            std 0.034, 92% of packs score 0   (dead: nobody solves it) + 2100s
+#   race-condition-fix     std 0.047, 69% full                (saturated: everyone solves) + only 4-CPU scenario
+#   custom-memory-heap-crash std 0.097                        (low signal) + 2400s (agent 1800)
+#   attention-mil          std 0.133, 89% full                (saturated) + 5.2 GB image
+#   git-leak-recovery      std 0.063, 75% full                (saturated, cheap)
+#   tree-directory-parser  std 0.076, all packs cluster ~0.78 (no separation, cheap)
+# Kept the expensive-but-discriminating ones (torch-tensor 0.249, path-tracing
+# 0.262, llm-inference-batching 0.233): they cost a lot but genuinely separate
+# top policies from the rest.
+SCENARIOS_BY_SPEC[26] = (
+    "audio-synth-stft-peaks",
+    "configure-git-webserver",
+    "crack-7z-hash",
+    "db-wal-recovery",
+    "deterministic-tarball",
+    "fix-code-vulnerability",
+    "git-multibranch",
+    "large-scale-text-editing",
+    "largest-eigenval",
+    "llm-inference-batching-scheduler",
+    "nginx-request-logging",
+    "parallel-particle-simulator",
+    "path-tracing",
+    "postgres-csv-clean",
+    "puzzle-solver",
+    "query-optimize",
+    "regex-engine-from-scratch",
+    "swe-bench-astropy-2",
+    "torch-tensor-parallelism",
+    "write-compressor",
+)
 
 SANDBOX_SCENARIOS: tuple[str, ...] = SCENARIOS_BY_SPEC[SPEC_NUMBER]
 
@@ -923,6 +968,13 @@ def _strip_provider_prefix(model: str) -> str:
     return model
 
 
+# Prefix on ``_EpisodeResult.error`` for failures that are the VALIDATOR's, not
+# the miner's — the episode never got as far as running hermes, so ``chat_exit``
+# is None and the hermes-side test in ``_looks_like_provider_failure`` cannot
+# see it. Marked so the session is discarded instead of POSTed as a miner score.
+INFRA_ERROR_PREFIX = "validator-infra: "
+
+
 def _looks_like_provider_failure(episodes: List["_EpisodeResult"]) -> bool:
     """True when every episode in the session ended with hermes itself
     failing — non-zero exit code or deadline kill — and no episode ever
@@ -957,6 +1009,12 @@ def _looks_like_provider_failure(episodes: List["_EpisodeResult"]) -> bool:
     """
     if not episodes:
         return False
+    # Ours, not the miner's: every episode failed before hermes could run
+    # (e.g. the policy sidecar had no route to the meter). ``chat_exit`` is
+    # None for those, so the hermes-side test below would read them as
+    # "unknown" and let an infra-poisoned zero be POSTed.
+    if all((ep.error or "").startswith(INFRA_ERROR_PREFIX) for ep in episodes):
+        return True
     # Anti-false-positive: any positively billed episode proves the
     # provider answered usefully at least once this session.
     # ``cost_usd == 0.0`` (vs ``None``) can be written by hermes for
@@ -2200,20 +2258,89 @@ class TrajectorySandboxHarness:
                 self._meter = meter
             return self._meter
 
+    @staticmethod
+    def _own_container_id_from_proc() -> Optional[str]:
+        """Our container id as the kernel sees it, independent of the hostname.
+
+        Docker writes the container id into the overlay upper/work dirs in
+        ``/proc/self/mountinfo`` (cgroup v2, where ``/proc/self/cgroup`` no
+        longer carries it) and into the cgroup path on v1. Returns the first
+        64-hex token found, else None.
+        """
+        for path in ("/proc/self/mountinfo", "/proc/self/cgroup"):
+            try:
+                blob = pathlib.Path(path).read_text()
+            except Exception:  # noqa: BLE001
+                continue
+            m = re.search(r"\b([0-9a-f]{64})\b", blob)
+            if m:
+                return m.group(1)
+        return None
+
     def _own_container(self) -> Optional[Container]:
         """The validator's own container when running inside docker (the
         compose deployment), else None (host process, e.g. eval_pack.py).
-        Under compose the hostname is the container id."""
+
+        Resolution order, because ``socket.gethostname()`` is NOT reliably the
+        container id: Watchtower recreates a container by copying the previous
+        container's config forward, so ``Config.Hostname`` keeps the *old*
+        container's id and ``containers.get(hostname)`` 404s. When that
+        happens the caller falls back to the episode network's gateway address
+        and the policy sidecar can never reach the meter, so every model call
+        fails and the whole session scores zero (SN11 uid 74, 2026-09-21).
+
+        1. ``containers.get(gethostname())`` — correct for a freshly created
+           container, where docker sets the hostname to the new id.
+        2. the id read from ``/proc/self/mountinfo`` / ``/proc/self/cgroup``.
+        3. a scan for the container whose ``Config.Hostname`` matches ours,
+           which finds a Watchtower-recreated container by its stale hostname.
+        """
         if self._self_container_checked:
             return self._self_container
         self._self_container_checked = True
         if not os.path.exists("/.dockerenv"):
             return None
+
+        hostname = socket.gethostname()
+        attempts: list[tuple[str, Optional[str]]] = [
+            ("hostname", hostname),
+            ("proc", self._own_container_id_from_proc()),
+        ]
+        for how, ident in attempts:
+            if not ident:
+                continue
+            try:
+                self._self_container = self.client.containers.get(ident)
+                if how != "hostname":
+                    logger.warning(
+                        "own container resolved by %s (%s), not by hostname %s — "
+                        "this container was probably recreated by Watchtower",
+                        how, ident[:12], hostname,
+                    )
+                return self._self_container
+            except Exception:  # noqa: BLE001
+                continue
+
         try:
-            self._self_container = self.client.containers.get(socket.gethostname())
+            for c in self.client.containers.list():
+                if (c.attrs.get("Config") or {}).get("Hostname") == hostname:
+                    logger.warning(
+                        "own container resolved by stale hostname scan: %s (%s) — "
+                        "this container was probably recreated by Watchtower",
+                        c.name, c.id[:12],
+                    )
+                    self._self_container = c
+                    return self._self_container
         except Exception as e:  # noqa: BLE001
-            logger.warning("running in docker but cannot resolve own container: %s", e)
-            self._self_container = None
+            logger.warning("own-container scan failed: %s", e)
+
+        logger.error(
+            "running in docker but cannot resolve own container (hostname=%s). "
+            "The policy sidecar will be pointed at the episode network gateway "
+            "instead of the meter and every model call will fail.",
+            hostname,
+        )
+        self._self_container = None
         return self._self_container
 
     def _create_episode_network(self, session_id: str, scenario: str):
@@ -2246,6 +2373,25 @@ class TrajectorySandboxHarness:
         if own is not None:
             net.connect(own, aliases=[METER_ALIAS])
             upstream = f"http://{METER_ALIAS}:{meter_port}/v1"
+        elif os.path.exists("/.dockerenv"):
+            # The gateway fallback below is only correct for a HOST process
+            # (eval_pack.py), where the meter binds the host's interfaces and
+            # the episode network's gateway reaches it. Inside docker the meter
+            # lives in this container and the episode network is `internal`, so
+            # the gateway address can never answer: the sidecar would come up,
+            # every model call would fail, the agent would write nothing, and
+            # the whole session would score baseline credit at $0. That is a
+            # broken validator, not a low-scoring miner, so fail loudly instead
+            # of producing a plausible-looking config (SN11 uid 74, 2026-09-21).
+            raise RuntimeError(
+                INFRA_ERROR_PREFIX +
+                "cannot resolve this validator's own container, so the policy "
+                "sidecar has no route to the meter. Recreate the validator "
+                "container so its hostname matches its id "
+                "(docker compose ... up -d --force-recreate validator); a "
+                "Watchtower update leaves the previous container's id as the "
+                "hostname. Refusing to run an episode that would score zero."
+            )
         else:
             gw = net.attrs["IPAM"]["Config"][0]["Gateway"]
             upstream = f"http://{gw}:{meter_port}/v1"

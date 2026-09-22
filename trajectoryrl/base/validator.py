@@ -154,6 +154,13 @@ class TrajectoryValidator:
         self._last_set_weights_at: Optional[int] = None
         self._last_eval_at: Optional[int] = None
 
+        # Self-reported health. None = healthy. Set when a session is
+        # discarded because the validator itself is broken, cleared when a
+        # score posts. Without it a validator can heartbeat green for days
+        # while scoring nothing (SN11 uid 74, 2026-09-21): the operator's
+        # only clue was `last_eval_at` quietly going stale.
+        self._health_issue: Optional[str] = None
+
         # Tempo gate: which block we last attempted set_weights at
         self._last_set_weights_block: int = 0
 
@@ -357,6 +364,7 @@ class TrajectoryValidator:
                     bench_version=self._sandbox_harness.sandbox_version,
                     llm_model=f"policy:auto (default {self.config.llm_model})",
                     llm_base_url=self.config.llm_base_url,
+                    health_issue=self._health_issue,
                 )
             except Exception as e:
                 logger.warning("Heartbeat error: %s", e)
@@ -1143,6 +1151,11 @@ class TrajectoryValidator:
                 "LLM key/credits/network. No score submitted.",
                 challenge_epoch_id,
             )
+            self._health_issue = (
+                f"infra: every scenario failed with no billed model call "
+                f"(epoch {challenge_epoch_id}); check the Engy key, credits, "
+                f"network, and the policy sidecar's route to the meter"
+            )
             return
 
         rejected = False
@@ -1182,6 +1195,7 @@ class TrajectoryValidator:
         if ok:
             self._last_scored_challenge_epoch_id = challenge_epoch_id
             self._last_eval_at = int(time.time())
+            self._health_issue = None      # a posted score clears the alarm
             self._save_eval_state()
 
         # Fire-and-forget log uploads
