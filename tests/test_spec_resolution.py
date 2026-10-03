@@ -140,6 +140,40 @@ class TestSpec27Set:
         assert sh.resolve_eval_spec(26) == (26, sh.SCENARIOS_BY_SPEC[26])
 
 
+class TestSpecConfig:
+    def test_every_spec_has_a_config(self):
+        assert set(sh.SPEC_CONFIG_BY_SPEC) == set(sh.SCENARIOS_BY_SPEC)
+
+    def test_spec27_lowers_the_episode_cap(self):
+        assert sh.SPEC_CONFIG_BY_SPEC[27].episode_cap_usd == 0.30
+        # SPEC 25 and 26 keep the launch cap, so a SPEC 26 epoch means the
+        # same on every validator while the fleet rolls forward.
+        assert sh.SPEC_CONFIG_BY_SPEC[25].episode_cap_usd == 1.00
+        assert sh.SPEC_CONFIG_BY_SPEC[26].episode_cap_usd == 1.00
+
+    def test_spec_config_resolves_like_resolve_eval_spec(self):
+        from trajectoryrl.utils.config import SPEC_NUMBER
+        local = sh.SPEC_CONFIG_BY_SPEC[SPEC_NUMBER]
+        assert sh.spec_config(26) is sh.SPEC_CONFIG_BY_SPEC[26]
+        assert sh.spec_config() is local
+        assert sh.spec_config(None) is local
+        assert sh.spec_config(999) is local
+
+    def test_every_cap_leaves_an_opening_turn(self):
+        # ~20k prompt tokens (system prompt, tools, SKILL.md) with the default
+        # completion length must fit, unclamped, on every allowlisted model.
+        from trajectoryrl.policy import MODEL_PRICES
+        from trajectoryrl.policy.meter import (
+            DEFAULT_MAX_TOKENS, estimate_prompt_tokens, reserve_for,
+        )
+        body = {"messages": [{"role": "user", "content": "x" * 48000}]}
+        assert 19000 <= estimate_prompt_tokens(body) <= 21000
+        for spec, cfg in sh.SPEC_CONFIG_BY_SPEC.items():
+            for model in MODEL_PRICES:
+                _, mt, clamped = reserve_for(model, body, room_usd=cfg.episode_cap_usd)
+                assert mt == DEFAULT_MAX_TOKENS and not clamped, (spec, model)
+
+
 # ---------------------------------------------------------------------------
 # 2. resolve_eval_spec
 # ---------------------------------------------------------------------------
@@ -370,6 +404,7 @@ class TestHarnessScenarioParam:
 
             async def evaluate_miner(self, **kwargs):
                 seen["scenarios"] = kwargs.get("scenarios")
+                seen["spec_number"] = kwargs.get("spec_number")
                 return _FakeResult()
 
         class _FakeVerification:
@@ -394,7 +429,27 @@ class TestHarnessScenarioParam:
                 epoch_seed=1,
                 validator_salt="salt",
                 scenarios=("db-wal-recovery",),
+                spec_number=26,
             )
         )
         assert seen["scenarios"] == ("db-wal-recovery",)
+        assert seen["spec_number"] == 26
         assert outcome.success
+
+    @pytest.mark.parametrize("spec_number,cap", [(26, 1.0), (27, 0.3), (None, 0.3)])
+    def test_evaluate_miner_runs_under_the_cap_of_its_spec(self, spec_number, cap):
+        """The episode cap is a per-spec value: a SPEC 26 epoch keeps the
+        launch cap on a binary whose local spec is 27."""
+        harness = sh.TrajectorySandboxHarness.__new__(sh.TrajectorySandboxHarness)
+        seen = {}
+
+        def fake_run_eval_sync(*args, **kwargs):
+            seen["cap_usd"] = kwargs.get("cap_usd")
+            return sh._SessionResult()
+
+        harness._run_eval_sync = fake_run_eval_sync
+        asyncio.run(harness.evaluate_miner(
+            "skill", 1, validator_salt="salt",
+            scenarios=("db-wal-recovery",), spec_number=spec_number,
+        ))
+        assert seen["cap_usd"] == cap

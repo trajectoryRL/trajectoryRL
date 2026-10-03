@@ -23,7 +23,7 @@ from typing import Any, Optional
 
 from aiohttp import ClientSession, ClientTimeout, web
 
-from . import EPISODE_CAP_USD, METER_PORT, MODEL_PRICES
+from . import METER_PORT, MODEL_PRICES
 
 logger = logging.getLogger(__name__)
 
@@ -216,7 +216,7 @@ class PolicyMeter:
         loop.run_forever()
 
     # ------------------------------------------------------------------ harness API (thread-safe)
-    def mint(self, name: str, cap_usd: float = EPISODE_CAP_USD) -> str:
+    def mint(self, name: str, cap_usd: float) -> str:
         token = f"ep-{secrets.token_urlsafe(24)}"
         with self._lock:
             self.episodes[token] = EpisodeUsage(name=name, cap_usd=cap_usd)

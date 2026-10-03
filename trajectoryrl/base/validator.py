@@ -945,6 +945,7 @@ class TrajectoryValidator:
             on_episode_done=on_episode_done,
             is_epoch_still_current=is_epoch_still_current,
             scenarios=eval_scenarios,
+            spec_number=eval_spec,
         )
 
         if not outcome.success:
