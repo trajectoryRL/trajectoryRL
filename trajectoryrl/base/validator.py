@@ -1,17 +1,22 @@
 """TrajectoryRL Validator — v6.0 winner-challenger daemon.
 
-Architecture (Season 1 — trajrl-bench, v6.0 IM):
-    1. Polls ``GET /api/v2/epoch/current`` (~10 s) for the active
-       challenger and the seated winner.
-    2. Refreshes the local winner cache from the server response on every
-       successful poll.
-    3. Fetches and verifies the challenger pack (SHA256), runs trajrl-bench
-       sandbox evaluation, and posts the signed score to
-       ``POST /api/v2/epoch/{challenge_epoch_id}/score``.
-    4. Sets on-chain weights from the cached winner; tempo-gated so the
+Two operating modes, selected by ``EVAL_ENABLED`` (default off):
+
+Weight-only (default):
+    1. Refreshes the local winner cache from
+       ``GET /api/v2/winner/current`` (~60 s).
+    2. Sets on-chain weights from the cached winner; tempo-gated so the
        chain accepts at most one weight write per tempo regardless of
        how often the daemon ticks.
-    5. Heartbeats every ~10 min with version + image digests.
+    3. Heartbeats every ~10 min with version.
+
+Eval-enabled (``EVAL_ENABLED=1``) — everything above, plus:
+    4. Polls ``GET /api/v2/epoch/current`` (~10 s) for the active
+       challenger.
+    5. Fetches and verifies the challenger pack (SHA256), runs trajrl-bench
+       sandbox evaluation, and posts the signed score to
+       ``POST /api/v2/epoch/{challenge_epoch_id}/score``.
+    6. Adds image digests + model info to the heartbeat.
 
 The validator carries no per-miner evaluation cache, no client-side
 integrity LLM judge, no ``pack_first_seen`` ownership state, and no
@@ -86,13 +91,16 @@ _SET_WEIGHTS_RETRY_DELAY = 12  # seconds; roughly 1 block interval
 # Daemon cadence (v6.0).
 #
 # Eval-tick polling is fixed at _EPOCH_POLL_INTERVAL — every tick we
-# poll /epoch/current + /winner/current and exit early if there's
-# nothing to do. We deliberately do NOT derive a long sleep from
+# poll /epoch/current and exit early if there's nothing to do. We
+# deliberately do NOT derive a long sleep from
 # `remaining_blocks * 12s`: under v6 dynamic-epoch the active epoch
 # can finalise early once every whitelisted validator has submitted,
 # so a long sleep would overshoot the early-finalise boundary and the
 # next epoch wouldn't be observed until the (now-stale) sleep elapses.
 _EPOCH_POLL_INTERVAL = 10
+# The winner changes at most once per challenge epoch and weights are
+# tempo-gated, so the cache doesn't need the eval loop's 10 s cadence.
+_WINNER_POLL_INTERVAL = 60
 _WEIGHT_CHECK_INTERVAL = 60
 _HEARTBEAT_INTERVAL = 600
 
@@ -140,11 +148,22 @@ class TrajectoryValidator:
                 config.network,
             )
 
-        logger.info("Initializing trajrl-bench sandbox harness...")
-        self._sandbox_harness = TrajectorySandboxHarness(config)
+        # Eval components exist only when this validator evaluates. A
+        # weight-only validator needs neither docker nor an LLM key.
+        self._sandbox_harness: Optional[TrajectorySandboxHarness] = None
+        self.pack_fetcher: Optional[PackFetcher] = None
+        if config.eval_enabled:
+            logger.info("Mode: eval enabled (EVAL_ENABLED=1)")
+            logger.info("Initializing trajrl-bench sandbox harness...")
+            self._sandbox_harness = TrajectorySandboxHarness(config)
 
-        logger.debug("Initializing pack fetcher...")
-        self.pack_fetcher = PackFetcher(cache_dir=config.pack_cache_dir)
+            logger.debug("Initializing pack fetcher...")
+            self.pack_fetcher = PackFetcher(cache_dir=config.pack_cache_dir)
+        else:
+            logger.info(
+                "Mode: weight-only — setting weights from the server winner; "
+                "no evaluation (set EVAL_ENABLED=1 to evaluate challengers)"
+            )
 
         # Winner cache (server-canonical, mirrored locally for fallback)
         self._winner_state_path = str(config.winner_state_path)
@@ -351,21 +370,34 @@ class TrajectoryValidator:
     # Heartbeat
     # ------------------------------------------------------------------
 
+    def _heartbeat_fields(self) -> Dict[str, Any]:
+        """Telemetry for the heartbeat payload.
+
+        A weight-only validator reports just its weight-setting liveness:
+        eval timestamps, image digests, model info and eval health would
+        describe an evaluator this process isn't running.
+        """
+        fields: Dict[str, Any] = {
+            "last_set_weights_at": self._last_set_weights_at,
+        }
+        if self._sandbox_harness is None:
+            return fields
+        fields.update(
+            last_eval_at=self._last_eval_at,
+            bench_image_hash=self._sandbox_harness.bench_image_hash,
+            harness_image_hash=self._sandbox_harness.scenario_image_hash,
+            bench_version=self._sandbox_harness.sandbox_version,
+            llm_model=f"policy:auto (default {self.config.llm_model})",
+            llm_base_url=self.config.llm_base_url,
+            health_issue=self._health_issue,
+        )
+        return fields
+
     async def _heartbeat_loop(self):
         """Send heartbeat every ~10 min."""
         while True:
             try:
-                await heartbeat(
-                    self.wallet,
-                    last_set_weights_at=self._last_set_weights_at,
-                    last_eval_at=self._last_eval_at,
-                    bench_image_hash=self._sandbox_harness.bench_image_hash,
-                    harness_image_hash=self._sandbox_harness.scenario_image_hash,
-                    bench_version=self._sandbox_harness.sandbox_version,
-                    llm_model=f"policy:auto (default {self.config.llm_model})",
-                    llm_base_url=self.config.llm_base_url,
-                    health_issue=self._health_issue,
-                )
+                await heartbeat(self.wallet, **self._heartbeat_fields())
             except Exception as e:
                 logger.warning("Heartbeat error: %s", e)
             await asyncio.sleep(_HEARTBEAT_INTERVAL)
@@ -978,17 +1010,14 @@ class TrajectoryValidator:
     # ------------------------------------------------------------------
 
     async def _eval_loop(self):
-        """Two-poll tick on the v6 daemon hot path:
+        """Poll ``GET /api/v2/epoch/current`` for the eval task
+        (challenger pack). Runs only when ``EVAL_ENABLED`` is on.
 
-        - ``GET /api/v2/epoch/current`` for the eval task (challenger pack).
-        - ``GET /api/v2/winner/current`` for the local-derivation inputs
-          that drive the winner cache (and therefore ``set_weights``).
-
-        Both endpoints are independent and share one tick. The loop
-        polls at a fixed cadence of ``_EPOCH_POLL_INTERVAL`` (10 s)
-        regardless of how much time is left in the current epoch — see
-        the comment on ``_EPOCH_POLL_INTERVAL`` for why we no longer
-        derive a long sleep from ``remaining_blocks``.
+        The loop polls at a fixed cadence of ``_EPOCH_POLL_INTERVAL``
+        (10 s) regardless of how much time is left in the current epoch
+        — see the comment on ``_EPOCH_POLL_INTERVAL`` for why we no
+        longer derive a long sleep from ``remaining_blocks``. The winner
+        cache is refreshed separately by ``_winner_loop``.
         """
         logger.info("Eval loop started (poll %ds)", _EPOCH_POLL_INTERVAL)
         while True:
@@ -999,26 +1028,17 @@ class TrajectoryValidator:
             await asyncio.sleep(_EPOCH_POLL_INTERVAL)
 
     async def _eval_loop_tick(self) -> None:
-        """Single eval-tick: refresh the winner cache, poll the active
-        challenge epoch, and (if not yet scored and budget permits) run
-        the eval and submit the score. Returns nothing — the caller
-        always sleeps for ``_EPOCH_POLL_INTERVAL``.
+        """Single eval-tick: poll the active challenge epoch, and (if
+        not yet scored and budget permits) run the eval and submit the
+        score. Returns nothing — the caller always sleeps for
+        ``_EPOCH_POLL_INTERVAL``.
         """
-        # 1) Refresh the winner cache from /api/v2/winner/current. The
-        #    server's `winner` field is advisory; derive_winner_state
-        #    runs the same stake-weighted aggregation locally and warns
-        #    on divergence.
-        try:
-            await self._refresh_winner_cache()
-        except Exception as e:
-            logger.warning("Winner cache refresh failed: %s", e)
-
-        # 2) Poll the active challenge epoch. Sign the request with the
-        #    validator wallet so the response includes
-        #    `epoch.challenger_pack_url` (gated to validators-or-24h per
-        #    docs/API.md). The `winner` block on this response is
-        #    intentionally ignored — see fetch_current_winner /
-        #    derive_winner_state.
+        # Poll the active challenge epoch. Sign the request with the
+        # validator wallet so the response includes
+        # `epoch.challenger_pack_url` (gated to validators-or-24h per
+        # docs/API.md). The `winner` block on this response is
+        # intentionally ignored — see fetch_current_winner /
+        # derive_winner_state.
         resp = await fetch_current_epoch(self.wallet)
         if resp is None:
             return  # transient → next tick
@@ -1070,8 +1090,32 @@ class TrajectoryValidator:
             challenge_epoch_id, commitment, eval_spec, eval_scenarios,
         )
 
+    # ------------------------------------------------------------------
+    # Winner loop
+    # ------------------------------------------------------------------
+
+    async def _winner_loop(self):
+        """Keep the winner cache (and therefore ``set_weights``) current.
+
+        Runs in both modes and independently of the eval loop, so a
+        weight-only validator still follows the winner and a long eval
+        can't starve the cache.
+        """
+        logger.info("Winner loop started (poll %ds)", _WINNER_POLL_INTERVAL)
+        while True:
+            try:
+                await self._refresh_winner_cache()
+            except Exception as e:
+                logger.warning("Winner cache refresh failed: %s", e)
+            await asyncio.sleep(_WINNER_POLL_INTERVAL)
+
     async def _refresh_winner_cache(self):
-        """Pull /api/v2/winner/current, run local derivation, persist cache."""
+        """Pull /api/v2/winner/current, adopt the server's winner, persist
+        the cache.
+
+        derive_winner_state also re-runs the aggregation locally as an
+        advisory cross-check and warns on divergence.
+        """
         winner_resp = await fetch_current_winner()
         if winner_resp is None:
             return  # transport error; keep the previous cache + TTL countdown
@@ -1443,17 +1487,29 @@ class TrajectoryValidator:
     # ------------------------------------------------------------------
 
     async def run(self):
-        """Run eval loop, weight loop, and heartbeat loop concurrently."""
+        """Run the winner, weight, and heartbeat loops concurrently —
+        plus the eval loop when ``EVAL_ENABLED`` is on."""
+        # Prime the winner cache so the first weight tick doesn't spend
+        # a whole tempo on fallback weights just because the cache was
+        # empty at startup.
         try:
-            await self._replay_pending_uploads()
+            await self._refresh_winner_cache()
         except Exception as e:
-            logger.warning("Startup log replay failed: %s", e)
+            logger.warning("Startup winner cache refresh failed: %s", e)
 
-        await asyncio.gather(
-            self._eval_loop(),
+        loops = [
+            self._winner_loop(),
             self._weight_loop(),
             self._heartbeat_loop(),
-        )
+        ]
+        if self.config.eval_enabled:
+            try:
+                await self._replay_pending_uploads()
+            except Exception as e:
+                logger.warning("Startup log replay failed: %s", e)
+            loops.append(self._eval_loop())
+
+        await asyncio.gather(*loops)
 
 
 async def main():

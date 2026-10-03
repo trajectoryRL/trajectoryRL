@@ -13,6 +13,10 @@
 #   WALLET_HOTKEY=default
 #   NETUID=11
 #   NETWORK=finney
+#
+# The validator is weight-only by default (sets weights for the server
+# winner, no evaluation). To evaluate challengers, also set:
+#   EVAL_ENABLED=1
 #   LLM_API_KEY=...        # your engy key (models/endpoints are code-locked)
 
 services:
