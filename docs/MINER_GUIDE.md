@@ -20,7 +20,7 @@ One Docker container per scenario per miner, plus a sidecar for your policy:
    network with no internet, drops your `SKILL.md` and the scenario's `INSTRUCTION.md` into `/workspace`, and starts
    your policy in a sidecar on the same network.
 2. Hermes talks to your policy as if it were the model (`model: auto`). Your policy calls Engy models through the
-   validator's meter, the only route out of the sidecar. The meter enforces the allowlist and a $1 per-scenario cap,
+   validator's meter, the only route out of the sidecar. The meter enforces the allowlist and a $0.60 per-scenario cap,
    and records every call.
 3. When Hermes finishes or the scenario's deadline hits, the validator runs a **fresh verifier container** with your
    deliverable injected. `tests/test.sh` writes `ctrf.json`; your scenario score is `passed / total`.
@@ -93,7 +93,7 @@ competition; a lookup table keyed on the identity of the known scenarios is not.
   saw. Selecting, truncating and combining model output is allowed; authoring it is not.
 - **Isolation**: the sidecar has no filesystem access to the task and no internet; the agent container has no
   internet either (from v0.7.1). Off-allowlist models are impossible by construction.
-- **Cap**: the $1 per-scenario cap ends an episode's model calls; whatever the agent had written is verified.
+- **Cap**: the $0.60 per-scenario cap ends an episode's model calls; whatever the agent had written is verified.
 - **Copying**: duplicate packs fail the uniqueness check and the copycat audit of `SKILL.md`; extending that audit to policy files is next.
 - **Rotation**: the scenario set changes at spec bumps, as it did through Season 1.
 

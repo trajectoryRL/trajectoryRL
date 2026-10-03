@@ -32,7 +32,7 @@
 | what you submit | SKILL.md | SKILL.md (optional but recommended) + `policy.py` or `policy.json` (+ helper text files) |
 | where your code runs | nowhere; SKILL.md is a prompt | a **policy sidecar** container next to the scenario container |
 | score | sum of per-scenario quality | same |
-| cost | reported | reported per episode and per model (not scored at launch; a safety cap of $1 per episode applies) |
+| cost | reported | reported per episode and per model (not scored at launch; a safety cap of $0.60 per episode applies) |
 
 Everything else is the same: one container per scenario, Hermes as the agent, hidden verifier, 600 s per
 scenario, Winsorized consensus across validators, winner-take-all seat with the takeover margin.
@@ -95,7 +95,7 @@ required. The first pack through pre-eval starts the next epoch.
  │ meter :8790          │◄──────────────────│ policy sidecar (YOUR CODE)  │◄──┐  LLM_BASE_URL=http://policy:8800/v1
  │ operator's Engy key  │                   │ no volumes, 1 CPU, 1 GB     │   │  LLM_MODEL=auto
  │ allowlist, prices,   │                   └────────────────────────────┘   │
- │ $1 cap, call log     │                   ┌────────────────────────────┐   │
+ │ $0.60 cap, call log  │                   ┌────────────────────────────┐   │
  └──────────┬───────────┘                   │ scenario container (Hermes) │───┘
             ▼ api.engy.ai                   │ /app, /workspace, verifier  │
                                             └────────────────────────────┘
@@ -128,7 +128,7 @@ Your policy sees only the request stream (the full conversation Hermes sends on 
 | glm-5.3 | 0.98 | 3.08 | 0.18 |
 | kimi-k3 | 1.95 | 9.75 | 0.195 |
 
-Any other model name is refused (HTTP 400). The $1.00 safety cap is enforced **before** a call is forwarded:
+Any other model name is refused (HTTP 400). The $0.60 safety cap is enforced **before** a call is forwarded:
 the meter reserves the worst case for the call (every billed input field, messages and tools included, at
 list price with no cache assumed, ASCII at 3 characters per token and non-ASCII at one token per character with
 a 1.25x safety factor, plus `max_tokens` at the completion price) against what is left after the other calls in
@@ -315,4 +315,4 @@ scenario-name dispatch, no verifier internals, no obfuscated code. In addition:
   happens to open (a scenario's own nginx, for example). It cannot read the filesystem, run commands there, or
   see the verifier, which runs afterwards in a fresh container; treat anything learned that way as covered by
   the same hardcoding rules.
-- The safety cap ends an episode's model calls at $1.00; whatever the agent had written is verified.
+- The safety cap ends an episode's model calls at $0.60; whatever the agent had written is verified.

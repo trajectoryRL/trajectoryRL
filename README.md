@@ -24,7 +24,7 @@ auto mode (`engy/auto`), for any customer and any harness.
  └────────────┘                 │  policy sidecar: the miner's fusion policy  │  metered calls
                                 │        │  only route: the meter             │ ─────────────►  8 open-weight models
                                 │        ▼                                    │   receipts
-                                │  meter: allowlist, $1 cap, cost, provenance │ ◄─────────────
+                                │ meter: allowlist, $0.6 cap, cost, provenance│ ◄─────────────
                                 │        │                                    │
                                 │  verifier container: hidden tests → score   │
                                 └─────────────────────────────────────────────┘
@@ -36,7 +36,7 @@ auto mode (`engy/auto`), for any customer and any harness.
   and stream the answer back.
 - **How it is scored**: the sum over 26 scenarios of tests passed over tests total, from a fresh verifier container.
   Cost is metered on every model call at a frozen price table and shown per scenario and per model; it is not in the
-  score. A $1 per-scenario safety cap bounds spending.
+  score. A $0.60 per-scenario safety cap bounds spending.
 - **Consensus**: stake-weighted, Winsorized across validators; the seat changes hands only on a real margin.
 - **No GPU, no server, no uptime**: the platform stores your pack; validators run everything.
 

@@ -227,6 +227,6 @@ The full request/response spec for `/api/v2/validators/epoch_snapshot` (includin
 - An internal network can still reach the host's own address on that bridge. Do not run services that must
   stay private on `0.0.0.0` on a validator host; bind them to a specific interface or localhost. The
   validator's meter is the only service a sidecar is meant to reach.
-- The episode cap is $1.00 per scenario at the frozen price table (`EPISODE_CAP_USD`); a session is at most
-  26 x $1. Typical evaluations cost $0.5-10 depending on the challenger's policy. Watch your Engy balance.
+- The episode cap is $0.60 per scenario at the frozen price table (`EPISODE_CAP_USD`); a session is at most
+  20 x $0.60 = $12. Typical evaluations cost $0.5-8 depending on the challenger's policy. Watch your Engy balance.
 - `TRAJRL_SKIP_ORPHAN_SCAN` and `TRAJRL_SCENARIO_NET` are lab knobs; never set them on a validator.

@@ -63,7 +63,7 @@ mean_quality  = final_score / N              (∈ [0, 1], convenience aggregate)
 
 Consensus uses `final_score`; `mean_quality` is reported alongside for human readability.
 
-**Cost** (USD at the frozen SPEC price table, from the validator's meter over every model call the policy made) is reported per scenario, per model and per session but **never folded into the score** in this spec; a $1 per-scenario safety cap bounds spending.
+**Cost** (USD at the frozen SPEC price table, from the validator's meter over every model call the policy made) is reported per scenario, per model and per session but **never folded into the score** in this spec; a $0.60 per-scenario safety cap bounds spending.
 
 No learning bonus, no split-half delta, no early-mean floor. With one episode per scenario the within-scenario delta concept doesn't apply.
 

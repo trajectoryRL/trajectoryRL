@@ -34,9 +34,9 @@ POLICY_FIRST_CALL_S = 120.0
 POLICY_IDLE_S = 600.0
 
 # Safety cap per episode in USD at the frozen price table. Not a scoring term (Ning 2026-09-18: cost is
-# reported, not scored, at launch); it bounds validator spend against runaway policies. 26 scenarios x $1 =
-# $26 worst case per eval.
-EPISODE_CAP_USD = 1.0
+# reported, not scored, at launch); it bounds validator spend against runaway policies. 20 scenarios x $0.60 =
+# $12 worst case per eval.
+EPISODE_CAP_USD = 0.6
 
 # Model allowlist and frozen prices ($ per token: prompt, completion, cache-read), the Engy catalog as of
 # 2026-09-18. Every validator must compute the same cost from the same table, so it ships in code.
