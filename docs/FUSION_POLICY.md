@@ -15,7 +15,7 @@
 > and every harness. The full sequence of seasons is in [ROADMAP.md](ROADMAP.md).
 
 **Scoring**: programmatic verifier, quality summed across the active scenario set (unchanged from Season 1)
-**Spec**: 25 (same 26 scenarios as SPEC 24; new testee: your fusion policy)
+**Spec**: 27 (20 scenarios since SPEC 26; $0.30 per-episode cap since SPEC 27; testee: your fusion policy)
 
 > Mining means writing a **fusion policy**: a program that sits between the agent harness (Hermes) and the
 > Engy model catalog and decides, per request, which models to call, in what combination (route, escalate,

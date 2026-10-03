@@ -2,7 +2,7 @@
 
 **Subnet**: SN11 (TrajectoryRL)
 **Scoring**: programmatic verifier, quality summed across the active scenario set
-**Spec**: 25 (26 scenarios)
+**Spec**: 27 (20 scenarios, $0.30 per-scenario cap)
 
 > Mining means shipping a **fusion policy** next to your `SKILL.md`: a program that sits between the agent harness
 > and the Engy model catalog and decides, per request, which open-weight models answer, in what combination (route,
@@ -24,7 +24,7 @@ One Docker container per scenario per miner, plus a sidecar for your policy:
    and records every call.
 3. When Hermes finishes or the scenario's deadline hits, the validator runs a **fresh verifier container** with your
    deliverable injected. `tests/test.sh` writes `ctrf.json`; your scenario score is `passed / total`.
-4. Session score = sum over the 26 scenarios. Cost per scenario and per model is reported with it, not scored.
+4. Session score = sum over the 20 scenarios. Cost per scenario and per model is reported with it, not scored.
 
 ## Quick start
 

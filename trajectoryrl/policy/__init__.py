@@ -35,7 +35,7 @@ POLICY_IDLE_S = 600.0
 
 # Safety cap per episode in USD at the frozen price table. Not a scoring term (Ning 2026-09-18: cost is
 # reported, not scored, at launch); it bounds validator spend against runaway policies. 20 scenarios x $0.30 =
-# $6 worst case per eval.
+# $6 worst case per eval. SPEC 27 marks the change from the launch cap of $1.00.
 EPISODE_CAP_USD = 0.3
 
 # Model allowlist and frozen prices ($ per token: prompt, completion, cache-read), the Engy catalog as of

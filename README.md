@@ -34,7 +34,7 @@ auto mode (`engy/auto`), for any customer and any harness.
   small SDK, or a raw OpenAI-compatible server). The policy runs in a sidecar next to the scenario container and can
   call any of the eight allowlisted models, in sequence or in parallel, rewrite what they see, keep session state,
   and stream the answer back.
-- **How it is scored**: the sum over 26 scenarios of tests passed over tests total, from a fresh verifier container.
+- **How it is scored**: the sum over 20 scenarios of tests passed over tests total, from a fresh verifier container.
   Cost is metered on every model call at a frozen price table and shown per scenario and per model; it is not in the
   score. A $0.30 per-scenario safety cap bounds spending.
 - **Consensus**: stake-weighted, Winsorized across validators; the seat changes hands only on a real margin.
