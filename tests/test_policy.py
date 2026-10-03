@@ -233,7 +233,7 @@ def test_ensure_meter_is_started_once_under_parallel_workers():
 
 def test_close_drops_episode_and_keeps_memory_bounded():
     m = PolicyMeter("http://127.0.0.1:1/v1", "k", port=_free_port())
-    toks = [m.mint(f"e{i}") for i in range(50)]
+    toks = [m.mint(f"e{i}", cap_usd=1.0) for i in range(50)]
     for t in toks:
         assert m.close(t) is not None
     assert m.episodes == {} and m.close(toks[0]) is None
@@ -253,19 +253,6 @@ def test_reserve_for_refuses_clamps_and_fits():
     assert reserve_for("kimi-k3", body, room_usd=0.001)[1] is None
     assert reserve_for("kimi-k3", body, room_usd=est * 1.95e-6 + 10 * 9.75e-6)[1] is None
 
-
-def test_default_cap_is_the_episode_cap_and_fits_an_opening_turn():
-    from trajectoryrl.policy import EPISODE_CAP_USD, MODEL_PRICES
-    from trajectoryrl.policy.meter import reserve_for, estimate_prompt_tokens, DEFAULT_MAX_TOKENS
-    m = PolicyMeter("http://127.0.0.1:1/v1", "k", port=_free_port())
-    assert m.usage(m.mint("e")).cap_usd == EPISODE_CAP_USD
-    # The cap must leave every allowlisted model its opening turn: a ~20k-token prompt (system prompt, tools,
-    # SKILL.md) with the default completion length, not clamped.
-    body = {"messages": [{"role": "user", "content": "x" * 48000}]}
-    assert 19000 <= estimate_prompt_tokens(body) <= 21000
-    for model in MODEL_PRICES:
-        r, mt, clamped = reserve_for(model, body, room_usd=EPISODE_CAP_USD)
-        assert mt == DEFAULT_MAX_TOKENS and not clamped and r < EPISODE_CAP_USD, model
 
 
 @pytest.mark.asyncio

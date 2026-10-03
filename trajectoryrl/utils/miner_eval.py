@@ -84,6 +84,7 @@ async def evaluate_miner_s1(
     on_episode_done: Optional[Callable[[_EpisodeResult, int, int], None]] = None,
     is_epoch_still_current: Optional[Callable[[str], bool]] = None,
     scenarios: Optional[Sequence[str]] = None,
+    spec_number: Optional[int] = None,
 ) -> MinerEvalOutcome:
     """Evaluate a single miner's pack via trajrl-bench (Season 1).
 
@@ -107,6 +108,9 @@ async def evaluate_miner_s1(
         scenarios: Scenario set for this eval (a ``SCENARIOS_BY_SPEC``
             entry picked from the server's spec schedule). Defaults to
             the harness's ``SANDBOX_SCENARIOS`` (local binary's spec).
+        spec_number: The spec this eval is scored under; selects its
+            ``SpecConfig`` (per-episode safety cap). Defaults to the
+            local binary's spec.
 
     Returns:
         ``MinerEvalOutcome`` describing success or skip reason. On
@@ -210,6 +214,7 @@ async def evaluate_miner_s1(
             is_epoch_still_current=is_epoch_still_current,
             scenarios=scenarios,
             policy_files=policy_files,
+            spec_number=spec_number,
         )
     except Exception as e:
         log.error("S1 evaluation failed: %s", e, exc_info=True)

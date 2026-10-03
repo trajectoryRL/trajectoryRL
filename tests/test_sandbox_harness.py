@@ -1447,7 +1447,7 @@ class TestParallelScenarioOrchestrator:
                              on_chat_start=None, on_chat_end=None,
                              on_container_started=None,
                              on_container_finished=None,
-                             policy_files=None):
+                             policy_files=None, cap_usd=None):
             calls["n"] += 1
             if calls["n"] == 1:
                 return _ep(scenario=spec["name"])  # infra-incomplete
@@ -1499,7 +1499,7 @@ class TestParallelScenarioOrchestrator:
                              on_chat_start=None, on_chat_end=None,
                              on_container_started=None,
                              on_container_finished=None,
-                             policy_files=None):
+                             policy_files=None, cap_usd=None):
             nonlocal active, max_observed
             with active_lock:
                 active += 1
@@ -1520,6 +1520,32 @@ class TestParallelScenarioOrchestrator:
         assert max_observed == 1
         assert [e.scenario for e in result.episodes] == list(scenarios)
 
+    def test_cap_reaches_every_episode(self, monkeypatch, tmp_path):
+        """The per-spec episode cap resolved for the eval is the one each
+        episode's meter token is minted with."""
+        scenarios = ("s0", "s1", "s2")
+        h = self._setup_harness(
+            monkeypatch, tmp_path, parallelism=2, scenarios=scenarios,
+        )
+        caps = []
+
+        def fake_run_episode(*, session_id, episode_index, skill_md, spec,
+                             on_chat_start=None, on_chat_end=None,
+                             on_container_started=None,
+                             on_container_finished=None,
+                             policy_files=None, cap_usd=None):
+            caps.append(cap_usd)
+            return _EpisodeResult(
+                episode_index=episode_index, scenario=spec["name"],
+                quality=0.5,
+            )
+
+        monkeypatch.setattr(h, "_run_episode", fake_run_episode)
+        h._run_eval_sync(
+            skill_md="x", epoch_seed=0, salt="s", pack_hash="abc", cap_usd=1.0,
+        )
+        assert caps == [1.0, 1.0, 1.0]
+
     def test_peak_concurrency_bounded_by_parallelism(
         self, monkeypatch, tmp_path,
     ):
@@ -1539,7 +1565,7 @@ class TestParallelScenarioOrchestrator:
                              on_chat_start=None, on_chat_end=None,
                              on_container_started=None,
                              on_container_finished=None,
-                             policy_files=None):
+                             policy_files=None, cap_usd=None):
             nonlocal active, max_observed
             with active_lock:
                 active += 1
@@ -1584,7 +1610,7 @@ class TestParallelScenarioOrchestrator:
                              on_chat_start=None, on_chat_end=None,
                              on_container_started=None,
                              on_container_finished=None,
-                             policy_files=None):
+                             policy_files=None, cap_usd=None):
             # Lower indices sleep longer → finish in reverse order.
             time.sleep(0.05 * (len(scenarios) - episode_index))
             return _EpisodeResult(
@@ -1630,7 +1656,7 @@ class TestParallelScenarioOrchestrator:
                              on_chat_start=None, on_chat_end=None,
                              on_container_started=None,
                              on_container_finished=None,
-                             policy_files=None):
+                             policy_files=None, cap_usd=None):
             nonlocal completed_count
 
             # Each scenario registers a unique mock "container" with
@@ -1719,7 +1745,7 @@ class TestParallelScenarioOrchestrator:
                                  on_chat_start=None, on_chat_end=None,
                                  on_container_started=None,
                                  on_container_finished=None,
-                                 policy_files=None):
+                                 policy_files=None, cap_usd=None):
                 # Quality depends on scenario name, not on completion order.
                 quality = {
                     "s0": 0.25, "s1": 0.5, "s2": 0.75, "s3": 1.0,

@@ -53,7 +53,7 @@ from docker.types import LogConfig
 
 from ..utils.config import SPEC_NUMBER, ValidatorConfig
 from ..policy import (
-    EPISODE_CAP_USD, METER_ALIAS, METER_PORT, POLICY_ALIAS, POLICY_FIRST_CALL_S, POLICY_IDLE_S, POLICY_PORT,
+    METER_ALIAS, METER_PORT, POLICY_ALIAS, POLICY_FIRST_CALL_S, POLICY_IDLE_S, POLICY_PORT,
     RUNTIME_FILE, SIDECAR_CPU_QUOTA, SIDECAR_HEALTH_TIMEOUT_S, SIDECAR_MEM_LIMIT,
 )
 from ..policy.meter import PolicyMeter
@@ -261,12 +261,64 @@ SCENARIOS_BY_SPEC[26] = (
 )
 
 # SPEC 27 (episode cap): the scenario set is SPEC 26's, unchanged. The bump marks
-# the per-episode safety cap going from $1.00 to $0.30 (``EPISODE_CAP_USD``): a
+# the per-episode safety cap going from $1.00 to $0.30 (``SpecConfig.episode_cap_usd``): a
 # policy that kept an expensive model for a whole long episode is cut off
 # earlier, so scores are not comparable with SPEC 26.
 SCENARIOS_BY_SPEC[27] = SCENARIOS_BY_SPEC[26]
 
+
+@dataclass(frozen=True)
+class SpecConfig:
+    """Spec-specific settings: what a spec fixes besides its scenario set.
+
+    An eval runs under the config of the spec it is scored in (the server's
+    ``epoch.spec_number``), so a spec keeps one meaning while validators roll
+    forward. A shipped entry is never edited: changing a value means a new
+    SPEC_NUMBER with its own entry.
+    """
+
+    # Safety cap per episode in USD at the frozen price table. Not a scoring
+    # term (Ning 2026-09-18: cost is reported, not scored, at launch); it
+    # bounds validator spend against runaway policies. Worst case per eval is
+    # this times the number of scenarios.
+    episode_cap_usd: float
+
+
+# The Season 2 launch settings. SPEC 25 and 26 ran under them; the specs
+# before 25 predate routing policies and share the entry.
+_LAUNCH_SPEC_CONFIG = SpecConfig(episode_cap_usd=1.00)
+
+# One entry per spec in ``SCENARIOS_BY_SPEC``, kept and retired together.
+SPEC_CONFIG_BY_SPEC: Dict[int, SpecConfig] = {
+    20: _LAUNCH_SPEC_CONFIG,
+    21: _LAUNCH_SPEC_CONFIG,
+    22: _LAUNCH_SPEC_CONFIG,
+    23: _LAUNCH_SPEC_CONFIG,
+    24: _LAUNCH_SPEC_CONFIG,
+    25: _LAUNCH_SPEC_CONFIG,
+    26: _LAUNCH_SPEC_CONFIG,
+    # SPEC 27: 20 scenarios x $0.30 = $6 worst case per eval.
+    27: SpecConfig(episode_cap_usd=0.30),
+}
+
+# A spec with scenarios but no config (or the reverse) fails loudly at import
+# time, like a SPEC_NUMBER bump without a scenario set.
+if set(SPEC_CONFIG_BY_SPEC) != set(SCENARIOS_BY_SPEC):
+    raise RuntimeError(
+        "SPEC_CONFIG_BY_SPEC and SCENARIOS_BY_SPEC must list the same specs: "
+        f"{sorted(SPEC_CONFIG_BY_SPEC)} != {sorted(SCENARIOS_BY_SPEC)}"
+    )
+
 SANDBOX_SCENARIOS: tuple[str, ...] = SCENARIOS_BY_SPEC[SPEC_NUMBER]
+
+
+def spec_config(spec_number: Optional[int] = None) -> SpecConfig:
+    """Config for an eval scored under ``spec_number``.
+
+    ``None`` or a spec this binary doesn't ship gives the local
+    ``SPEC_NUMBER``'s config, the same fallback as ``resolve_eval_spec``.
+    """
+    return SPEC_CONFIG_BY_SPEC.get(spec_number, SPEC_CONFIG_BY_SPEC[SPEC_NUMBER])
 
 
 def resolve_eval_spec(api_spec: Any) -> tuple[int, tuple[str, ...]]:
@@ -1486,6 +1538,7 @@ class TrajectorySandboxHarness:
         is_epoch_still_current: Optional[Callable[[str], bool]] = None,
         scenarios: Optional[Sequence[str]] = None,
         policy_files: Optional[Dict[str, str]] = None,
+        spec_number: Optional[int] = None,
     ) -> SandboxEvaluationResult:
         """Run the multi-scenario session.
 
@@ -1493,6 +1546,11 @@ class TrajectorySandboxHarness:
         ``SCENARIOS_BY_SPEC`` entry picked per epoch from the server's
         spec schedule). Defaults to ``SANDBOX_SCENARIOS`` — the local
         binary's spec.
+
+        ``spec_number`` is the spec this eval is scored under (the same
+        resolution that picked ``scenarios``). It selects the spec's
+        ``SpecConfig``, which carries the per-episode safety cap. Defaults
+        to the local binary's spec.
 
         Callbacks (all optional, all invoked from the executor thread,
         all best-effort — exceptions are caught and logged):
@@ -1523,10 +1581,11 @@ class TrajectorySandboxHarness:
         ).hexdigest()[:16]
 
         eval_scenarios = tuple(scenarios) if scenarios else tuple(SANDBOX_SCENARIOS)
+        cap_usd = spec_config(spec_number).episode_cap_usd
         logger.info(
-            "eval starting: pack_hash=%s, seed=%d, scenarios=%s",
+            "eval starting: pack_hash=%s, seed=%d, episode_cap=$%.2f, scenarios=%s",
             pack_hash[:12] if pack_hash else "?",
-            epoch_seed, list(eval_scenarios),
+            epoch_seed, cap_usd, list(eval_scenarios),
         )
 
         loop = asyncio.get_event_loop()
@@ -1540,6 +1599,7 @@ class TrajectorySandboxHarness:
                     is_epoch_still_current=is_epoch_still_current,
                     scenarios=eval_scenarios,
                     policy_files=policy_files,
+                    cap_usd=cap_usd,
                 ),
             )
         except Exception as e:
@@ -1564,6 +1624,7 @@ class TrajectorySandboxHarness:
         is_epoch_still_current: Optional[Callable[[str], bool]] = None,
         scenarios: Optional[Sequence[str]] = None,
         policy_files: Optional[Dict[str, str]] = None,
+        cap_usd: Optional[float] = None,
     ) -> _SessionResult:
         """One container per scenario, one episode each.
 
@@ -1761,6 +1822,7 @@ class TrajectorySandboxHarness:
                         skill_md=skill_md,
                         spec=spec,
                         policy_files=policy_files,
+                        cap_usd=cap_usd,
                         on_chat_start=(
                             (lambda sc=spec["name"], idx=cell_index, tot=total:
                                 on_episode_start(sc, idx, tot))
@@ -1898,6 +1960,7 @@ class TrajectorySandboxHarness:
         on_container_started: Optional[Callable[[Container], None]] = None,
         on_container_finished: Optional[Callable[[], None]] = None,
         policy_files: Optional[Dict[str, str]] = None,
+        cap_usd: Optional[float] = None,
     ) -> _EpisodeResult:
         """Run one cell: spin up the scenario container, exec hermes,
         extract output, run verifier, tear down.
@@ -1941,7 +2004,10 @@ class TrajectorySandboxHarness:
         # it were the LLM (LLM_BASE_URL -> http://policy:8800/v1, model
         # 'auto'); the sidecar can only reach the meter.
         meter = self._ensure_meter()
-        ep_token = meter.mint(f"{session_id}/{scenario}", EPISODE_CAP_USD)
+        ep_token = meter.mint(
+            f"{session_id}/{scenario}",
+            spec_config().episode_cap_usd if cap_usd is None else cap_usd,
+        )
         pnet = None
         sidecar = None
         # Season 2: the agent's model endpoint is the policy sidecar on the
