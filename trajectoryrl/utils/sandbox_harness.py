@@ -260,6 +260,12 @@ SCENARIOS_BY_SPEC[26] = (
     "write-compressor",
 )
 
+# SPEC 27 (episode cap): the scenario set is SPEC 26's, unchanged. The bump marks
+# the per-episode safety cap going from $1.00 to $0.30 (``EPISODE_CAP_USD``): a
+# policy that kept an expensive model for a whole long episode is cut off
+# earlier, so scores are not comparable with SPEC 26.
+SCENARIOS_BY_SPEC[27] = SCENARIOS_BY_SPEC[26]
+
 SANDBOX_SCENARIOS: tuple[str, ...] = SCENARIOS_BY_SPEC[SPEC_NUMBER]
 
 

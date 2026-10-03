@@ -24,7 +24,7 @@ auto mode (`engy/auto`), for any customer and any harness.
  └────────────┘                 │  policy sidecar: the miner's fusion policy  │  metered calls
                                 │        │  only route: the meter             │ ─────────────►  8 open-weight models
                                 │        ▼                                    │   receipts
-                                │ meter: allowlist, $0.6 cap, cost, provenance│ ◄─────────────
+                                │meter: allowlist, $0.30 cap, cost, provenance│ ◄─────────────
                                 │        │                                    │
                                 │  verifier container: hidden tests → score   │
                                 └─────────────────────────────────────────────┘
@@ -34,9 +34,9 @@ auto mode (`engy/auto`), for any customer and any harness.
   small SDK, or a raw OpenAI-compatible server). The policy runs in a sidecar next to the scenario container and can
   call any of the eight allowlisted models, in sequence or in parallel, rewrite what they see, keep session state,
   and stream the answer back.
-- **How it is scored**: the sum over 26 scenarios of tests passed over tests total, from a fresh verifier container.
+- **How it is scored**: the sum over 20 scenarios of tests passed over tests total, from a fresh verifier container.
   Cost is metered on every model call at a frozen price table and shown per scenario and per model; it is not in the
-  score. A $0.60 per-scenario safety cap bounds spending.
+  score. A $0.30 per-scenario safety cap bounds spending.
 - **Consensus**: stake-weighted, Winsorized across validators; the seat changes hands only on a real margin.
 - **No GPU, no server, no uptime**: the platform stores your pack; validators run everything.
 
@@ -60,6 +60,7 @@ trajectoryrl-miner web-submit pack.json
 
 Baselines measured through the validator code on the 26 scenarios: SKILL.md only (pin qwen3.8-27b) 19.9;
 pin glm-5.3-flash 22.6 at $0.56 a session; pin kimi-k3 22.8 at $8.50; kimi-k3 with three cheap advisers 23.6 at $10.02.
+These runs used the launch cap of $1.00 per scenario and have not been re-measured under the $0.30 cap.
 
 ## Quick start for validators
 

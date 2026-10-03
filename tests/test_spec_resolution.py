@@ -123,6 +123,23 @@ class TestSpec26Set:
         assert sh.resolve_eval_spec(25) == (25, sh.SCENARIOS_BY_SPEC[25])
 
 
+class TestSpec27Set:
+    def test_spec27_keeps_the_spec26_scenarios(self):
+        # SPEC 27 marks the episode cap change ($1.00 -> $0.30), not a scenario change.
+        assert sh.SCENARIOS_BY_SPEC[27] == sh.SCENARIOS_BY_SPEC[26]
+        assert len(sh.SCENARIOS_BY_SPEC[27]) == 20
+
+    def test_spec27_is_the_local_default(self):
+        from trajectoryrl.utils.config import SPEC_NUMBER
+        assert SPEC_NUMBER == 27
+        assert sh.SANDBOX_SCENARIOS == sh.SCENARIOS_BY_SPEC[27]
+
+    def test_spec26_still_resolves_during_transition(self):
+        # resolve_eval_spec must still serve SPEC 26 while validators roll forward
+        # and the server has not yet flipped the active spec to 27.
+        assert sh.resolve_eval_spec(26) == (26, sh.SCENARIOS_BY_SPEC[26])
+
+
 # ---------------------------------------------------------------------------
 # 2. resolve_eval_spec
 # ---------------------------------------------------------------------------
