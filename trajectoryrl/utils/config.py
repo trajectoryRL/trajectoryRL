@@ -83,6 +83,15 @@ SCORING_VERSION = SPEC_NUMBER
 TOP_N_RECHECK = 3
 
 
+def _env_flag(name: str) -> bool:
+    """True when the env var is set to an affirmative value.
+
+    Accepts 1/true/yes/on (any case) so an operator who writes
+    ``EVAL_ENABLED=true`` doesn't silently stay in weight-only mode.
+    """
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 @dataclass
 class ValidatorConfig:
     """Configuration for TrajectoryRL validator.
@@ -114,6 +123,13 @@ class ValidatorConfig:
     wallet_hotkey: str = "default"
     netuid: int = 11
     network: str = "finney"
+
+    # Operating mode. Off (default) = weight-only: mirror the
+    # server-canonical winner into on-chain weights and nothing else — no
+    # challenger polling, no sandbox, no LLM key, no docker socket. On =
+    # additionally evaluate each epoch's challenger and submit the score.
+    # Operator switch: ``EVAL_ENABLED=1``.
+    eval_enabled: bool = False
 
     # Evaluation config
     eval_interval_blocks: int = 7200  # ~24 hours at 12s/block (window length)
@@ -303,6 +319,7 @@ class ValidatorConfig:
             wallet_hotkey=os.getenv("WALLET_HOTKEY", "default"),
             netuid=int(os.getenv("NETUID", "11")),
             network=os.getenv("NETWORK", "finney"),
+            eval_enabled=_env_flag("EVAL_ENABLED"),
             # --- Paths ---
             eval_state_path=Path(os.getenv("EVAL_STATE_PATH", "/var/lib/trajectoryrl/eval_state.json")),
             winner_state_path=Path(os.getenv("WINNER_STATE_PATH", "/var/lib/trajectoryrl/winner_state.json")),

@@ -12,6 +12,37 @@
 
 ---
 
+## Operating modes: weight-only (default) vs. eval
+
+The validator daemon has two modes, selected by `EVAL_ENABLED` in `.env.validator`.
+
+| | Weight-only (default) | Eval (`EVAL_ENABLED=1`) |
+|---|---|---|
+| Follows the winner (`GET /api/v2/winner/current`, ~60 s) | yes | yes |
+| Sets on-chain weights for the winner (tempo-gated) | yes | yes |
+| Heartbeat | version + `last_set_weights_at` | plus image digests, model, `last_eval_at`, eval health |
+| Polls `GET /api/v2/epoch/current`, runs the sandbox, `POST`s scores | no | yes |
+| Needs `LLM_API_KEY`, the Docker socket, sandbox-sized hardware | no | yes |
+
+In both modes the daemon adopts the winner the server publishes. It also re-runs the score aggregation
+over the per-validator submissions in the same response as an advisory cross-check, and logs a warning on
+divergence; the recomputed value does not override the server's winner. If the server is unreachable for
+longer than the winner-cache TTL (24 h), the daemon burns to the owner UID rather than write stale weights.
+
+**Switching modes.** Edit `EVAL_ENABLED` in `.env.validator`, then recreate the container so it re-reads the
+file: `docker compose -f docker/docker-compose.validator.yml --env-file .env.validator up -d validator`.
+A plain `docker restart`, or a watchtower image update, keeps the container's old environment.
+
+**Upgrading an evaluating validator to a release with this switch.** The default is weight-only, and
+watchtower carries the old environment over. A validator that should keep evaluating must have
+`EVAL_ENABLED=1` in its environment *before* the new image arrives — add it to `.env.validator` and
+recreate the container on the old image (which ignores the variable). Otherwise it silently stops
+submitting scores when the image updates.
+
+The rest of this guide describes what an eval validator does.
+
+---
+
 ## What you do as a validator
 
 Each epoch (~24 h, 7200 chain blocks):

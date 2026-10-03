@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """TrajectoryRL Validator entry point.
 
-Runs the TrajectoryValidator with continuous evaluation loop:
-  - Daily eval at UTC eval_utc_hour: evaluate all active packs, score with split-half delta
-  - tempo (~72 min): compute weights from eval scores, set_weights on-chain
+Runs the TrajectoryValidator daemon (see trajectoryrl/base/validator.py):
+  - Weight-only (default): mirror the server-canonical winner into
+    on-chain weights, tempo-gated.
+  - EVAL_ENABLED=1: additionally evaluate each epoch's challenger in the
+    trajrl-bench sandbox and submit the score.
 
 Each validator operates independently. Yuma Consensus aggregates weights on-chain.
 
 Environment variables:
-    WALLET_NAME             Bittensor wallet name         (default: validator)
+    WALLET_NAME             Bittensor wallet name          (default: validator)
     WALLET_HOTKEY           Hotkey name inside wallet      (default: default)
     NETUID                  Subnet UID                     (default: 11)
     NETWORK                 Subtensor network              (default: finney)
-    WEIGHT_INTERVAL_BLOCKS  Blocks between set_weights     (default: 360, ~72min)
-    SIMILARITY_THRESHOLD    NCD similarity threshold       (default: 0.80)
-    INACTIVITY_BLOCKS       Blocks before inactive         (default: 14400, ~48h)
+    EVAL_ENABLED            1 = evaluate challengers       (default: 0, weight-only)
+    LLM_API_KEY             engy key, needed with EVAL_ENABLED=1
     LOG_LEVEL               Logging level                  (default: INFO)
-    EVAL_ON_STARTUP         Run eval immediately on startup (1=enable, default: 0)
 """
 
 import asyncio
