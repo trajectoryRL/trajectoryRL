@@ -231,6 +231,32 @@ async def test_row_falls_back_to_the_response_id_for_a_non_engy_upstream(meter):
     m.close(tok)
 
 
+@pytest.mark.asyncio
+async def test_each_upstream_call_is_logged_with_its_request_id(meter, caplog):
+    m, up = meter
+    tok = m.mint("sess-log/scenario_a", cap_usd=1.0)
+    with caplog.at_level("INFO", logger="trajectoryrl.policy.meter"):
+        await _post(m, tok, {"model": "kimi-k3", "messages": [{"role": "user", "content": "x"}]})
+        await _rows(m, tok, 1)
+    lines = [r.getMessage() for r in caplog.records if r.name == "trajectoryrl.policy.meter"]
+    assert len(lines) == 1
+    assert "sess-log/scenario_a" in lines[0] and "kimi-k3" in lines[0] and f"rid={up.rids[-1]}" in lines[0]
+    m.close(tok)
+
+
+@pytest.mark.asyncio
+async def test_log_line_lists_the_ids_of_retried_attempts(meter, caplog):
+    m, up = meter
+    up.was_busy = False
+    tok = m.mint("sess-log/scenario_b", cap_usd=1.0)
+    with caplog.at_level("INFO", logger="trajectoryrl.policy.meter"):
+        await _post(m, tok, {"model": "kimi-k3", "messages": [{"role": "user", "content": "busy-once"}]})
+        await _rows(m, tok, 1)
+    lines = [r.getMessage() for r in caplog.records if r.name == "trajectoryrl.policy.meter"]
+    assert f"rid={up.rids[-1]}" in lines[-1] and f"retry_rids={up.rids[-2]}" in lines[-1]
+    m.close(tok)
+
+
 # ---------------------------------------------------------------- runtime helpers (imported as a module)
 
 @pytest.fixture(scope="module")

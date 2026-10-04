@@ -399,6 +399,11 @@ class PolicyMeter:
                 ep.errors += 1
         if not stream:
             resp.headers["x-trajrl-budget-remaining-usd"] = f"{max(0.0, ep.cap_usd - ep.spent_usd):.6f}"
+        # One line per upstream call in the validator log, so a call can be traced
+        # to Engy's request log without opening the episode's meter.json.
+        logger.info("[%s] meter call model=%s status=%s stream=%s rid=%s retry_rids=%s tokens=%d/%d/%d usd=%.6f s=%.1f",
+                    ep.name, model, status, stream, rid or "-", ",".join(retry_rids) or "-", pt, cached, ct, usd,
+                    time.time() - t0)
         self._row(ep, dict(ts=round(t0, 3), model=model, status=status, stream=stream, prompt=pt, cached=cached,
                            completion=ct, finish=finish, err=err, retries=retries, ttfb=ttfb, max_tokens=mt, clamped=clamped,
                            s=round(time.time() - t0, 3), usd=round(usd, 8), rid=rid, retry_rids=retry_rids, **fp))
