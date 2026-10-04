@@ -2,9 +2,9 @@
 
 OpenAI-compatible passthrough to the locked inference endpoint with the operator's key. The sidecar authenticates
 with a per-episode token minted by the harness. Per token the meter enforces the model allowlist and the safety cap,
-records every call (model, tokens, cached tokens, cost at the frozen price table, latency, status), and returns
-``x-trajrl-budget-remaining-usd`` on every response. In-stream concurrency error frames from the gateway are retried
-here so a policy never sees them.
+records every call (model, tokens, cached tokens, cost at the frozen price table, latency, status, the upstream's
+request id), and returns ``x-trajrl-budget-remaining-usd`` on every response. In-stream concurrency error frames from
+the gateway are retried here so a policy never sees them.
 
 Runs in a daemon thread with its own event loop so the synchronous harness (``_run_eval_sync`` in an executor
 thread) can mint tokens and read usage without touching the validator's main loop.
@@ -79,6 +79,12 @@ def content_fingerprint(content: str, tool_calls: list) -> dict:
         "tool_sha": hashlib.sha256(json.dumps(calls, sort_keys=True).encode()).hexdigest()[:16] if calls else None,
         "tool_n": len(calls),
     }
+
+
+def engy_request_id(payload: Any) -> str | None:
+    """Engy's request id from a response body or stream chunk (``x_engy.request_id``)."""
+    x = payload.get("x_engy") if isinstance(payload, dict) else None
+    return (x.get("request_id") if isinstance(x, dict) else None) or None
 
 
 # Worst-case prompt-token estimate from the request body: no cache hits assumed.
@@ -295,11 +301,19 @@ class PolicyMeter:
             body.setdefault("stream_options", {})["include_usage"] = True
         hdr = {"Authorization": f"Bearer {self.key}", "Content-Type": "application/json"}
         t0 = time.time(); usage = None; finish = None; status = 0; err = None; retries = 0; ttfb = None; fp = {}
+        # The upstream's handle for this call, so a row can be looked up in Engy's
+        # request log: the full id (X-Engy-Request-Id header, x_engy.request_id in
+        # the body or the stream's finish chunk), else the response ``id``. Each
+        # attempt the meter retries is its own request upstream; those ids are kept.
+        rid = None; retry_rids: list[str] = []
         async with ClientSession(timeout=ClientTimeout(total=900)) as cs:
             while True:
                 async with cs.post(f"{self.up}/chat/completions", json=body, headers=hdr) as up:
                     status = up.status
+                    rid = up.headers.get("X-Engy-Request-Id") or None
                     if status in (429, 503) and retries < 6:
+                        if rid:
+                            retry_rids.append(rid)
                         await up.read(); retries += 1; await asyncio.sleep(1.5 * retries); continue
                     if status != 200:
                         data = await up.read(); err = data[:300].decode("utf-8", "replace")
@@ -309,6 +323,7 @@ class PolicyMeter:
                         data = await up.read(); ttfb = round(time.time() - t0, 3)
                         try:
                             d = json.loads(data); usage = d.get("usage")
+                            rid = rid or engy_request_id(d) or d.get("id")
                             ch0 = (d.get("choices") or [{}])[0]
                             finish = ch0.get("finish_reason")
                             msg = ch0.get("message") or {}
@@ -321,6 +336,8 @@ class PolicyMeter:
                         first = await up.content.readany(); ttfb = round(time.time() - t0, 3)
                         if (b'"error"' in first[:400] or b"concurrency" in first[:400]) and retries < 8:
                             err = first[:300].decode("utf-8", "replace"); retries += 1
+                            if rid:
+                                retry_rids.append(rid)
                             await asyncio.sleep(2.0 * retries); continue
                         resp = web.StreamResponse(status=200, headers={
                             "Content-Type": up.headers.get("Content-Type", "text/event-stream"),
@@ -333,7 +350,7 @@ class PolicyMeter:
                             async for c in up.content.iter_any():
                                 yield c
 
-                        text_parts: list[str] = []; tcs: dict[int, dict] = {}
+                        text_parts: list[str] = []; tcs: dict[int, dict] = {}; chunk_id = None
                         async for chunk in _gen():
                             await resp.write(chunk); buf += chunk
                             while b"\n\n" in buf:
@@ -344,6 +361,8 @@ class PolicyMeter:
                                             j = json.loads(line[6:])
                                             if j.get("usage"):
                                                 usage = j["usage"]
+                                            rid = engy_request_id(j) or rid
+                                            chunk_id = chunk_id or j.get("id")
                                             for ch in j.get("choices") or []:
                                                 if ch.get("finish_reason"):
                                                     finish = ch["finish_reason"]
@@ -360,6 +379,7 @@ class PolicyMeter:
                                         except Exception:  # noqa: BLE001
                                             pass
                         await resp.write_eof()
+                        rid = rid or chunk_id
                         fp = content_fingerprint("".join(text_parts), [tcs[i] for i in sorted(tcs)])
                     break
         usd, pt, cached, ct = cost_of(model, usage) if status == 200 else (0.0, 0, 0, 0)
@@ -381,7 +401,7 @@ class PolicyMeter:
             resp.headers["x-trajrl-budget-remaining-usd"] = f"{max(0.0, ep.cap_usd - ep.spent_usd):.6f}"
         self._row(ep, dict(ts=round(t0, 3), model=model, status=status, stream=stream, prompt=pt, cached=cached,
                            completion=ct, finish=finish, err=err, retries=retries, ttfb=ttfb, max_tokens=mt, clamped=clamped,
-                           s=round(time.time() - t0, 3), usd=round(usd, 8), **fp))
+                           s=round(time.time() - t0, 3), usd=round(usd, 8), rid=rid, retry_rids=retry_rids, **fp))
         return resp
 
     def _row(self, ep: EpisodeUsage, row: dict) -> None:

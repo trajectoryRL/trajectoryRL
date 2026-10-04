@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 import socket
 import sys
 import threading
@@ -65,19 +66,35 @@ class _FakeUpstream:
 
     def __init__(self):
         self.port = _free_port(); self.calls = 0; self.thread = None
+        self.rids: list[str] = []; self.was_busy = False
 
     async def chat(self, req):
         self.calls += 1
         body = await req.json()
-        if "slow" in json.dumps(body.get("messages")):
+        marks = json.dumps(body.get("messages"))
+        if "slow" in marks:
             await asyncio.sleep(0.5)          # lets concurrent calls overlap (reservation tests)
         usage = {"prompt_tokens": 100, "completion_tokens": 50, "prompt_tokens_details": {"cached_tokens": 40}}
+        msg = {"role": "assistant", "content": "hi"}
+        if "plain-openai" in marks:           # a non-Engy upstream: only the standard response id
+            return web.json_response({"id": "gen-plain", "choices": [{"message": msg, "finish_reason": "stop"}], "usage": usage})
+        # Engy's response identity: the full id on the header (non-stream) and in x_engy, a 24-char prefix in `id`.
+        rid = secrets.token_hex(32); self.rids.append(rid)
+        cid = f"chatcmpl-{rid[:24]}"; hdr = {"X-Engy-Request-Id": rid}
+        if "busy-once" in marks and not self.was_busy:
+            self.was_busy = True
+            return web.json_response({"error": {"message": "capacity"}}, status=429, headers=hdr)
         if body.get("stream"):
             resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"}); await resp.prepare(req)
-            await resp.write(b'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}\n\n')
-            await resp.write(b'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":' + json.dumps(usage).encode() + b'}\n\n')
+            first = {"id": cid, "choices": [{"delta": {"content": "hi"}, "finish_reason": None}]}
+            done = {"id": cid, "choices": [{"delta": {}, "finish_reason": "stop"}], "usage": usage}
+            if "cut-stream" not in marks:     # a stream that never reaches its finish chunk carries only `id`
+                done["x_engy"] = {"request_id": rid}
+            await resp.write(b"data: " + json.dumps(first).encode() + b"\n\n")
+            await resp.write(b"data: " + json.dumps(done).encode() + b"\n\n")
             await resp.write(b"data: [DONE]\n\n"); await resp.write_eof(); return resp
-        return web.json_response({"choices": [{"message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}], "usage": usage})
+        return web.json_response({"id": cid, "choices": [{"message": msg, "finish_reason": "stop"}], "usage": usage,
+                                  "x_engy": {"request_id": rid}}, headers=hdr)
 
     def start(self):
         ready = threading.Event()
@@ -148,6 +165,70 @@ async def test_meter_allowlist_and_cost_and_cap(meter):
     assert summary["calls"] == 2 and summary["refused_cap"] == 1 and summary["refused_model"] == 1
     status, _, _ = await _post(m, tok, {"model": "kimi-k3", "messages": []})
     assert status == 401
+
+
+async def _rows(m, tok, n):
+    """The meter books a streamed call a moment after the client sees [DONE]: wait for row ``n``."""
+    for _ in range(200):
+        rows = m.usage(tok).rows
+        if len(rows) >= n:
+            return rows
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"meter recorded {len(m.usage(tok).rows)} rows, wanted {n}")
+
+
+@pytest.mark.asyncio
+async def test_row_records_engy_request_id_for_a_plain_call(meter):
+    m, up = meter
+    tok = m.mint("t/rid-plain", cap_usd=1.0)
+    status, _, _ = await _post(m, tok, {"model": "kimi-k3", "messages": [{"role": "user", "content": "x"}]})
+    assert status == 200
+    row = (await _rows(m, tok, 1))[-1]
+    assert row["rid"] == up.rids[-1] and row["retry_rids"] == []
+    m.close(tok)
+
+
+@pytest.mark.asyncio
+async def test_row_records_engy_request_id_from_the_stream_finish_chunk(meter):
+    m, up = meter
+    tok = m.mint("t/rid-stream", cap_usd=1.0)
+    status, _, _ = await _post(m, tok, {"model": "kimi-k3", "messages": [], "stream": True})
+    assert status == 200
+    row = (await _rows(m, tok, 1))[-1]
+    assert row["rid"] == up.rids[-1]       # the full id, not the truncated chatcmpl- prefix
+    m.close(tok)
+
+
+@pytest.mark.asyncio
+async def test_row_falls_back_to_the_chunk_id_when_the_stream_has_no_finish_handle(meter):
+    m, up = meter
+    tok = m.mint("t/rid-cut", cap_usd=1.0)
+    await _post(m, tok, {"model": "kimi-k3", "messages": [{"role": "user", "content": "cut-stream"}], "stream": True})
+    row = (await _rows(m, tok, 1))[-1]
+    assert row["rid"] == f"chatcmpl-{up.rids[-1][:24]}"
+    m.close(tok)
+
+
+@pytest.mark.asyncio
+async def test_row_keeps_the_ids_of_attempts_the_meter_retried(meter):
+    m, up = meter
+    tok = m.mint("t/rid-retry", cap_usd=1.0)
+    status, _, _ = await _post(m, tok, {"model": "kimi-k3", "messages": [{"role": "user", "content": "busy-once"}]})
+    assert status == 200
+    row = (await _rows(m, tok, 1))[-1]
+    assert row["retries"] == 1
+    assert row["retry_rids"] == [up.rids[-2]] and row["rid"] == up.rids[-1]
+    m.close(tok)
+
+
+@pytest.mark.asyncio
+async def test_row_falls_back_to_the_response_id_for_a_non_engy_upstream(meter):
+    m, _ = meter
+    tok = m.mint("t/rid-other", cap_usd=1.0)
+    await _post(m, tok, {"model": "kimi-k3", "messages": [{"role": "user", "content": "plain-openai"}]})
+    row = (await _rows(m, tok, 1))[-1]
+    assert row["rid"] == "gen-plain"
+    m.close(tok)
 
 
 # ---------------------------------------------------------------- runtime helpers (imported as a module)
