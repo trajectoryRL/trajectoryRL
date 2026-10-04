@@ -276,7 +276,7 @@ thing: the sidecar, the meter, the scenarios and the verifier exactly as validat
 ### What a local eval leaves behind
 
 `eval_output/episodes/<scenario>/`: `policy.log` (your policy's own log), `meter.json` (every model call
-with tokens, cost, clamps, refusals, and the provenance result), `testee_transcript.txt` (what Hermes did),
+with tokens, cost, clamps, refusals, the Engy request id as `rid`, and the provenance result), `testee_transcript.txt` (what Hermes did),
 `evaluation.json` (verifier result, cost by model, setup time, stall flag), and `error.txt` when the sidecar
 failed to start (the traceback is in it).
 
