@@ -1482,13 +1482,16 @@ class TestParallelScenarioOrchestrator:
         cfg = ValidatorConfig.from_env(dotenv_path=env_file)
         assert cfg.parallel_scenario_evals == 1
 
-    def test_sequential_when_parallelism_one(self, monkeypatch, tmp_path):
+    @pytest.mark.parametrize("parallelism,scenarios", [
+        (1, ("s0", "s1", "s2")),
+        (3, ("build-cython-ext", "jq-data-processing", "intrusion-detection")),
+    ])
+    def test_sequential_when_parallelism_one(self, monkeypatch, tmp_path, parallelism, scenarios):
         """With parallelism=1, no two episodes are in flight at the
         same instant — the dispatcher reproduces the pre-PR sequential
         behavior."""
-        scenarios = ("s0", "s1", "s2")
         h = self._setup_harness(
-            monkeypatch, tmp_path, parallelism=1, scenarios=scenarios,
+            monkeypatch, tmp_path, parallelism=parallelism, scenarios=scenarios,
         )
 
         active = 0
@@ -1938,3 +1941,26 @@ class TestRetryEpisodeOnIncomplete:
         )
         assert calls["n"] == 1             # no retry attempted
         assert slept == []
+
+
+class TestSpec28VerifierLimits:
+    @pytest.mark.parametrize('limited', [False, True])
+    def test_docker_receives_rotation_resource_limits(self, limited):
+        from unittest.mock import MagicMock
+        harness = TrajectorySandboxHarness.__new__(TrajectorySandboxHarness)
+        harness._docker_client = MagicMock()
+        harness._run_verifier_container(
+            image='scenario:test', tests_files_b64={},
+            agent_output_path='/app/output', agent_output_bytes=None,
+            session_id='resource-test', episode_index=0, timeout=60,
+            limit_resources=limited,
+        )
+        kwargs = harness._docker_client.containers.create.call_args.kwargs
+        if limited:
+            assert kwargs['mem_limit'] == '2g'
+            assert kwargs['memswap_limit'] == '2g'
+            assert kwargs['cpu_quota'] == 100000
+        else:
+            assert 'mem_limit' not in kwargs
+            assert 'memswap_limit' not in kwargs
+            assert 'cpu_quota' not in kwargs
