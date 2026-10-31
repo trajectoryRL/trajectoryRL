@@ -266,6 +266,33 @@ SCENARIOS_BY_SPEC[26] = (
 # earlier, so scores are not comparable with SPEC 26.
 SCENARIOS_BY_SPEC[27] = SCENARIOS_BY_SPEC[26]
 
+# SPEC 28: replace six saturated scenarios; 20 scenarios and $0.30 cap unchanged.
+SCENARIOS_BY_SPEC[28] = (
+    "audio-synth-stft-peaks",
+    "build-cython-ext",
+    "configure-git-webserver",
+    "db-wal-recovery",
+    "fix-code-vulnerability",
+    "git-multibranch",
+    "intrusion-detection",
+    "jq-data-processing",
+    "large-scale-text-editing",
+    "largest-eigenval",
+    "llm-inference-batching-scheduler",
+    "optimal-transport",
+    "parallel-particle-simulator",
+    "path-tracing",
+    "puzzle-solver",
+    "solve-maze-challenge",
+    "swe-bench-astropy-2",
+    "torch-tensor-parallelism",
+    "train-bpe-tokenizer",
+    "write-compressor",
+)
+
+# Initial SPEC-28 resource envelope. Existing rotations retain their behavior.
+SPEC28_NEW_SCENARIOS = frozenset(SCENARIOS_BY_SPEC[28]) - frozenset(SCENARIOS_BY_SPEC[27])
+
 
 @dataclass(frozen=True)
 class SpecConfig:
@@ -299,6 +326,7 @@ SPEC_CONFIG_BY_SPEC: Dict[int, SpecConfig] = {
     26: _LAUNCH_SPEC_CONFIG,
     # SPEC 27: 20 scenarios x $0.30 = $6 worst case per eval.
     27: SpecConfig(episode_cap_usd=0.30),
+    28: SpecConfig(episode_cap_usd=0.30),
 }
 
 # A spec with scenarios but no config (or the reverse) fails loudly at import
@@ -1706,6 +1734,10 @@ class TrajectorySandboxHarness:
         # sequential behavior. Bounded by ``total`` so we don't
         # allocate idle worker threads when the scenario set is small.
         parallelism = max(1, int(self.config.parallel_scenario_evals))
+        if SPEC28_NEW_SCENARIOS.intersection(eval_scenarios):
+            # An agent (4 GiB), policy sidecar (1 GiB) and verifier (2 GiB)
+            # coexist during grading. Start this new rotation serially.
+            parallelism = 1
         if total > 0:
             parallelism = min(parallelism, total)
         logger.info(
@@ -2232,6 +2264,7 @@ class TrajectorySandboxHarness:
                 session_id=session_id,
                 episode_index=episode_index,
                 timeout=verifier_timeout_s,
+                limit_resources=scenario in SPEC28_NEW_SCENARIOS,
             )
             reward = int(verifier_result.get("reward", 0))
             ctrf = verifier_result.get("ctrf")
@@ -2650,9 +2683,15 @@ class TrajectorySandboxHarness:
         session_id: str,
         episode_index: int,
         timeout: int,
+        limit_resources: bool = False,
     ) -> dict:
         """Run the scenario's tests/test.sh against the agent's output."""
         name = f"verifier_{session_id}_ep{episode_index}"
+
+        resource_limits = (
+            {"mem_limit": "2g", "memswap_limit": "2g", "cpu_quota": 100000}
+            if limit_resources else {}
+        )
 
         container = self.client.containers.create(
             image=image,
@@ -2666,6 +2705,7 @@ class TrajectorySandboxHarness:
             },
             log_config=LogConfig(type=LogConfig.types.JSON,
                                  config={"max-size": "10m"}),
+            **resource_limits,
         )
 
         try:

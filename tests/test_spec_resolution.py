@@ -129,10 +129,10 @@ class TestSpec27Set:
         assert sh.SCENARIOS_BY_SPEC[27] == sh.SCENARIOS_BY_SPEC[26]
         assert len(sh.SCENARIOS_BY_SPEC[27]) == 20
 
-    def test_spec27_is_the_local_default(self):
+    def test_spec28_is_the_local_default(self):
         from trajectoryrl.utils.config import SPEC_NUMBER
-        assert SPEC_NUMBER == 27
-        assert sh.SANDBOX_SCENARIOS == sh.SCENARIOS_BY_SPEC[27]
+        assert SPEC_NUMBER == 28
+        assert sh.SANDBOX_SCENARIOS == sh.SCENARIOS_BY_SPEC[28]
 
     def test_spec26_still_resolves_during_transition(self):
         # resolve_eval_spec must still serve SPEC 26 while validators roll forward
@@ -453,3 +453,31 @@ class TestHarnessScenarioParam:
             scenarios=("db-wal-recovery",), spec_number=spec_number,
         ))
         assert seen["cap_usd"] == cap
+
+
+class TestSpec28Set:
+    def test_swaps_six_saturated_scenarios(self):
+        before = set(sh.SCENARIOS_BY_SPEC[27])
+        after = set(sh.SCENARIOS_BY_SPEC[28])
+        assert after - before == {
+            "build-cython-ext",
+            "intrusion-detection",
+            "jq-data-processing",
+            "optimal-transport",
+            "solve-maze-challenge",
+            "train-bpe-tokenizer",
+        }
+        assert before - after == {
+            "crack-7z-hash",
+            "deterministic-tarball",
+            "nginx-request-logging",
+            "postgres-csv-clean",
+            "query-optimize",
+            "regex-engine-from-scratch",
+        }
+        assert len(before) == len(after) == 20
+        assert sh.resolve_eval_spec(28) == (28, sh.SCENARIOS_BY_SPEC[28])
+
+    def test_old_spec_and_budget_are_preserved(self):
+        assert sh.resolve_eval_spec(27) == (27, sh.SCENARIOS_BY_SPEC[27])
+        assert sh.spec_config(28).episode_cap_usd == sh.spec_config(27).episode_cap_usd == 0.30
