@@ -1735,9 +1735,9 @@ class TrajectorySandboxHarness:
         # allocate idle worker threads when the scenario set is small.
         parallelism = max(1, int(self.config.parallel_scenario_evals))
         if SPEC28_NEW_SCENARIOS.intersection(eval_scenarios):
-            # An agent (4 GiB), policy sidecar (1 GiB) and verifier (2 GiB)
-            # coexist during grading. Start this new rotation serially.
-            parallelism = 1
+            # Bound resource overlap while allowing the full rotation to
+            # finish within the current epoch's evaluation window.
+            parallelism = min(parallelism, 2)
         if total > 0:
             parallelism = min(parallelism, total)
         logger.info(

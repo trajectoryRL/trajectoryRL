@@ -1484,7 +1484,7 @@ class TestParallelScenarioOrchestrator:
 
     @pytest.mark.parametrize("parallelism,scenarios", [
         (1, ("s0", "s1", "s2")),
-        (3, ("build-cython-ext", "jq-data-processing", "intrusion-detection")),
+        (1, ("build-cython-ext", "jq-data-processing", "intrusion-detection")),
     ])
     def test_sequential_when_parallelism_one(self, monkeypatch, tmp_path, parallelism, scenarios):
         """With parallelism=1, no two episodes are in flight at the
@@ -1549,12 +1549,15 @@ class TestParallelScenarioOrchestrator:
         )
         assert caps == [1.0, 1.0, 1.0]
 
+    @pytest.mark.parametrize("scenarios,expected", [
+        (("s0", "s1", "s2", "s3", "s4"), 3),
+        (("build-cython-ext", "jq-data-processing", "intrusion-detection"), 2),
+    ])
     def test_peak_concurrency_bounded_by_parallelism(
-        self, monkeypatch, tmp_path,
+        self, monkeypatch, tmp_path, scenarios, expected,
     ):
         """With parallelism=N, at most N episodes are ever in flight
         simultaneously."""
-        scenarios = ("s0", "s1", "s2", "s3", "s4")
         h = self._setup_harness(
             monkeypatch, tmp_path, parallelism=3, scenarios=scenarios,
         )
@@ -1562,7 +1565,7 @@ class TestParallelScenarioOrchestrator:
         active = 0
         active_lock = threading.Lock()
         max_observed = 0
-        start_barrier = threading.Barrier(3, timeout=5.0)
+        start_barrier = threading.Barrier(expected, timeout=5.0)
 
         def fake_run_episode(*, session_id, episode_index, skill_md, spec,
                              on_chat_start=None, on_chat_end=None,
@@ -1594,8 +1597,8 @@ class TestParallelScenarioOrchestrator:
             skill_md="x", epoch_seed=0, salt="s", pack_hash="abc",
         )
 
-        # Concurrency cap is exactly 3, never exceeded.
-        assert max_observed == 3
+        # SPEC 28 caps the configured parallelism at two; prior sets keep it.
+        assert max_observed == expected
         # Ordering is still stable by cell_index, not completion order.
         assert [e.scenario for e in result.episodes] == list(scenarios)
 
