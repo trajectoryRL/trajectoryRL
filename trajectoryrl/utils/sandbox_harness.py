@@ -1735,9 +1735,10 @@ class TrajectorySandboxHarness:
         # allocate idle worker threads when the scenario set is small.
         parallelism = max(1, int(self.config.parallel_scenario_evals))
         if SPEC28_NEW_SCENARIOS.intersection(eval_scenarios):
-            # Bound resource overlap while allowing the full rotation to
-            # finish within the current epoch's evaluation window.
-            parallelism = min(parallelism, 2)
+            # Keep the existing three-worker throughput for the retained
+            # scenarios. Only two new scenarios may overlap (see dispatch
+            # below); a blanket two-worker cap exceeds a two-hour epoch.
+            parallelism = min(parallelism, 3)
         if total > 0:
             parallelism = min(parallelism, total)
         logger.info(
@@ -1820,6 +1821,7 @@ class TrajectorySandboxHarness:
         ) as pool:
             futures: dict[Future, int] = {}
             submitted = 0
+            pending = list(range(total))
             while submitted < total or futures:
                 # Top up the pool, respecting the epoch-current gate.
                 # The gate is consulted before every scenario submit
@@ -1830,8 +1832,18 @@ class TrajectorySandboxHarness:
                     and len(futures) < parallelism
                     and not abort_event.is_set()
                 ):
-                    cell_index = submitted
-                    if cell_index > 0 and not _check_still_current():
+                    new_in_flight = sum(
+                        scenario_specs[i]["name"] in SPEC28_NEW_SCENARIOS
+                        for i in futures.values()
+                    )
+                    cell_index = next((
+                        i for i in pending
+                        if scenario_specs[i]["name"] not in SPEC28_NEW_SCENARIOS
+                        or new_in_flight < 2
+                    ), None)
+                    if cell_index is None:
+                        break  # new-scenario slots full; wait for completion
+                    if submitted > 0 and not _check_still_current():
                         logger.info(
                             "[%s] pack %s no longer the current "
                             "challenger after %d/%d scenarios "
@@ -1869,6 +1881,7 @@ class TrajectorySandboxHarness:
                         on_container_finished=_make_finished_cb(cell_index),
                     )
                     futures[fut] = cell_index
+                    pending.remove(cell_index)
                     submitted += 1
 
                 if abort_event.is_set():

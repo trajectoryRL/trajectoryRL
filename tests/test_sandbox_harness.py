@@ -1597,10 +1597,51 @@ class TestParallelScenarioOrchestrator:
             skill_md="x", epoch_seed=0, salt="s", pack_hash="abc",
         )
 
-        # SPEC 28 caps the configured parallelism at two; prior sets keep it.
+        # New scenarios have two slots; prior scenarios keep configured slots.
         assert max_observed == expected
         # Ordering is still stable by cell_index, not completion order.
         assert [e.scenario for e in result.episodes] == list(scenarios)
+
+    def test_mixed_rotation_bypasses_busy_new_slots(self, monkeypatch, tmp_path):
+        """A third new scenario must not block a retained scenario's slot."""
+        scenarios = ("build-cython-ext", "jq-data-processing",
+                     "intrusion-detection", "retained-0", "retained-1")
+        h = self._setup_harness(
+            monkeypatch, tmp_path, parallelism=5, scenarios=scenarios,
+        )
+        active = new_active = peak = new_peak = 0
+        lock = threading.Lock()
+        first_wave = threading.Barrier(3, timeout=2)
+        starts = []
+
+        def fake_run_episode(**kw):
+            nonlocal active, new_active, peak, new_peak
+            name = kw["spec"]["name"]
+            is_new = name in {"build-cython-ext", "jq-data-processing",
+                              "intrusion-detection"}
+            with lock:
+                starts.append(name)
+                active += 1
+                new_active += is_new
+                peak = max(peak, active)
+                new_peak = max(new_peak, new_active)
+                wave = len(starts) <= 3
+            if wave:
+                first_wave.wait()
+            time.sleep(0.02)
+            with lock:
+                active -= 1
+                new_active -= is_new
+            return _EpisodeResult(episode_index=kw["episode_index"],
+                                  scenario=name, quality=0.5)
+
+        monkeypatch.setattr(h, "_run_episode", fake_run_episode)
+        result = h._run_eval_sync(skill_md="x", epoch_seed=0, salt="s", pack_hash="abc")
+        assert peak == 3
+        assert new_peak == 2
+        assert set(starts[:3]) == {"build-cython-ext", "jq-data-processing", "retained-0"}
+        assert [e.scenario for e in result.episodes] == list(scenarios)
+        assert all(e.error is None for e in result.episodes)
 
     def test_preserves_cell_index_order_when_completions_race(
         self, monkeypatch, tmp_path,
