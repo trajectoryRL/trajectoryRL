@@ -395,13 +395,6 @@ class MinerConfig:
 
     log_level: str = "INFO"
 
-    # Per-submission fee paid via on-chain recycle_alpha before each web
-    # submit. Defaults to the network fee (50 alpha); must be >= the network's
-    # configured SUBMISSION_FEE_ALPHA or the web fee_check rejects the
-    # submission. Set to 0 to disable local recycling (only valid while the
-    # network fee is off).
-    submission_fee_alpha: float = 50.0
-
     @classmethod
     def from_env(cls, dotenv_path: Optional[Path] = None) -> "MinerConfig":
         """Load configuration from environment variables.
@@ -423,5 +416,4 @@ class MinerConfig:
             netuid=int(os.getenv("NETUID", "11")),
             network=os.getenv("NETWORK", "finney"),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
-            submission_fee_alpha=float(os.getenv("SUBMISSION_FEE_ALPHA", "50")),
         )

@@ -2,6 +2,9 @@
 
 **Subnet**: SN11 (TrajectoryRL)
 
+> New public web submissions pause from challenge epoch **4650 / SPEC 28**.
+> Building and validating packs locally remain available.
+
 > Live eval mechanics, active scenarios, and mission framing: <https://trajrl.com/rules>.
 > For mechanism design (consensus, winner selection), see [INCENTIVE_MECHANISM.md](INCENTIVE_MECHANISM.md).
 
@@ -24,7 +27,6 @@ The miner CLI (`trajectoryrl-miner`) is a **toolbox**: independent commands you 
 | **Bittensor wallet** | `btcli wallet create --wallet.name miner --wallet.hotkey default` |
 | **Registration** | `btcli subnet register --netuid 11 --wallet.name miner` (dynamic cost) |
 | **Python** | 3.10+ |
-| **Alpha balance** | Enough α to cover the submission fee (`SUBMISSION_FEE_ALPHA`, default **50 α**) paid via `recycle_alpha` before each submission. No pack hosting infra needed — the platform stores your pack. |
 
 ---
 
@@ -45,11 +47,9 @@ trajectoryrl-miner build SKILL.md -o pack.json
 # Season 2: add your fusion policy directory (policy.py or policy.json + helper files)
 trajectoryrl-miner build SKILL.md --policy ./my_policy -o pack.json
 
-# 3. Pay the submission fee and submit.
-#    The CLI recycles SUBMISSION_FEE_ALPHA (default 50 α) on-chain via
-#    recycle_alpha, then POSTs the pack + recycle receipt to the platform.
-#    The platform stores the pack, verifies the receipt, runs pre-eval,
-#    and admits it to the challenger queue directly. No on-chain commit needed.
+# 3. Submit to a service accepting new submissions.
+#    The CLI signs the HTTP request with your hotkey.
+#    It does not burn or recycle alpha.
 trajectoryrl-miner web-submit pack.json
 # → prints pack_url + cooldown info
 ```
@@ -77,22 +77,25 @@ trajectoryrl-miner web-submit pack.json
 ```
 
 The `web-submit` command:
-1. Recycles `SUBMISSION_FEE_ALPHA` α on-chain (coldkey-signed) and captures the `(block, extrinsic_index)` receipt.
-2. POSTs the pack content + receipt to `POST /api/v2/miners/submit`, signed with your hotkey.
-3. The server verifies the signature, pack format, hash, recycle receipt, and then kicks off pre-eval asynchronously — no follow-up `set_commitment` needed.
+1. Validates and hashes your pack locally.
+2. POSTs the pack content to `POST /api/v2/miners/submit`, signed with your hotkey.
+3. Reports the server response. On acceptance, the platform handles pre-eval and queue admission without a follow-up `set_commitment`.
+
+The sample CLI performs no alpha burn/recycle and sends no fee receipt. Legacy
+`SUBMISSION_FEE_ALPHA` settings are ignored. A service requiring fee receipts
+will reject this sample request; it will not trigger a payment.
 
 The platform queues the pack for the next eligible challenger epoch on its own. Pack URLs are not exposed in any other API for **48 hours** (the "reveal gate"), so a competitor can't scrape the dashboard to harvest your fresh pack.
 
 Full request/response spec for `/api/v2/miners/submit` is in [`trajectoryrl.web/API.md`](https://github.com/trajectoryRL/trajectoryrl.web/blob/main/API.md).
 
-## Submission Fee
+## Submission Availability
 
-Every submission must be backed by an on-chain `recycle_alpha` burn. Recycling is irreversible — it is the economic cost that deters spam and low-quality packs (replaces the old owner-ban / Coldban system).
-
-- **Amount** — `SUBMISSION_FEE_ALPHA` (default **50 α**), signed by your **coldkey** via `recycle_alpha(hotkey, amount, netuid=11)`. Recycling at least the required amount; surplus is also burned. Too little is rejected.
-- **Receipt** — the CLI passes the recycle's `(block, extrinsic_index)` with the submission; the server verifies it on-chain (your hotkey, `amount ≥ fee`, within **24 h**) before queuing the pack.
-- **Reuse** — the receipt is consumed **only when the pack enters the eval queue** (`pending_eval`). A submission that fails a technical check (bad format, duplicate hash, similarity, …) does **not** consume the receipt, so the same recycle can back another submission of a different pack within its 24 h window. Re-submitting the same `pack_hash` that already failed terminally does not re-evaluate it.
-- **Cooldown** — one submission per hotkey every **~20 min** (server-enforced via `MINER_SUBMIT_COOLDOWN_SECONDS`), on top of the fee.
+Public web submissions pause from **SPEC 28 / challenge epoch 4650**. The
+server returns **HTTP 503** while submissions are closed; the CLI reports
+failure without making any on-chain payment. Existing queued evaluations and
+validator score reporting continue. Use `--api-base-url` with a compatible
+staging or self-hosted service for submission development.
 
 ---
 
@@ -115,7 +118,7 @@ Build a pack from a SKILL.md file and, with `--policy DIR`, the policy files in 
 trajectoryrl-miner build ./SKILL.md -o pack.json
 ```
 
-Output:
+Example output from a service accepting submissions:
 ```
 Pack built: pack.json
   Hash:  a3f8c2...
@@ -135,7 +138,11 @@ trajectoryrl-miner validate pack.json
 
 ### web-submit
 
-The **sole submission channel**. Recycles `SUBMISSION_FEE_ALPHA` α on-chain (coldkey-signed), then POSTs the pack + recycle receipt to `POST /api/v2/miners/submit`. The server stores your pack at an unguessable random GCS path, verifies the receipt on-chain, creates the `miner_submissions` row, and kicks off pre-eval. No S3 / R2 / bucket config required — the request is signed with your hotkey, so the only credential you need is the wallet itself and enough alpha to cover the fee.
+POSTs the pack to `POST /api/v2/miners/submit`, signed with your hotkey. The
+sample performs no alpha burn/recycle and does not access your coldkey. When
+submissions are enabled and accepted, the server stores your pack, creates the
+submission row and starts pre-eval. No S3 / R2 / bucket configuration is needed.
+Public submissions pause at epoch 4650; HTTP 503 is reported as a failure.
 
 This command is **self-contained** — you do **not** need to follow up with anything. The platform queues the pack for evaluation on its own.
 
@@ -144,13 +151,11 @@ trajectoryrl-miner web-submit pack.json
 trajectoryrl-miner web-submit pack.json --api-base-url https://stage.trajrl.com
 ```
 
-Output:
+Example output from a service accepting submissions:
 
 ```
 Pack hash: a3f8c2...
 Endpoint: https://trajrl.com/api/v2/miners/submit
-Recycling 50 α (fee) on-chain...
-  recycle block: 3456789  extrinsic: 2
 Submitting pack content to web service...
 Submitted! pack_url = https://storage.googleapis.com/<bucket>/<prefix>/<uid>/<random_key>.json
   submission_id:    12345
@@ -163,8 +168,6 @@ challenger queue automatically. No on-chain commit required.
 ```
 
 **Cooldown**: The endpoint enforces a per-miner cooldown (default **~20 min**, set server-side via `MINER_SUBMIT_COOLDOWN_SECONDS=1200`). Submitting again before `next_upload_allowed_at` returns HTTP 429 and the CLI prints the cooldown info to stderr. Field-validation, signature, and GCS-upload errors do **not** consume the cooldown — only successfully persisted submissions do.
-
-**Submission fee**: The fee (`recycle_alpha`, coldkey-signed) is consumed only when the pack reaches `pending_eval`. A submission that fails a technical check does not consume the receipt — the same recycle can back a new submission within its 24 h window.
 
 **Idempotency**: Resubmitting the **same** `(hotkey, pack_hash)` after the cooldown lifts is safe — the server reuses the existing `pack_url` (no re-upload), so the URL you got the first time stays valid.
 
@@ -201,7 +204,7 @@ Show your current on-chain commitment.
 trajectoryrl-miner status
 ```
 
-Output:
+Example output from a service accepting submissions:
 ```
 On-chain commitment:
   Pack hash: a3f8c2...
@@ -228,9 +231,8 @@ The CLI reads wallet and storage config from environment variables. Create a `.e
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `TRAJECTORYRL_API_BASE_URL` | no | `https://trajrl.com` | Override the web service base URL (for staging / self-hosted). The CLI also accepts `--api-base-url` per-invocation. |
-| `SUBMISSION_FEE_ALPHA` | no | `50` | Minimum α recycled per submission via `recycle_alpha(hotkey, amount, netuid=11)`. Recycling is irreversible. |
 
-No HMAC keys / bucket credentials needed — the request is signed with the miner's bittensor hotkey. You do need enough alpha in your hotkey's balance to cover the fee.
+No HMAC keys / bucket credentials needed — the request is signed with the miner's bittensor hotkey. The sample does not make any on-chain payment.
 
 ### S3-Compatible Storage (for legacy `upload` command only)
 
@@ -280,8 +282,8 @@ For SKILL.md authoring patterns and what makes a pack score well, the canonical 
 │                                                         │
 │  1. Write / iterate on SKILL.md                         │
 │  2. build → pack.json                                   │
-│  3. web-submit → recycles fee on-chain, then platform   │
-│                  stores pack + queues it directly       │
+│  3. web-submit → hotkey-signed HTTP request              │
+│                  (when submissions are enabled)         │
 │  4. Wait for validator evaluation (one epoch)           │
 │  5. Check results, iterate                              │
 └─────────────────────────────────────────────────────────┘
