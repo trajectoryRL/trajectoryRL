@@ -776,3 +776,45 @@ class TestValidatorConfig:
         # from_env still requires a few env vars to be set; just check
         # SPEC_NUMBER is exposed as a class attribute or accessible.
         assert hasattr(ValidatorConfig, "from_env")
+
+
+# ---------------------------------------------------------------------------
+# BURN_ALL: every weight tick burns to OWNER_UID, winner ignored
+# ---------------------------------------------------------------------------
+
+
+class TestBurnAll:
+    def _validator(self, burn_all: bool):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+        from trajectoryrl.base.validator import TrajectoryValidator
+        v = TrajectoryValidator.__new__(TrajectoryValidator)
+        v.config = SimpleNamespace(burn_all=burn_all, weight_interval_blocks=100)
+        v.subtensor = MagicMock()
+        v.subtensor.get_current_block.return_value = 9_000_000
+        v._last_set_weights_block = 0
+        v._winner_state = MagicMock(is_seated=True, winner_hotkey="5Gwin", winner_uid=97)
+        v._winner_state.is_fresh.return_value = True
+        v._do_set_weights = AsyncMock(return_value=True)
+        v._save_eval_state = MagicMock()
+        return v
+
+    def test_burn_all_sets_owner_uid_only(self):
+        import asyncio
+        from trajectoryrl.base.validator import OWNER_UID
+        v = self._validator(burn_all=True)
+        asyncio.run(v._weight_loop_tick())
+        v._do_set_weights.assert_awaited_once()
+        uids, weights = v._do_set_weights.await_args.args
+        assert uids == [OWNER_UID] and weights == [1.0]
+        assert v._last_set_weights_block == 9_000_000
+
+    def test_burn_all_off_sets_winner(self):
+        import asyncio
+        v = self._validator(burn_all=False)
+        asyncio.run(v._weight_loop_tick())
+        uids, weights = v._do_set_weights.await_args.args
+        assert uids == [97] and weights == [1.0]
+
+    def test_burn_all_default_on(self):
+        assert ValidatorConfig.burn_all is True
