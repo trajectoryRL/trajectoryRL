@@ -198,6 +198,12 @@ class ValidatorConfig:
     # same lowest-cost winner (use once to clear divergent cached state).
     disable_winner_protection: bool = False
 
+    # Burn all miner emission: every weight tick sets 100% on OWNER_UID
+    # (burned, RecycleOrBurn=Burn) and ignores the seated winner. On by
+    # default so every validator on this image agrees; BURN_ALL=0 restores
+    # winner weights.
+    burn_all: bool = True
+
     # LLM configuration (used by sandbox harness and LLM judges).
     llm_model: str = DEFAULT_LLM_MODEL
     llm_api_key: str = ""
@@ -367,6 +373,7 @@ class ValidatorConfig:
             aggregate_when_start=os.getenv("AGGREGATE_WHEN_START", "1") == "1",
             full_cycle_on_startup=os.getenv("FULL_CYCLE_ON_STARTUP", "0") == "1",
             disable_winner_protection=os.getenv("DISABLE_WINNER_PROTECTION", "1") == "1",
+            burn_all=os.getenv("BURN_ALL", "1") == "1",
             # --- IM parameters are hardcoded (dataclass defaults) ---
             # Do NOT load from env: score_delta,
             # rho_reliability, consensus_epsilon, bootstrap_threshold,

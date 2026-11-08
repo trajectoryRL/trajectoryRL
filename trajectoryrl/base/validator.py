@@ -1298,6 +1298,12 @@ class TrajectoryValidator:
         if not self._should_set_weights(current_block):
             return
 
+        if self.config.burn_all:
+            await self._set_burn_weights(reason="burn_all")
+            self._last_set_weights_block = current_block
+            self._save_eval_state()
+            return
+
         if not self._winner_state.is_seated:
             await self._set_fallback_weights(reason="No winner seated yet")
             self._last_set_weights_block = current_block
